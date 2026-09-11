@@ -986,6 +986,66 @@ def _looks_like_real_path(token: str) -> bool:
     return False
 
 
+# ── Rework prescription（DSH 参照，2026-09-11）─────────────────────
+# DSH `GoalBlockReason`（packages/goal/goal/src/index.ts:222-237）把「为什么不
+# 能继续」建模为 **受限 kebab-case code + 非空 message 双字段强制**，而不是
+# 让消费方去猜自由文本里有没有某种 token。照该形态补上结构化那条正路：
+# 调用方可以显式声明处方的**类别**（闭合词表），具体说明仍写在 feedback。
+#
+# 为什么需要它（fixlist #8 实测）：QA/VERIFY 类返修的真实处方是「补哪类证据 /
+# 改哪个状态 / 引用哪条验收条款」，写不出文件路径 → 旧判据（只认路径 token 与
+# filesChanged 关键字）对它们**结构上永假** → 合法返修被拒（一次纯为这重写
+# 耗 3min43s）。这是「判据太窄」的误伤，不是模型不配合。
+REWORK_PRESCRIPTION_KINDS = frozenset({
+    "path-change",       # 改/加/删某个文件（旧判据已覆盖的形态）
+    "missing-evidence",  # 补某类证据或凭证（test_run / browse_e2e / doc_review …）
+    "state-mismatch",    # 状态或元数据不符（任务字段、契约、切片状态）
+    "clause-violation",  # 违反某条验收条款或契约条款
+    "param-invalid",     # 调用参数或输入非法
+})
+
+
+def _feedback_prescription_problem(feedback: str | None) -> str | None:
+    """文本侧的处方判据（旧口径原样保留）：None=合格，否则缺失原因码。"""
+    if not feedback or not str(feedback).strip():
+        return "feedback_empty"
+    text = str(feedback).replace("\\", "/")
+    if "fileschanged" in text.lower():
+        return None
+    for m in _PATH_TOKEN_RE.finditer(text):
+        if _looks_like_real_path(m.group(0)):
+            return None
+    return "feedback_without_prescription"
+
+
+def rework_prescription_problem(
+    feedback: str | None,
+    prescription_kind: str | None = None,
+) -> str | None:
+    """Return None when this rework carries a way out; else a reason code.
+
+    合格条件（**任一**成立即可）：
+      1. 显式声明 ``prescription_kind`` 且落在 REWORK_PRESCRIPTION_KINDS 内；
+      2. feedback 里能识别出具体文件路径（旧判据）；
+      3. feedback 里出现 filesChanged 关键字（旧判据）。
+
+    三者是「或」，且**不因 kind 写错而否决**：未登记的 kind 只是拿不到
+    第 1 条正路，仍回落看 feedback。旧行为对「带路径的返修」一律接受，
+    判据不能因为模型把类别写成近义词/大小写变体，就把一个本来合格的返修
+    弹回去（审计 L1）。只有 feedback 也拿不出处方时，才把「未登记类别」
+    作为附加诊断报出。
+    """
+    kind = str(prescription_kind).strip() if prescription_kind else ""
+    if kind and kind in REWORK_PRESCRIPTION_KINDS:
+        return None
+    reason = _feedback_prescription_problem(feedback)
+    if reason is None:
+        return None
+    if kind:
+        return f"unknown_prescription_kind:{kind}"
+    return reason
+
+
 def rework_feedback_missing_prescription(feedback: str | None) -> bool:
     """Structured-only check: does rework feedback carry a way out?
 
@@ -993,16 +1053,12 @@ def rework_feedback_missing_prescription(feedback: str | None) -> bool:
     AND no explicit filesChanged keyword. Over-accept by design — only
     flag feedback with neither concrete paths nor a filesChanged
     reference, so legitimate rework is never bounced.
+
+    布尔壳（向后兼容）：等价于 ``rework_prescription_problem(feedback) is not
+    None``。新调用点请直接用 ``rework_prescription_problem`` —— 它多接受
+    ``prescription_kind``，并能返回**具体缺失原因**供回执使用。
     """
-    if not feedback or not str(feedback).strip():
-        return True
-    text = str(feedback).replace("\\", "/")
-    if "fileschanged" in text.lower():
-        return False
-    for m in _PATH_TOKEN_RE.finditer(text):
-        if _looks_like_real_path(m.group(0)):
-            return False
-    return True
+    return rework_prescription_problem(feedback) is not None
 
 
 def extract_acceptance_path_refs(criteria: Any) -> list[str]:

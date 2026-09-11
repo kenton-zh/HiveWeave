@@ -197,7 +197,11 @@ async def test_cleanup_spares_rework_duplicate(task_env):
         evidence={"verdict": "PASS", "tests_passed": True, "test_output": "ok"},
     )
     await ts.start_review(pid, dup)
-    await ts.review_task(pid, dup, "rework")
+    # 处方门禁下沉（2026-09-11）：返修必须带可执行处方（路径或
+    # prescriptionKind），否则状态不落。
+    await ts.review_task(
+        pid, dup, "rework", feedback="rerun tests/test_verify.py"
+    )
     verify_ok = await ts.create_task(
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],

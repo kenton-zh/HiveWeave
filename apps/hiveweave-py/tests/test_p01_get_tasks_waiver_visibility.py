@@ -218,7 +218,11 @@ async def test_get_tasks_waiver_disappears_after_rework_invalidate(env):
     assert await has_valid_waiver(env["project_id"], tid) is True
 
     # rework → invalidate_valid_waivers
-    await svc.review_task(env["project_id"], tid, "rework", feedback="fix")
+    # （2026-09-11 处方门禁下沉：无路径的返修必须声明结构化处方类别）
+    await svc.review_task(
+        env["project_id"], tid, "rework",
+        feedback="fix", prescription_kind="missing-evidence",
+    )
     assert await has_valid_waiver(env["project_id"], tid) is False
 
     with patch(

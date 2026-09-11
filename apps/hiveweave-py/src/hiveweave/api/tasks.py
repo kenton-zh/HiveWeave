@@ -25,6 +25,7 @@ from hiveweave.services.attestation import (
 from hiveweave.services.org import OrgService
 from hiveweave.services.policy import policy_service
 from hiveweave.services.task import TaskService
+from hiveweave.services.tasks.review import ReworkPrescriptionAbsent
 
 log = structlog.get_logger(__name__)
 
@@ -72,6 +73,10 @@ class TaskReview(BaseModel):
     decision: str  # "approve" or "rework"
     feedback: str | None = None
     actorAgentId: str | None = None
+    # 返修处方的结构化类别（见 worktree_review.REWORK_PRESCRIPTION_KINDS）。
+    # decision='rework' 且 feedback 写不出文件路径时必填 —— 否则 400
+    # （ReworkPrescriptionAbsent 是 ValueError 子类，走 _raise_from_value_error）。
+    prescriptionKind: str | None = None
 
 
 class TaskClaim(BaseModel):
@@ -87,6 +92,11 @@ class TaskForceApprove(BaseModel):
 
 def _raise_from_value_error(e: ValueError) -> None:
     """Map ValueError to 404 (not found) or 400 (illegal transition)."""
+    # 处方缺失按**类型**判定，优先于消息子串匹配：problem 码里会带上调用方
+    # 传入的 kind（如 prescriptionKind="clause not found"），靠子串匹配会把
+    # 本该 400 的请求误判成 404（审计 L4）。
+    if isinstance(e, ReworkPrescriptionAbsent):
+        raise HTTPException(status_code=400, detail=str(e))
     msg = str(e)
     if "not found" in msg.lower():
         raise HTTPException(status_code=404, detail=msg)
@@ -363,6 +373,10 @@ async def force_approve_task(
         await _tasks.review_task(
             project_id, task_id, "approve", feedback,
             reviewer_id=reviewer_id,
+            # 逃生门语义：operator 要求放行。但若证据闸（verdict=FAIL /
+            # integrity=fail）把它强制转成返修，那一步同样需要处方——这里
+            # 按「证据缺失」类别给出，避免应急路径被新门禁挡成 400（审计 L6）。
+            prescription_kind="missing-evidence",
         )
     except ValueError as e:
         _raise_from_value_error(e)
@@ -454,7 +468,8 @@ async def review_task(project_id: str, task_id: str, body: TaskReview) -> dict:
                            f"to rework, but is '{current_status}'",
                 )
         await _tasks.review_task(
-            project_id, task_id, body.decision, body.feedback
+            project_id, task_id, body.decision, body.feedback,
+            prescription_kind=body.prescriptionKind,
         )
     except ValueError as e:
         _raise_from_value_error(e)

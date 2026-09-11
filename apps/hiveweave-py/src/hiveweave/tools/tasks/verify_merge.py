@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.tasks.review import ReworkPrescriptionAbsent
 from hiveweave.services.tasks.verify import is_verify_title
 from hiveweave.tools import helpers as _helpers
 from hiveweave.tools.tasks.verify_spawn import (
@@ -97,7 +98,23 @@ async def rework_tasks_after_merge_conflict(
                 "rework",
                 feedback,
                 reason_code="merge_conflict_rework",
+                # 冲突返修的本质就是「改这些文件」→ 处方类别 = path-change。
+                # 必须显式声明：`files` 可能退化成 "(unknown)"，或全是无已知
+                # 扩展名的仓库根文件（Makefile / Dockerfile / LICENSE），文本
+                # 判据认不出 → 这道**自动**返修会被处方门禁挡下，而它不经过
+                # tool 层、受让人不会收到任何提示（审计 M2）。
+                prescription_kind="path-change",
             )
+        except ReworkPrescriptionAbsent as e:
+            # 单独具名：门禁拒绝意味着任务会停在 approved 且受让人不知情，
+            # 不是可静默跳过的小事（对照 DSH AGENTS.md:122「空 catch 必须
+            # 具名它吞掉了什么」）。
+            log.error(
+                "merge_conflict_rework_prescription_absent",
+                task_id=tid,
+                problem=e.problem,
+            )
+            continue
         except Exception as e:
             log.warning("merge_conflict_rework_task_failed", task_id=tid, error=str(e))
             continue

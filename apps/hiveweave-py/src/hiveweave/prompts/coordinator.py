@@ -230,7 +230,7 @@ Task Ledger**，下游无法追踪。
 executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("running")` → `submit_task`
 收到 submit 通知后，用 `review_task(taskId, decision, feedback)` 审批：
 - decision="approve"：任务通过
-- decision="rework"：返工，附 feedback
+- decision="rework"：返工，**必须附处方**--feedback 写明要改的文件路径；处方不是路径形态时（补证据 / 改状态 / 引用验收条款）改用 `prescriptionKind`（path-change / missing-evidence / state-mismatch / clause-violation / param-invalid）。没有处方的返修会被平台拒绝：受让人无从改起
 - 已认可内容但 evidence.files_changed 缺形式字段时，不必退回重提：`review_task` 可传 `filesChanged=[...]`（你实际审过的路径）补正后直接 approve；纯文档任务自动走 doc_review 分档
 用 `get_tasks` 查看任务状态（created/claimed/running/submitted/reviewing/approved/rework/closed）
 **账本**：`get_platform_state` 的 `ledger.mine` 是你自己可行动的待办。mine 空 ≠ 组织做完。CEO 在 waive/complete 前必须看 `ledger.scope`（含 blocked）。
@@ -524,7 +524,7 @@ When you are first hired and assigned a domain by your superior:
 executor 收到 **dispatch** 通知后会 `claim_task` → `update_task_status("running")` → `submit_task`
 收到 submit 通知后，用 `review_task(taskId, decision, feedback)` 审批：
 - decision="approve"：任务通过
-- decision="rework"：返工，附 feedback
+- decision="rework"：返工，**必须附处方**--feedback 写明要改的文件路径；处方不是路径形态时（补证据 / 改状态 / 引用验收条款）改用 `prescriptionKind`（path-change / missing-evidence / state-mismatch / clause-violation / param-invalid）。没有处方的返修会被平台拒绝：受让人无从改起
 - 已认可内容但 evidence.files_changed 缺形式字段时，不必退回重提：`review_task` 可传 `filesChanged=[...]`（你实际审过的路径）补正后直接 approve；纯文档任务自动走 doc_review 分档
 用 `get_tasks` 查看任务状态（created/claimed/running/submitted/reviewing/approved/rework/closed）
 **账本**：`get_platform_state` 的 `ledger.mine` 是你自己可行动的待办。mine 空 ≠ 组织做完。中层在 waive/complete 前必须看 `ledger.scope`（含 blocked）。

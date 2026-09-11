@@ -12,6 +12,11 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.tasks.review import ReworkPrescriptionAbsent
+from hiveweave.services.worktree_review import (
+    REWORK_PRESCRIPTION_KINDS,
+    rework_prescription_problem,
+)
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
 
@@ -80,6 +85,25 @@ class ReviewTaskParams(BaseModel):
         ),
         json_schema_extra={
             "aliases": ["filesChanged", "files_changed", "files"]
+        },
+    )
+
+    prescription_kind: str | None = Field(
+        default=None,
+        alias="prescriptionKind",
+        description=(
+            "Required when decision='rework' AND your feedback cannot name "
+            "file paths (evidence/state/clause type rework). One of: "
+            "'path-change' (add/edit/delete a file), 'missing-evidence' "
+            "(produce a specific attestation/credential), 'state-mismatch' "
+            "(task/contract/slice field is wrong), 'clause-violation' "
+            "(breaks an acceptance criterion), 'param-invalid' (bad input). "
+            "The kind is the machine-routable half of the prescription; your "
+            "feedback carries the detail. Rework without any prescription — "
+            "no kind, no path, no filesChanged — is rejected."
+        ),
+        json_schema_extra={
+            "aliases": ["prescriptionKind", "prescription_kind"]
         },
     )
 
@@ -682,28 +706,51 @@ async def review_task_tool(
         # 审计 #10（L8）：rework 理由只断言状态（「设计文档在 MAIN 不可见」）
         # 不给出路 → 多轮拉扯。feedback 非空但既无路径 token 也无
         # filesChanged 关键字时硬拒，强制附处方（结构化判定，不做 NL 猜测）。
-        from hiveweave.services.worktree_review import (
-            rework_feedback_missing_prescription,
-        )
-
-        if decision == "rework" and rework_feedback_missing_prescription(
-            params.feedback
-        ):
+        # 2026-09-11（fixlist #8）：判据补上结构化处方类别——QA/VERIFY 类返修
+        # 的处方是「补哪类证据 / 改哪个状态 / 引用哪条条款」，写不出文件路径，
+        # 旧判据对它们结构上永假（实测一次重写耗 3min43s）。
+        if decision == "rework":
+            problem = rework_prescription_problem(
+                params.feedback, params.prescription_kind
+            )
+            if problem:
+                return ToolResult.err(
+                    "REWORK REJECTED (prescription_absent): rework feedback "
+                    "states a verdict without a way out — the assignee "
+                    "cannot act on it. Review the assignee worktree, not "
+                    "MAIN, then rework with the concrete prescription: "
+                    "name the file paths to change, e.g. "
+                    "review_task(decision='rework', feedback=<what fails + "
+                    "files to fix>, filesChanged=[<paths you actually "
+                    "reviewed>]). If your prescription is not path-shaped "
+                    "(missing evidence / wrong state / broken clause), pass "
+                    "prescriptionKind instead — one of "
+                    f"{sorted(REWORK_PRESCRIPTION_KINDS)}. "
+                    f"Fact bit: prescription_absent=true ({problem}). "
+                    "RETRY[action=add_prescription_then_rework]"
+                )
+        # 门禁下沉后仍保留这一层：它是**早拒**（省掉一次 service 往返、并给出
+        # 更完整的修复指引），不再是唯一 enforcement —— 真正的判定在
+        # `_force_rework`，因为那里才知道最终决定是不是返修（approve 被证据闸
+        # 强制转 rework 的路径绕不过它）。见 DSH packages/AGENTS.md:14。
+        try:
+            await ts.review_task(
+                project_id, params.task_id, decision, params.feedback,
+                reviewer_id=agent_id,
+                prescription_kind=params.prescription_kind,
+            )
+        except ReworkPrescriptionAbsent as exc:
             return ToolResult.err(
-                "REWORK REJECTED (prescription_absent): rework feedback "
-                "states a verdict without a way out — the assignee "
-                "cannot act on it. Review the assignee worktree, not "
-                "MAIN, then rework with the concrete prescription: "
-                "name the file paths to change, e.g. "
-                "review_task(decision='rework', feedback=<what fails + "
-                "files to fix>, filesChanged=[<paths you actually "
-                "reviewed>]). Fact bit: prescription_absent=true. "
+                "REWORK REJECTED (prescription_absent): this decision lands as "
+                "rework but carries no way out — the assignee cannot act on "
+                "'needs rework' alone. State WHAT fails and HOW to verify the "
+                "fix (file:line, expected vs actual, or the spec clause "
+                "violated). If your prescription is not path-shaped, pass "
+                "prescriptionKind — one of "
+                f"{sorted(REWORK_PRESCRIPTION_KINDS)}. "
+                f"Fact bit: prescription_absent=true ({exc.problem}). "
                 "RETRY[action=add_prescription_then_rework]"
             )
-        await ts.review_task(
-            project_id, params.task_id, decision, params.feedback,
-            reviewer_id=agent_id,
-        )
 
         # TEST6 S11 / TEST18 NEW-7: fulfill review obligation on approve OR
         # rework — either decision completes the review act; rework starts a
@@ -848,7 +895,12 @@ async def review_task_tool(
                                 "blocking_issues: "
                                 + "; ".join(str(x) for x in list(bis)[:5])
                             )
-                    if rework_feedback_missing_prescription(feedback):
+                    # 处方指引（HINT，非门禁——门禁已在 service 层统一判定）。
+                    # 只在 feedback 确实没写出路径时补一句「怎么交」的操作指引；
+                    # 有 prescriptionKind 时不再画蛇添足（reviewer 的说明即处方）。
+                    if rework_prescription_problem(
+                        feedback, params.prescription_kind
+                    ):
                         feedback = (
                             feedback
                             + " Prescription: the review channel is your "
@@ -1171,6 +1223,11 @@ async def _auto_rework_on_evidence_gate(
                 "rework",
                 params.feedback or deny_msg[:500],
                 reviewer_id=agent_id,
+                # reason_code 保持默认 "review_rework"：改它会让 timeline 的
+                # 「评审打回」标签退化（`services/tasks/timeline.py` 只认
+                # review_rework），而这个 code 变更对门禁并非必需——kind 已
+                # 足以通过（审计 L3）。
+                prescription_kind="missing-evidence",
             )
             try:
                 from hiveweave.services.obligation import ObligationLedger

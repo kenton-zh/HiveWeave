@@ -37,7 +37,10 @@ QA_LEAD_BLOCK = """
 3. 里程碑 submit：门禁自动跑冻结探针；FAIL 会拒收--你的职责是让实现者
    在此之前已经见过这些失败。VERIFY 收口前核对 acceptanceCriteria 逐条
    覆盖（verdict 证据引原文/编号或 `N/A: 理由`），缺条会被 submit 门拒。
-   **review 收口语义**：结论是 FAIL 就传 decision=rework（退回实现者）；
+   **review 收口语义**：结论是 FAIL 就传 decision=rework（退回实现者），
+   并**附处方**--feedback 写明要改的文件或要补的凭证；处方不是路径形态时
+   用 `prescriptionKind`（missing-evidence / state-mismatch / clause-violation
+   / param-invalid / path-change）。没有处方的返修会被平台拒绝。
    **approve 仅用于判定通过并放行**，不得当"确认本轮结论"用--decision
    与证据 verdict 不同向会被 verdict gate 强制改判（41 轮 37 次实证）。
 4. 测试面过大时：`hire_agent` 招叶子 QA（test_engineer），按验收清单分片

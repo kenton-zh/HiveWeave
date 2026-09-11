@@ -1701,7 +1701,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "evidence verdict=FAIL (VERIFY) auto-reroutes approve to "
             "rework — FAIL must be fixed, never silently closed. Receipt "
             "starts with VERDICT: APPROVE or VERDICT: REWORK — always read "
-            "it; approve=release-only, rework=needs changes."
+            "it; approve=release-only, rework=needs changes. rework MUST "
+            "carry a prescription: file paths in feedback, or "
+            "prescriptionKind when the fix is not path-shaped (missing "
+            "evidence / wrong state / broken clause)."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},
@@ -1719,6 +1722,29 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "wrong evidence.files_changed in the worktree proof gate "
                     "(e.g. pure-doc tasks) — instead of bouncing the task to "
                     "re-submit formality fields."
+                ),
+            },
+            "prescriptionKind": {
+                "type": "string",
+                "enum": [
+                    "path-change",
+                    "missing-evidence",
+                    "state-mismatch",
+                    "clause-violation",
+                    "param-invalid",
+                ],
+                "aliases": ["prescription_kind"],
+                "description": (
+                    "Required when decision='rework' AND your feedback cannot "
+                    "name file paths (evidence/state/clause type rework). "
+                    "'missing-evidence' = produce a specific attestation/"
+                    "credential; 'state-mismatch' = a task/contract/slice "
+                    "field is wrong; 'clause-violation' = breaks an "
+                    "acceptance criterion; 'param-invalid' = bad input. "
+                    "The kind is the machine-routable half of the "
+                    "prescription, your feedback carries the detail. Rework "
+                    "with no prescription at all (no kind, no path, no "
+                    "filesChanged) is rejected."
                 ),
             },
         },

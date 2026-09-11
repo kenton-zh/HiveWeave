@@ -277,7 +277,9 @@ class TestReworkLoop:
 
         tid = await _create_submitted(env, svc)
         await svc.start_review(pid, tid)
-        await svc.review_task(pid, tid, "rework", feedback="fix bugs")
+        await svc.review_task(
+            pid, tid, "rework", feedback="fix bugs in src/main.py"
+        )
         t = await svc.get_task(pid, tid)
         assert t["status"] == "running"
 
