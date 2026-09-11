@@ -113,11 +113,52 @@ if exist "%PRESERVE%\.env" (
 )
 if exist "%PRESERVE%" rmdir /s /q "%PRESERVE%"
 
+REM ── 生成分发配置（fixlist #4① / P0-4）──────────────────────────
+REM 此前本脚本只在构建间「保留 / 回填」已有 .env，**从不生成** ⇒ 首次
+REM 打包产物没有 .env ⇒ launcher._frozen_bootstrap_env 走
+REM `if is_file(): load else: pass`（静默跳过缺失 referent）⇒ 预算静默
+REM 回落到代码默认值（实测 hard=570 而 dev .env 写 1710，4 个 run 精确
+REM 死在 600.0s）。故此处**在构建期生成**，而不是留到首启：
+REM   · 首启时 EXE 可能装在 Program Files 这类只读目录，写入必失败；
+REM   · 构建期生成 = 产物面自带配置，与源码面彻底分离。
+REM 三条纪律：
+REM   1) 已有 .env **永远优先**（上一段用户数据回填刚放回来的，或在
+REM      dist 里手工调过的）—— 绝不覆盖用户/运维的配置；
+REM   2) 模板丢了就 **exit /b 1**（fail-closed）—— 宁可不出包，也不出
+REM      一个「没配置的包」，那正是 P0-4 的形状；
+REM   3) 落点 <exe>/.env —— 与 launcher 的 `frozen_env_file_present` 探针
+REM      及 `_frozen_bootstrap_env` 的读取点同一处。
+if not exist "%OUT%\.env" (
+  if not exist "apps\desktop\release.env" (
+    echo RELEASE ENV TEMPLATE MISSING: apps\desktop\release.env
+    echo   分发产物必须自带配置，缺模板即中止（不产出无配置产物）
+    exit /b 1
+  )
+  copy /y "apps\desktop\release.env" "%OUT%\.env" >nul
+  if errorlevel 1 (
+    echo RELEASE ENV GENERATION FAILED: %OUT%\.env
+    exit /b 1
+  )
+  echo   generated %OUT%\.env (from apps\desktop\release.env)
+) else (
+  echo   kept existing %OUT%\.env (user config always wins)
+)
+
+REM 出厂门禁：产物必须确证吃上配置（缺 .env 的包不许出厂）。
+REM --require-env 的判据是 fail-closed 的（未打印 frozen_env_file_present
+REM 也判失败），所以这条同时兜住"陈旧的旧产物"。
+if exist "%OUT%\.env" (
+  echo [release gate] checking artifact env: %OUT%\.env
+) else (
+  echo RELEASE ENV MISSING AFTER GENERATION - refusing to ship %OUT%
+  exit /b 1
+)
+
 echo.
 echo ============================================================
 echo  DONE: %OUT%\HiveWeave.exe
 echo  User data preserved: %OUT%\data + .env
-echo  Smoke: "%OUT%\HiveWeave.exe" --selfcheck
+echo  Smoke: python scripts\smoke_release.py --require-env
 echo  Run  : "%OUT%\HiveWeave.exe"
 echo ============================================================
 endlocal
