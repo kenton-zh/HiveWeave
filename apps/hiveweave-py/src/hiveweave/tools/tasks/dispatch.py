@@ -408,8 +408,11 @@ async def dispatch_task_tool(
         except ValueError as e:
             return ToolResult.err(str(e))
         # fixplan §6 #12：交付物平面降档（视觉门遇非 web 平面 → 降档 + 留痕）。
-        # dispatch 无 tags 入参 ⇒ 留痕只能进回执（下方 plane_note）；
-        # 任务账本侧的留痕由 create 路径写 tag 承担。
+        # ⚠ 已知缺口（审计 P1-4，未修）：本路径**不传 tags** ⇒ 任务级
+        # `plane:<x>` 在这里读不到，只有项目级 `project_meta.delivery_plane`
+        # 生效；且返回的 tag 被丢弃，任务账本上**没有** `gate_downgraded:` 留痕。
+        # 目前只有回执里那句 plane_reason 提示（下方 `⚠ {plane_reason}`）。
+        # 与 create.py:290 / api/tasks.py:187 两处（均传 tags 且写 tag）不一致。
         from hiveweave.services.delivery_plane import resolve_and_downgrade
 
         policy_id, _plane_tag, plane_reason = await resolve_and_downgrade(
