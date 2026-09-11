@@ -184,7 +184,6 @@ def test_budget_exhausted_result_carries_steering_reason():
         tool_turn_acc=[],
         round_num=50,
         last_usage=None,
-        usage_rounds=[],
         note="[TURN ROUND CAP] test",
         reason="force_commit_rounds",
     )
@@ -220,6 +219,13 @@ async def test_sweep_stale_agent_runs_marks_interrupted(tmpdir):
         "VALUES (?, ?, ?, 'completed', ?, 10, 10, 1000, 0, 0, ?)",
         ["r-ok", "a1", "act1", now + 1000, now],
     )
+    # L5：给 stale run 挂一个 running 步骤 —— startup_sweep 造成的孤儿
+    # 语义是「调用**从未开始**」（DSH TOOL_NOT_STARTED），须置 not_started=1。
+    await conn.execute(
+        "INSERT INTO run_steps (id, run_id, step_index, step_type, status, started_at) "
+        "VALUES ('s-stale', 'r-stale', 0, 'llm_request', 'running', ?)",
+        [now],
+    )
     await conn.commit()
 
     n = await sweep_stale_agent_runs(ws)
@@ -228,6 +234,19 @@ async def test_sweep_stale_agent_runs_marks_interrupted(tmpdir):
     row = await cur.fetchone()
     await cur.close()
     assert row["status"] == "interrupted"
+
+    # L5：孤儿步骤带 not_started（而非 outcome_unknown）+ 可重试指引
+    cur = await conn.execute(
+        "SELECT status, not_started, outcome_unknown, error FROM run_steps "
+        "WHERE id = 's-stale'"
+    )
+    step = await cur.fetchone()
+    await cur.close()
+    assert step["status"] == "error"
+    assert step["not_started"] == 1
+    assert step["outcome_unknown"] == 0
+    assert "before the platform recorded it as started" in step["error"]
+    assert "Retry it if it is still needed." in step["error"]
 
 
 # ── E9 配套：bash venv 提示 ──────────────────────────────────

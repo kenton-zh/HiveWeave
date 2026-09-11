@@ -559,7 +559,14 @@ PROJECT_DB_TABLES = [
         error TEXT,
         started_at INTEGER NOT NULL,
         ended_at INTEGER,
-        duration_ms INTEGER
+        duration_ms INTEGER,
+        runner_failed INTEGER DEFAULT 0,
+        command_failed INTEGER DEFAULT 0,
+        injection_applied INTEGER DEFAULT 0,
+        timeout_kind TEXT,
+        timeout_ms INTEGER,
+        outcome_unknown INTEGER DEFAULT 0,
+        not_started INTEGER DEFAULT 0
     )
     """,
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
@@ -592,6 +599,21 @@ PROJECT_DB_TABLES = [
     #             此前完全未接线，4 个 600s 硬杀 run 的 timeout_kind 全 NULL）
     """ALTER TABLE run_steps ADD COLUMN timeout_kind TEXT""",
     """ALTER TABLE run_steps ADD COLUMN timeout_ms INTEGER""",
+    # L5（2026-09-11）：第三种事实位 —— 悬挂步骤的「结果未知」。
+    # 既有两个位回答的都是「命令跑了没 / 跑过没过」，而孤儿步骤（run 已死、
+    # 步骤仍 running）**既不是没跑、也不是跑了没过**，是第三种语义：调用已
+    # 发出但完成结果未持久化。此前只能靠自由文本 `orphan step swept: ...`
+    # 表达 → 下游只能 grep 文案，口径一变就断。
+    #
+    # 对齐 DSH `packages/core/session/src/repair.ts:14-18` 的两个具名恢复码，
+    # 分野 = **有没有 `tool/call` 事件**（即命令是否真的发出过）：
+    #   outcome_unknown — 调用已记录但结果未持久化（DSH TOOL_OUTCOME_UNKNOWN）
+    #   not_started     — 调用**从未开始**就被重启掐断（DSH TOOL_NOT_STARTED），
+    #                     由 startup_sweep 造成，语义更接近「重试即可，无副作用」
+    # 两位**分开**而非合成一位：前者要 agent 先核实外部状态，后者可直接重试，
+    # 混成一位会把「别盲目重试」的警告浪费在安全的重试上。
+    """ALTER TABLE run_steps ADD COLUMN outcome_unknown INTEGER DEFAULT 0""",
+    """ALTER TABLE run_steps ADD COLUMN not_started INTEGER DEFAULT 0""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -770,7 +792,10 @@ PROJECT_DB_TABLES = [
 # （packages/llm/token-meter/src/invariant.ts）。
 PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     "llm_usage": {"cold_start", "creation_unreported"},
-    "run_steps": {"runner_failed", "command_failed", "injection_applied", "timeout_kind", "timeout_ms"},
+    "run_steps": {
+        "runner_failed", "command_failed", "injection_applied",
+        "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
+    },
 }
 
 # ── Meta DB 索引 ────────────────────────────────────────────

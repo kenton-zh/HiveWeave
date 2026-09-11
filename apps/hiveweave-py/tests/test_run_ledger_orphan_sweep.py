@@ -32,7 +32,9 @@ _SCHEMA = [
     "duration_ms INTEGER, "
     # F4/F7 事实位（2026-08-30 加列；本文件 2026-09-10 补进 schema）
     "runner_failed INTEGER DEFAULT 0, command_failed INTEGER DEFAULT 0, "
-    "injection_applied INTEGER DEFAULT 0, timeout_kind TEXT, timeout_ms INTEGER)",
+    "injection_applied INTEGER DEFAULT 0, timeout_kind TEXT, timeout_ms INTEGER, "
+    # L5 第三/第四格（2026-09-11）：孤儿步骤的「结果未知」与「从未开始」
+    "outcome_unknown INTEGER DEFAULT 0, not_started INTEGER DEFAULT 0)",
 ]
 
 
@@ -94,6 +96,13 @@ class _FakeDb:
             "SELECT timeout_kind FROM run_steps WHERE id = ?", [step_id]
         ).fetchone()[0]
 
+    def step_flags(self, step_id: str) -> tuple[object, object]:
+        """L5：孤儿步骤的 (outcome_unknown, not_started)。"""
+        return self.conn.execute(
+            "SELECT outcome_unknown, not_started FROM run_steps WHERE id = ?",
+            [step_id],
+        ).fetchone()
+
 
 def _patched_db(fake: _FakeDb):
     return patch("hiveweave.services.run_ledger.project_db.execute",
@@ -115,6 +124,34 @@ def test_create_activation_sweeps_orphan_steps_of_ended_run():
         assert status == "error"
         assert ended_at is not None
         assert "orphan" in error
+
+
+def test_swept_orphan_carries_outcome_unknown_and_retry_guide():
+    """L5：清扫的孤儿步骤带第三格事实位 + DSH 三段式重试指引原文。
+
+    分野照 DSH `repair.ts:14-18`：调用**已记录**但结果未持久化 ⇒
+    outcome_unknown=1（不是 not_started —— 那个留给 startup_sweep）。
+    指引必须含「明确的可执行判据」，且**逐字**保留 "Do not retry blindly."
+    """
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "completed")
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.create_activation("a1", "wake"))
+
+    outcome_unknown, not_started = fake.step_flags("s1")
+    assert outcome_unknown == 1, "孤儿步骤必须声明 outcome_unknown"
+    assert not_started == 0, "本清扫不是 not_started 语义（那是 startup_sweep）"
+
+    _status, _ended, error = fake.step_status("s1")
+    # 回溯锚点保留（既有 F7 timeout_kind 回填靠它匹配）
+    assert error.startswith("orphan step swept")
+    # 三段式指引逐字校验（照抄 DSH repair.ts:106）
+    assert "Its outcome is unknown." in error
+    assert "retry only if the operation is read-only or idempotent" in error
+    assert "first verify external state or ask the user" in error
+    assert "Do not retry blindly." in error
 
 
 def test_create_activation_keeps_steps_of_running_run():

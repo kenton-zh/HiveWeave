@@ -118,14 +118,34 @@ class RunLedger:
         # interrupted 保留恢复语义（generate_checkpoint 会为中断 run 生成
         # 摘要），孤儿步骤是永不收尾的悬挂项，标 error 使其被如实计入
         # 失败分支而非误报为进行中。best-effort，失败不影响激活创建。
+        # L5（2026-09-11）：孤儿步骤**结果未知**是第三种事实位，不再只靠自由
+        # 文本表达。分野照 DSH `packages/core/session/src/repair.ts:14-18`
+        # —— 两个具名恢复码按「有没有 tool/call 事件」区分：
+        #   本清扫（run 已死、步骤仍 running）⇒ 调用**已记录但结果未持久化**
+        #     ⇒ outcome_unknown=1（DSH TOOL_OUTCOME_UNKNOWN）
+        #   startup_sweep（上次进程被杀造成的孤儿）⇒ 调用**从未开始**
+        #     ⇒ not_started=1（DSH TOOL_NOT_STARTED），见下方另一条 UPDATE
+        # 文案照抄 DSH `repair.ts:106` 原文（含 "Do not retry blindly."）——
+        # agent 拿到的是**可执行的重试判据**，不是一句「被清扫了」。
         try:
             await project_db.execute(
                 agent_id,
-                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ? "
+                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ?, "
+                "outcome_unknown = 1 "
                 "WHERE run_id IN (SELECT id FROM agent_runs "
                 "WHERE agent_id = ? AND status != 'running') "
                 "AND status = 'running'",
-                [_now_ms(), "orphan step swept: run ended while step running", agent_id],
+                [
+                    _now_ms(),
+                    "orphan step swept: run ended while step running. "
+                    "The tool call was interrupted after it was recorded, but no "
+                    "result was durably recorded. Its outcome is unknown. Decide "
+                    "whether to retry from the tool semantics: retry only if the "
+                    "operation is read-only or idempotent; if it may have side "
+                    "effects, first verify external state or ask the user. "
+                    "Do not retry blindly.",
+                    agent_id,
+                ],
             )
         except Exception as e:
             log.warning("run_ledger.orphan_step_sweep_failed", agent_id=agent_id, error=str(e))
@@ -651,6 +671,30 @@ async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
         )
         rows = await cursor.fetchall()
         await cursor.close()
+        # L5（2026-09-11）：本 sweep 造成的孤儿步骤 = 调用**从未开始**就被
+        # 上次进程的死亡掐断（DSH `repair.ts:15` TOOL_NOT_STARTED 语义）——
+        # 与 create_activation 清扫的「已记录但结果未持久化」是**两回事**，
+        # 故置 not_started 而非 outcome_unknown：无副作用的直接重试即可，
+        # 不该把「别盲目重试」的警告浪费在这里。
+        try:
+            await conn.execute(
+                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ?, "
+                "not_started = 1 "
+                "WHERE run_id IN (SELECT id FROM agent_runs WHERE status = 'running') "
+                "AND status = 'running'",
+                [
+                    now,
+                    "startup_sweep: orphan step from prior process. The tool call "
+                    "was interrupted before the platform recorded it as started. "
+                    "Retry it if it is still needed.",
+                ],
+            )
+            await conn.commit()
+        except Exception as e:
+            log.debug(
+                "run_ledger.startup_sweep_steps_failed",
+                workspace=str(workspace_path), error=str(e),
+            )
         cursor = await conn.execute(
             "UPDATE agent_runs SET status = 'interrupted', ended_at = ?, "
             "error_reason = ? WHERE status = 'running'",
