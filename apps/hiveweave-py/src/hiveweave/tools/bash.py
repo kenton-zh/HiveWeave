@@ -963,6 +963,7 @@ async def _validate_command_safety_resolved(
     tool_name: str,
     tool_args: dict | None = None,
     ask_already_resolved: bool = False,
+    cwd: str | None = None,
 ) -> tuple[bool, str]:
     """交互式执行入口用：校验 + ask 在线审批解析（T2.2）。
 
@@ -975,6 +976,11 @@ async def _validate_command_safety_resolved(
     #15：删除族命令先做**授权树落点判定**（``resolve_delete_landing_for_agent``）
     —— 全落在 ``boundary_root ∪ temp_dir ∪ extra_dirs`` 内 → allow（自建路径
     自己删，零审批行）；越界 → 直接 deny（fail-closed，**不挂起等审批**）。
+
+    ``cwd``（P0-1 修复）：**命令的实际执行目录**，用于解析相对路径删除目标。
+    必须由调用方按 bash 的真实解析口径传（``workspace_path / workdir``，见
+    ``execute_bash`` 的 ``cwd`` 计算）—— 否则相对目标会按**后端进程 CWD**
+    解析 ⇒ 一律判越界（比不做落点判定更糟）。
     """
     from hiveweave.services.command_guard import (
         resolve_ask_with_approval,
@@ -982,7 +988,9 @@ async def _validate_command_safety_resolved(
     )
 
     # #15：删除命令落点判定（越界 → deny，不进入 ask 等待）
-    landing = await resolve_delete_landing_for_agent(command, agent_id=agent_id)
+    landing = await resolve_delete_landing_for_agent(
+        command, agent_id=agent_id, cwd=cwd
+    )
     if landing is not None and landing.blocked:
         return True, landing.reason
     delete_in_boundary = landing is not None and not landing.blocked
@@ -1336,13 +1344,33 @@ _ALIAS_BARE_ARG_HINTS: dict[str, tuple[frozenset[str], str]] = {
            "Get-Process（ps aux 会把 aux 当进程名）"),
 }
 
-# 命令段分隔符：; | && || 换行。段首 token 才算「命令」。引号内的分隔符
+# 命令段分隔符：; | || && & 换行。段首 token 才算「命令」。引号内的分隔符
 # **不**分段 —— 否则 `git commit -m "fix: parse; sed edge case"` 会被切出
 # 一个假的 `sed` 段而误拦（审计实测）。
+#
+# ⚠️ 单 `&`（后台/PS 分隔符）此前**不切** ⇒ `sleep 1 & tail -f log` 整串的
+# head 是 `sleep`，管道尾的 `tail` 永远查不到 —— 这是**切分器的缺陷**，不只
+# 影响 unix 检测（任何基于 segments 的判定都踩）。已补切。
+#
+# 但 `&` 有多个**非**分段语义，必须排除（否则把 `2>&1` / `&>` 切坏）：
+#   - `2>&1` / `>&2` ：文件描述符重定向，`&` 紧跟在 `>`/`<` 之后或数字之后；
+#   - `&>` / `&>>`   ：bash 的 stdout+stderr 重定向，`&` 后紧跟 `>`；
+#   - `&&`           ：已在上方单独处理（逻辑与）。
+#   判据：`&` 前一个非空字符是 `>`/`<`，或 `&` 后紧跟 `>`；以及 `&&`。
+_AMPERSAND_RE = re.compile(r"[><]&|&[<>]|&&")
+
+# 复合语句关键字：`for … ; do CMD; done` / `if … ; then CMD; fi` 这类切段后，
+# 段首 token 是 `do`/`then`/`fi` 等**关键字**而非命令名 ⇒ head-token 判定
+# 永远匹配不上 unix 词表（`for i in 1 2; do head -1 f; done` 曾整串漏网）。
+# 这些关键字本身不是命令，取 head 时应**跳过**它们继续看下一个 token。
+_SHELL_KEYWORDS = frozenset({
+    "do", "then", "else", "elif", "fi", "done", "esac", "in",
+    "{", "}", "(", ")", "!",
+})
 
 
 def _split_command_segments(command: str) -> list[str]:
-    """按未被引号包裹的 ; | && || 换行 切分命令段。"""
+    """按未被引号包裹的 ; | || && & 换行 切分命令段（`&` 的 fd 重定向不切）。"""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
@@ -1366,7 +1394,15 @@ def _split_command_segments(command: str) -> list[str]:
             buf = []
             i += 2
             continue
-        if ch in (";", "|", "\n"):
+        if ch in (";", "|", "\n", "&"):
+            # `&` 只在**不是** fd 重定向（2>&1 / &> out）时才是段分隔符
+            if ch == "&":
+                prev = command[i - 1] if i > 0 else ""
+                nxt = command[i + 1] if i + 1 < n else ""
+                if prev in (">", "<") or nxt in (">", "<"):
+                    buf.append(ch)
+                    i += 1
+                    continue
             segments.append("".join(buf))
             buf = []
             i += 1
@@ -1378,13 +1414,26 @@ def _split_command_segments(command: str) -> list[str]:
 
 
 def _segment_head_token(segment: str) -> str:
-    """取命令段的首个 token（跳过 VAR=val 前缀与前导空白/括号）。"""
+    """取命令段的首个 token（跳过 VAR=val 前缀、前导空白/括号、复合语句关键字）。
+
+    ``for …; do CMD; done`` 切段后 ``do`` 自成一段，首 token 是关键字而非命令名
+    ⇒ 必须跳过 ``do``/``then``/``fi`` 等继续看下一个 token，否则整串 unix-only
+    命令永远漏网（`for i in 1 2; do head -1 f; done` 是实测漏网形态）。
+    """
     seg = segment.strip().lstrip("(").strip()
     while True:
         m = re.match(r"^[A-Za-z_][\w]*=\S*\s+", seg)
         if not m:
             break
         seg = seg[m.end():]
+    # 跳过复合语句关键字（可连续，如 `} else {`）
+    while True:
+        m = re.match(r"^([\w{}()!]+)\s*", seg)
+        if not m or m.group(1).lower() not in _SHELL_KEYWORDS:
+            break
+        seg = seg[m.end():]
+        if not seg:
+            return ""
     m = re.match(r"^[\"']?([\w./\\:-]+)", seg)
     if not m:
         return ""
@@ -1856,12 +1905,17 @@ async def execute_bash(
     # 1. 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录
     # T2.2: ask 判定走在线审批（agent_id 在场时）；guard_ask_resolved=上游
     # 已解析放行，不重复弹审批。
+    # P0-1: cwd 传**实际执行目录**（与下方 `cwd = ws / workdir` 同一口径）——
+    # 相对路径删除目标的落点判定必须以此为准，否则一律误判越界。
     blocked, reason = await _validate_command_safety_resolved(
         command,
         agent_id=agent_id or "",
         tool_name="bash" if dialect != "pwsh" else "pwsh",
         tool_args={"command": command[:200]},
         ask_already_resolved=guard_ask_resolved,
+        cwd=str(Path(workspace_path or os.getcwd()) / workdir)
+        if workdir
+        else (workspace_path or os.getcwd()),
     )
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=command[:120])
@@ -2082,11 +2136,13 @@ async def execute_run_command(
 
     # 统一命令安全校验 — 自毁命令 + 敏感路径 + .hiveweave 系统目录（A3 + 旁路修复）
     # T2.2: ask 判定走在线审批
+    # P0-1: cwd 传实际执行目录（run_command 的 cwd 参数已是绝对目录）。
     blocked, reason = await _validate_command_safety_resolved(
         command,
         agent_id=agent_id or "",
         tool_name="run_command",
         tool_args={"command": command[:200]},
+        cwd=cwd or workspace_path,
     )
     if blocked:
         log.warning("run_command.blocked", reason=reason,
@@ -2951,6 +3007,7 @@ async def _bash_background(
     verify_tid: str | None,
     dialect: str = "bash",
     injection_meta: dict | None = None,
+    workdir: str = "",
 ) -> ToolResult:
     """Run bash off the org turn; attestations still issue when the job finishes."""
     from hiveweave.services.offturn import (
@@ -2963,11 +3020,13 @@ async def _bash_background(
     cmd = _strip_trailing_ampersand(cmd)
     # T2.2: ask 判定走在线审批；获批后传 guard_ask_resolved 给 execute_bash，
     # 同一命令不重复弹审批。
+    # P0-1: cwd 传实际执行目录（与 execute_bash 的 `exec_ws / workdir` 同口径）。
     blocked, reason = await _validate_command_safety_resolved(
         cmd,
         agent_id=agent_id,
         tool_name="bash" if dialect != "pwsh" else "pwsh",
         tool_args={"command": cmd[:200]},
+        cwd=str(Path(exec_ws) / workdir) if workdir else exec_ws,
     )
     if blocked:
         log.warning("bash.blocked", reason=reason, command_preview=cmd[:120])
@@ -3145,6 +3204,7 @@ async def _shell_tool_impl(
             verify_tid=verify_tid,
             dialect=dialect,
             injection_meta=inj_meta,
+            workdir="",
         )
 
     # 前台尾部 &：长驻服务走注册 spawn；其余必须 offturn job，禁止 shell 脱管。
@@ -3158,6 +3218,7 @@ async def _shell_tool_impl(
             verify_tid=verify_tid,
             dialect=dialect,
             injection_meta=inj_meta,
+            workdir="",
         )
 
     result = await execute_bash(

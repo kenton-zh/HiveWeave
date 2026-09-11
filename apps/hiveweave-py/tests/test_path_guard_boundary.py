@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -146,13 +147,13 @@ def test_dialect_gate_covers_pipe_tail_via_segment_split() -> None:
     """**管道尾覆盖守卫**：方言门靠 ``_split_command_segments`` 切管道，
     每段再查 head token ⇒ 管道尾的 unix 命令同样命中。
 
-    实测结论（不要被"位置无关"字面误导）：``|`` / ``;`` / ``&&`` 都切段，
-    故 head-token 路已覆盖管道尾；曾另写的"扫全 token"循环**不改变行为**
-    （逐例验证：所有形态都已被 head 路拦下），属死代码，故未保留 ——
-    只保留真正缺的 ``find`` 词条补齐（见下一用例）。
+    ⚠️ 曾经的错误结论（已由 team-lead 审计推翻，留档警示）：我曾据 ``|``/``;``
+    切段就断言 head-token 路**完全覆盖**管道尾，据此删掉了预检的 unix 分支 ——
+    **错了**：``|``/``;``/``&&`` 会切，但**单 ``&``** 和 ``for…do`` / ``if…then``
+    的**关键字 head** 都不覆盖（见 ``test_segmenter_splits_single_ampersand`` 与
+    ``test_head_token_skips_shell_keywords``）。教训：探针形态单一 ⇒ 覆盖假象。
 
-    本用例钉住这个**机制**：若有人把 ``_split_command_segments`` 改成不切
-    管道，或把 gate 改成只看整串首 token，这里立刻转红。"""
+    本用例钉住 **``|`` 这条**确实成立（修分段器后仍须成立）。"""
     from hiveweave.tools import bash as bash_mod
 
     # 段确实被管道切开（机制前提）
@@ -165,6 +166,82 @@ def test_dialect_gate_covers_pipe_tail_via_segment_split() -> None:
     # 纯净命令不得误拦
     assert bash_mod.detect_untranslated_unix("git log --oneline -5") is None
     assert bash_mod.detect_untranslated_unix("python -m pytest -q") is None
+
+
+def test_segmenter_splits_single_ampersand_not_fd_redirect() -> None:
+    """**P1-1 根因守卫**：单 `&`（后台/PS 分隔符）必须切段，fd 重定向不能切。
+
+    审计反例：``sleep 1 & tail -f log`` 此前整串一段、head=`sleep` ⇒ 管道尾的
+    `tail` 永远漏网（agent 里极高频）。这是**切分器的缺陷**，修此处让所有
+    segments 消费者（unix 检测 + 跨树预检）一并受益。
+
+    回滚探针：把 ``_split_command_segments`` 的 `&` 分支删掉即转红。"""
+    from hiveweave.tools import bash as bash_mod
+
+    segs = bash_mod._split_command_segments("sleep 1 & tail -f log")
+    assert len(segs) == 2, f"单 & 未切段：{segs}"
+    assert bash_mod.detect_untranslated_unix("sleep 1 & tail -f log") is not None
+
+    # 误杀检查：fd 重定向的 `&` **不能**切（`&&` 是逻辑与，本就该切成两段）
+    for cmd in ("python -u x.py 2>&1", "cmd &> out.txt", "cmd 2>&1"):
+        assert len(bash_mod._split_command_segments(cmd)) == 1, cmd
+    assert len(bash_mod._split_command_segments("a && b")) == 2  # 既有语义不变
+    for cmd in ("python -u x.py 2>&1 | Where-Object { $_ -match 'x' }",
+                "cmd &> out.txt", "python -u x.py > out 2>&1"):
+        assert bash_mod.detect_untranslated_unix(cmd) is None, cmd
+
+
+def test_head_token_skips_shell_keywords() -> None:
+    """**P1-1 根因守卫**：``for…do`` / ``if…then`` 切段后 head 是关键字，
+    取 head 时必须跳过 ``do``/``then``/``fi``/``done`` 等。
+
+    审计反例：``for i in 1 2; do head -1 f; done`` 三段 head 分别是
+    ``for``/``do``/``done`` ⇒ 永远匹配不上 unix 词表。
+    回滚探针：删掉 ``_segment_head_token`` 的关键字跳过循环即转红。"""
+    from hiveweave.tools import bash as bash_mod
+
+    cases = [
+        "for i in 1 2; do head -1 f; done",
+        "if true; then head -1 f; fi",
+        "for i in 1; do sed -e s/a/b/ f; done",
+        "while true; do grep x f; done",
+    ]
+    for cmd in cases:
+        assert bash_mod.detect_untranslated_unix(cmd) is not None, cmd
+    # 关键字本身不等于 unix 命令：纯 shell 循环不得误拦
+    assert bash_mod.detect_untranslated_unix(
+        "for i in 1 2; do echo hi; done") is None
+    assert bash_mod.detect_untranslated_unix("if true; then echo hi; fi") is None
+
+
+def test_head_token_skips_keywords_does_not_leak_into_next_word() -> None:
+    """跳过关键字不得"吃掉"下一个词的首字符（`do` 后紧跟 `done` 等边界）。"""
+    from hiveweave.tools import bash as bash_mod
+
+    assert bash_mod._segment_head_token(" done") == ""
+    assert bash_mod._segment_head_token(" do head -1 f") == "head"
+    assert bash_mod._segment_head_token(" then sed x") == "sed"
+    assert bash_mod._segment_head_token(" else grep x") == "grep"
+    # 非关键字且以关键字为前缀的词不得被跳过
+    assert bash_mod._segment_head_token(" donek") == "donek"
+    assert bash_mod._segment_head_token(" headless") == "headless"
+
+
+def test_cross_tree_precheck_survives_single_ampersand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**Q2 结论守卫**：跨树引用预检扫**段内全 token**，本就不受单 `&` 不分段
+    影响；修分段器后仍须成立（防两处根因耦合）。"""
+    from hiveweave.tools import bash as bash_mod
+
+    ws = os.path.join(os.sep, "proj", ".hiveweave", "worktrees", "A044")
+    for cmd in ("sleep 1 & cat .hiveweave/worktrees/A045/x",
+                "for i in 1 2; do cat .hiveweave/worktrees/A045/x; done",
+                "if true; then rm .hiveweave/worktrees/A045/x; fi"):
+        assert bash_mod.precheck_command_string(cmd, ws) is not None, cmd
+    # 本树引用不得误拦
+    own = f"cat {ws}/src/x.py"
+    assert bash_mod.precheck_command_string(own, ws) is None
 
 
 def test_dialect_gate_covers_find_and_former_precheck_words() -> None:

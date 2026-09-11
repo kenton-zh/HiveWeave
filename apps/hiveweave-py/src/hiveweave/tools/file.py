@@ -511,12 +511,14 @@ def _reports_read_scope(
     ``rel`` 是**已剥前导 ``./`` 的相对路径**（如
     ``.hiveweave/reports/<id>/x.png``）。
 
-    顺序 = 平台先查可能有货的树：**当前树 → MAIN（共享契约落点）→ 兄弟树**。
-    兄弟树放在最后：fixplan §10.2 的读侧顺序是 MAIN → 请求者 → assignee；
-    请求者/assignee 的身份在本层拿不到（只有 workspace_path），而
-    ``.hiveweave/worktrees/<id>`` 是**同一个项目**下的命名空间
-    （``dispatch_pin.py:7,34``），所以「本项目全部树」是 §10.2 涵盖范围的
-    一个**上界**（多查≥少查）。查不查得到都会在回执里说明，不做断言。
+    顺序 = fixplan §10.2 / ``fixplan:351`` 的读侧顺序：**MAIN（请求者/共享
+    权威落点）→ 本树 → 兄弟树**。MAIN 排第一不是随手排的 —— 共享产物的
+    权威落点就在 MAIN（``service_create.py:99-105``，写侧单一权威落点），
+    所以"可能写了它的树"里 MAIN 的可能性最高；本树（请求者）次之；兄弟树
+    是 assignee 的近似上界（``.hiveweave/worktrees/<id>`` 是同一项目下的
+    命名空间，``dispatch_pin.py:7,34``）。与 vision 侧
+    ``_multi_tree_bases`` 的顺序**完全一致**（两处各写一套会漂移）。
+    查不查得到都会在回执里说明，不做断言。
     """
     if not rel:
         return []
@@ -537,8 +539,10 @@ def _reports_read_scope(
         out.append((tree_tag(full), full))
 
     ws = os.path.realpath(write_workspace) if write_workspace else ""
-    _add(ws)
+    # MAIN 优先（共享产物的权威落点，fixplan:351）；project_root 未给时
+    # root 即项目根，去重会自然退化为单棵。
     _add(os.path.realpath(root))
+    _add(ws)
     # 兄弟 worktree（`.hiveweave/worktrees/*`，跳过 _quarantine 兜底目录）
     try:
         wt_root = os.path.join(

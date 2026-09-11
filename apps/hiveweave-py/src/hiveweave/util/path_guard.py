@@ -130,9 +130,18 @@ def is_foreign_worktree_ref(path: str, workspace_path: str) -> bool:
 
     非 worktree 路径（普通项目文件）返回 False —— 普通路径的写隔离由
     ``_resolve_safe`` / ACL 沙箱各自负责，本函数只管「跨树引用」这一维。
+
+    平台自管兜底目录（``QUARANTINE_DIR`` = ``.hiveweave/worktrees/_quarantine``，
+    ``git_worktree/constants.py:9``）**不是别的 agent 的树** —— 它是平台自己
+    搬迁隔离用的目录，不由任何 agent 拥有。⇒ ``_`` 前缀 id 一律放行，与
+    ``tools/file.py:548`` 兄弟树扫描、``services/vision.py:204`` 的同一豁免
+    对齐（否则平台自管目录会被 shell/file 两个入口当"越出授权树"拦截）。
     """
     target_id = worktree_id_in_path(path)
     if not target_id:
+        return False
+    if target_id.startswith("_"):
+        # 平台自管（_quarantine 等），非任何 agent 的树 ⇒ 非跨树引用
         return False
     own_id = worktree_id_in_path(workspace_path)
     if own_id is None:
