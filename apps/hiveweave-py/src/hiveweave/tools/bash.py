@@ -1245,6 +1245,9 @@ _UNIX_ONLY_HINTS: dict[str, str] = {
     "tail": "Get-Content f -Tail N（跟随写入加 -Wait）",
     "grep": "Select-String -Pattern P -Path f；递归 "
             "Get-ChildItem -Recurse -File dir | Select-String -Pattern P",
+    "find": "按名/递归用 Get-ChildItem -Recurse -File -Filter '*x*'（或 "
+            "Where-Object { $_.Name -like '*x*' }）；删除用 "
+            "Get-ChildItem … | Remove-Item -Force（先 Select-Object FullName 看清单）",
     "touch": "New-Item -ItemType File -Force -Path f",
     "which": "Get-Command <名> | Select-Object -ExpandProperty Source",
     "cut": "($line -split ',')[0] 或 Import-Csv",
@@ -1723,62 +1726,55 @@ def with_cwd_display(fn):
     return _wrapped
 
 
-# ── #6 · spawn 前命令串预检（越出授权树 + unix 命令）──────────────
+# ── #6 · spawn 前命令串预检（越出授权树）────────────────────────────
 #
-# 两件事，都是**发车前**判定（fail-fast，不是等 pwsh 报错才归因）：
+# **一件事**，在**发车前**判定（fail-fast，不是等沙箱报错才归因）：
 #
 # ① **越出授权树**：命令里出现 `.hiveweave/worktrees/<非本树 id>/` ⇒ 效果落点
 #    越出 ``boundary_root``（``acl_sandbox/policy.py:54``）。判据复用
 #    ``util/path_guard``，与 file 侧**同一函数、同一处方**（fixplan §10.3）。
 #    注意共用的是"越出授权树"的判定，**不是** DSH 那种单树内 sandbox。
 #
-# ② **unix-only 命令**：受限跑在 pwsh 上的命令串里出现
-#    ``head/tail/grep/wc/sed/awk/xargs/find`` 等 ⇒ pwsh 直接
-#    「不是内部或外部命令」，白烧一轮。既有 ``_pwsh_dialect_gate`` 只查
-#    **段首 token**，**管道尾/参数位**的 unix 命令漏网（`git log | head -5`
-#    曾是 5 小时照抄的形态）⇒ 本预检是它的**位置无关补齐**。
+# ② unix-only 命令**不在此处**：``detect_untranslated_unix`` 已覆盖——
+#    ``_split_command_segments`` 会切开 `|` / `;` / `&&`，每段再查 head token，
+#    故**管道尾同样命中**（逐例实测：`git log | head -5` / `ls | wc -l` 均被拦）。
+#    曾在此另写一份正则 + "扫全 token"循环，实测**不改变任何行为** ⇒ 属死代码
+#    已删，真正的缺口只是 ``find`` 不在方言门词表里（已补）。
+#    在此再判一次还会引入「翻译 vs 拒绝」的顺序陷阱
+#    （`git log | head -3` 属封闭集，要**翻译**不要**拒绝**）。
 #
 # 平台纪律：**不猜译、不改写**用户命令 —— 拒发 + 同款中文处方。
-_UNIX_ONLY_PRECHECK_RE = re.compile(
-    r"(?:^|[\s|;&(])(?:head|tail|grep|wc|sed|awk|xargs|find|"
-    r"nl|tr|uniq|cut|basename|dirname|realpath|readlink|df|du|seq|which|env)"
-    r"(?=\s|$|\|)"
-)
 
 
-def precheck_command_string(
-    command: str, workspace_path: str = ""
-) -> str | None:
-    """spawn 前命令串预检：返回拒绝文案（含处方）或 None（放行）。
+def precheck_command_string(command: str, workspace_path: str = "") -> str | None:
+    """spawn 前命令串预检：越出授权树则返回拒绝文案（含处方），否则 None。
 
-    与 ``_pwsh_dialect_gate`` 的分工：后者按**段首 token** 判 unix-only
-    命令并给等价写法（教学）；本函数补**位置无关**的兜底 + **越出授权树**
-    这一维（后者 DSH 无此概念，判据来自我们自己的 boundary_root）。
+    判据来自**我们自己的模型**（fixplan §10.3）：``boundary_root`` 已界定
+    「本 agent 的授权树」（``acl_sandbox/policy.py:54``）。命令串里出现
+    **别的** worktree 落点 = 效果落点越出授权树 —— 这不是新规则，是既有
+    边界在 shell 侧的 enforcement（此前只有 file 侧在看，而 ``run_command``
+    是 bash 的逃生口，守卫只在 file 侧不算 enforcement）。
 
-    仅当受限 shell 实际是 pwsh 时才做 unix 命令预检（native Git Bash 下
-    这些命令合法，误拒会造成回归）；跨树引用预检**无条件**生效
-    （它判的是「效果落点」，与 shell 方言无关）。
+    **只做越界一维**：unix-only 交给 ``detect_untranslated_unix``（同文件，
+    位置无关补齐后已覆盖管道尾/参数位）。在此再判一次会与封闭集管道尾翻译
+    抢跑（`git log | head -3` 属封闭集，要**翻译**不要**拒绝**）。
+
+    跨树判定与 shell 方言**正交** ⇒ 无条件生效（native Git Bash 下同样越界）。
     """
     if not command or not command.strip():
         return None
-    # ① 越出授权树（无条件；判据 = boundary_root，见 path_guard 模块 docstring）
     for seg in _split_command_segments(command):
         for tok in seg.split():
             t = tok.strip("\"'")
             if not t or t.startswith("-"):
                 continue
             if path_guard.is_foreign_worktree_ref(t, workspace_path):
-                return f"Command blocked: {path_guard.OUT_OF_BOUNDARY_HINT}"
-    # ② unix-only 命令（仅 pwsh 生效；位置无关，补 dialect gate 的盲区）
-    if _pwsh_is_effective_shell() and _UNIX_ONLY_PRECHECK_RE.search(command):
-        return (
-            "Command blocked: 命令串里出现了 unix-only 命令"
-            "（head/tail/grep/wc/sed/awk/xargs/find 等），"
-            "在 Windows 沙箱里 bash 命令由 pwsh 执行，这些在 pwsh 里"
-            "**不是内部或外部命令**（即便段首是合法命令，管道尾/参数位同样会炸）。"
-            "改用 pwsh 等价（Get-Content -TotalCount / Select-String / "
-            "Select-Object -First 等），或直接用 `pwsh` 工具写 PowerShell 语法。"
-        )
+                # 点名越出的是**哪棵树**（多树归因的最小事实，fixplan §10.5）
+                tid = path_guard.worktree_id_in_path(t) or "?"
+                return (
+                    f"Command blocked: 命令指向 worktree {tid}（不是你所在的树）。"
+                    f"{path_guard.OUT_OF_BOUNDARY_HINT}"
+                )
     return None
 
 
@@ -1815,6 +1811,7 @@ def _pwsh_dialect_gate(command: str) -> str | None:
     return detect_untranslated_unix(command)
 
 
+@with_cwd_display
 async def execute_bash(
     command: str,
     workdir: str,
@@ -1846,8 +1843,9 @@ async def execute_bash(
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
 
-    # #6 · spawn 前命令串预检（越出授权树 + 位置无关的 unix-only）。
-    # 在安全校验**之前**：越界/方言问题不需要先弹审批（fail-fast 省一轮墙钟）。
+    # #6 · spawn 前命令串预检（**只做越出授权树**这一维；unix-only 见既有
+    # ``detect_untranslated_unix``，已位置无关）。在安全校验**之前**：
+    # 越界问题不需要先弹审批（fail-fast 省一轮墙钟）。
     precheck = precheck_command_string(command, workspace_path)
     if precheck:
         log.warning("bash.precheck_blocked", command_preview=command[:120])
@@ -2053,6 +2051,7 @@ async def execute_bash(
     })
 
 
+@with_cwd_display
 async def execute_run_command(
     command: str,
     cwd: str,
@@ -2071,8 +2070,9 @@ async def execute_run_command(
         return {"success": False, "output": "",
                 "error": "Error: command is required"}
 
-    # #6 · spawn 前命令串预检（与 execute_bash 同一条链，不可旁路 ——
-    # 守卫只在 file.py 不算 enforcement：run_command 是 bash 的逃生口）。
+    # #6 · spawn 前命令串预检（**只做越出授权树**；unix-only 见既有方言门）。
+    # 与 execute_bash 同一条链，不可旁路 ——
+    # 守卫只在 file.py 不算 enforcement：run_command 是 bash 的逃生口。
     precheck = precheck_command_string(command, workspace_path)
     if precheck:
         log.warning("run_command.precheck_blocked", command_preview=command[:120])

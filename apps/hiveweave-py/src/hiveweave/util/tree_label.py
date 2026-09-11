@@ -58,9 +58,17 @@ def cwd_display(cwd: str, relative: str | None = None) -> str:
 
 # Leaf/QA miss: do not mention git_worktree_list, peer trees, or ../docs
 # (from a worktree, ../ is the sibling-worktrees dir, not MAIN).
+#
+# #5（2026-09-12，fixplan §10.2 第 3 条）：**删除越界断言**。
+# 原文写「若仍报缺失，说明该产物**确实不存在**或已随取消任务归档」——
+# 但本函数只跑了**一棵树**的解析，没有任何依据对**全世界**下结论。
+# 这是 L17/L20 同族病（单点查空就下全局结论）：模型据此停止追查，
+# 而 read_file 的读侧多树查找（MAIN → 请求者 → assignee）当时甚至
+# 因 `_is_platform_reports_read` 的 `lstrip("./")` bug 从未生效。
+# ⇒ 现在只报**事实**（不在本树）+ **下一步**（让平台去查），不下断言。
 READ_MISS_HINT = (
     " Not in this tree. Shared contracts are MAIN docs/ after merge "
-    "(empty MAIN is OK). Do not search other agents' trees."
-    " 平台自管共享产物（.hiveweave/reports/**）会自动从 MAIN 读取——"
-    "若仍报缺失，说明该产物确实不存在或已随取消任务归档。"
+    "(empty MAIN is OK). 平台自管共享产物（.hiveweave/reports/**）"
+    "写侧落在 MAIN，读侧会自动跨树查找（MAIN → 请求者树 → assignee 树）"
+    "并在回执说明在哪棵树命中。"
 )

@@ -21,9 +21,11 @@ from typing import Any
 
 import structlog
 
+from hiveweave.util import path_guard
 from hiveweave.util.tree_label import (
     READ_MISS_HINT,
     listing_header,
+    tree_tag,
     write_tree_suffix,
 )
 
@@ -226,63 +228,15 @@ async def fetch_additional_read_dirs(project_root: str) -> list[str]:
 def _double_worktree_prefix(workspace_path: str, full_path: str) -> str | None:
     """Detect a self-nested worktree prefix (ghost tree) in ``full_path``.
 
-    When the agent's workspace IS a worktree — ``<project>/.hiveweave/
-    worktrees/<id>`` — a path that repeats the worktree prefix, e.g. the
-    relative path ``.hiveweave/worktrees/<id>/src/x.py``, resolves to
-    ``<project>/.hiveweave/worktrees/<id>/.hiveweave/worktrees/<id>/src/x.py``.
-    ``_check_hiveweave_dir`` allow-lists ``.hiveweave/worktrees/``, so without
-    this check the write path would silently ``mkdir(parents=True)`` a ghost
-    nested tree (M4 — slack-clone_03 A044 start_dev_server failure).
+    **#6（2026-09-12）薄封装** —— 实现已抽到
+    :func:`hiveweave.util.path_guard.double_worktree_prefix`，shell 侧
+    （``tools/bash.py``）与 file 侧**共用同一判定、同一处方**。保留本名
+    仅为兼容既有调用点与测试（``tests/test_file_self_nested_prefix.py``），
+    避免一次性重命名扩散到无关文件。行为与抽取前**逐字一致**。
 
-    幽灵判定（2026-08-13 审计 P1 收紧，同日复审放宽）：以 **workspace 自身**
-    为基准——相对路径中出现的 ``.hiveweave`` 段**仅当后随 ``worktrees`` 段**
-    且（workspace 自身已在 worktree 内，或项目根 workspace 已见过首个合法
-    ``worktrees`` 段）才算幽灵：
-    - 同 id 重复：``…/worktrees/<id>/.hiveweave/worktrees/<id>/…``
-    - 跨 id：``…/worktrees/A044/.hiveweave/worktrees/A045/…``（不同 id 各
-      一次，同 id 计数法漏判，实测可无限交替加深幽灵树）
-    ``.hiveweave/shared|tool_outputs|reports|…`` 段**不判幽灵**：worktree
-    workspace 内的 agent 必须能读写平台自管目录——executor 把大工具输出落盘
-    ``<ws>/.hiveweave/tool_outputs/`` 并回传句柄，见 .hiveweave 就拒会切断
-    该契约（复审 P1）。返回触发幽灵的段名或 None。
+    详细判定说明见 :mod:`hiveweave.util.path_guard` 的模块 docstring。
     """
-    try:
-        ws = Path(workspace_path).resolve()
-        full = Path(full_path).resolve()
-    except (OSError, ValueError):
-        return None
-    try:
-        rel_parts = full.relative_to(ws).parts
-    except ValueError:
-        return None
-    # workspace 自身是否已在 worktree 内（<project>/.hiveweave/worktrees/<id>）
-    ws_cf = [p.casefold() for p in ws.parts]
-    ws_in_worktree = any(
-        ws_cf[i] == ".hiveweave" and ws_cf[i + 1] == "worktrees"
-        for i in range(len(ws_cf) - 1)
-    )
-    cf = [p.casefold() for p in rel_parts]
-    seen_wt = False  # 已见过 .hiveweave/worktrees 段（项目根 workspace 首个合法）
-    i = 0
-    while i < len(cf):
-        if cf[i] != ".hiveweave":
-            i += 1
-            continue
-        if i + 1 < len(cf) and cf[i + 1] == "worktrees":
-            # .hiveweave/worktrees/<id> 段：
-            # - workspace 自身已在 worktree 内 → 相对路径再现 worktrees
-            #   前缀 = 幽灵嵌套（同 id / 跨 id / 多层交替全拦）
-            # - 项目根 workspace → 首个合法（单次出现），再现 = 幽灵
-            if ws_in_worktree or seen_wt:
-                return rel_parts[i]
-            seen_wt = True
-            i += 2
-            continue
-        # .hiveweave/shared|tool_outputs|reports|… 段：合法（平台自管目录，
-        # worktree 内 agent 也必须能读 tool_outputs 落盘句柄）——不判幽灵
-        i += 1
-        continue
-    return None
+    return path_guard.double_worktree_prefix(workspace_path, full_path)
 
 
 def _resolve_safe_detail(
@@ -340,15 +294,39 @@ def _resolve_safe(workspace_path: str, file_path: str) -> str | None:
     return full
 
 
-def _is_platform_reports_read(file_path: str) -> bool:
-    """40 轮 P0-1：`.hiveweave/reports/**` 是平台自管共享产物（契约/取证/截图）。
+def strip_dot_slash_prefix(p: str) -> str:
+    """剥前导 ``./`` 序列，**不碰**其他 '.' 段。
 
-    写入方是平台宿主（写契约、browse 写截图），落在 MAIN 的
-    ``.hiveweave/reports/<task_id>/``——从叶子 worktree cwd 用相对路径读取时，
-    旧解析只拼 worktree 前缀 → 永远 File not found（40 轮实测：4 人 3 通道
-    76 次读取 0 成功，225min 契约税）。本判定命中后解析改走项目根。
+    用逐段切片而非 ``str.lstrip("./")`` —— 后者把参数当**字符集**，会把
+    ``.hiveweave/reports/x`` 剥成 ``hiveweave/reports/x``，使一切以点开头的
+    路径判定恒不命中。本仓已有三处同族修正
+    （``services/policy.py:475`` / ``services/worktree_review.py:93`` /
+    ``tools/tasks/submit.py:707``），此处是第四处（2026-09-12 审计实测：
+    ``_is_platform_reports_read`` 因该 bug **恒返回 False**，reports 重定向
+    从未生效）。
     """
-    p = file_path.replace("\\", "/").lstrip("./")
+    s = (p or "").replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s
+
+
+def _is_platform_reports_read(file_path: str) -> bool:
+    """`.hiveweave/reports/**` 是平台自管共享产物（契约/取证/截图）。
+
+    **判据来源**：``services/git_worktree/service_create.py:99-105`` ——
+    ``.hiveweave/{shared,reports,drafts,handoffs}`` 四目录反选入库、
+    **跨 worktree 可见可合并**；``:171-175`` 给 reports 定的是「默认文本合并、
+    预期多方写」。写侧因此有**单一权威落点**（MAIN 的 ``.hiveweave/reports/``）
+    —— 只有落在同一棵树上，其 merge 策略才成立。
+
+    ⇒ 本判定命中后解析改走项目根（即 MAIN）。**这不是"硬重定向"，是共享
+    契约的落点**（fixplan §10.2）。
+
+    40 轮实测背景：旧解析只拼 worktree 前缀 → 永远 File not found（4 人 3
+    通道 76 次读取 0 成功，225min 契约税）。
+    """
+    p = strip_dot_slash_prefix(file_path)
     return p == ".hiveweave/reports" or p.startswith(".hiveweave/reports/")
 
 
@@ -515,28 +493,184 @@ def _is_binary(abs_path: str) -> bool:
         return False
 
 
-def _reports_evidence_hint(file_path: str, root: str) -> str:
-    """46/11 #4：reports 路径缺失时区分「证据未产生」vs「id 错误」。
+# ── #5 读侧多树查找（判据来源：我们自己的四目录共享模型）────────────
+# 出处：services/git_worktree/service_create.py:99-105（四目录反选入库、
+# 跨 worktree 可见可合并）+ :171-175（reports = 默认文本合并、预期多方写）；
+# services/acl_sandbox/policy.py:54（boundary_root：executor=worktree）。
+# ⇒ 我们的**共享是有意的，隔离也是有的**：写侧单一权威落点（MAIN），
+#   读侧必须能跨越 per-agent worktree 找到它，且**回执要说明在哪棵树命中**
+#   —— 多树语境下「这条读取落在哪个树」是归因的必要条件（fixplan §10.5）。
+_REPORTS_ID_RE = re.compile(r"\.hiveweave/reports/([^/]+)")
 
-    file_path 匹配 ``.hiveweave/reports/<id>/…`` 时，检查 `<id>` 目录是否
-    存在：存在 → 证据目录已有但该文件未生成；不存在 → 该 id 无任何证据。
+
+def _reports_read_scope(
+    rel: str, root: str, write_workspace: str
+) -> list[tuple[str, str]]:
+    """reports 相对路径的候选树：(树标签, 该树内的绝对路径)。
+
+    ``rel`` 是**已剥前导 ``./`` 的相对路径**（如
+    ``.hiveweave/reports/<id>/x.png``）。
+
+    顺序 = 平台先查可能有货的树：**当前树 → MAIN（共享契约落点）→ 兄弟树**。
+    兄弟树放在最后：fixplan §10.2 的读侧顺序是 MAIN → 请求者 → assignee；
+    请求者/assignee 的身份在本层拿不到（只有 workspace_path），而
+    ``.hiveweave/worktrees/<id>`` 是**同一个项目**下的命名空间
+    （``dispatch_pin.py:7,34``），所以「本项目全部树」是 §10.2 涵盖范围的
+    一个**上界**（多查≥少查）。查不查得到都会在回执里说明，不做断言。
+    """
+    if not rel:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(base: str) -> None:
+        if not base:
+            return
+        try:
+            full = os.path.realpath(os.path.join(base, rel))
+        except (OSError, ValueError):
+            return
+        key = os.path.normcase(full)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((tree_tag(full), full))
+
+    ws = os.path.realpath(write_workspace) if write_workspace else ""
+    _add(ws)
+    _add(os.path.realpath(root))
+    # 兄弟 worktree（`.hiveweave/worktrees/*`，跳过 _quarantine 兜底目录）
+    try:
+        wt_root = os.path.join(
+            os.path.realpath(root), ".hiveweave", "worktrees",
+        )
+        for name in sorted(os.listdir(wt_root)):
+            if name.startswith("_"):
+                continue
+            _add(os.path.join(wt_root, name))
+    except OSError:
+        pass
+    return out
+
+
+def _reports_evidence_hint(file_path: str, root: str, workspace_path: str = "") -> str:
+    """reports 路径未命中时，逐树说明「查了哪些树、哪棵树有该 id 目录」。
+
+    46/11 #4 原实现只查项目根一棵树就下结论（``no reports directory for id``）；
+    #5（2026-09-12）改为**候选树逐查 + 回执点名命中树**：
+    - 任一候选树里有 ``reports/<id>/`` 且非空 → 列出该树里已有哪些文件
+      （「证据目录已有但你要的文件未生成」）；
+    - 候选树里都没有该 id 目录 → 只说「查过哪些树、均未见到该 id 目录」，
+      **不断言"确实不存在"**（L17/L20 同族病：单点查空就下全局结论）。
+
     非 reports 路径返回空串。
     """
-    import re as _re
-    norm = file_path.replace("\\", "/")
-    m = _re.search(r"\.hiveweave/reports/([^/]+)", norm)
+    norm = strip_dot_slash_prefix(file_path)
+    m = _REPORTS_ID_RE.search(norm)
     if not m:
         return ""
     eid = m.group(1)
-    # 查找项目根下的 reports/<id>
-    reports_dir = Path(root) / ".hiveweave" / "reports" / eid if root else None
-    if reports_dir and reports_dir.is_dir():
-        entries = [e.name for e in reports_dir.iterdir() if not e.name.startswith(".")]
-        if entries:
-            return (f" [reports/{eid} exists: {', '.join(entries[:5])}"
-                    f"{'…' if len(entries) > 5 else ''} — file not yet generated]")
-        return f" [reports/{eid} exists but is empty — evidence not yet produced]"
-    return f" [no reports directory for id '{eid}' — evidence not yet produced]"
+    candidates = _reports_read_scope(norm, root, workspace_path or root)
+    if not candidates:
+        return f" [no reports directory for id '{eid}' in the searched trees]"
+    present: list[str] = []
+    for tag, base in candidates:
+        # base 是 `<树根>/.hiveweave/reports/<id>/<file>` ⇒ 上溯两级才是
+        # `<树根>/.hiveweave/reports`，再拼 `<id>` 才是该 id 的目录。
+        d = Path(base).parent.parent / eid
+        try:
+            if not d.is_dir():
+                continue
+            entries = [e.name for e in d.iterdir() if not e.name.startswith(".")]
+        except OSError:
+            continue
+        shown = ", ".join(entries[:5]) + ("…" if len(entries) > 5 else "")
+        present.append(f"{tag}: {shown}" if entries else f"{tag}: (empty)")
+    searched = ", ".join(tag for tag, _ in candidates)
+    if present:
+        return (
+            f" [reports/{eid} found in {len(present)} of the searched trees —"
+            f" {'; '.join(present)} — your file is not generated yet]"
+        )
+    return (
+        f" [searched {len(candidates)} tree(s) for reports/{eid}: {searched}"
+        f" — no reports directory for this id in any of them"
+        f" (this is not proof the evidence does not exist)]"
+    )
+
+
+def _find_shadowed_read(
+    file_path: str,
+    root: str,
+    workspace_path: str,
+    primary_full: str,
+) -> str | None:
+    """本树命中失败后，在候选树里找一个**存在**的同名文件。
+
+    #5（2026-09-12）读侧多树查找：只对**共享产物路径**生效
+    （``.hiveweave/reports/**`` —— 四目录共享设计里唯一"平台宿主写、叶子读"
+    的通道），不改变普通项目文件的解析（那仍受 per-agent 写隔离约束）。
+    命中返回该文件绝对路径，否则 None（调用方维持原 miss 路径与文案）。
+    """
+    if not _is_platform_reports_read(file_path):
+        return None
+    rel = strip_dot_slash_prefix(file_path)
+    primary_key = os.path.normcase(os.path.realpath(primary_full))
+    for _tag, cand in _reports_read_scope(rel, root, workspace_path):
+        if os.path.normcase(cand) == primary_key:
+            continue
+        try:
+            if os.path.isfile(cand):
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_reports_across_trees(
+    file_path: str,
+    root: str,
+    workspace_path: str,
+    primary_full: str,
+) -> tuple[str, str | None] | None:
+    """共享 reports 产物的跨树解析：返回 ``(绝对路径, 命中树标签)``。
+
+    候选序 = **本树 → MAIN（权威落点）→ 兄弟 worktree**（fixplan §10.2）。
+    「本树」= **写侧授权树**（``workspace_path``，即 ``boundary_root``，
+    见 ``acl_sandbox/policy.py:54``），**不是** ``_resolve_for_read_detail``
+    预解析出来的路径 —— 后者对 reports 走的就是项目根，拿它当基准会把
+    "MAIN 命中"误判成"本树命中"从而丢掉归因标签（实测踩过）。
+
+    本树命中返回 ``(path, None)``（无跨树归因需求，不加回执噪音）；
+    跨树命中返回 ``(path, 树标签)`` —— **必须点名在哪棵树**，多树语境下
+    这是归因的必要条件（fixplan §10.5）。全部未命中返回 None。
+    """
+    rel = strip_dot_slash_prefix(file_path)
+    if not rel:
+        return None
+    ws_key = os.path.normcase(os.path.realpath(workspace_path)) if workspace_path else ""
+    for _tag, cand in _reports_read_scope(rel, root, workspace_path):
+        try:
+            if not os.path.isfile(cand):
+                continue
+        except OSError:
+            continue
+        # 命中就在本树（cand 落在 workspace_path 内）→ 无跨树标签
+        if ws_key and _path_within(cand, ws_key):
+            return cand, None
+        return cand, tree_tag(cand)
+    return None
+
+
+def _path_within(candidate: str, base_key: str) -> bool:
+    """``candidate``（已 normcase+realpath 语义）是否落在 ``base_key`` 内。"""
+    ck = os.path.normcase(candidate)
+    if ck == base_key:
+        return True
+    try:
+        return os.path.commonpath([ck, base_key]).startswith(base_key)
+    except ValueError:
+        return False
 
 
 def _format_size(size: int) -> str:
@@ -598,9 +732,30 @@ async def read_file(
                          "sensitive file pattern."}
 
     p = Path(full)
-    if not p.exists():
-        # 46/11 #4：reports 路径区分「证据未产生」vs「id 错误」
-        reports_hint = _reports_evidence_hint(file_path, root or "")
+    # #5：共享产物（reports/**）的解析**先走跨树候选序**（本树 → MAIN →
+    # 兄弟树），因为写侧权威落点是 MAIN；单一解析点无法表达"哪棵树的"。
+    # 非共享路径维持原解析（隔离不受影响）。
+    read_tree_tag: str | None = None
+    if _is_platform_reports_read(file_path):
+        got = _resolve_reports_across_trees(
+            file_path, root or "", workspace_path, full,
+        )
+        if got is None:
+            from hiveweave.services import fs_errors
+
+            reports_hint = _reports_evidence_hint(
+                file_path, root or "", workspace_path,
+            )
+            fs_errors.observed_absent(
+                full, agent_id=agent_id, project_id=project_id
+            )
+            return {"success": False, "output": "",
+                    "error": f"Error: File not found: {file_path}."
+                             f"{reports_hint}{READ_MISS_HINT}",
+                    fs_errors.ERROR_CODE_KEY: fs_errors.NOT_FOUND}
+        full, read_tree_tag = got
+        p = Path(full)
+    elif not p.exists():
         # FS 错误码分类学 + 观察到缺席事件（编排层区分「漏步」vs「不可读」；
         # 带 project_id 的事实才会进 L3 总线触发按事实唤醒——审计 P1-2）
         from hiveweave.services import fs_errors
@@ -610,7 +765,7 @@ async def read_file(
         )
         return {"success": False, "output": "",
                 "error": f"Error: File not found: {file_path}."
-                         f"{reports_hint}{READ_MISS_HINT}",
+                         f"{READ_MISS_HINT}",
                 fs_errors.ERROR_CODE_KEY: fs_errors.NOT_FOUND}
     if p.is_dir():
         from hiveweave.services import fs_errors
@@ -669,6 +824,15 @@ async def read_file(
     suffix = f"\n\n(Showing lines {start + 1}-{end} of {total})"
     if truncated_note:
         suffix = truncated_note + suffix
+    if read_tree_tag:
+        # #5：跨树命中要说明**在哪棵树**（多树归因必要条件；共享产物落 MAIN
+        # 是四目录共享设计的正常形态，不是"硬重定向"）
+        suffix += (
+            f"\n\n[read from {read_tree_tag}"
+            " — shared .hiveweave/reports/ is written to MAIN by design"
+            " (remote worktrees are visible to all agents; see git_worktree"
+            " shared 4-dir contract)]"
+        )
     record_file_version(full)
     return {"success": True, "output": body + suffix, "error": None}
 
@@ -817,10 +981,12 @@ async def list_files(
                     "in your worktree yet (empty shared/ is not tracked). "
                     "Write: write_file to .hiveweave/shared/<file> → "
                     "checkpoint → merge; members see it after their next "
-                    "worktree merge. Do not search other agents' trees."
+                    "worktree merge."
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            # 生成 shared 提示失败**不改变**结论（目录本就不存在）：提示是
+            # 附加教学，不是判定依据。吞掉并留痕，让排障时能看到为什么没提示。
+            log.debug("file.shared_hint_failed", path=str(path), err=str(exc))
         return {"success": False, "output": "",
                 "error": f"Error: Directory not found: {path}."
                          f"{shared_hint}"}
@@ -1001,8 +1167,11 @@ async def _project_id_for_workspace(workspace: str) -> str | None:
             ws = r["workspace_path"] or ""
             if ws and os.path.normcase(os.path.normpath(ws)) == want:
                 return str(r["id"])
-    except Exception:
-        pass
+    except Exception as exc:
+        # 查不到 project_id 属**预期降级**（meta 库未初始化 / 无匹配行）：
+        # 调用方把 None 解释为"非 MAIN 树"，不影响读路径正确性。留痕备排障。
+        log.debug("file.main_project_id_unresolved",
+                  workspace=workspace, err=str(exc))
     return None
 
 

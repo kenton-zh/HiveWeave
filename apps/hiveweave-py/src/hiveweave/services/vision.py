@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 import structlog
+
+from hiveweave.util.tree_label import tree_tag
 
 log = structlog.get_logger()
 
@@ -78,6 +81,147 @@ def resolve_screenshot_path(workspace: str | None, raw: str | None) -> Path | No
     Absolute paths and ``..`` escapes outside the workspace are rejected
     (same contract as ``create_doc_review``).
     """
+    return _resolve_screenshot(workspace, raw, project_root=None)
+
+
+def resolve_screenshot_path_multi_tree(
+    workspace: str | None,
+    raw: str | None,
+    project_root: str | None,
+) -> tuple[Path | None, str]:
+    """#5 读侧多树查找：先本树（workspace，含项目根），再跨树候选。
+
+    判据来源（我们自己的模型，非 DSH）：
+    - ``services/git_worktree/service_create.py:99-105`` ——
+      ``.hiveweave/{shared,reports,drafts,handoffs}`` 四目录反选入库、
+      **跨 worktree 可见可合并**；
+    - 写侧因此有**单一权威落点**（截图/契约一律落 MAIN 的
+      ``.hiveweave/reports/``）；读侧只查一棵树就失败，正是
+      ``look_at_image`` 读 MAIN 截图**必失败**的成因（fixplan §10.2）。
+
+    跨树候选序见 :func:`_multi_tree_bases`：**MAIN → 本树 → 兄弟 worktree**。
+
+    返回 ``(path | None, note)``：``note`` 说明**在哪棵树命中**或**查过哪些树**
+    ——多树语境下这是归因的必要条件（fixplan §10.5）。不做"确实不存在"断言。
+    """
+    resolved = _resolve_screenshot(workspace, raw, project_root=project_root)
+    if resolved is not None and resolved.is_file():
+        return resolved, ""
+    if not raw or not str(raw).strip():
+        return None, ""
+    # 本树未命中 → 跨树候选（MAIN → 兄弟树）。相对路径才有跨树语义：
+    # 绝对路径、或含 `..` 逃逸的相对路径，一律不跨树猜（隔离不减）。
+    cand = Path(str(raw).strip().strip("\"'"))
+    if cand.is_absolute():
+        return None, ""
+    rel = str(cand).replace("\\", "/").lstrip("/")
+    if ".." in Path(rel).parts:
+        return None, ""
+    ws_key = _norm_key(workspace)
+    tried: list[str] = []
+    for base in _multi_tree_bases(workspace, project_root):
+        try:
+            full = (Path(base) / rel).resolve()
+        except (OSError, ValueError):
+            continue
+        tag = tree_tag(str(full))
+        tried.append(tag)
+        if full.is_file():
+            if _key_within(_norm_key(str(full)), ws_key):
+                return full, ""      # 本树命中：无跨树归因需求
+            return full, (
+                f" [read from {tag} — shared artifacts are written to MAIN"
+                " by design (4-dir shared contract)]"
+            )
+    if not tried:
+        return None, ""
+    return None, (
+        f" [searched {len(tried)} tree(s): {', '.join(tried)}"
+        " — not found in any of them; this is not proof the image"
+        " does not exist]"
+    )
+
+
+def _norm_key(p: str | None) -> str:
+    """路径比较键（realpath + normcase）。空值返回空串。"""
+    if not p or not str(p).strip():
+        return ""
+    try:
+        return os.path.normcase(os.path.realpath(str(p)))
+    except (OSError, ValueError):
+        return ""
+
+
+def _key_within(child_key: str, base_key: str) -> bool:
+    """``child_key`` 是否落在 ``base_key`` 内（**按路径分量**，非裸前缀）。
+
+    裸 ``str.startswith`` 会把 ``C:\\proj-wt`` 误判成 ``C:\\proj`` 的子路径
+    —— 多树场景下两个 worktree 目录名常常是长同名前缀（``A044``/``A0440``），
+    必须走 ``commonpath``。
+    """
+    if not child_key or not base_key:
+        return False
+    if child_key == base_key:
+        return True
+    try:
+        return os.path.commonpath([child_key, base_key]) == base_key
+    except ValueError:
+        return False
+
+
+def _multi_tree_bases(
+    workspace: str | None, project_root: str | None
+) -> list[str]:
+    """候选树根（去重、保序）：**MAIN → 本树 → 兄弟 worktree**。
+
+    判据出处同 :func:`resolve_screenshot_path_multi_tree`：共享产物的权威
+    落点是 MAIN（``service_create.py:99-105``），所以 MAIN 排第一；
+    兄弟树是 `§10.2`「MAIN → 请求者 → assignee」在同一项目命名空间
+    （``dispatch_pin.py:7,34``）下的上界。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(base: str | None) -> None:
+        if not base or not str(base).strip():
+            return
+        try:
+            rp = str(Path(base).resolve())
+        except (OSError, ValueError):
+            return
+        key = os.path.normcase(rp)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(rp)
+
+    _add(project_root)          # MAIN 优先（共享产物的权威落点）
+    proj = project_root or workspace
+    if proj:
+        wt_root = Path(proj) / ".hiveweave" / "worktrees"
+        try:
+            for name in sorted(p.name for p in wt_root.iterdir() if p.is_dir()):
+                if name.startswith("_"):   # _quarantine（constants.py:9）
+                    continue
+                _add(str(wt_root / name))
+        except OSError as exc:
+            # 没有 worktrees 目录 = 单树布局（非必然异常）：兄弟树本就不存在，
+            # 候选集只剩 MAIN + 本树，属预期降级。
+            log.debug("vision.sibling_trees_unavailable",
+                      root=str(wt_root), err=str(exc))
+    _add(workspace)             # 本树兜底（非 worktree 布局时即项目根）
+    return out
+
+
+def _resolve_screenshot(
+    workspace: str | None, raw: str | None, *, project_root: str | None
+) -> Path | None:
+    """``resolve_screenshot_path`` 的实现体。
+
+    ``project_root`` 为 None 时只允许 workspace 内（原契约）；
+    给出时在**同一函数内**允许多一层项目根（shared 产物的权威落点）——
+    这样"共享设计"与"隔离实现"用同一段判定，不会两处漂移。
+    """
     if not raw or not str(raw).strip():
         return None
     if not workspace or not str(workspace).strip():
@@ -86,6 +230,14 @@ def resolve_screenshot_path(workspace: str | None, raw: str | None) -> Path | No
         root = Path(workspace).resolve()
     except OSError:
         return None
+    bases = [root]
+    if project_root and str(project_root).strip():
+        try:
+            proj = Path(project_root).resolve()
+        except OSError:
+            proj = None
+        if proj is not None and proj != root:
+            bases.append(proj)
     candidate = Path(str(raw).strip().strip("\"'"))
     if not candidate.is_absolute():
         candidate = root / candidate
@@ -93,16 +245,19 @@ def resolve_screenshot_path(workspace: str | None, raw: str | None) -> Path | No
         resolved = candidate.resolve()
     except OSError:
         return None
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        log.warning(
-            "vision.path_escape",
-            path=str(resolved),
-            workspace=str(root),
-        )
-        return None
-    return resolved
+    for base in bases:
+        try:
+            resolved.relative_to(base)
+            return resolved
+        except ValueError:
+            continue
+    log.warning(
+        "vision.path_escape",
+        path=str(resolved),
+        workspace=str(root),
+        project_root=str(project_root or ""),
+    )
+    return None
 
 
 def load_image_for_llm(

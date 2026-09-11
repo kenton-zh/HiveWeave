@@ -16,7 +16,7 @@ from hiveweave.services.model import ModelService
 from hiveweave.services.vision import (
     analyze_image,
     load_image_for_llm,
-    resolve_screenshot_path,
+    resolve_screenshot_path_multi_tree,
     resolve_screenshot_under_project,
 )
 from hiveweave.tools.base import tool
@@ -81,7 +81,7 @@ async def look_at_image_tool(
             "(what should the vision model look for / how to answer)."
         )
 
-    resolved = await _resolve_look_at_image_path(params, agent_id, workspace)
+    resolved, note = await _resolve_look_at_image_path(params, agent_id, workspace)
     if isinstance(resolved, str):
         return ToolResult.err(resolved)
 
@@ -89,7 +89,7 @@ async def look_at_image_tool(
     if image is None:
         return ToolResult.err(
             f"Could not load image at {resolved}: missing, not an image "
-            "suffix, empty, or over size cap (2MB)."
+            "suffix, empty, or over size cap (2MB)." + note
         )
 
     svc = ModelService()
@@ -118,7 +118,7 @@ async def look_at_image_tool(
 
     assert text is not None and model is not None
     return ToolResult.ok(
-        text,
+        text + note,
         model_name=model.get("name"),
         model_id=model.get("model_id"),
         image_path=str(resolved),
@@ -129,12 +129,19 @@ async def _resolve_look_at_image_path(
     params: LookAtImageParams,
     agent_id: str,
     workspace: str,
-) -> Path | str:
-    """Return a sandboxed Path, or an error string.
+) -> tuple[Path | str, str]:
+    """Return ``(sandboxed Path | error string, tree-origin note)``.
 
     ``attestation_id`` loads screenshot_path from artifact_hashes and
     sandboxes under the project root (incl. ``.hiveweave/worktrees/``).
-    Bare ``image_path`` stays sandboxed to this agent's workspace.
+    Bare ``image_path`` resolves under this agent's workspace **first, then
+    across the project's trees** (#5, 2026-09-12): shared artifacts
+    (``.hiveweave/reports/**``) are written to MAIN by design
+    (``service_create.py:99-105``, the 4-dir reverse-checkout contract), so
+    a leaf worktree reading them must not fail just because the file is not
+    in its own tree. The note names the tree that was hit.
+
+    ``note`` 为空串 = 本树命中（无跨树归因需求）。
     """
     att_id = (params.attestation_id or "").strip()
     if att_id:
@@ -147,38 +154,56 @@ async def _resolve_look_at_image_path(
 
         project_id = await get_project_id(agent_id)
         if not project_id:
-            return "Cannot resolve project for this agent."
+            return "Cannot resolve project for this agent.", ""
         row = await attestation_service.get(project_id, att_id)
         if not row:
-            return f"Attestation not found: {att_id}"
+            return f"Attestation not found: {att_id}", ""
         shot = screenshot_path_from_artifact_hashes(row.get("artifact_hashes"))
         if not shot:
             return (
                 f"Attestation {att_id} has no screenshot_path in "
                 "artifact_hashes. Re-run browse screenshot so the path "
                 "is stored."
-            )
+            ), ""
         project_root = await meta_db.get_project_workspace(project_id)
         resolved = resolve_screenshot_under_project(project_root, shot)
         if resolved is None:
             return (
                 "Screenshot path from attestation is outside the project "
                 f"(no .. escape): {shot!r}."
-            )
-        return resolved
+            ), ""
+        return resolved, ""
 
     raw_path = (params.image_path or "").strip()
     if not raw_path:
         return (
             "look_at_image requires image_path, or attestation_id "
             "to load another agent's screenshot."
-        )
-    resolved = resolve_screenshot_path(workspace, raw_path)
+        ), ""
+    project_root = await _project_root_for_agent(agent_id)
+    resolved, note = resolve_screenshot_path_multi_tree(
+        workspace, raw_path, project_root,
+    )
     if resolved is None:
         return (
             f"Invalid or out-of-workspace image_path: {raw_path!r}. "
             "Path must be under the agent workspace (no .. escape). "
             "To inspect another agent's screenshot, pass attestation_id."
-        )
-    return resolved
+            + note
+        ), ""
+    return resolved, note
+
+
+async def _project_root_for_agent(agent_id: str) -> str | None:
+    """agent → 项目根（跨树查找的共同祖先）。查询失败返回 None（退回本树）。"""
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.tools.helpers import get_project_id
+
+        project_id = await get_project_id(agent_id)
+        if not project_id:
+            return None
+        return await meta_db.get_project_workspace(project_id)
+    except Exception:
+        return None
 
