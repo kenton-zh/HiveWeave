@@ -1326,6 +1326,19 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "milestone QA task. Not per-leaf merge."
                 ),
             },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["tag"],
+                "description": (
+                    "Tags for a NEW task (ignored on taskId reuse). Put the "
+                    "task-level delivery plane here as `plane:<web|native-desktop|"
+                    "game-engine|cli|library>` — on a non-web plane a visual "
+                    "gate is downgraded instead of dispatching a browser E2E "
+                    "gate that can never pass. A downgrade tag is appended "
+                    "automatically."
+                ),
+            },
             "dependsOn": {
                 "type": "array",
                 "items": {"type": "string"},

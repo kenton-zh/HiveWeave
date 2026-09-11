@@ -163,7 +163,8 @@ class DispatchService:
                             source: str = "agent",
                             depends_on: list[str] | None = None,
                             parent_task_id: str | None = None,
-                            acceptance_criteria: list | None = None) -> dict:
+                            acceptance_criteria: list | None = None,
+                            tags: list[str] | None = None) -> dict:
         """Coordinator dispatches a task to a subordinate.
 
         1. Create a Task Ledger entry via :class:`TaskService` — obtains
@@ -302,6 +303,7 @@ class DispatchService:
                 depends_on=depends_on,
                 parent_task_id=parent_task_id,
                 acceptance_criteria=acceptance_criteria,
+                tags=tags,
             )
 
         # Ensure executor/builder-coordinator worktree + pin paths in the message

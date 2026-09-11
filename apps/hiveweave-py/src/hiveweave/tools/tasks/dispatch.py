@@ -145,6 +145,18 @@ class DispatchTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["submitGate", "submit_gate", "gate"]},
     )
+    tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tags for a NEW task (ignored when reusing taskId). The task-level "
+            "delivery-plane fact lives here as `plane:<web|native-desktop|"
+            "game-engine|cli|library>`; supplying it lets a visual gate be "
+            "downgraded for a non-web plane instead of dispatching a browser "
+            "E2E gate that can never pass. A downgrade tag is appended "
+            "automatically."
+        ),
+        json_schema_extra={"aliases": ["tags", "tag"]},
+    )
     milestone_verify: bool = Field(
         default=False,
         alias="milestoneVerify",
@@ -408,16 +420,21 @@ async def dispatch_task_tool(
         except ValueError as e:
             return ToolResult.err(str(e))
         # fixplan §6 #12：交付物平面降档（视觉门遇非 web 平面 → 降档 + 留痕）。
-        # ⚠ 已知缺口（审计 P1-4，未修）：本路径**不传 tags** ⇒ 任务级
-        # `plane:<x>` 在这里读不到，只有项目级 `project_meta.delivery_plane`
-        # 生效；且返回的 tag 被丢弃，任务账本上**没有** `gate_downgraded:` 留痕。
-        # 目前只有回执里那句 plane_reason 提示（下方 `⚠ {plane_reason}`）。
-        # 与 create.py:290 / api/tasks.py:187 两处（均传 tags 且写 tag）不一致。
+        # P1-4（2026-09-12）：原实现**不传 tags** ⇒ 任务级 `plane:<x>` 在此路径
+        # 失效（只剩项目级 `project_meta.delivery_plane` 生效），且返回的 tag
+        # 被丢弃 ⇒ 账本无 `gate_downgraded:` 留痕 —— 而 `delivery_plane.py`
+        # 自己写着「create / dispatch / api 三处调用方必须把 tag 写进任务……
+        # 降档不许静默」。现补接线：新建任务时把 tags 透传进去，降档 tag 追加；
+        # **复用已有任务（taskId）时不追加** —— 那是改既有数据，超出本次范围，
+        # 只保留回执提示。
         from hiveweave.services.delivery_plane import resolve_and_downgrade
 
-        policy_id, _plane_tag, plane_reason = await resolve_and_downgrade(
-            policy_id, project_id=project_id
+        _dispatch_tags: list[str] = list(params.tags or [])
+        policy_id, plane_tag, plane_reason = await resolve_and_downgrade(
+            policy_id, project_id=project_id, tags=_dispatch_tags
         )
+        if plane_tag and not params.task_id:
+            _dispatch_tags = sorted({*_dispatch_tags, plane_tag})
         if params.milestone_verify:
             from hiveweave.services.org import OrgService
             from hiveweave.services.policy import infer_role_family
@@ -476,6 +493,7 @@ async def dispatch_task_tool(
         depends_on=params.depends_on,
         parent_task_id=params.parent_task_id,
         acceptance_criteria=params.acceptance_criteria,
+        tags=_dispatch_tags or None,
     )
     if result.get("success"):
         # Align with review_task: inbox alone is not enough — wake assignee
