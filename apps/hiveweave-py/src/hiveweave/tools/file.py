@@ -639,7 +639,9 @@ def _resolve_reports_across_trees(
 ) -> tuple[str, str | None] | None:
     """共享 reports 产物的跨树解析：返回 ``(绝对路径, 命中树标签)``。
 
-    候选序 = **本树 → MAIN（权威落点）→ 兄弟 worktree**（fixplan §10.2）。
+    候选序 = **MAIN（权威落点）→ 本树 → 兄弟 worktree**（fixplan:351 的
+    「MAIN → 请求者树 → assignee 树」；实际顺序由 ``_reports_read_scope``
+    单一权威给出，本函数只消费，不另立一套）。
     「本树」= **写侧授权树**（``workspace_path``，即 ``boundary_root``，
     见 ``acl_sandbox/policy.py:54``），**不是** ``_resolve_for_read_detail``
     预解析出来的路径 —— 后者对 reports 走的就是项目根，拿它当基准会把
@@ -736,8 +738,9 @@ async def read_file(
                          "sensitive file pattern."}
 
     p = Path(full)
-    # #5：共享产物（reports/**）的解析**先走跨树候选序**（本树 → MAIN →
-    # 兄弟树），因为写侧权威落点是 MAIN；单一解析点无法表达"哪棵树的"。
+    # #5：共享产物（reports/**）的解析**先走跨树候选序**（MAIN → 本树 →
+    # 兄弟树，见 _reports_read_scope；fixplan:351），因为写侧权威落点是
+    # MAIN；单一解析点无法表达"哪棵树的"。
     # 非共享路径维持原解析（隔离不受影响）。
     read_tree_tag: str | None = None
     if _is_platform_reports_read(file_path):
