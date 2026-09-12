@@ -350,8 +350,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "H5/canvas game harness runner. FIRST browse(goto) the game URL "
             "WITH ?hw_test=1 so the harness exposes window.__HW_TEST__. Then "
             "probe → list → run(caseId). run() executes window.__HW_TEST__, "
-            "screenshots canvas, returns codePass + visionCriteria; then "
-            "assert_visual. No harness (probe=observe-only) → do not claim "
+            "screenshots canvas, returns codePass + detail + metrics + "
+            "visionCriteria (structured fields shown verbatim on both pass "
+            "and fail; no need to raw-eval __HW_TEST__.run() to read metrics); "
+            "then assert_visual. No harness (probe=observe-only) → do not claim "
             "gameplay pass. Never attempt realtime AI play of action games."
         ),
         "properties": {
@@ -1649,6 +1651,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "lists missing items without submitting. VERIFY tasks MUST pass "
             "verdict=PASS|FAIL (blockingIssues when FAIL, E1 hard gate); "
             "delivery-contract tasks MUST pass deliveryContract={summary, test}. "
+            "If a required credential is STRUCTURALLY impossible to issue "
+            "(e.g. code_audit when your branch has no diff vs MAIN — task "
+            "already merged), the gate records attestation_impossible"
+            "(reason=tool_limited) and consumes it itself: no waiver needed. "
             "Branch conflicting with main is rejected (merge_conflict_with_main) "
             "— run `git rebase main` in your worktree, resolve, checkpoint, "
             "then resubmit. Only the assignee can submit."
@@ -1913,7 +1919,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "quality (default, real quality exemption — you lose "
                     "approval right) | tool_failure (tool/upstream failure "
                     "such as audit LLM outage — you keep approval right). "
-                    "When unsure use quality."
+                    "When unsure use quality. NOT for a credential that is "
+                    "physically impossible to issue (e.g. code_audit on an "
+                    "already-merged branch with no diff): submit already "
+                    "records attestation_impossible(reason=tool_limited) and "
+                    "consumes it itself — only use this tool to override that "
+                    "fact by hand."
                 ),
             },
             "evidenceAttestationId": {

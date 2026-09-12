@@ -108,7 +108,8 @@ class GameRunCaseParams(BaseModel):
         description=(
             "probe: detect __HW_TEST__ / render_game_to_text / advanceTime. "
             "list: list case ids. "
-            "run: execute one case, screenshot canvas, return codePass + visionCriteria."
+            "run: execute one case, screenshot canvas, return codePass + "
+            "detail + metrics + visionCriteria."
         ),
     )
     case_id: str | None = Field(
@@ -150,7 +151,9 @@ class GameRunCaseParams(BaseModel):
     "Run an H5/canvas game test harness case (docs/spec/h5-game-test-harness.md). "
     "Requires prior browse(goto) to the game URL (?hw_test=1). "
     "Actions: probe | list | run(caseId). "
-    "run() drives inputs via window.__HW_TEST__, returns codePass + visionCriteria, "
+    "run() drives inputs via window.__HW_TEST__, returns codePass + detail + "
+    "metrics + visionCriteria (structured fields shown verbatim on BOTH pass "
+    "and fail — no need to raw-eval __HW_TEST__.run() for metrics), "
     "screenshots canvas, injects pixels — then you MUST assert_visual. "
     "No harness → observe-only; do not claim gameplay pass. "
     "Never attempt realtime AI play of action games. "
@@ -418,7 +421,7 @@ async def _action_run(
         out = (
             f"CASE FAIL (code gate): id={case_id}\n"
             f"codePass=false errors={json.dumps(code_errors, ensure_ascii=False)}\n"
-            f"result={json.dumps(result, ensure_ascii=False)}\n"
+            f"{_structured_harness_lines(result)}"
             f"screenshot={shot_rel} ok={shot_ok}\n"
             f"{shot_note}\n"
             "Do NOT assert_visual pass. Dual gate failed on code. "
@@ -435,6 +438,7 @@ async def _action_run(
     out = (
         f"CASE codePass=true: id={case_id}\n"
         f"simulatedMs={result.get('simulatedMs')}\n"
+        f"{_structured_harness_lines(result)}"
         f"visionCriteria={criteria_line}\n"
         f"screenshot={shot_rel} ok={shot_ok}\n"
         f"{shot_note}\n"
@@ -452,6 +456,26 @@ async def _action_run(
             "then assert_visual before submit."
         )
     return ToolResult.ok(out, **extra)
+
+
+def _structured_harness_lines(result: dict[str, Any]) -> str:
+    """Model-visible structured fields, identical on the pass and fail paths.
+
+    report TEST_DSH_54 #5（2026-09-12）：pass 路径过去只把 scalars
+    （simulatedMs）拼进模型可见文本，探针的 ``detail`` / ``metrics`` 只落在
+    extra，被 provider 组包白名单剥离 —— QA 想读 **pass 用例** 的 metrics
+    明细只能绕去 ``browse eval __HW_TEST__.run()``。这里把两者按同一格式
+    **原样**放进模型可见文本；fail 路径复用同一格式，消除「失败话多、成功
+    话少」的倒挂。
+    """
+    lines = ""
+    detail = result.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        lines += f"detail={detail.strip()}\n"
+    metrics = result.get("metrics")
+    if metrics is not None:
+        lines += f"metrics={json.dumps(metrics, ensure_ascii=False)}\n"
+    return lines
 
 
 def _safe_filename(case_id: str) -> str:
