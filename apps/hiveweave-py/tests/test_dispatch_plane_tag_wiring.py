@@ -10,6 +10,11 @@
 
 本测试用 **AST 结构断言 + 行为断言**（不是文本子串）—— 回退接线即打红。
 
+2026-09-12 补（report TEST_DSH_54 #4）：本节 1–4 组**全部**是 AST / 参数面
+断言，**无一例真带 `taskId` 调用** —— 于是 `_dispatch_tags` 未绑定的复用
+分支在 11 例全绿下带着 P0 崩溃活着（AST 断言恰好锁住了错误构造）。第 5 组
+`TestReusePathBehavior` 补上真实调用形态：守卫必须守对方向，不能只守"存在"。
+
 判据来源：我们自己的 `delivery_plane.py` docstring（三处调用方契约）。
 **不引用 DSH**：DSH 无交付物平面概念（无组织层/无任务账本），其做法
 不构成本场景判据（fixplan §10 纪律 + MEMORY.md 强制三问）。
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import hiveweave.services.dispatch as dispatch_mod
 import hiveweave.tools.tasks.dispatch as dispatch_tool_mod
@@ -184,3 +190,188 @@ class TestReuseDoesNotMutateExistingTask:
             "追加降档 tag 的分支缺少 `not params.task_id` 守卫 —— "
             "复用已有任务时会被追加 tag（改既有数据）"
         )
+
+
+# ── 5. 行为：复用分支必须真能跑（report TEST_DSH_54 #4 / Layer 6「路坏型」）──
+#
+# 为什么单列：`suite 1-4` 全是 AST/参数面断言，**没有一例真带 task_id 调用**
+# （旧版全文件 `grep -n task_id` 只命中上面的 AST 断言）。结果是
+# `_dispatch_tags` 绑在 `if not params.task_id:` 分支内、用在共用出口
+# （:496）这个构造在 **11 例全绿** 的情况下活着 —— 守卫测的是"守卫存在"，
+# 而不是"复用这条路真的能走"。这正是被审计批评的「守卫存在 ≠ 守卫住了
+# 正确的方向」：AST 断言恰好把错误构造锁死。
+#
+# 判据来源：我们自己的 `dispatch_task` 工具 docstring 原文
+# 「To re-assign/delegate an EXISTING task, pass taskId — this keeps a single
+# ledger entry」⇒ 复用是**官方且在文档里被主动引导**的路径。
+# 修法按新判型「路坏型」：修好它 + 补行为测试，不新增也不删除机制。
+
+class TestReusePathBehavior:
+    """真以 `taskId` 调用一次 —— 复用路径的行为覆盖（不再只有 AST）。"""
+
+    async def test_reuse_with_task_id_reaches_dispatch_service(self):
+        """带 taskId 必须成功走到 DispatchService（旧码必抛 UnboundLocalError）。"""
+        import hiveweave.tools.helpers as helpers
+        from hiveweave.services.dispatch import DispatchService
+        from hiveweave.services.org import OrgService
+        from hiveweave.tools.tasks.dispatch import dispatch_task_tool
+
+        params = DispatchTaskParams(
+            target="A009",
+            task="重新下开工令",
+            submitGate="unit",
+            taskId="task-existing-1",
+        )
+        dispatch_mock = AsyncMock(
+            return_value={
+                "success": True,
+                "task_id": "task-existing-1",
+                "from_agent_id": "boss-agent",
+                "to_agent_id": "assignee-agent",
+            }
+        )
+
+        async def _get_agent(aid: str):
+            if aid == "assignee-agent":
+                return {
+                    "id": "assignee-agent",
+                    "permission_type": "executor",
+                    "parent_id": "boss-agent",
+                    "name": "Eng",
+                }
+            return {
+                "id": "boss-agent",
+                "permission_type": "coordinator",
+                "parent_id": None,
+                "name": "Boss",
+            }
+
+        with (
+            patch.object(helpers, "get_project_id", AsyncMock(return_value="proj")),
+            patch.object(
+                helpers, "resolve_agent_id", AsyncMock(return_value="assignee-agent")
+            ),
+            patch.object(DispatchService, "dispatch_task", dispatch_mock),
+            patch.object(OrgService, "get_agent", AsyncMock(side_effect=_get_agent)),
+        ):
+            result = await dispatch_task_tool(params, "boss-agent", "/tmp")
+
+        assert result.success is True, (
+            "复用路径（带 taskId）必须能派单 —— 旧码在此抛 "
+            "UnboundLocalError: _dispatch_tags（P0 #4）"
+        )
+        dispatch_mock.assert_awaited_once()
+        kwargs = dispatch_mock.await_args.kwargs
+        assert kwargs["existing_task_id"] == "task-existing-1"
+        # 语义保留：复用不追加降档 tag（不改既有数据）⇒ tags 回落到 None
+        assert kwargs["tags"] is None
+
+    async def test_reuse_path_skips_plane_downgrade_side_effect(self):
+        """复用分支**不得**触发 resolve_and_downgrade（那会改既有任务的平面）。"""
+        import hiveweave.tools.helpers as helpers
+        from hiveweave.services import delivery_plane
+        from hiveweave.services.dispatch import DispatchService
+        from hiveweave.services.org import OrgService
+        from hiveweave.tools.tasks.dispatch import dispatch_task_tool
+
+        params = DispatchTaskParams(
+            target="A009", task="重新下开工令", taskId="task-existing-2"
+        )
+        downgrade_mock = AsyncMock()
+        dispatch_mock = AsyncMock(
+            return_value={
+                "success": True,
+                "task_id": "task-existing-2",
+                "from_agent_id": "boss-agent",
+                "to_agent_id": "assignee-agent",
+            }
+        )
+
+        async def _get_agent(aid: str):
+            if aid == "assignee-agent":
+                return {
+                    "id": "assignee-agent",
+                    "permission_type": "executor",
+                    "parent_id": "boss-agent",
+                    "name": "Eng",
+                }
+            return {
+                "id": "boss-agent",
+                "permission_type": "coordinator",
+                "parent_id": None,
+                "name": "Boss",
+            }
+
+        with (
+            patch.object(helpers, "get_project_id", AsyncMock(return_value="proj")),
+            patch.object(
+                helpers, "resolve_agent_id", AsyncMock(return_value="assignee-agent")
+            ),
+            patch.object(DispatchService, "dispatch_task", dispatch_mock),
+            patch.object(OrgService, "get_agent", AsyncMock(side_effect=_get_agent)),
+            patch.object(
+                delivery_plane, "resolve_and_downgrade", downgrade_mock
+            ),
+        ):
+            await dispatch_task_tool(params, "boss-agent", "/tmp")
+
+        downgrade_mock.assert_not_awaited()
+
+    async def test_auto_fact_snapshot_runs_without_artifact_refs(self):
+        """L2 自动核验快照必须在**没有 artifact_refs** 时也能跑。
+
+        同族回归（与 `_dispatch_tags` 同一形态）：`meta_db` 曾只在
+        `if params.artifact_refs:` 内 import，却在共用路径使用 ⇒ NameError
+        被 `except Exception` 以 debug 静默吞掉，快照在绝大多数派单上是死的。
+        断言 `collect_and_format` 真被 await —— 若 `meta_db` 未绑定，
+        它在更早一行就抛，本断言转红。
+        """
+        import hiveweave.tools.helpers as helpers
+        from hiveweave.db import meta as meta_mod
+        from hiveweave.services import dispatch_facts
+        from hiveweave.services.dispatch import DispatchService
+        from hiveweave.services.org import OrgService
+        from hiveweave.tools.tasks.dispatch import dispatch_task_tool
+
+        params = DispatchTaskParams(target="A009", task="x", taskId="task-existing-3")
+        facts_mock = MagicMock(return_value="")  # collect_and_format 是同步函数
+        dispatch_mock = AsyncMock(
+            return_value={
+                "success": True,
+                "task_id": "task-existing-3",
+                "from_agent_id": "boss-agent",
+                "to_agent_id": "assignee-agent",
+            }
+        )
+
+        async def _get_agent(aid: str):
+            if aid == "assignee-agent":
+                return {
+                    "id": "assignee-agent",
+                    "permission_type": "executor",
+                    "parent_id": "boss-agent",
+                    "name": "Eng",
+                }
+            return {
+                "id": "boss-agent",
+                "permission_type": "coordinator",
+                "parent_id": None,
+                "name": "Boss",
+            }
+
+        with (
+            patch.object(helpers, "get_project_id", AsyncMock(return_value="proj")),
+            patch.object(
+                helpers, "resolve_agent_id", AsyncMock(return_value="assignee-agent")
+            ),
+            patch.object(DispatchService, "dispatch_task", dispatch_mock),
+            patch.object(OrgService, "get_agent", AsyncMock(side_effect=_get_agent)),
+            patch.object(
+                meta_mod, "get_project_workspace", AsyncMock(return_value="/tmp")
+            ),
+            patch.object(dispatch_facts, "collect_and_format", facts_mock),
+        ):
+            result = await dispatch_task_tool(params, "boss-agent", "/tmp")
+
+        assert result.success is True
+        facts_mock.assert_called_once()

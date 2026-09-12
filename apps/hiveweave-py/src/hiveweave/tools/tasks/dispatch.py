@@ -335,10 +335,17 @@ async def dispatch_task_tool(
     # Catches "spec file not visible" bugs immediately (creator-side check).
     artifact_warnings: list[str] = []
     shared_refs_ok = False
+    # 同族缺陷（与上方 `_dispatch_tags` 同一形态，2026-09-12 一并修）：
+    # `meta_db` 原先只在 `if params.artifact_refs:` 分支内 import，却在下方
+    # L2 自动核验快照块（共用路径）里使用 ⇒ `artifact_refs` 为空时必抛
+    # NameError，被那个块的 `except Exception` 以 debug 级静默吞掉 ——
+    # **平台自动核验快照在绝大多数派单上是死的**（日志可见
+    # `dispatch_auto_facts_failed error="cannot access local variable 'meta_db'"`）。
+    # 提到分支外 import，让两条路径都绑定。
+    from hiveweave.db import meta as meta_db
+
     if params.artifact_refs:
         from pathlib import Path as _P
-
-        from hiveweave.db import meta as meta_db
 
         main_ws = await meta_db.get_project_workspace(project_id)
         from hiveweave.services.worktree_review import (
@@ -412,6 +419,20 @@ async def dispatch_task_tool(
     title: str | None = None
     source = "agent"
     plane_reason: str | None = None
+    # P0 修复（report TEST_DSH_54 §3-4 / Layer 6「路坏型」）：`_dispatch_tags`
+    # 必须在**两个分支之前**绑定。
+    #
+    # 历史缺陷：a818d70（2026-09-12 03:08）把它的赋值写在 `if not params.task_id:`
+    # 分支内（旧 :432），却在**新建/复用共用的出口**（:496 `tags=_dispatch_tags`）
+    # 使用 ⇒ 带 `taskId` 走复用分支时变量从未绑定，必抛
+    # `UnboundLocalError: cannot access local variable '_dispatch_tags'`。
+    # 团队把它误读成「2026-06 的陈账」而选择绕行（ask_agent）不报修 —— 实际是
+    # 9 小时前的自伤回归。守卫测试 tests/test_dispatch_plane_tag_wiring.py 只有
+    # AST 断言、无一例真带 taskId 调用，11 例全绿 ⇒ 复用路径零覆盖。
+    #
+    # 语义不变：**复用已有任务时不追加降档 tag**（那是改既有数据），
+    # 由下方 `if plane_tag and not params.task_id:` 守卫保证。
+    _dispatch_tags: list[str] = list(params.tags or [])
     if not params.task_id:
         from hiveweave.services.attestation import policy_from_submit_gate
 
@@ -427,9 +448,11 @@ async def dispatch_task_tool(
         # 降档不许静默」。现补接线：新建任务时把 tags 透传进去，降档 tag 追加；
         # **复用已有任务（taskId）时不追加** —— 那是改既有数据，超出本次范围，
         # 只保留回执提示。
+        #
+        # 注：`_dispatch_tags` 的绑定已上提到分支之外（见上方 P0 修复注释）——
+        # 它必须对**新建与复用两条路径**都可见，否则复用分支在 :496 处崩。
         from hiveweave.services.delivery_plane import resolve_and_downgrade
 
-        _dispatch_tags: list[str] = list(params.tags or [])
         policy_id, plane_tag, plane_reason = await resolve_and_downgrade(
             policy_id, project_id=project_id, tags=_dispatch_tags
         )
