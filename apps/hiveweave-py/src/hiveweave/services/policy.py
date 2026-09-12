@@ -223,7 +223,17 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
 }
 
 # Paths HR (no DOC_WRITE / SOURCE_WRITE) may write — legacy prefix scope.
-# Keep in sync with file.py allowed_subdirs + bash.py _ALLOWED_HW_SUBDIRS
+#
+# ⚠ 这张表**故意**比 agent 可访问的 .hiveweave 子目录集更窄（只含 doc 性质的
+# shared/reports/drafts），不要"对齐"成全集：这里管的是**无源码写权角色能写哪**，
+# 而 `tools/file.py::_check_hiveweave_dir` 与 `tools/bash.py::_ALLOWED_HW_SUBDIRS`
+# 管的是**agent 工具通道能读写哪**（含 worktrees/handoffs/sandbox-temp，
+# 以及只读的 merge-quarantine）。三者语义不同，不共用一个常量。
+#
+# 真正需要防的是「file.py 与 bash.py 两份清单悄悄漂移」（report TEST_DSH_54 #5
+# 点名的既有债务：加目录要三处手工同步）。该漂移由**行为化交叉守卫**兜住 ——
+# `tests/test_hiveweave_dir_protection.py::TestHiveweaveAllowlistConsistency`
+# 逐子目录断言两层判定一致，只改一处即转红。
 COORDINATOR_WRITE_PREFIXES = (
     "docs/",
     "doc/",

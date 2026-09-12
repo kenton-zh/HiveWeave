@@ -762,6 +762,10 @@ def _strip_hiveweave_test_excludes(command: str) -> str:
 # 放行的 .hiveweave 子目录 — agent 可在这些子目录内执行文件操作
 # 与 file.py 的 allowed_subdirs（_check_hiveweave_dir）保持一致:
 # shared=团队共享 / reports, drafts, worktrees=工作文件 / handoffs=交接文档
+# ⚠ 两份清单的一致性**由测试兜底**（不是靠这段注释）：
+# tests/test_hiveweave_dir_protection.py::TestHiveweaveAllowlistConsistency
+# 逐子目录断言 file.py 与 bash.py 判定一致 —— 只改一处即转红。
+# 另有**只读**子目录（不在本清单内，见下方 logs / merge-quarantine 两个例外）。
 # (?![\w.-]) 精确拒绝「路径名续字符」：放行 `git -C .hiveweave/worktrees`（尾随空格/结尾），
 # 拦 `.hiveweave/shared-evil/`、`.hiveweave/worktrees2/` 这类前缀目录（\b 会被 d- / s2 击穿）
 _ALLOWED_HW_SUBDIRS = re.compile(
@@ -779,16 +783,31 @@ _HW_LOGS_REF = re.compile(
 # fd 复制（`2>&1` / `1>&2`：`>` 后紧跟 `&`）不是写入，必须排除——否则无害的
 # stderr 合并也会被当成写操作，把 `cat .hiveweave/logs/a.log 2>&1 | head` 拦掉。
 # 真正的写重定向（`> file` / `>> file`）后跟的不是 `&`，照常命中。
+# 2026-09-12（审计）：补 `dd` / `ln` / `sqlite3` —— 三者在 `_HIVEWEAVE_FILE_OPS`
+# 里（会触发 .hiveweave 门），却不在本写入词表里，于是 `dd of=.hiveweave/logs/x`
+# 或 `dd of=.hiveweave/merge-quarantine/x` 会被下方的**只读例外**放行。只读例外
+# 是本文件里唯一"靠写入词表来证明是读"的地方，所以词表漏一个动词 = 该目录的写
+# 也漏了。宁可多拦（误拦一条含裸 `ln` 的读命令）也不能少拦。
 _HW_WRITE_MARKERS = re.compile(
     r"(?:>>|(?<![<=!>-])>)(?!&)"
     r"|\b(?:rm|del|erase|rmdir|rd|mv|move|cp|copy|"
     r"xcopy|robocopy|echo|tee|truncate|mkdir|touch|"
+    r"dd|ln|sqlite3|"
     r"remove-item|clear-content|out-file|set-content|add-content|new-item|"
     r"move-item|rename-item|copy-item|tee-object|"
     # 别名必须与 _HIVEWEAVE_FILE_OPS 对齐（审计 [3]）：`… | ri` 能命中
     # FILE_OPS + LOGS_REF，若此处缺别名就会被只读门放行而真删除。
     r"ri|mi|cpi)\b",
     re.IGNORECASE,
+)
+
+# report TEST_DSH_54 #5（v2 收窄版）：`merge-quarantine` 是平台自管的隔离区
+# —— 平台在 `services/platform_state.py` T2.5 主动回报"有隔离文件待处理"，
+# 却因该目录不在 `_ALLOWED_HW_SUBDIRS` 里而拒绝 agent 读取（实测 18/18 次
+# 拒绝全部指向它）。与 `logs` 同形态处理：**只读放行**（诊断需要），
+# 任何写入/删除/搬移动词仍拦（隔离区不许 agent 改写）。
+_HW_MERGE_QUARANTINE_REF = re.compile(
+    r"\.hiveweave[\\/]+merge-quarantine(?![\w.-])", re.IGNORECASE
 )
 
 
@@ -799,6 +818,8 @@ def _check_hiveweave_command(command: str) -> bool:
     `cd .hiveweave` 和 `ls .hiveweave` 这类无害命令不拦。
     放行指向 shared/reports/drafts/worktrees/handoffs 子目录的文件操作（团队共享/工作文件）。
     放行 .hiveweave/logs 下的**只读**操作（诊断出口，P1-7）；写/删仍拦。
+    放行 .hiveweave/merge-quarantine 下的**只读**操作（隔离区诊断，TEST_DSH_54 #5）；
+    写/删仍拦 —— 该目录由平台自管，不是 agent 工作目录。
     """
     command = _strip_hiveweave_test_excludes(command)
     if not _HIVEWEAVE_REF.search(command):
@@ -810,6 +831,12 @@ def _check_hiveweave_command(command: str) -> bool:
         return False
     # 只读诊断日志：无写入标记才放行
     if _HW_LOGS_REF.search(command) and not _HW_WRITE_MARKERS.search(command):
+        return False
+    # 只读隔离区诊断：无写入标记才放行（同 logs 形态）
+    if (
+        _HW_MERGE_QUARANTINE_REF.search(command)
+        and not _HW_WRITE_MARKERS.search(command)
+    ):
         return False
     return True
 

@@ -569,6 +569,7 @@ def _check_file_security(
                     _is_sensitive,
                     hiveweave_root=root if allow_project_read else workspace_path,
                     allow_project_read=allow_project_read,
+                    write=not allow_project_read,
                 )
                 if err:
                     return err
@@ -587,6 +588,7 @@ def _check_file_security(
                 _is_sensitive,
                 hiveweave_root=workspace_path,
                 allow_project_read=False,
+                write=True,
             )
             if err:
                 return err
@@ -603,6 +605,7 @@ def _check_file_security(
         _is_sensitive,
         hiveweave_root=root if allow_project_read else workspace_path,
         allow_project_read=allow_project_read,
+        write=not allow_project_read,
     )
 
 
@@ -614,8 +617,16 @@ def _check_single_file(
     _is_sensitive,
     hiveweave_root: str | None = None,
     allow_project_read: bool = False,
+    write: bool = False,
 ) -> str | None:
-    """Check a single file path for security violations."""
+    """Check a single file path for security violations.
+
+    ``write`` 决定 .hiveweave 拒绝的理由分类（read_denied / write_denied）——
+    report TEST_DSH_54 #5/#8：一个纯 `read_file` 曾被描述成 "cannot modify"，
+    Agent 无法从错误里判断"该换哪条路"还是"这条路本来就该被放行"，于是
+    18 次失败里有 11 次是反复换路径试探。拒绝文案必须说清**哪种操作被拒**，
+    并直接给出可用通道。
+    """
     resolved, hint = _resolve(file_path)
     if hint is not None:
         return f"Error: {hint}"
@@ -623,16 +634,28 @@ def _check_single_file(
         scope = "project" if allow_project_read else "workspace"
         return f"Error: Sandbox violation - path must be within {scope}: {file_path}"
     hw_base = hiveweave_root or workspace_path
-    if _check_hiveweave_dir(resolved, hw_base):
+    if _check_hiveweave_dir(resolved, hw_base, write=write):
         # Allow listing .hiveweave root (read-only, shows subdirs)
         # but block write operations to protected areas
         from pathlib import Path
 
         from .file import HIVEWEAVE_DIR
 
-        if Path(resolved).name == HIVEWEAVE_DIR:
+        if Path(resolved).name == HIVEWEAVE_DIR and not write:
             return None  # list_files on .hiveweave is allowed
-        return "Error: Access denied - cannot modify .hiveweave system directory"
+        if write:
+            return (
+                "Error: Access denied (write_denied) - cannot modify this "
+                ".hiveweave path. Platform-managed: data.db, tool_outputs/, "
+                "merge-quarantine/ (read-only). Resolve quarantined merges with "
+                "the git_worktree_* tools instead of editing them directly."
+            )
+        return (
+            "Error: Access denied (read_denied) - cannot read this .hiveweave "
+            "subdirectory. Readable: shared/, reports/, drafts/, worktrees/, "
+            "handoffs/, sandbox-temp/, merge-quarantine/. Platform-managed "
+            "state is available via get_platform_state."
+        )
     if _is_sensitive(file_path):
         return f"Error: Access denied - '{file_path}' is a sensitive file"
     return None

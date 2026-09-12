@@ -9,6 +9,7 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
+from textwrap import dedent as _dedent
 
 import pytest
 
@@ -481,3 +482,219 @@ class TestSharedDirAccess:
             workspace_path=str(tmp_path),
         )
         assert (hw_shared / "doc.md").exists()
+
+
+# ── merge-quarantine：只读放行、写仍保护（report TEST_DSH_54 #5 v2 收窄版）──
+#
+# 判据来源（我们自己）：`services/platform_state.py` T2.5 把 merge-quarantine
+# 当**只读诊断源**接进平台状态（统计"待处理 quarantine"并回报给 Agent），
+# 却因该目录未入白名单而不让 Agent 读 —— 实测 18/18 次拒绝全部指向它。
+# 反向：隔离区由平台自管（git_worktree 把阻塞 merge 的 untracked 文件搬进去），
+# agent 不得改写 ⇒ 读放行 / 写保护。
+
+
+class TestMergeQuarantineReadOnly:
+    def test_check_dir_allows_read(self, tmp_path: Path):
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "merge-quarantine" / "20260912-141336"
+                / "docs" / "SPEC.md"),
+            str(tmp_path),
+        ) is False
+
+    def test_check_dir_blocks_write(self, tmp_path: Path):
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "merge-quarantine" / "20260912-141336"
+                / "docs" / "SPEC.md"),
+            str(tmp_path),
+            write=True,
+        ) is True
+
+    def test_check_dir_allows_listing(self, tmp_path: Path):
+        """agent 要能 list 该目录才知道里面有什么。"""
+        from hiveweave.tools.file import _check_hiveweave_dir
+        assert _check_hiveweave_dir(
+            str(tmp_path / ".hiveweave" / "merge-quarantine"), str(tmp_path)
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_read_file_allowed(self, tmp_path: Path):
+        from hiveweave.tools.file import read_file
+        q = tmp_path / ".hiveweave" / "merge-quarantine" / "20260912-141336"
+        q.mkdir(parents=True)
+        (q / "NOTE.md").write_text("quarantined conflict")
+        result = await read_file(
+            file_path=".hiveweave/merge-quarantine/20260912-141336/NOTE.md",
+            offset=0,
+            limit=100,
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is True, result.get("error")
+        assert "quarantined conflict" in result["output"]
+
+    @pytest.mark.asyncio
+    async def test_list_files_allowed(self, tmp_path: Path):
+        from hiveweave.tools.file import list_files
+        q = tmp_path / ".hiveweave" / "merge-quarantine" / "20260912-141336"
+        q.mkdir(parents=True)
+        (q / "NOTE.md").write_text("x")
+        result = await list_files(
+            path=".hiveweave/merge-quarantine/20260912-141336",
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is True, result.get("error")
+        assert "NOTE.md" in result["output"]
+
+    @pytest.mark.asyncio
+    async def test_write_file_still_blocked(self, tmp_path: Path):
+        """写明：读放行不等于写放行（隔离区是平台自管区）。"""
+        from hiveweave.tools.file import write_file
+        q = tmp_path / ".hiveweave" / "merge-quarantine"
+        q.mkdir(parents=True)
+        result = await write_file(
+            file_path=".hiveweave/merge-quarantine/evil.md",
+            content="hack",
+            workspace_path=str(tmp_path),
+        )
+        assert result["success"] is False
+        assert not (q / "evil.md").exists()
+
+    def test_bash_allows_read(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "cat .hiveweave/merge-quarantine/20260912-141336/NOTE.md"
+        ) is False
+        assert _check_hiveweave_command(
+            "ls .hiveweave/merge-quarantine"
+        ) is False
+
+    def test_bash_blocks_write(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "rm -rf .hiveweave/merge-quarantine/20260912-141336"
+        ) is True
+        assert _check_hiveweave_command(
+            "echo hi > .hiveweave/merge-quarantine/x.md"
+        ) is True
+
+    def test_bash_blocks_less_obvious_writers(self):
+        """审计 2026-09-12：只读例外靠**写入词表**证明"这是读"，
+        词表漏一个动词 = 该目录的写也漏了。`dd`/`ln`/`sqlite3` 在
+        `_HIVEWEAVE_FILE_OPS` 里却曾不在写入词表 ⇒ 可绕过只读门。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        assert _check_hiveweave_command(
+            "dd of=.hiveweave/merge-quarantine/x.bin"
+        ) is True
+        assert _check_hiveweave_command(
+            "ln -s /etc/passwd .hiveweave/merge-quarantine/link"
+        ) is True
+        assert _check_hiveweave_command(
+            "sqlite3 .hiveweave/merge-quarantine/q.db 'drop table t'"
+        ) is True
+        # 同一词表也保护 logs 只读例外（既有孔隙一并收口）
+        assert _check_hiveweave_command("dd of=.hiveweave/logs/x.bin") is True
+
+
+# ── 跨层一致性：file.py 与 bash.py 的两份清单不得漂移 ─────────────
+#
+# report TEST_DSH_54 #5 点名的既有债务：加一个 .hiveweave 子目录要在
+# file.py / bash.py / policy.py 三处手工同步，漏一处就出上面那类
+# "平台让你读、工具层拒你读" 的分裂。注释哨兵挡不住漂移，**行为化断言**可以：
+# 对 file.py 放行的每个子目录，bash.py 必须同样放行；反向亦然（用探针目录）。
+
+
+class TestHiveweaveAllowlistConsistency:
+    """file.py::allowed_subdirs ⇄ bash.py::_ALLOWED_HW_SUBDIRS 行为一致。"""
+
+    def _file_allowed_subdirs(self) -> set[str]:
+        """从 file.py 源码里取 allowed_subdirs 字面量（改一处即被本测试发现）。"""
+        import ast
+        import inspect
+
+        from hiveweave.tools import file as file_mod
+
+        src = inspect.getsource(file_mod._check_hiveweave_dir)
+        tree = ast.parse(_dedent(src))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = [getattr(t, "id", None) for t in node.targets]
+                if "allowed_subdirs" in targets and isinstance(
+                    node.value, ast.Set
+                ):
+                    return {
+                        e.value
+                        for e in node.value.elts
+                        if isinstance(e, ast.Constant)
+                        and isinstance(e.value, str)
+                    }
+        raise AssertionError(
+            "未能在 _check_hiveweave_dir 中找到 allowed_subdirs 集合字面量 —— "
+            "改结构时必须同步本守卫"
+        )
+
+    def test_bash_allows_every_file_allowed_subdir(self):
+        from hiveweave.tools.bash import _check_hiveweave_command
+
+        subs = self._file_allowed_subdirs()
+        assert subs, "allowed_subdirs 解析为空 ⇒ 守卫失效（先修守卫）"
+        missing = [
+            s for s in sorted(subs)
+            if _check_hiveweave_command(f"cat .hiveweave/{s}/probe.md") is not False
+        ]
+        assert not missing, (
+            f"这些子目录在 file.py 放行、bash.py 却拦截：{missing} —— "
+            "两份清单已漂移（加目录时漏同步 bash.py）"
+        )
+
+    def test_merge_quarantine_readonly_in_both_layers(self):
+        """只读子目录也不能单边漂移：两层都必须"读放行、写拦截"。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        from hiveweave.tools.file import _check_hiveweave_dir
+
+        probe = ".hiveweave/merge-quarantine/probe/NOTE.md"
+        # file.py：读放行、写保护
+        assert _check_hiveweave_dir(str(Path("/w") / probe), "/w") is False
+        assert _check_hiveweave_dir(str(Path("/w") / probe), "/w", write=True) is True
+        # bash.py：读放行、写拦截
+        assert _check_hiveweave_command(f"cat {probe}") is False
+        assert _check_hiveweave_command(f"rm -rf {probe}") is True
+
+    def test_file_allows_every_bash_allowed_subdir(self):
+        """**反向**：bash 放行的子目录，file 层也必须放行。
+
+        审计 2026-09-12 指出上面的正向断言只覆盖一个方向 —— 只把目录加进
+        bash.py（漏改 file.py）时正向不转红。本测试补上反向。
+        子目录名从 bash 正则里**抠**出来（不手抄第二份清单，避免守卫自身漂移）。
+        """
+        import re as _re
+
+        from hiveweave.tools.bash import _ALLOWED_HW_SUBDIRS
+        from hiveweave.tools.file import _check_hiveweave_dir
+
+        m = _re.search(r"\(\?:([^)]+)\)", _ALLOWED_HW_SUBDIRS.pattern)
+        assert m, (
+            "无法从 _ALLOWED_HW_SUBDIRS 解析子目录清单 —— 正则形态变了，"
+            "请同步本守卫（守卫失效比守卫缺失更危险）"
+        )
+        subs = [s for s in m.group(1).split("|") if s]
+        assert len(subs) >= 6, f"解析出的子目录过少，守卫可能已失效：{subs}"
+
+        missing = [
+            s for s in subs
+            if _check_hiveweave_dir(str(Path("/w") / f".hiveweave/{s}/probe.md"), "/w")
+        ]
+        assert not missing, (
+            f"这些子目录在 bash.py 放行、file.py 却拦截：{missing} —— "
+            "两份清单已漂移（加目录时漏同步 file.py）"
+        )
+
+    def test_bash_still_blocks_non_allowlisted_dirs(self):
+        """反向对照：不一致不能靠"全都放行"达成。"""
+        from hiveweave.tools.bash import _check_hiveweave_command
+        from hiveweave.tools.file import _check_hiveweave_dir
+
+        for probe in (".hiveweave/tool_outputs/x.txt", ".hiveweave/data.db"):
+            assert _check_hiveweave_dir(str(Path("/w") / probe), "/w") is True
+            assert _check_hiveweave_command(f"cat {probe}") is True
+

@@ -60,6 +60,12 @@ async def browse(
     """列目录（返回 entries: name/type/size）。"""
     workspace = await _workspace_for(projectId)
     target = _resolve_safe(workspace, path)
+    # 审计 2026-09-12：本端点此前**没有**走单一入口 —— 下面的循环只跳过
+    # 「名字叫 .hiveweave 的子项」，所以把 `.hiveweave` 自身当 path 传进来时，
+    # data.db / tool_outputs/ / merge-quarantine/ 的名字与大小照样被列出。
+    # 按读语义过一次同一策略：放行 6 个工作子目录 + 只读的 merge-quarantine，
+    # 拦住 .hiveweave 根与 tool_outputs/ 等受保护区。
+    _reject_protected_hiveweave(workspace, target, write=False)
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
     if target.is_file():
@@ -87,15 +93,26 @@ async def browse(
     return {"path": path, "entries": entries, "isFile": False}
 
 
-def _reject_protected_hiveweave(workspace: str, target: Path) -> None:
-    """HTTP 与工具层共用同一 .hiveweave 保护策略（治根：单一入口）。"""
+def _reject_protected_hiveweave(
+    workspace: str, target: Path, *, write: bool = False
+) -> None:
+    """HTTP 与工具层共用同一 .hiveweave 保护策略（治根：单一入口）。
+
+    ``write`` 必须由调用方按端点语义显式传入（read → False / write → True）。
+    漏传会让写端点继承"读放行"的口径：`merge-quarantine` 是**只读**放行的
+    子目录（report TEST_DSH_54 #5），读放行/写保护 —— 写端点不传就等于
+    把平台自管的隔离区向 HTTP 敞开了写（审计 2026-09-12 实测：改动前 403，
+    漏传后 200）。拒绝理由也按操作类型分列，与工具层文案同口径。
+    """
     from hiveweave.tools.file import _check_hiveweave_dir
 
-    if _check_hiveweave_dir(str(target), workspace):
-        raise HTTPException(
-            status_code=403,
-            detail="Path targets protected .hiveweave internals",
+    if _check_hiveweave_dir(str(target), workspace, write=write):
+        detail = (
+            "Path targets protected .hiveweave internals (write denied)"
+            if write
+            else "Path targets protected .hiveweave internals (read denied)"
         )
+        raise HTTPException(status_code=403, detail=detail)
 
 
 @router.get("/read")
@@ -106,7 +123,7 @@ async def read_file(
     """读文件（限 512KB，二进制返回 base64? 此处按文本返回）。"""
     workspace = await _workspace_for(projectId)
     target = _resolve_safe(workspace, path)
-    _reject_protected_hiveweave(workspace, target)
+    _reject_protected_hiveweave(workspace, target, write=False)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
     try:
@@ -134,7 +151,7 @@ async def write_file(body: WriteFileBody) -> dict:
     """写文件（append=True 追加，否则覆盖）。"""
     workspace = await _workspace_for(body.projectId)
     target = _resolve_safe(workspace, body.path)
-    _reject_protected_hiveweave(workspace, target)
+    _reject_protected_hiveweave(workspace, target, write=True)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if body.append else "w"

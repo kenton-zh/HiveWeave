@@ -509,7 +509,9 @@ def resolve_for_read(
     return full
 
 
-def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
+def _check_hiveweave_dir(
+    abs_path: str, workspace_path: str, *, write: bool = False
+) -> bool:
     """Return True if the path targets protected .hiveweave internals.
 
     保护策略（分层）:
@@ -518,7 +520,18 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
     - `.hiveweave/shared/` → 放行（团队共享空间，所有 agent 可读可写）
     - `.hiveweave/reports/`, `.hiveweave/drafts/`, `.hiveweave/worktrees/` → 放行（agent 工作文件）
     - `.hiveweave/handoffs/` → 放行（解散交接文档，供上级 read_file 读取；审计 2026-08-05 深度审计 P0）
+    - `.hiveweave/merge-quarantine/` → **只读放行**（见下）
     - 其他 `.hiveweave/<subdir>/` → 保护（未知子目录默认保护）
+
+    ``write=False``（默认）表示这是一次**读**检查；``write=True`` 表示写。
+
+    merge-quarantine 只读放行的判据（report TEST_DSH_54 #5，v2 收窄版）：
+    平台自己在 `services/platform_state.py` 的 T2.5 把 merge-quarantine 当
+    **只读诊断源**接进了平台状态（统计"待处理 quarantine"并回报给 Agent），
+    却因该目录未入白名单而不让 Agent 读里面到底是什么 —— 实测 18/18 次
+    拒绝全部指向它，Agent 只能靠猜。反向也重要：隔离区由平台自管（
+    git_worktree 把阻塞 merge 的 untracked 文件搬进去），**agent 不得改写**，
+    所以是"读放行、写仍保护"，而不是把它整个并入 allowed_subdirs。
     """
     try:
         ws = Path(workspace_path).resolve()
@@ -540,6 +553,16 @@ def _check_hiveweave_dir(abs_path: str, workspace_path: str) -> bool:
                 return False  # 在允许的工作子目录内
             except ValueError:
                 pass
+
+        # 只读放行的平台自管子目录 —— 读可以（诊断），写不行（平台自管）。
+        if not write:
+            readonly_subdirs = {"merge-quarantine"}
+            for sub in readonly_subdirs:
+                try:
+                    target.relative_to(hw_root / sub)
+                    return False  # 只读放行
+                except ValueError:
+                    pass
 
         # tool_outputs/ 保护
         try:
@@ -952,7 +975,7 @@ async def write_file(
                 "error": f'Error: Sandbox violation — "{file_path}" '
                          "outside workspace"}
 
-    if _check_hiveweave_dir(full, workspace_path):
+    if _check_hiveweave_dir(full, workspace_path, write=True):
         return {"success": False, "output": "",
                 "error": 'Error: Access denied: ".hiveweave" is the '
                          "HiveWeave system directory."}
