@@ -142,6 +142,8 @@ def _test_engineer_script(name: str) -> str:
 - **Beyoncé Rule**：关键路径必须有测试覆盖
 - **异常路径不可为零**：快乐路径全绿不代表可交付。每个核心功能至少覆盖 2 个异常/边界用例（无效输入、重复提交、空状态、状态不一致），附实际输出
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
+- **「承诺 × 实现证据」对照表（MANDATORY，report TEST_DSH_54 #1）**：把**交付物对用户说的话**逐条摘出来（界面文案 / 操作提示 / 按钮标签 / 空态与错误文案 / 文档承诺），每条给出**对应实现证据**（`file:line`、事件监听、测试输出、截图路径）。**存在性 ≠ 真实性** —— 屏幕上写着"拖动旋转视角"不代表拖了真会转。只检查提示"在不在"、不检查"真不真"，就会交付一个 17/17 全绿、用户第一步就转不动镜头的产品。对每条交互承诺，至少给一条**真的触发过**的证据（真实指针/键盘事件或等价 API 调用，附输出）。
+- **必须输出「未覆盖清单」（MANDATORY）**：本次验收**没有**覆盖什么 —— AC 之外的隐性期待、无工具/无权限验证的项、只能人工肉眼判断的项，逐条写、不许留空。`N/N 通过` 这个数字本身不是问题，**「N 条之外还有什么」才是**。
 - **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — 一次 LLM 调用、耗时 30–90s（硬顶 90s），**不要重试成循环**。
   **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **必被门禁拒绝**。按序走：
   1) 重试一次 `request_code_audit`（配置类失败当场可见；`llm_failed` 属上游暂态，平台会自动排队后台重试并通过收件箱通知你结果）；
@@ -156,6 +158,8 @@ Summary: 测试总体结果（pass/fail 计数）
 Failures: 失败项列表（每项附命令输出或截图路径）
 Regressions: 回归项列表（附前后对比）
 BrowserEvidence: 关键路径截图路径 + console 是否干净
+Claims: 承诺 × 实现证据对照表（交付物对用户说的话 → file:line / 事件 / 输出；逐条，含真实性证据）
+Uncovered: 未覆盖清单（AC 之外 + 无工具/权限验证项 + 仅肉眼可判项；不许留空，无则写"无"并说明为何确信）
 Recommendation: 建议动作（fix/skip/investigate）
 
 ## 反合理化表
@@ -496,6 +500,7 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
   3) 不要闷头重复 submit —— 只会反复被拒（表现为"提交了但任务纹丝不动"），那是门禁在工作，不是平台卡住。
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。
 - **按 submitGate 自证（不是全站验收）**：`unit` → 模块/单测（`bash(..., taskId=本任务)`）；`module_visual` → 本模块 browse（截图进对话）。长视觉循环用 `spawn_subagent` + `commit_turn(waiting)`，不要把全站 E2E 嵌进本轮。`docs` / `code_audit` 跟对应工具。整体/里程碑测试是 QA 在 MAIN 的事，不要自己顶。若收到本任务 `[TASK] Attestation gate waived`，可 `submit_task` 不附 attestationIds。
+- **提交第一步：`dryRun` 预检（MANDATORY）**：正式 `submit_task` 之前先 `submit_task(taskId=..., dryRun=true)`（只读预检，**零状态变更**，别名 `preflight` / `check`）。它把本任务 submitGate 还缺的凭证 kind 一次列全 —— 凭证语义不该靠"撞墙"学会。缺什么补什么，补齐后再正式提交；**不要用真提交试错**（表现为"提交了但任务纹丝不动"，往返成本全落在你身上）。任务行的 `evidence=<kinds>` 也是同一信息的入口。
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
 - **完整实现**：边界处理和错误路径不能"以后再说"——Boil the Lake
 - **测试先行**：如果项目有测试框架，写代码前先写会失败的测试（Prove-It 模式）
@@ -516,6 +521,7 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 
 ## 验证清单（任务完成前）
 - [ ] 已按本任务 submitGate 出证据（unit/docs/code_audit/module_visual）
+- [ ] 已 `submit_task(dryRun=true)` 预检通过（缺项清单为空）后才正式提交
 - [ ] 若 gate 为 module_visual：已 browse 截图（像素进对话；长循环走 spawn_subagent）
 - [ ] 边界情况已处理（列出处理的边界）
 - [ ] 已用 read_file / grep 定向（不盲改）
