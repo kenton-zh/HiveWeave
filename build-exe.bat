@@ -15,6 +15,37 @@ set PATH=%NODE22%;%PATH%
 set OUT=apps\desktop\dist\HiveWeave
 set PRESERVE=apps\desktop\dist\.hw-preserve
 
+REM ── [0/5] 前置门禁：产物 EXE 在运行则立即中止 ──────────────────
+REM 为什么必须放在最前面：PyInstaller COLLECT 整删 dist\HiveWeave，而运行中
+REM 进程锁着 exe + _internal\*.dll，删目录必失败。若跑完 [1][2] 才炸，用户白等
+REM 几分钟，且 .hw-preserve 可能留下半搬移现场 —— fail fast 更安全。
+REM 用 tasklist 而非 taskkill：不替用户做「杀掉他的程序」这个决定，只报告。
+echo [0/5] Checking for running HiveWeave.exe (file lock guard)...
+REM ⚠ 用 tasklist+find 双保险：tasklist 在「无匹配」时退出码仍为 0（只打印
+REM 「信息: 没有运行的任务匹配指定标准。」），所以必须靠管道末端 find 的退出码
+REM 判别（命中=0 / 未命中=1）。cmd 的管道 errorlevel 取末端命令，这是本判据的基石。
+REM 已实测两分支：无此进程 → find=1 → 放行；有（如 explorer.exe）→ find=0 → 中止。
+tasklist /FI "IMAGENAME eq HiveWeave.exe" 2>nul | find /I "HiveWeave.exe" >nul
+if not errorlevel 1 (
+  echo.
+  echo ============================================================
+  echo  BUILD ABORTED: HiveWeave.exe is currently running.
+  echo ============================================================
+  echo  PyInstaller must delete dist\HiveWeave, but a running process
+  echo  holds a lock on HiveWeave.exe and _internal\*.dll, so the build
+  echo  would fail after several minutes.
+  echo.
+  echo  Fix: close the HiveWeave window, or run:
+  echo        taskkill /IM HiveWeave.exe /F
+  echo  Then re-run build-exe.bat.
+  echo.
+  echo  NOTE: if you renamed the exe, this check cannot see it.
+  echo        Check Task Manager for any process under dist\HiveWeave.
+  echo ============================================================
+  exit /b 1
+)
+echo   OK - no running instance, file lock is free.
+
 echo [1/5] Building frontend (pnpm --filter @hiveweave/web build)...
 call pnpm --filter @hiveweave/web build
 if errorlevel 1 (
