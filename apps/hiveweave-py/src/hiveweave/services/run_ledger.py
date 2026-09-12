@@ -42,12 +42,19 @@ def _short_hash(data: str) -> str:
 _FACT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("empty_stream", "INTEGER DEFAULT 0"),
     ("cache_verdict", "TEXT"),
+    # report TEST_DSH_54 #6：`final` 分类早已落库（cache_verdict），但
+    # **哪一段前缀漂了**（compacted_drift / history_rewritten）只在日志，
+    # 平台日志文件一停就永远答不出。明细落库，字面回答该问题。
+    ("cache_drifts", "TEXT"),
+    # report TEST_DSH_54 #2：run 级孤儿计数事实位 —— 让"run 报 completed
+    # 但里面有从未执行/结果未知的步骤"可被机器读出，而不必改 completed 枚举。
+    ("orphan_steps", "INTEGER DEFAULT 0"),
 )
 _fact_columns_ready: set[tuple[str, int]] = set()
 
 
 async def _ensure_fact_columns(agent_id: str) -> None:
-    """给**存量库**补 agent_runs 的两个事实位列（新库由正典 DDL 直接建）。
+    """给**存量库**补 agent_runs 的事实位列（新库由正典 DDL 直接建）。
 
     失败**不标记**、下次重试；只把 `duplicate column` 当正常幂等路径。
     """
@@ -127,6 +134,18 @@ class RunLedger:
         #     ⇒ not_started=1（DSH TOOL_NOT_STARTED），见下方另一条 UPDATE
         # 文案照抄 DSH `repair.ts:106` 原文（含 "Do not retry blindly."）——
         # agent 拿到的是**可执行的重试判据**，不是一句「被清扫了」。
+        #
+        # ⚠ 2026-09-12 修正（report TEST_DSH_54 #2）：上面这条"结果未知"的
+        # 判据此前**不成立** —— 它被无条件用在所有孤儿步骤上，而
+        # `record_step_start`（INSERT）发生在 `execute()` 之前，所以
+        # "run 已死、步仍 running" 里混着两种完全不同的东西：
+        #   · started=1 → 真的执行过 ⇒ 结果未知，可能已有副作用（本分支）
+        #   · started=0 → **从未派发** ⇒ 必然无副作用 ⇒ 不该收副作用警告
+        # 实测后果：116 个从未执行的步骤（含 submit_task×7 /
+        # update_task_status×12）被要求"先核实外部状态"，CEO 的交付消息
+        # 因此重发；`not_started` 则全库为 0。现在按 started 分流。
+        # 存量行 started IS NULL（无法判定）→ 保守归入 outcome_unknown，
+        # 宁可少给"可安全重试"，不可错给。
         try:
             await project_db.execute(
                 agent_id,
@@ -134,7 +153,8 @@ class RunLedger:
                 "outcome_unknown = 1 "
                 "WHERE run_id IN (SELECT id FROM agent_runs "
                 "WHERE agent_id = ? AND status != 'running') "
-                "AND status = 'running'",
+                "AND status = 'running' "
+                "AND (started = 1 OR started IS NULL)",
                 [
                     _now_ms(),
                     "orphan step swept: run ended while step running. "
@@ -150,6 +170,54 @@ class RunLedger:
         except Exception as e:
             log.warning("run_ledger.orphan_step_sweep_failed", agent_id=agent_id, error=str(e))
 
+        # 从未派发的孤儿（started=0）—— 与上一条**分开**：调用没发出去，
+        # 必然没有副作用，可直接重试。把它与"结果未知"混成一档，就是
+        # report #2 那 116 条误导指令的来源（也让 not_started 全库为 0）。
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ?, "
+                "not_started = 1 "
+                "WHERE run_id IN (SELECT id FROM agent_runs "
+                "WHERE agent_id = ? AND status != 'running') "
+                "AND status = 'running' "
+                "AND started = 0",
+                [
+                    _now_ms(),
+                    "orphan step never started: the run ended before this tool "
+                    "call was dispatched, so it never executed and had no side "
+                    "effect. Retry it if it is still needed.",
+                    agent_id,
+                ],
+            )
+        except Exception as e:
+            log.warning(
+                "run_ledger.orphan_step_not_started_sweep_failed",
+                agent_id=agent_id, error=str(e),
+            )
+
+        # run 级事实位 orphan_steps（report TEST_DSH_54 #2 的收口条件）。
+        # 为什么不改终态枚举：下游 UI 与回归脚本都按 `completed` 统计，
+        # 改枚举是破坏性的。用事实位回答同一个问题 —— 「这个 run 报完成，
+        # 但里面有没有从未执行/结果未知的步骤」在 run 级**可被机器读出**，
+        # 而不是只能下钻到 step 级才发现（CEO 交付消息丢失正是这么发生的）。
+        try:
+            await _ensure_fact_columns(agent_id)
+            for _row in await project_db.query(
+                agent_id,
+                "SELECT run_id, COUNT(*) FROM run_steps "
+                "WHERE (outcome_unknown = 1 OR not_started = 1) "
+                "AND run_id IN (SELECT id FROM agent_runs "
+                "WHERE agent_id = ? AND status != 'running') "
+                "GROUP BY run_id",
+                [agent_id],
+            ):
+                await self.set_run_fact(
+                    agent_id, _row[0], orphan_steps=int(_row[1] or 0)
+                )
+        except Exception as e:
+            log.debug("run_ledger.orphan_run_fact_failed", error=str(e))
+
         # F7 补出口（TEST_DSH_50/51：timeout_kind 在真超时+悬挂上实测 50% / 0%）。
         # 上面 swept 的孤儿步骤，其 run 是被整轮兜底（HARD_TOTAL_TIMEOUT_S + 30
         # 的 asyncio.wait_for）掐断的 —— 那是**整轮级超时**，与工具自身声明的
@@ -158,6 +226,11 @@ class RunLedger:
         # startup_sweep / cancel 造成的孤儿误标成超时。
         # 注：`schema.py` 里 F7 原注释的取值域是 (runner/command/wait)，本处新增
         # `turn`（整轮兜底），注释已同步。
+        # ⚠ 只匹配 `orphan step swept%`（**执行过的**那一类）。审计 2026-09-12
+        # 指出：放宽到 `orphan step %` 会让「从未派发」（not_started）的步骤也
+        # 被贴 timeout_kind='turn'，把"这一步跑没跑"与"run 为什么死"两个轴混在
+        # 同一个位上。从未派发的步骤其成因已由 not_started 精确表达，
+        # run 级死因在 agent_runs.error_reason —— 不需要借这个位。
         try:
             await project_db.execute(
                 agent_id,
@@ -263,12 +336,15 @@ class RunLedger:
         step_id = str(uuid.uuid4())
         now = _now_ms()
         try:
+            # `started` 显式写 0（不依赖列默认值）：迁移来的老库该列是
+            # `INTEGER`（无 DEFAULT，存量行为 NULL）——必须由 INSERT 自己定值，
+            # 否则新行也会是 NULL，被清扫保守地当成"可能已执行"。
             await project_db.execute(
                 agent_id,
                 "INSERT INTO run_steps "
                 "(id, run_id, step_index, step_type, tool_name, tool_call_id, "
-                "tool_args_hash, tool_args_excerpt, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)",
+                "tool_args_hash, tool_args_excerpt, status, started_at, started) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 0)",
                 [
                     step_id,
                     run_id,
@@ -285,6 +361,33 @@ class RunLedger:
             log.warning("run_ledger.record_step_start_failed", agent_id=agent_id, error=str(e))
             return None
         return step_id
+
+    async def mark_step_started(self, agent_id: str, step_id: str) -> None:
+        """把步骤标成「**已开始执行**」——必须在 ``execute()`` 前一刻调用。
+
+        为什么需要这个位（report TEST_DSH_54 #2/#9，2026-09-12）：
+        ``record_step_start`` 只证明"平台记录了这次调用"，它在 ``execute()``
+        *之前*发生 —— 所以一行 ``status='running'`` 无法区分
+        「从未派发」与「执行中被整轮超时掐死」。清扫侧只能一律记
+        ``outcome_unknown``（"结果未知，先核实外部状态"），于是 116 个**从未
+        执行**的步骤拿到了副作用警告，`not_started` 全库为 0。
+
+        本方法补的就是那个缺失的输入：置位后，孤儿步骤才真的是"结果未知"；
+        未置位的孤儿则是"从未开始"⇒ 必然无副作用 ⇒ 可直接重试。
+
+        best-effort：失败只记日志（漏置位会让该行退回保守的 outcome_unknown，
+        宁可少警告，不可错给"可安全重试"）。
+        """
+        if not step_id:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE run_steps SET started = 1 WHERE id = ?",
+                [step_id],
+            )
+        except Exception as e:
+            log.debug("run_ledger.mark_step_started_failed", error=str(e))
 
     async def record_step_end(
         self,
@@ -415,6 +518,9 @@ class RunLedger:
         """写 run 级**事实位**（best-effort，不影响主流程）。
 
         2026-09-11 批次 1：`empty_stream` / `cache_verdict` 两个事实位的落库口。
+        2026-09-12（report TEST_DSH_54 #2）：新增 `orphan_steps` —— 让
+        "run 报 completed 但里面有从未执行/结果未知的步骤"在 run 级可读，
+        而不必改 `completed` 终态枚举（下游 UI 与回归脚本按它统计）。
 
         **为什么需要它**：回归清单的 R11 / R3 两条判据此前**只能靠日志猜** ——
         · R11 分不清「usage=0 是丢账」还是「usage=0 是正确记账（0 chunk 无 token
@@ -424,7 +530,7 @@ class RunLedger:
           同一件事，而只有后者是平台侧可修的。
         把事实落库后，口径才能在**判定**层收窄，而不是在**解释**层打补丁。
         """
-        allowed = {"empty_stream", "cache_verdict"}
+        allowed = {"empty_stream", "cache_verdict", "cache_drifts", "orphan_steps"}
         cols = {k: v for k, v in facts.items() if k in allowed and v is not None}
         if not cols:
             return
@@ -671,22 +777,44 @@ async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
         )
         rows = await cursor.fetchall()
         await cursor.close()
-        # L5（2026-09-11）：本 sweep 造成的孤儿步骤 = 调用**从未开始**就被
-        # 上次进程的死亡掐断（DSH `repair.ts:15` TOOL_NOT_STARTED 语义）——
-        # 与 create_activation 清扫的「已记录但结果未持久化」是**两回事**，
-        # 故置 not_started 而非 outcome_unknown：无副作用的直接重试即可，
-        # 不该把「别盲目重试」的警告浪费在这里。
+        # L5（2026-09-11）：本 sweep 处理的是"上次进程死亡留下的孤儿步骤"。
+        #
+        # ⚠ 2026-09-12 修正（report TEST_DSH_54 #2）：原文假定这些步骤
+        # "调用**从未开始**"——那在多进程下**不成立**。进程被杀时，正在
+        # execute() 里的步骤同样是 running，而它可能已经产生了副作用
+        # （写文件 / 发消息 / dispatch）。把这一类也标成 not_started 并附
+        # "Retry it if it is still needed"，就是一次**副作用双发的邀请**。
+        # 现在用同一个 started 事实位分流：
+        #   started=0 → 从未派发 ⇒ 必然无副作用 ⇒ not_started（可直接重试）
+        #   started=1 / NULL → 可能已执行 ⇒ outcome_unknown（先核实外部状态）
         try:
+            await conn.execute(
+                "UPDATE run_steps SET status = 'error', ended_at = ?, error = ?, "
+                "outcome_unknown = 1 "
+                "WHERE run_id IN (SELECT id FROM agent_runs WHERE status = 'running') "
+                "AND status = 'running' "
+                "AND (started = 1 OR started IS NULL)",
+                [
+                    now,
+                    "startup_sweep: orphan step from prior process. The tool call "
+                    "was interrupted while it was running, so it may have taken "
+                    "effect. Its outcome is unknown. Decide whether to retry from "
+                    "the tool semantics: retry only if the operation is read-only "
+                    "or idempotent; if it may have side effects, first verify "
+                    "external state. Do not retry blindly.",
+                ],
+            )
             await conn.execute(
                 "UPDATE run_steps SET status = 'error', ended_at = ?, error = ?, "
                 "not_started = 1 "
                 "WHERE run_id IN (SELECT id FROM agent_runs WHERE status = 'running') "
-                "AND status = 'running'",
+                "AND status = 'running' "
+                "AND started = 0",
                 [
                     now,
                     "startup_sweep: orphan step from prior process. The tool call "
-                    "was interrupted before the platform recorded it as started. "
-                    "Retry it if it is still needed.",
+                    "was never dispatched, so it never executed and had no side "
+                    "effect. Retry it if it is still needed.",
                 ],
             )
             await conn.commit()

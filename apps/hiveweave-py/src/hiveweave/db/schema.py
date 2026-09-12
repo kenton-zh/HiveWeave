@@ -593,7 +593,8 @@ PROJECT_DB_TABLES = [
         timeout_kind TEXT,
         timeout_ms INTEGER,
         outcome_unknown INTEGER DEFAULT 0,
-        not_started INTEGER DEFAULT 0
+        not_started INTEGER DEFAULT 0,
+        started INTEGER DEFAULT 0
     )
     """,
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
@@ -641,6 +642,23 @@ PROJECT_DB_TABLES = [
     # 混成一位会把「别盲目重试」的警告浪费在安全的重试上。
     """ALTER TABLE run_steps ADD COLUMN outcome_unknown INTEGER DEFAULT 0""",
     """ALTER TABLE run_steps ADD COLUMN not_started INTEGER DEFAULT 0""",
+    # report TEST_DSH_54 #2/#9（2026-09-12）：`outcome_unknown` 与 `not_started`
+    # 此前**无法在行级区分** —— `agents/streaming.py` 的 record_step_start
+    # （INSERT, status='running'）发生在 execute() **之前**，所以一行 running
+    # 既可能是"已派发、执行中被整轮超时掐死"，也可能是"从未派发"。
+    # 少了这个输入，v1 提议的"无执行证据 ⇒ not_started ⇒ 可安全重试"会把
+    # 前者误标成后者，对 submit_task/dispatch_task 这类副作用工具就是**双发**。
+    # 本列是补上的那个输入：execute() 前一刻置 started=1。
+    #   行级判定：started=1 → outcome_unknown（可能已有副作用，先核外部状态）
+    #             started=0 → not_started（从未执行 ⇒ 必然无副作用 ⇒ 可直接重试）
+    # 存量行必须是 **NULL**（"无法判定"）⇒ 一律按 outcome_unknown 保守处理。
+    #
+    # ⚠ 这里**故意不写 DEFAULT 0**：SQLite 的 `ALTER TABLE ADD COLUMN … DEFAULT 0`
+    # 会给**存量行回填 0**（实测：legacy running 行读出 started=0，`IS NULL` 命中 0 行），
+    # 于是升级前遗留的 running 行会落进 started=0 → 被判"从未执行、可直接重试" ——
+    # 正是本修复要避免的那次**副作用双发邀请**。不写 DEFAULT ⇒ 存量行为 NULL。
+    # 新行由 `record_step_start` 的 INSERT **显式**写 started=0（不依赖列默认值）。
+    """ALTER TABLE run_steps ADD COLUMN started INTEGER""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -822,6 +840,7 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     "run_steps": {
         "runner_failed", "command_failed", "injection_applied",
         "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
+        "started",
     },
 }
 

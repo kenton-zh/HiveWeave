@@ -524,6 +524,15 @@ async def _record_subagent_step(
             tool_name="spawn_subagent",
         )
         if step_id:
+            # 审计 2026-09-12（report TEST_DSH_54 #2 同族）：本步骤在子代理**跑完
+            # 之后**才记录，也就是"这一步确实执行过"。必须在 INSERT 后立刻置
+            # started=1 —— 否则进程若死在 INSERT 与 record_step_end 之间，孤儿
+            # 清扫会把它判成 not_started（"从未执行、无副作用、可直接重试"），
+            # 而子代理其实已经跑过、可能已产生副作用 ⇒ 副作用双发。
+            await _rl.mark_step_started(
+                getattr(parent, "id", None) or getattr(parent, "short_id", None),
+                step_id,
+            )
             # 42 轮 P1：失败不能只写「subagent failed」——带子 run 终止
             # status/reason（截 200 字符防泄漏/超长）+ 上游/逻辑分类位，
             # 父代理据此区分「环境瞬断可原样重试」与「子逻辑错误需改 prompt」。

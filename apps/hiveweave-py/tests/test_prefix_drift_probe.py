@@ -8,8 +8,8 @@
 5. history_rewritten：上次 history 不是本次前缀（中段改写）。
 6. model_changed：model_id@base_url 变化（换缓存域）。
 7. 多重漂移 verdict 拼接。
-8. report_cache_readout 三分类：hit_ok / cache_window_expired / drift_zero_hit，
-   以及无 verdict 时 None。
+8. report_cache_readout 四分类：hit_ok / cold_start / cache_window_expired / drift_zero_hit，
+   以及无 verdict 时 None（cold_start 为 TEST_DSH_54 #6 新增）。
 9. 段切分边界：无 compacted / 无尾部 system / 空 messages。
 """
 
@@ -279,6 +279,80 @@ def test_readout_drift_zero_hit_when_drifted_and_zero_hit():
 
 def test_readout_none_without_verdict():
     assert report_cache_readout("ghost", input_tokens=1, cache_read=0, cache_creation=0) is None
+
+
+# ── 8b. cold_start：无可读缓存域的零命中 ≠ 平台改写了前缀 ──────────
+#
+# report TEST_DSH_54 #6（2026-09-12）：15 个 drift_zero_hit 里有 8 个落在
+# 各 Agent 首次活动窗口（12:03–12:50）—— 那里的 cache_read=0 是**必然**
+# （还没有缓存可读），判词却写「平台改写了前缀，可修」，会把排查引向
+# 错误根因。新增 cold_start 桶与 drift_zero_hit 分开。
+
+
+def test_readout_cold_start_on_first_ever_run():
+    """no_baseline（agent 首个 run / 重启后首个 run）⇒ cold_start。"""
+    reset_probe()
+    compare_and_record("a-cold", _build_messages(), model_key=MODEL_KEY)
+    r = report_cache_readout(
+        "a-cold", input_tokens=9000, cache_read=0, cache_creation=9000
+    )
+    assert r is not None
+    assert r["verdict"] == "no_baseline"
+    assert r["final"] == "cold_start", (
+        "首次活动窗口的零命中是必然，不得标成 drift_zero_hit（'平台可修'）"
+    )
+    assert r["drifts"] == []
+
+
+def test_readout_cold_start_on_model_change():
+    """model_changed（换缓存域）⇒ 没有可比的缓存，同属 cold_start。"""
+    reset_probe()
+    compare_and_record("a-mc", _build_messages(), model_key="m1@u")
+    compare_and_record("a-mc", _build_messages(), model_key="m2@u")
+    r = report_cache_readout(
+        "a-mc", input_tokens=9000, cache_read=0, cache_creation=0
+    )
+    assert r is not None
+    assert r["verdict"] == "model_changed"
+    assert r["final"] == "cold_start"
+
+
+def test_cold_start_does_not_swallow_real_drift():
+    """反向对照：真漂移仍必须落 drift_zero_hit（新桶不得吞掉可修项）。"""
+    reset_probe()
+    compare_and_record("a-real", _build_messages(identity="V1"), model_key=MODEL_KEY)
+    compare_and_record("a-real", _build_messages(identity="V2"), model_key=MODEL_KEY)
+    r = report_cache_readout(
+        "a-real", input_tokens=9000, cache_read=0, cache_creation=0
+    )
+    assert r is not None
+    assert r["final"] == "drift_zero_hit"
+    assert r["drifts"] == ["identity_drift"]
+
+
+def test_readout_carries_drift_detail_for_persistence():
+    """`drifts[]` 明细必须随结果返回 —— 它是落库（cache_drifts）的唯一来源。
+
+    报告原文：『真正仍缺的只有 drifts[] 那份明细（到底哪一段前缀漂了：
+    compacted_drift？history_rewritten？）』—— 不随结果带出就永远落不了库。
+    """
+    reset_probe()
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-detail", _build_messages(compacted="C1", history=h), model_key=MODEL_KEY
+    )
+    compare_and_record(
+        "a-detail", _build_messages(compacted="C2", history=h, user="q2"),
+        model_key=MODEL_KEY,
+    )
+    r = report_cache_readout(
+        "a-detail", input_tokens=1, cache_read=0, cache_creation=0
+    )
+    assert r is not None
+    assert r["final"] == "drift_zero_hit"
+    assert "compacted_drift" in r["drifts"], (
+        "漂移明细必须可取值 —— 否则事后答不出'漂的是哪一段'"
+    )
 
 
 def test_readout_is_one_shot():

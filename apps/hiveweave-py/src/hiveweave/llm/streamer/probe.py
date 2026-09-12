@@ -21,10 +21,13 @@ run 首请求 ``cache_read=0``，零命中 input 合计 1,742,881 tokens。R3 �
 最终分类（``final``，report_cache_readout 输出，联合首请求 usage）：
 
 - ``hit_ok``                 首请求 cache_read > 0（命中）
+- ``cold_start``             **没有可读的缓存域**（no_baseline / model_changed）
+                             ⇒ cache_read=0 是必然，非平台责任（2026-09-12 新增，
+                             report TEST_DSH_54 #6：此前与 drift 混成一档）
 - ``cache_window_expired``   前缀对齐但 cache_read=0 → provider 缓存窗口
                              过期/驱逐（滑动窗口约 5-10min，平台侧不可修
                              ——gap_s 用于判断是否超出窗口）
-- ``drift_zero_hit``         有漂移且 cache_read=0 → 漂移实锤，平台侧可修
+- ``drift_zero_hit``         前缀**真漂移**且 cache_read=0 → 漂移实锤，平台侧可修
 
 设计约束：
 
@@ -202,13 +205,32 @@ def report_cache_readout(
     分类并输出结构化日志。verdict 为**一次性消费**（读取后清除）：
     空响应重试循环不会用同一指纹重复报告；无基准或 verdict 已消费时
     返回 None。
+
+    分类（2026-09-12 增 `cold_start`，report TEST_DSH_54 #6）：
+
+    - ``hit_ok``                 首请求 cache_read > 0（命中）
+    - ``cold_start``             **没有可读的缓存域**（`no_baseline` 首次
+                                 run / `model_changed` 换了缓存域）——
+                                 cache_read=0 是**必然**，与平台无关
+    - ``cache_window_expired``   前缀对齐但 cache_read=0 → provider 缓存窗口
+                                 过期/驱逐（平台侧不可修）
+    - ``drift_zero_hit``         前缀**真漂移**且 cache_read=0 ⇒ 平台侧可修
+
+    为什么必须把 cold_start 单列：TEST_DSH_54 的 15 个 drift_zero_hit 里
+    有 8 个落在各 Agent 首次活动窗口（12:03–12:50）—— 那里的 cache_read=0
+    是必然（还没有缓存可读），判词却写「平台改写了前缀，可修」，会把排查
+    引向错误根因。`no_baseline` / `model_changed` 此前都落进 drift 桶。
     """
     last = _last_verdict.pop(agent_id, None)
     if last is None:
         return None
+    verdict_str = str(last.get("verdict") or "")
     if cache_read and cache_read > 0:
         final = "hit_ok"
-    elif last["verdict"] == "prefix_stable":
+    elif "no_baseline" in verdict_str or "model_changed" in verdict_str:
+        # 无基准 / 换缓存域 ⇒ 没有可读的缓存，零命中是必然而非漂移
+        final = "cold_start"
+    elif verdict_str == "prefix_stable":
         final = "cache_window_expired"
     else:
         final = "drift_zero_hit"

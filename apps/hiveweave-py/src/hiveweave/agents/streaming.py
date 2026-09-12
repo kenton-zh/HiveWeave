@@ -255,6 +255,18 @@ async def on_tool_call(
             log.debug("run_ledger.step_start_failed", error=str(e))
 
     # 执行工具
+    #
+    # report TEST_DSH_54 #2（2026-09-12）：在**进入 execute() 前一刻**落
+    # "已开始"事实位。上面 record_step_start 只写了 INSERT（status='running'），
+    # 而它在此处之前发生 —— 所以单看一行 running，无法区分
+    # 「从未派发」与「执行中被整轮超时掐死」。少了这个输入，孤儿清扫只能
+    # 一律记 outcome_unknown（"结果未知，先核实外部状态"），把 116 个从未
+    # 执行的步骤也拖进副作用警告里（实测 submit_task×7 / update_task_status×12）。
+    # 置位后：started=1 ⇒ 结果未知（可能已有副作用）；started=0 ⇒ 从未执行
+    # ⇒ 必然无副作用 ⇒ 可直接重试。
+    if step_id:
+        await agent._run_ledger.mark_step_started(agent.id, step_id)
+
     result = await agent._tool_executor.execute(
         agent_id=agent.id,
         tool_name=tool_name,

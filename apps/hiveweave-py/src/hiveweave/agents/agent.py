@@ -1457,11 +1457,26 @@ class Agent:
                         # R3 判据需要在 DB 里分清 hit_ok / cache_window_expired /
                         # drift_zero_hit —— 只有后者是"平台自己改写了前缀"的实锤；
                         # 混成一个命中率数字会把 provider 缓存窗口过期也算到我们头上。
+                        #
+                        # TEST_DSH_54 #6（2026-09-12）：同时落**漂移明细**
+                        # （`drifts[]`：到底是 compacted_drift 还是
+                        # history_rewritten）。此前明细只在日志，平台日志文件
+                        # 一停就再也答不出"漂移的是哪一段前缀"。也可能出现
+                        # cold_start（无可读缓存域）—— 与 drift 分开记，
+                        # 免得把"必然零命中"当成"平台改写了前缀"去排查。
                         if _probe and self._current_run_id:
                             await self._run_ledger.set_run_fact(
                                 self.id,
                                 self._current_run_id,
                                 cache_verdict=_probe.get("final"),
+                                cache_drifts=(
+                                    json.dumps(
+                                        _probe.get("drifts") or [],
+                                        ensure_ascii=False,
+                                    )
+                                    if _probe.get("drifts")
+                                    else None
+                                ),
                             )
                 except Exception as probe_err:
                     log.debug(

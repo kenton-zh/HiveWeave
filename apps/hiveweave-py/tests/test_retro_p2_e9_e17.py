@@ -219,11 +219,17 @@ async def test_sweep_stale_agent_runs_marks_interrupted(tmpdir):
         "VALUES (?, ?, ?, 'completed', ?, 10, 10, 1000, 0, 0, ?)",
         ["r-ok", "a1", "act1", now + 1000, now],
     )
-    # L5：给 stale run 挂一个 running 步骤 —— startup_sweep 造成的孤儿
-    # 语义是「调用**从未开始**」（DSH TOOL_NOT_STARTED），须置 not_started=1。
+    # L5 语义在 2026-09-12 被 report TEST_DSH_54 #2 修正：
+    # 原文假定本 sweep 的孤儿步骤"调用**从未开始**"⇒ 一律 not_started=1
+    # 并附"可直接重试"。但进程被杀时 **execute() 中**的步骤同样是 running，
+    # 而它可能已产生副作用（写文件 / 发消息 / dispatch）—— 一律给"可重试"
+    # 是一次副作用双发的邀请。现在按 started 事实位分流。
+    # 这里显式种 started=0（确凿的"从未派发"）来验证 not_started 分支；
+    # started=1 的分支见 tests/test_run_ledger_orphan_sweep.py。
     await conn.execute(
-        "INSERT INTO run_steps (id, run_id, step_index, step_type, status, started_at) "
-        "VALUES ('s-stale', 'r-stale', 0, 'llm_request', 'running', ?)",
+        "INSERT INTO run_steps (id, run_id, step_index, step_type, status, "
+        "started_at, started) "
+        "VALUES ('s-stale', 'r-stale', 0, 'llm_request', 'running', ?, 0)",
         [now],
     )
     await conn.commit()
@@ -235,7 +241,7 @@ async def test_sweep_stale_agent_runs_marks_interrupted(tmpdir):
     await cur.close()
     assert row["status"] == "interrupted"
 
-    # L5：孤儿步骤带 not_started（而非 outcome_unknown）+ 可重试指引
+    # L5：started=0 的孤儿步骤带 not_started（而非 outcome_unknown）+ 可重试指引
     cur = await conn.execute(
         "SELECT status, not_started, outcome_unknown, error FROM run_steps "
         "WHERE id = 's-stale'"
@@ -245,8 +251,50 @@ async def test_sweep_stale_agent_runs_marks_interrupted(tmpdir):
     assert step["status"] == "error"
     assert step["not_started"] == 1
     assert step["outcome_unknown"] == 0
-    assert "before the platform recorded it as started" in step["error"]
+    assert "was never dispatched" in step["error"]
+    assert "had no side effect" in step["error"]
     assert "Retry it if it is still needed." in step["error"]
+
+
+async def test_startup_sweep_marks_mid_execution_orphan_outcome_unknown(tmpdir):
+    """反向（TEST_DSH_54 #2）：started=1 的孤儿**不得**被标 not_started。
+
+    它是"执行中被进程死亡掐断"，可能有副作用 ⇒ 必须是 outcome_unknown
+    并附"先核实外部状态 / 别盲目重试"，而不是"可直接重试"。
+    """
+    from hiveweave.db import project as project_db
+    from hiveweave.services.run_ledger import sweep_stale_agent_runs
+
+    ws = str(tmpdir)
+    conn = await project_db.ensure_project_db(ws)
+    now = int(time.time() * 1000)
+    await conn.execute(
+        "INSERT INTO agent_runs "
+        "(id, agent_id, activation_id, status, lease_expires_at, "
+        "budget_llm_calls, budget_tool_calls, budget_elapsed_ms, "
+        "actual_llm_calls, actual_tool_calls, started_at) "
+        "VALUES (?, ?, ?, 'running', ?, 10, 10, 1000, 0, 0, ?)",
+        ["r-mid", "a1", "act1", now + 1000, now],
+    )
+    await conn.execute(
+        "INSERT INTO run_steps (id, run_id, step_index, step_type, status, "
+        "started_at, started) "
+        "VALUES ('s-mid', 'r-mid', 0, 'tool_call', 'running', ?, 1)",
+        [now],
+    )
+    await conn.commit()
+
+    assert await sweep_stale_agent_runs(ws) == 1
+    cur = await conn.execute(
+        "SELECT not_started, outcome_unknown, error FROM run_steps "
+        "WHERE id = 's-mid'"
+    )
+    step = await cur.fetchone()
+    await cur.close()
+    assert step["outcome_unknown"] == 1, "执行中被掐断 ≠ 从未开始"
+    assert step["not_started"] == 0
+    assert "Do not retry blindly." in step["error"]
+    assert "Retry it if it is still needed." not in step["error"]
 
 
 # ── E9 配套：bash venv 提示 ──────────────────────────────────
