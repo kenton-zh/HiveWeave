@@ -1533,7 +1533,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Other task ids only (self-id rejected). Unmet → blocked (not claimed/woken). VERIFY titles skip auto-block. People-waiting is commit_turn, not this list."},
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
-            "tags": {"type": "array", "items": {"type": "string"}},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "aliases": ["tag"],
+                "description": (
+                    "Tags for the task. Put the task-level delivery plane here "
+                    "as `plane:<web|native-desktop|game-engine|cli|library>` — "
+                    "on a non-web plane a visual gate is downgraded instead of "
+                    "requiring a browser E2E gate that can never pass. A "
+                    "downgrade tag is appended automatically."
+                ),
+            },
             "verifiedFacts": {"type": "array", "items": {"type": "string"},
                 "aliases": ["verified_facts"],
                 "description": "已核事实：你亲自核验过的现场事实逐条列出，注入任务卡（执行者免盲探索）。只写亲自确认过的。"},

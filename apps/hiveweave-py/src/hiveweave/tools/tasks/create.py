@@ -79,7 +79,13 @@ class CreateTaskParams(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Tags for the task (optional).",
+        description=(
+            "Tags for the task (optional). The **task-level delivery plane** "
+            "lives here as `plane:<web|native-desktop|game-engine|cli|library>` "
+            "— on a non-web plane a visual gate is downgraded instead of "
+            "requiring a browser E2E gate that can never pass. A downgrade "
+            "tag is appended automatically; the reason also lands in the receipt."
+        ),
         json_schema_extra={"aliases": ["tags", "tag"]},
     )
     contract_json: dict[str, Any] | None = Field(

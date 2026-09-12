@@ -27,6 +27,10 @@ Generic Executor 额外包含 Identity Relationships（user / superior / self �
 
 from __future__ import annotations
 
+from hiveweave.tools.shell_dialect import (
+    rejected_commands_inline as _rejected_commands_inline,
+)
+
 
 # reviewer / inspector / 审查员 → _inspector_script
 # (测试工程师 / Test Engineer 走 _test_engineer_script，含浏览器 QA)
@@ -42,9 +46,26 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 # 命令的角色脚本（executor / test_engineer），把「撞墙→报错→再撞」变成
 # 「开局就知道怎么写」。注意 host_shells 的工具名替换会作用于本段文本：
 # 这里刻意用 `pwsh` 整词，替换后仍是 pwsh，不会串成别的东西。
-_SHELL_DIALECT_SECTION = """## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
+#
+# ⚠ 2026-09-12 修：禁用清单**不再手抄**。此前这里只列 ~11 项，而
+# `tools/shell_dialect.py` 两张表合计 67 条（类1 55 + 类2 12），去重后 66 项
+# （`find` 两表都有），漏掉的全是 unix 肌肉记忆高频项
+# （cp/mv/sort/kill/find/tail/chmod/du/which…）——agent 照提示词避开了
+# grep/sed，却照样写 `cp -r` / `sort -u` 撞墙。
+# **清单类内容双写必然漂移**，故改为从词表真值源生成。
+#
+# 代价与边界：这只消除「同一份名单写两遍」这一类漂移。**提示词句子的语义
+# 是否仍然成立、词表本身该不该增删某个命令，机器判不了**——那要人/LLM 复核。
+# 不要把这条改动当成「提示词一致性有保障了」。
+_SHELL_DIALECT_SECTION = f"""## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
 命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
-- 禁用：`ls -la` / `cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `grep` / `sed` / `awk` / `wc` / `xargs` / `VAR=value cmd`（bash 环境变量前缀）
+
+**以下命令会被平台前置拒绝（`unix-only command(s) not available`）——全部别用**：
+{_rejected_commands_inline()}
+
+- 另有这些**结构性**写法也不行：`cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `VAR=value cmd`（bash 环境变量前缀）
+- ⚠ **同名不同义最危险**：`sort` 会落到 `system32\\sort.exe`（不认 `-u`，**静默排错**）；`find` 会落到 `system32\\find.exe`（**查字符串，不是查文件**）。这两个不报错但结果错，务必换用 pwsh 写法。
+- ⚠ **`cp` / `mv` / `rm` / `mkdir` 不在上表也不算安全**：pwsh 里它们是 `Copy-Item` 等的别名，本身能用，但**带 unix 短 flag 就会失败**（`cp -r` / `rm -rf` / `mkdir -p`）——用 `Copy-Item -Recurse` / `Remove-Item -Recurse` / `New-Item -ItemType Directory -Force`。
 - 改用：列目录 `Get-ChildItem -Force`；读文件 `Get-Content x -Tail 100`；写文件用 **write_file / apply_patch 工具**（不要用 shell 写）；输出 `Write-Host`；串接用 `;`（PowerShell 语义确认过再用）或分多次调用；筛选 `Select-Object -First 20` / `Select-String`；计数 `Measure-Object -Line`
 - 设环境变量再跑进程：分两步——`$env:HALYARD_DATA_DIR = "D:/..."` 换行 `python -m uvicorn ...`（写成 `HALYARD_DATA_DIR=... python ...` 必然失败）
 

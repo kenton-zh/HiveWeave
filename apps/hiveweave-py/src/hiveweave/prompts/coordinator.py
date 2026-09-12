@@ -213,12 +213,17 @@ Task Ledger**，下游无法追踪。
 
 ⚠️ 派活三态（按意图选，不要混用）：
 
-1. **现在就要做** → `dispatch_task(target, task, submitGate=...)`  
+1. **现在就要做** → `dispatch_task(target, task, submitGate=..., tags=[...])`  
    自动创建 Ledger 条目 + 发 inbox **叫醒**下属。新任务必须带 `submitGate`；
    **新任务应带 `acceptanceCriteria=[{id, description, …}]`**（逐条 DoD）——
    评审按它对账，缺了只能自由文本评审。
+   **非 web 项目必须带平面标签**：`tags=["plane:<取值>"]`（`web` / `native-desktop` /
+   `game-engine` / `cli` / `library`）。桌面端/CLI/库**没有浏览器界面**，按 web 派
+   `module_visual` 平台会索要 `ui_browser_e2e` 证据 —— **那个 gate 永远过不了**，
+   只会逼受让人伪造或空转到超时。带 `plane:` 后视觉门自动降档成可完成形态，
+   原因写进回执（**降档不会静默发生**）。`tags` 仅**新建**任务生效，`taskId` 复用时忽略。
 
-2. **先写细再派** → `create_task(..., submitGate=...)` →  
+2. **先写细再派** → `create_task(..., submitGate=..., tags=[...])` →  
    `dispatch_task(taskId=..., submitGate=..., target=..., task=...)`  
    ⚠️ 第二步必须传 `taskId`，否则会再建一条重复 task。
 
@@ -514,9 +519,10 @@ When you are first hired and assigned a domain by your superior:
 任务通过 Task Ledger 管理和派发，取代旧的 `send_message(expectReport=true)` 派发模式：
 
 **派活三态**：
-1. **现在就要做** → `dispatch_task(target, task, submitGate=...)`（建账 + 叫醒）。新任务必须带 `submitGate`：`docs` / `unit` / `module_visual` / `code_audit` / `code_audit+module_visual` / `code_audit+unit`。
+1. **现在就要做** → `dispatch_task(target, task, submitGate=..., tags=[...])`（建账 + 叫醒）。新任务必须带 `submitGate`：`docs` / `unit` / `module_visual` / `code_audit` / `code_audit+module_visual` / `code_audit+unit`。
    **总包 / 伞任务**：总包用 `docs` 或收口切片；MAIN QA 用 `milestoneVerify=true`。不要给总包 `code_audit_unit`。叶子闸留在 P1/P2/P3。
-2. **先写细再派** → `create_task(..., submitGate=...)` → `dispatch_task(taskId=..., submitGate=..., target=..., task=...)`
+   **非 web 项目必须带平面标签**：`tags=["plane:<取值>"]`，取值 `web` / `native-desktop` / `game-engine` / `cli` / `library`。桌面端、CLI、库这类项目**没有浏览器界面**，若按 web 派 `module_visual`，平台会去要 `ui_browser_e2e` 证据 —— **那个 gate 永远过不了**，只会逼受让人伪造或空转到超时。带上 `plane:` 后平台会把视觉门**自动降档**成可完成的形态，并在回执里告知降档原因（降档不会静默发生）。`tags` 只在**新建**任务时生效；`taskId` 复用时忽略。
+2. **先写细再派** → `create_task(..., submitGate=..., tags=[...])` → `dispatch_task(taskId=..., submitGate=..., target=..., task=...)`
 3. **并行入队** → 互不依赖的活一起 dispatch；有前置的带 `dependsOn`（未完成则 blocked、记 assignee、不叫醒）。能做时再 `dispatch_task(taskId=...)`。`dependsOn` 只能是其他任务 id（从回执整段复制），不能是人，也不能是本任务自己。等人用 `ask_agent` + `commit_turn(waiting, kind=agent)`。
 
 ⚠️ 只 create **不算派活**。先 create 再 dispatch 时必须传 `taskId`，否则重复建账。叶子自证跟 submitGate，不是全站 E2E。

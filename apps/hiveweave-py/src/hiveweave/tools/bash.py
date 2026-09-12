@@ -12,6 +12,12 @@
 
 from __future__ import annotations
 
+# 方言词表真值源（与 prompts/executor.py 共用；零依赖，不引入循环）。
+from hiveweave.tools.shell_dialect import (
+    ALIAS_FLAG_HINTS,
+    UNIX_ONLY_HINTS,
+)
+
 # P1-3（B 结构解）：pwsh 输出的 UTF-8 编码钉（对齐 deepseek-harness
 # pwsh-local 的 ENCODING_PREAMBLE index.ts:48-49）。Windows PowerShell
 # 5.1 默认写 OEM 代码页会 garbled 非 ASCII；pwsh 7 默认 UTF-8 不受影响。
@@ -1241,98 +1247,16 @@ def _map_unix_to_pwsh(cmd: str) -> str:
 #
 # 每条建议都在 pwsh 7.6 实测过（见 commit 说明）；不确定的不写建议，
 # 只报「pwsh 下不可用」并指向 pwsh 工具。
-
-# 类 1：pwsh 里根本不存在的命令（PATH 上无同名 exe）。
-_UNIX_ONLY_HINTS: dict[str, str] = {
-    "sed": "逐行替换用 (Get-Content f) -replace 'A','B' | Set-Content f；"
-           "取行区间用 Get-Content f | Select-Object -Skip N -First M",
-    "awk": "取列用 Get-Content f | ForEach-Object { ($_ -split '\\s+')[0] }",
-    "wc": "行数用 (Get-Content f).Count",
-    "xargs": "用管道 + ForEach-Object：Get-ChildItem … | ForEach-Object { … $_ }",
-    "head": "Get-Content f -TotalCount N",
-    "tail": "Get-Content f -Tail N（跟随写入加 -Wait）",
-    "grep": "Select-String -Pattern P -Path f；递归 "
-            "Get-ChildItem -Recurse -File dir | Select-String -Pattern P",
-    "find": "按名/递归用 Get-ChildItem -Recurse -File -Filter '*x*'（或 "
-            "Where-Object { $_.Name -like '*x*' }）；删除用 "
-            "Get-ChildItem … | Remove-Item -Force（先 Select-Object FullName 看清单）",
-    "touch": "New-Item -ItemType File -Force -Path f",
-    "which": "Get-Command <名> | Select-Object -ExpandProperty Source",
-    "cut": "($line -split ',')[0] 或 Import-Csv",
-    "tr": "-replace 运算符：$s -replace 'a','b'",
-    "uniq": "Select-Object -Unique 或 Sort-Object -Unique",
-    "du": "(Get-ChildItem -Recurse -File . | Measure-Object Length -Sum).Sum",
-    "df": "Get-PSDrive -PSProvider FileSystem",
-    "basename": "Split-Path -Leaf <路径>",
-    "dirname": "Split-Path -Parent <路径>",
-    "realpath": "Resolve-Path <路径>",
-    "readlink": "Resolve-Path <路径>",
-    "chmod": "Windows 无 POSIX 权限位；用 icacls（通常不需要）",
-    "chown": "Windows 无 POSIX 属主；用 icacls（通常不需要）",
-    "printf": "Write-Output 或 -f 格式化：'{0}' -f $v",
-    "stat": "Get-Item f | Format-List *",
-    "seq": "范围运算符：1..3",
-    "ln": "New-Item -ItemType SymbolicLink -Path L -Target T",
-    "nl": "Get-Content f | ForEach-Object { \"$($_.ReadCount): $_\" }",
-    "less": "Get-Content f（分页无必要，输出已截断）",
-    "env": "Get-ChildItem Env:",
-    "md5sum": "Get-FileHash f -Algorithm MD5",
-    "sha256sum": "Get-FileHash f -Algorithm SHA256",
-    "mktemp": "New-TemporaryFile",
-    "pgrep": "Get-Process -Name <名>",
-    # 45 轮 P0：kill 族等价建议必须指向护栏放行的形式——护栏 deny
-    # stop-process/pkill/taskkill(批量)，suggesting Stop-Process 会把
-    # 「方言正确」的改写再送进护栏拒绝，agent 两头撞墙。
-    "pkill": "按名杀灭会被护栏拒绝（按名误杀曾灭平台宿主）。先 "
-             "Get-Process -Name <名> 查 PID，再 kill <pid>（精确 PID 放行）",
-    "sudo": "Windows 无 sudo；平台已按需授权，去掉 sudo 直接跑",
-    "man": "Get-Help <命令>",
-    "dos2unix": "(Get-Content f -Raw) -replace \"`r`n\",\"`n\" | "
-                "Set-Content f -NoNewline",
-    # ── 45 轮 s3-clone_10 实锤/盘点补充（pwsh 无同名命令或 builtin）──
-    "export": "$env:NAME='val'（pwsh 无 export，赋值即生效）",
-    "od": "Format-Hex -Path f（字节转储）",
-    "xxd": "Format-Hex -Path f",
-    "base64": "[Convert]::ToBase64String([IO.File]::ReadAllBytes(f))；"
-              "解码用 [Convert]::FromBase64String",
-    "uname": "无等价；系统信息看 $PSVersionTable",
-    "id": "whoami（当前用户）",
-    "strings": "Select-String -Path f -Pattern '[\\x20-\\x7E]{4,}'（或 python 一行）",
-    "tac": "$c=Get-Content f; [Array]::Reverse($c); $c",
-    "rev": "-join ($s[-1..-$s.Length])",
-    "shuf": "Get-Random -InputObject $arr -Count $arr.Count",
-    "split": "分批用 Get-Content f | Select-Object -Skip N -First M 逐段写出",
-    "column": "Format-Table",
-    "paste": "两文件并排少用；Import-Csv 或 python 一行",
-    "join": "Import-Csv 后按 key 合并，或 python 一行",
-    "iconv": "[IO.File]::ReadAllText(f, [Text.Encoding]::GetEncoding('源编码'))",
-    "nohup": "后台用 bash 工具的 background 参数，或 Start-Process -NoNewWindow",
-    "time": "Measure-Command { … }",
-    "lsof": "端口看 netstat -ano；文件句柄看 Get-Process | Select-Object Id,ProcessName,Path",
-    "wait": "Wait-Process -Id <pid>",
-}
+#
+# ⚠ 2026-09-12：两张表已**移出本文件**到 `tools/shell_dialect.py` —— 因为
+# `prompts/executor.py` 的方言段此前手抄了一份「禁用清单」且只列 11 项，
+# 而两张表合计 67 条（去重 66，`find` 两表都有），两边漂移。
+# 现在提示词从同一模块生成。**改词表请改 shell_dialect.py，别在这里加。**
+_UNIX_ONLY_HINTS: dict[str, str] = UNIX_ONLY_HINTS
 
 # 类 2：pwsh 有同名别名/同名 exe，但 unix flag 语义对不上 —— 会报参数错误
 # 或（更糟）静默做别的事。仅当带 unix 短 flag 时才拦。
-_ALIAS_FLAG_HINTS: dict[str, str] = {
-    "ls": "Get-ChildItem -Force（-l/-h 无对应；要长格式用 "
-          "Format-Table 或 Select-Object）",
-    "cat": "Get-Content f（-n 无对应，行号用 "
-           "ForEach-Object { \"$($_.ReadCount): $_\" }）",
-    "rm": "Remove-Item -Recurse -Force <路径>（-rf 会被当成 -Filter 歧义拒绝）",
-    "cp": "Copy-Item -Recurse -Force <源> <目标>",
-    "mv": "Move-Item -Force <源> <目标>",
-    "echo": "Write-Output（-e 会被当成 -ErrorAction 歧义拒绝；"
-            "换行用双引号里的 `n）",
-    "sort": "Sort-Object -Unique（system32\\sort.exe 不认 -u，会静默排错）",
-    "find": "Get-ChildItem -Recurse -File -Filter '*.py'"
-            "（system32\\find.exe 是查字符串，不是查文件）",
-    "kill": "裸 kill <pid> 即温和终止（护栏放行）；顽固进程 "
-            "taskkill //PID <pid> //F（仅你自己启动的进程）",
-    "ps": "Get-Process（ps aux 会把 aux 当进程名）",
-    "tee": "Tee-Object -FilePath f（-a 用 -Append）",
-    "diff": "Compare-Object (Get-Content a) (Get-Content b)",
-}
+_ALIAS_FLAG_HINTS: dict[str, str] = ALIAS_FLAG_HINTS
 
 # unix 短 flag：`-l` / `-rf` / `-9`（kill -9）。长名（`-Force`/`-Recurse`）不算
 # —— 那是 pwsh 自己的参数；`--long` 也不算（pwsh cmdlet 不用双横线）。
