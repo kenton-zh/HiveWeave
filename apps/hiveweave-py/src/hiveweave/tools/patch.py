@@ -150,8 +150,10 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
         return f"ERROR: Sandbox violation: {file_path}"
 
     # .hiveweave 系统目录保护 — 阻止 patch 修改/删除 data.db 等系统文件
+    # write=True：patch 是写路径；`merge-quarantine/` 只对**读**放行
+    # （report TEST_DSH_54 #5：读放行/写保护，不是整目录并入白名单）。
     from hiveweave.tools.file import _check_hiveweave_dir
-    if _check_hiveweave_dir(full, workspace_path):
+    if _check_hiveweave_dir(full, workspace_path, write=True):
         return (f"ERROR: `.hiveweave` is the HiveWeave system directory. "
                 f"NEVER patch files inside .hiveweave (data.db, "
                 f"tool_outputs/, etc.). System files are managed by "
@@ -289,24 +291,25 @@ def _apply_single(patch: dict[str, Any], workspace_path: str) -> str:
 
 
 def _normalize_patches(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Accept both standard 'patches' array and LLM-direct single-patch form."""
+    """Accept both standard 'patches' array and LLM-direct single-patch form.
+
+    op 推断走唯一实现 `_infer_op`（此前这里有**第三份**内联副本，
+    且数组项形态完全不被推断 —— report TEST_DSH_54 #11）。
+    """
     patches = raw.get("patches")
     if isinstance(patches, list):
-        return patches
+        out: list[dict[str, Any]] = []
+        for item in patches:
+            if isinstance(item, dict) and not item.get("op"):
+                item = {**item, "op": _infer_op(item)}
+            out.append(item)
+        return out
 
     # LLM passed direct parameters
     file_path = raw.get("filePath") or raw.get("file_path")
     if isinstance(file_path, str):
-        op = raw.get("op")
-        if not op:
-            if raw.get("oldString") is not None or raw.get("old_string") is not None:
-                op = "update"
-            elif raw.get("content") is not None:
-                op = "add"
-            else:
-                op = "add"
         merged = dict(raw)
-        merged["op"] = op
+        merged["op"] = merged.get("op") or _infer_op(merged)
         return [merged]
 
     return []
@@ -370,6 +373,28 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator, model_valida
 from .base import tool
 from .helpers import coerce_to_list
 from .result import ToolResult
+
+# ── op 推断：唯一实现（report TEST_DSH_54 #11）────────────────────
+# `op` 曾只在**顶层直传**形态被推断（见 `_normalize_direct_params`），
+# `patches[]` 数组项缺 `op` 则直落 pydantic 必填错误
+# `'patches.<N>.op': Field required` —— 实测 13 次 / 4 个 Agent 全撞后者。
+# 两处推断逻辑收敛到这里：同一语义只有一个实现，新形态接入不会各写一份。
+_OLD_STRING_KEYS = (
+    "oldString", "old_string", "old_str", "oldText", "search",
+)
+
+
+def _infer_op(patch: dict) -> str:
+    """从可见字段推断缺失的 `op`（与模型从 edit_file 学来的分布一致）。
+
+    规则（刻意保守，与既有顶层直传行为逐字一致）：
+    - 提供 oldString 族字段 ⇒ ``update``
+    - 提供 content ⇒ ``add``
+    - 都没有 ⇒ ``add``（删除**无法**从"缺字段"推断，必须显式传 op='delete'）
+    """
+    if any(k in patch for k in _OLD_STRING_KEYS):
+        return "update"
+    return "add"
 
 
 class PatchItem(BaseModel):
@@ -448,28 +473,41 @@ class ApplyPatchParams(BaseModel):
             if k in direct_keys:
                 patch[k] = v
         # Infer op if not provided
-        if "op" not in patch:
-            if any(k in patch for k in ("oldString", "old_string", "old_str", "oldText", "search")):
-                patch["op"] = "update"
-            elif "content" in patch:
-                patch["op"] = "add"
-            else:
-                patch["op"] = "add"
+        if not patch.get("op"):
+            patch["op"] = _infer_op(patch)
         return {"patches": [patch]}
 
     @field_validator("patches", mode="before")
     @classmethod
     def _coerce_patches(cls, v: Any) -> Any:
-        """Coerce JSON string to list if LLM passes a string instead of array."""
+        """Coerce JSON string to list, and infer a missing per-item `op`.
+
+        report TEST_DSH_54 #11：模型看到的契约（`tools/executor.py` 手写
+        schema 表）明确鼓励两种形态 ——
+        「Either pass patches[] (array of ops) or a single change as direct
+        filePath + oldString/newString/content」—— 但数组项的 `op` 在
+        pydantic 侧是**必填**，而旧的 op 推断只覆盖顶层直传形态。
+        结果：模型照可见契约传 ⇒ 必然被拒（13 次 / 4 个 Agent）。
+        契约的模型可见面与代码强制面必须一致：这里让数组项缺 `op` 也走
+        同一套推断（唯一实现 `_infer_op`），而不是让模型为平台的字段
+        设计付往返成本。
+        """
         if isinstance(v, str):
             import json
             try:
                 parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    return parsed
             except (json.JSONDecodeError, TypeError):
-                pass
-        return v
+                return v
+            v = parsed
+        if not isinstance(v, list):
+            return v
+        out: list[Any] = []
+        for item in v:
+            if isinstance(item, dict) and not item.get("op"):
+                item = dict(item)
+                item["op"] = _infer_op(item)
+            out.append(item)
+        return out
 
 
 class EditFileParams(BaseModel):

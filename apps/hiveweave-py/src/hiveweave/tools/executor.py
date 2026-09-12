@@ -579,7 +579,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Apply file patch operations (add/update/delete). Prefer this "
             "or edit_file for a small change; write_file fully replaces a file. "
             "Either pass patches[] (array of ops) or a single change as direct "
-            "filePath + oldString/newString/content."
+            "filePath + oldString/newString/content. Per-item `op` may be "
+            "omitted: it is inferred as 'update' when oldString is given, "
+            "else 'add'. Pass op='delete' explicitly to delete."
         ),
         "properties": {
             "patches": {
@@ -587,7 +589,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "op": {"type": "string", "description": "Operation: 'add' (create), 'update' (replace), or 'delete'"},
+                        # TEST_DSH_54 #11：契约的模型可见面必须与代码强制面一致。
+                        # `op` 在 pydantic 侧曾为必填、而此处未列 required，
+                        # 模型照可见契约传 ⇒ 13 次 / 4 Agent 全撞
+                        # 'patches.<N>.op': Field required。现 op 真的可选
+                        #（patch.py::_infer_op 推断），此处如实说明 —— 不再
+                        # 靠"标了 required"来对齐，那会造出新的不一致。
+                        "op": {"type": "string", "description": "Optional. 'add' (create), 'update' (replace), 'delete'. Inferred from oldString/content when omitted."},
                         "filePath": {"type": "string", "description": "Path to the file (relative to workspace)"},
                         "oldString": {"type": "string", "description": "For update: literal text to find. Must match exactly."},
                         "newString": {"type": "string", "description": "For update: literal replacement. Empty string deletes the match."},
@@ -1424,7 +1432,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["task_id"],
                 "description": "Optional. Tries hw/<shortId>/t-<taskId[:8]> first.",
             },
-            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
+            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight", "check"],
                 "description": "Preflight only: list missing items. No merge, no teardown. Default false."},
         },
         "required": ["branchName"],
@@ -1665,7 +1673,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "Required for UI/code tasks."
                 ),
             },
-            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight"],
+            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight", "check"],
                 "description": "Preflight only: list missing items. No submit. Default false."},
             "failuresAcknowledged": {
                 "type": "array",
@@ -2329,6 +2337,83 @@ def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:
     return None
 
 
+def _resolve_alias_via_pydantic(tool_name: str, arg_name: str) -> str | None:
+    """兜底：用工具**自己的 pydantic 参数模型**解析别名，返回 schema 侧的正名。
+
+    为什么需要它（report TEST_DSH_54 #11 的系统形态，2026-09-12）：
+    参数别名有两张表 —— 手写的 `TOOL_PARAM_SCHEMAS`（模型可见面）与 pydantic
+    模型上的 `json_schema_extra={"aliases": [...]}`（代码强制面）。实测有
+    **73 处**别名只存在于后者，于是模型用它天然会说的名字（`dispatch_task` 的
+    `to`、`get_tasks` 的 `state`、`submit_task` 的 `conclusion`/`blocking`）
+    会被本函数上方判成 `Unknown parameters` 直接拒绝 —— 而代码本来是接受的。
+    这正是 #11（`apply_patch.patches[].op`）与"三件套"纪律（`create_task.tags`）
+    同一类病：**模型可见的契约 ≠ 代码强制的契约**。
+
+    逐条手工同步两张表已经失败过三次，所以这里改机制：只要**该工具自己的
+    pydantic 模型认这个名字**，本门禁就不该拒它。解析尽量落到 schema 侧的正名
+    （`blocking` → pydantic 字段 `blocking_issues` → schema 属性 `blockingIssues`），
+    保证下游拿到的仍是 schema 契约里的名字。
+
+    安全边界：只对**该工具自身**的参数模型生效（无跨工具泄漏）；schema 里完全
+    没有对应属性的名字仍然拒绝（那是真正的未知参数，fail loud）。
+    """
+    try:
+        import hiveweave.tools  # noqa: F401 — 确保 registry 已装填
+        from hiveweave.tools.base import _extract_aliases, get_tool_def
+
+        td = get_tool_def(tool_name)
+        params = getattr(td, "params_model", None) if td is not None else None
+        if params is None:
+            return None
+        for field_name, field in params.model_fields.items():
+            if arg_name == field_name or arg_name in _extract_aliases(field):
+                return field_name
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_alias_normalized(props: dict, arg_name: str) -> str | None:
+    """最后兜底：按 camel↔snake 归一比较（`dir_path` ↔ `dirPath`）。
+
+    模型在 camelCase / snake_case 之间摇摆是最常见的形态（同一字段这次写
+    `dirPath`、下次写 `dir_path`），两张表不可能穷举。只接受**唯一**归一命中，
+    避免把有歧义的名字猜错。归一到 schema 正名后交给 pydantic 是会通过的 ——
+    schema 侧的正名本来就是 pydantic 接受的别名。
+    """
+    def _norm(s: str) -> str:
+        return s.replace("_", "").lower()
+
+    target = _norm(arg_name)
+    hits = [p for p in props if _norm(p) == target]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _canonical_for_arg(tool_name: str, key: str, props: dict) -> str | None:
+    """三段解析（report TEST_DSH_54 #11 的机制修复）：
+
+    1. schema 别名**精确**命中（既有行为，优先）；
+    2. 该工具自己的 pydantic 模型认这个名字 ⇒ 取 pydantic 字段名；
+    3. 把字段名映射回 schema 正名，精确不成再按 camel↔snake 归一。
+
+    全不命中才判未知参数（保持 fail loud）。
+
+    ⚠ 归一化**只作用于第 2 步拿到的 pydantic 字段名**，不作用于原始 key。
+    审计 2026-09-12 实测：若对原始 key 无条件归一，`list_files` 会接受
+    `dirpath` / `DIRPATH` 这类**连 pydantic 都不认**的拼写（pydantic 是静默
+    丢弃它们的），门禁就比代码强制面更宽了 —— 与本修复的目的正好相反。
+    """
+    hit = _resolve_alias_for_tool(key, props)
+    if hit is not None:
+        return hit
+    field_name = _resolve_alias_via_pydantic(tool_name, key)
+    if not field_name:
+        return None
+    return _resolve_alias_for_tool(field_name, props) or _resolve_alias_normalized(
+        props, field_name
+    )
+
+
 def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
     """Validate and normalize tool arguments against the schema.
 
@@ -2364,7 +2449,7 @@ def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
         for key, value in args.items():
             if value is None:
                 continue
-            canonical = _resolve_alias_for_tool(key, props)
+            canonical = _canonical_for_arg(tool_name, key, props)
             if canonical == req:
                 normalized[req] = value
                 found = True
@@ -2376,7 +2461,7 @@ def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
     for key, value in args.items():
         if key in normalized:  # already resolved as a required param
             continue
-        canonical = _resolve_alias_for_tool(key, props)
+        canonical = _canonical_for_arg(tool_name, key, props)
         if canonical is not None:
             if canonical not in normalized:
                 normalized[canonical] = value
