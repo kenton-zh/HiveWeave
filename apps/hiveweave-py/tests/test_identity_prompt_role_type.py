@@ -176,3 +176,36 @@ def test_identity_permission_type_wins_over_stale_role_type():
     )
     assert "You are a COORDINATOR" in text
     assert "You are an EXECUTOR" not in text
+
+
+# ── 提示词纪律守卫（report TEST_DSH_54 #3 / #8-3，2026-09-12）──────────────
+# 边界说明：这些断言只钉住「纪律文本在场且关键字句未被改回自由文本」，
+# **不保证语义正确** —— 语义成立与否机器判不了，需人/LLM 复核。
+
+
+def test_identity_known_issue_doc_provenance_rule_present():
+    """#8-3：共享层「已知问题」文档的日期只是被观测时间，不是引入时间；
+    再次撞上「已知旧问题」必须先核是否同一问题（git blame / git log -S），不能照抄文档结论。"""
+    text = build_identity_prompt("开发工程师", "executor", "", name="阿蓝")
+    assert "被观测到的时间" in text
+    assert "不是引入时间" in text
+    assert "先核它是不是同一个问题" in text
+    assert "git blame" in text
+    assert "git log -S" in text
+
+
+def test_test_engineer_probe_positive_control_rule_present():
+    """#3：项目自建探针须有正向对照（故障时会转红），且明示平台只给骨架模板与纪律、不给探针实现。"""
+    script = build_executor_script("测试工程师", "鹿鸣")
+    assert "探针自检" in script
+    assert "故障时它会转红" in script
+    assert "阳性样本" in script
+    assert "阴性样本" in script
+    assert "平台只给骨架模板与验收流程纪律，不给探针实现" in script
+
+
+def test_generic_executor_probe_self_check_rule_present():
+    script = build_executor_script("开发工程师", "阿蓝")
+    assert "探针自检" in script
+    assert "故障时它会转红" in script
+    assert "平台只给骨架与纪律" in script

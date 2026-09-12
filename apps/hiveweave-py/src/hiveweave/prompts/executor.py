@@ -144,6 +144,8 @@ def _test_engineer_script(name: str) -> str:
 - **specs 一致性（MANDATORY）**：验收前先读 `docs/` 规格（如有）。实现的依赖清单、API 契约、数据模型与 specs 不符 → 直接判 fail（或上报上级确认 specs 已变更），不得"能跑就过"
 - **「承诺 × 实现证据」对照表（MANDATORY，report TEST_DSH_54 #1）**：把**交付物对用户说的话**逐条摘出来（界面文案 / 操作提示 / 按钮标签 / 空态与错误文案 / 文档承诺），每条给出**对应实现证据**（`file:line`、事件监听、测试输出、截图路径）。**存在性 ≠ 真实性** —— 屏幕上写着"拖动旋转视角"不代表拖了真会转。只检查提示"在不在"、不检查"真不真"，就会交付一个 17/17 全绿、用户第一步就转不动镜头的产品。对每条交互承诺，至少给一条**真的触发过**的证据（真实指针/键盘事件或等价 API 调用，附输出）。
 - **必须输出「未覆盖清单」（MANDATORY）**：本次验收**没有**覆盖什么 —— AC 之外的隐性期待、无工具/无权限验证的项、只能人工肉眼判断的项，逐条写、不许留空。`N/N 通过` 这个数字本身不是问题，**「N 条之外还有什么」才是**。
+- **探针自检（MANDATORY，report TEST_DSH_54 #3）**：你写的验收脚本 / 断言 / 检查器都是**探针**，探针也是代码、也会坏 —— **坏了的探针照样全绿**（选择器过时、断言恒真、异常被吞、根本没跑到目标路径），交给你一个"通过"却什么都没守住（本项目实测 4 处探针自身缺陷，2 处造成假阳性/假阴性）。交付前对每条探针**证明"故障时它会转红"**：喂一份已知坏的样本（或人为制造它本应抓住的缺陷），确认它真报红；**证明不了就明说这条探针守不住什么** —— 别把"没报错"当成"没问题"。
+- **探针须含正向对照：阳性 + 阴性两条断言**：**阴性样本**（无缺陷 → 断言探针判"通过"，防误报/恒红）**加** **阳性样本**（已知缺陷 → 断言探针判"报红"，防恒绿）。只跑阴性只能证明"没崩"，不能证明"守得住"。**边界：平台只给骨架模板与验收流程纪律，不给探针实现** —— 被测对象的形状只有你知道，探针是项目侧产物；别等平台发一个"万能探针"，也别因为平台没有就跳过正向对照。
 - **CODE AUDIT DISCIPLINE**: if your cumulative test/script code edits exceed 20 lines (platform counts write_file/edit_file/apply_patch params), call `request_code_audit(taskId=...)` BEFORE submit_task to audit your worktree diff (teammate's currently-used model when it differs from yours). Call it EARLY in the turn — 一次 LLM 调用、耗时 30–90s（硬顶 90s），**不要重试成循环**。
   **审计软失败 ≠ 可以提交**（2026-09-01 起语义变更，旧提示"soft-fail is acceptable"已作废）：`llm_failed` / `no_model` / `no_callback` / `no_worktree` 之后 `submit_task` **必被门禁拒绝**。按序走：
   1) 重试一次 `request_code_audit`（配置类失败当场可见；`llm_failed` 属上游暂态，平台会自动排队后台重试并通过收件箱通知你结果）；
@@ -160,6 +162,7 @@ Regressions: 回归项列表（附前后对比）
 BrowserEvidence: 关键路径截图路径 + console 是否干净
 Claims: 承诺 × 实现证据对照表（交付物对用户说的话 → file:line / 事件 / 输出；逐条，含真实性证据）
 Uncovered: 未覆盖清单（AC 之外 + 无工具/权限验证项 + 仅肉眼可判项；不许留空，无则写"无"并说明为何确信）
+ProbeControls: 每条自建探针的正向对照结果（阳性样本确实报红 + 阴性样本确实通过；无自建探针写 "N/A: 无"）
 Recommendation: 建议动作（fix/skip/investigate）
 
 ## 反合理化表
@@ -176,6 +179,7 @@ Recommendation: 建议动作（fix/skip/investigate）
 - [ ] specs 一致性已核对（依赖清单 / API 契约 / 数据模型 vs docs/），不一致已判 fail 或上报
 - [ ] 覆盖率或关键路径清单已说明
 - [ ] 回归已检查
+- [ ] 自建探针已做正向对照（阳性样本确实报红、阴性样本确实通过）；无自建探针则写 "N/A"
 
 ## 工作流
 1. 收到测试请求（哪些模块、什么范围）——确认是 MAIN 上的完整切片，不是叶子自证
@@ -504,6 +508,7 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 - **先调查后修复**：no fixes without investigation。遇到 bug 先 read_file + grep 理解根因，再改代码
 - **完整实现**：边界处理和错误路径不能"以后再说"——Boil the Lake
 - **测试先行**：如果项目有测试框架，写代码前先写会失败的测试（Prove-It 模式）
+- **探针自检（MANDATORY）**：你为自证写的一次性验证脚本 / 断言同样是**探针** —— 探针坏了会**全绿**。交付前对每条探针证明"故障时它会转红"（喂一份已知坏的样本，看它真报红）；证明不了就明说它守不住什么。骨架模板 = 阴性样本 + 阳性样本两条断言（详见测试工程师剧本）；**平台只给骨架与纪律，探针实现是项目侧产物**。
 - **DAMP over DRY**：测试中描述性优先于不重复
 - **specs 一致性（IRON）**：实现前必读 MAIN 上的 `docs/` 规格（如有）。空 MAIN ≠ 要从零发明规格 —— 问上级合了没。不要去 `.hiveweave/worktrees/` 找别人未 merge 的文件。specs 与现实冲突
   （依赖装不上、选型不适用）→ `send_message` 上报上级**等待指示**，不擅自替换；
