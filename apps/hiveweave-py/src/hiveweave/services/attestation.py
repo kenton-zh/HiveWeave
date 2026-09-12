@@ -1118,6 +1118,48 @@ BROWSE_E2E_KIND = "browse_e2e"
 
 CODE_AUDIT_KIND = "code_audit"
 
+# ── attestation_impossible（结构化事实位，报告 Layer 6 第 4 行）──────────
+#
+# 报告判据：「凭证在物理上无法签发」与「质量不够所以豁免」是两件事，却共用
+# waive_attestation 一个入口 —— 豁免一旦发生就不留结构性事实位，下一个人读到
+# 的是「CEO 关了闸」。此处把前者做成**平台自己检测、由门禁自己消化**的事实：
+# 命中时门禁不再要求该 kind，也不再教人手动豁免。
+#
+# 事实落点：tool_attestations 表的一种 kind（"attestation_impossible"）。
+# 结构化字段按既有标记约定写进 command_or_url（同 [verdict=...]），完整
+# JSON 写 stdout；同一事实另盖进 tasks.evidence（key 见
+# ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY）。两处均可事后审计。
+ATTESTATION_IMPOSSIBLE_KIND = "attestation_impossible"
+# reason 枚举（当前唯一值）：tool_limited = 工具/物理限制导致结构上无法签发，
+# 既不是质量问题，也不是人为豁免。
+ATTESTATION_IMPOSSIBLE_REASON_TOOL_LIMITED = "tool_limited"
+ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY = "attestation_impossible"
+
+# ── code_audit_soft_fail（持久软失败事实位，F1 同构修复）────────────────
+#
+# Layer 6 第 4 行安全修复的**另一半**。approve/HTTP 侧的
+# ``drop_code_audit_kind_if_soft`` 原先还信任 ``evidence["code_audit_soft_fail"]``
+# ——而 HTTP 路径的 evidence 是**客户端原文**，任何调用方自带
+# ``{"code_audit_soft_fail": {"reason": "llm_failed"}}`` 即可跳过 code_audit 门。
+#
+# 现与 ``attestation_impossible`` 同构：平台在 submit 判定软失败时**平台签发**
+# 一条 ``tool_attestations`` 事实行（:func:`record_code_audit_soft_fail`），
+# approve 侧只认这条落库行（:func:`resolve_soft_fail_kind`）。同一条事实也另
+# 盖进 ``tasks.evidence``（UI/兼容用），但 evidence **不再是门禁判据**。
+# 结构化字段写进 ``command_or_url``：``[reason=<X>] [need=code_audit]``。
+CODE_AUDIT_SOFT_FAIL_KIND = "code_audit_soft_fail"
+# 软失败 reason 枚举（与 code_audit._SOFT_FAIL_ATTEMPT_REASONS 对齐）——
+# 仅记录进事实行供审计，不作为门禁判据（判据是「有没有平台落库行」）。
+CODE_AUDIT_SOFT_FAIL_REASONS = frozenset({"llm_failed", "no_model", "no_callback"})
+
+# 返修（rework）时必须退役的「平台门禁放宽事实位」kind 清单（F2）：这些事实
+# 只对一个 submit/review 轮次有效——返修后若补了真代码，陈旧事实不得继续让
+# code_audit 免检。见 :func:`invalidate_gate_facts`。
+GATE_FACT_KINDS: tuple[str, ...] = (
+    ATTESTATION_IMPOSSIBLE_KIND,
+    CODE_AUDIT_SOFT_FAIL_KIND,
+)
+
 # Tag tokens that hard-select docs_only policy (narrow — avoid loose "docs").
 _DOCS_TAGS = frozenset({"docs_only", "doc_review"})
 _UI_TAGS = frozenset({"ui_browser_e2e", "ui", "e2e", "browser", "module_visual"})
@@ -1344,6 +1386,56 @@ async def count_waivers(project_id: str, task_id: str | None) -> int:
         return 0
 
 
+async def invalidate_gate_facts(project_id: str, task_id: str | None) -> int:
+    """Retire a task's unexpired platform gate-relaxation facts (set expires_at=now).
+
+    Covers :data:`GATE_FACT_KINDS` （``attestation_impossible`` /
+    ``code_audit_soft_fail``）——这些事实是 submit 门禁**自己消化**掉的必需
+    kind 的凭据，只对一个 submit/review 轮次有效。
+
+    **F2 修复**：陈旧的 ``attestation_impossible`` 事实会活过返修——先以
+    「无 diff」正当落一条事实行，任务被返修、补了真代码，approve 时仍读到旧行
+    ⇒ code_audit 继续免检。返修即退役本任务的事实行，新轮次从干净状态开始。
+
+    可观测（不静默删）：只 ``UPDATE expires_at = now``，行保留供审计；退役数
+    >0 时落 ``gate_facts_invalidated_on_rework`` 日志。只影响 ``task_id``
+    绑定的行，不动其它任务。
+
+    **接线**：由 :func:`invalidate_valid_waivers` 在返修时调用——该函数是
+    ``services.tasks.review._force_rework``（两条返修路径的唯一汇聚点）必然
+    调用的钩子，因此 tool / HTTP(api/tasks) / verify_merge 等所有返修入口都被
+    覆盖；单独另开一个调用点会漏掉非 tool 路径。
+
+    Returns the number of fact rows retired.
+    """
+    if not task_id:
+        return 0
+    await attestation_service.ensure_schema(project_id)
+    tid = await canonical_task_id(project_id, task_id) or str(task_id)
+    now = int(time.time() * 1000)
+    placeholders = ", ".join("?" * len(GATE_FACT_KINDS))
+    try:
+        retired = await _execute_rowcount(
+            project_id,
+            "UPDATE tool_attestations SET expires_at = ? "
+            "WHERE project_id = ? AND task_id = ? "
+            f"AND kind IN ({placeholders}) "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            [now, project_id, tid, *GATE_FACT_KINDS, now],
+        )
+    except ProjectDbError:
+        return 0
+    if retired > 0:
+        log.info(
+            "gate_facts_invalidated_on_rework",
+            project_id=project_id,
+            task_id=task_id,
+            retired=retired,
+            kinds=list(GATE_FACT_KINDS),
+        )
+    return retired
+
+
 async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
     """Invalidate all unexpired waivers for a task (set expires_at=now).
 
@@ -1352,7 +1444,13 @@ async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
     Lifetime count (count_waivers) is preserved for the MAX_WAIVERS_PER_TASK
     cap; only the active waiver is retired. Rows are kept for audit.
 
-    Returns the number of waivers retired.
+    返修同时退役该任务的**平台门禁放宽事实位**（F2，见
+    :func:`invalidate_gate_facts`）——它们与 waiver 同属「一次提交/审批轮次」
+    的放宽，不得活过返修。挂在本函数上是因为它是返修汇聚点
+    (``_force_rework``) 的既有钩子，能覆盖全部返修入口。
+
+    Returns the number of waivers retired (fact rows are reported separately
+    via the ``gate_facts_invalidated_on_rework`` log).
     """
     if not task_id:
         return 0
@@ -1376,7 +1474,383 @@ async def invalidate_valid_waivers(project_id: str, task_id: str | None) -> int:
             task_id=task_id,
             retired=retired,
         )
+    # F2：返修退役平台门禁放宽事实位（attestation_impossible /
+    # code_audit_soft_fail）。best-effort：失败不改变 waiver 退役结果，但要
+    # 留日志（不得静默）。
+    try:
+        await invalidate_gate_facts(project_id, task_id)
+    except Exception as e:  # noqa: BLE001 — 观测面，不阻断返修收尾
+        log.warning(
+            "gate_fact_invalidate_failed",
+            project_id=project_id,
+            task_id=task_id,
+            error=str(e),
+        )
     return retired
+
+
+async def _worktree_has_no_auditable_diff(worktree: str) -> bool | None:
+    """True 仅当能**证明**该 worktree 没有任何可审内容；None = 无法判定。
+
+    证据 = ``git status --porcelain`` 为空（无未提交/未跟踪）**且**
+    ``git diff --name-only <base>...HEAD`` 为空（分支相对基准无自有提交，
+    即任务已 merge 回基准）。任一 git 探测失败（ok=False）→ None
+    （fail-closed，调用方保持原门禁）。
+    """
+    if not worktree:
+        return None
+    try:
+        from hiveweave.services.git_worktree import _git, _resolve_base_branch
+    except Exception:  # noqa: BLE001 — 取不到 git 辅助即不可判
+        return None
+    try:
+        ok_status, status_out = await _git(["status", "--porcelain"], worktree)
+    except Exception:  # noqa: BLE001
+        return None
+    if not ok_status:
+        return None
+    if (status_out or "").strip():
+        return False
+    try:
+        base = await _resolve_base_branch(worktree)
+    except Exception:  # noqa: BLE001
+        base = None
+    if not base:
+        return None
+    try:
+        ok_diff, diff_out = await _git(
+            ["diff", "--name-only", f"{base}...HEAD"], worktree
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if not ok_diff:
+        return None
+    return not (diff_out or "").strip()
+
+
+async def detect_attestation_impossible(
+    project_id: str,
+    agent_id: str,
+    task_id: str | None,
+    needed: frozenset[str] | None,
+) -> dict[str, Any] | None:
+    """检测「要求的凭证物理上无法签发」，返回结构化事实，否则 None。
+
+    当前可证的场景：policy 要求 code_audit，但 agent 的 worktree 相对基准
+    分支**没有任何 diff**（任务已 merge / 已回到基准）——此时
+    request_code_audit 结构上不可能审出内容、发不出 PASS 凭证。这不是
+    「质量不够所以豁免」，所以不该走 waive_attestation。
+
+    判定 fail-closed（保守优先）：worktree 无法定位、git 探测失败、
+    ``task_id`` 缺失、上一轮同任务的 code_audit 前科（ISSUES 回滚前科 /
+    已有 PASS），或**前科查询/比对异常**时一律返回 None —— 保持原门禁与人工
+    豁免路径不变。
+    """
+    if not needed or CODE_AUDIT_KIND not in needed or not agent_id or not task_id:
+        return None
+    try:
+        from hiveweave.services.worktree_review import agent_worktree_path
+
+        worktree = await agent_worktree_path(agent_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not worktree:
+        return None
+    no_diff = await _worktree_has_no_auditable_diff(worktree)
+    if no_diff is not True:
+        return None
+
+    # 前科守卫：同任务上一轮 code_audit 为 ISSUES 时不得自动消化——这正是
+    # run_code_audit 空 diff 分支的 ROLLED_BACK 保护，不能借本事实位绕过；
+    # 已有 PASS（未过期）时门禁本就不缺该 kind，也不该记一条伪事实。
+    #
+    # **fail-closed（审计 ②-1 修复）**：查询「前科」或判定同任务时的任何异常
+    # 都视为「前科不可判」⇒ 整体 return None（不产生事实位 = 不放行），而
+    # 不是把异常当成「无前科」继续放行——后者与 docstring 自称的 fail-closed
+    # 相反。``find_latest_attestation_by_kind`` 正常路径查询失败返回 None
+    # （不抛），因此走到 except 只可能是真正的意外异常。
+    prior = None
+    try:
+        prior = await find_latest_attestation_by_kind(
+            project_id,
+            agent_id=agent_id,
+            kind=CODE_AUDIT_KIND,
+            max_age_ms=DEFAULT_MAX_AGE_MS,
+        )
+        if prior is not None:
+            same_task = await _task_ids_equal(
+                project_id, task_id, prior.get("task_id")
+            )
+            if same_task and parse_audit_verdict(prior) in ("ISSUES", "PASS"):
+                return None
+    except Exception:  # noqa: BLE001 — 前科不可判即不放行（fail-closed）
+        return None
+
+    return {
+        "reason": ATTESTATION_IMPOSSIBLE_REASON_TOOL_LIMITED,
+        "need": CODE_AUDIT_KIND,
+        "detail": "no_auditable_diff",
+        "detected_at": int(time.time() * 1000),
+    }
+
+
+async def record_attestation_impossible(
+    project_id: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    info: dict[str, Any],
+) -> str:
+    """把「凭证物理无法签发」写成 tool_attestations 事实行（平台签发、可审计）。
+
+    结构化字段按标记约定写进 ``command_or_url``，完整 JSON 写 stdout；
+    审计查询：``SELECT * FROM tool_attestations WHERE
+    kind='attestation_impossible'``（谁 / 何时 / 何任务 / 何原因 / 由谁消化）。
+    exit_code 留 NULL —— 这行不是执行结论（既非 PASS 也非 FAIL），不应被
+    任何执行凭证校验当成通过凭证。
+    """
+    reason = str(
+        info.get("reason") or ATTESTATION_IMPOSSIBLE_REASON_TOOL_LIMITED
+    )
+    need = str(info.get("need") or CODE_AUDIT_KIND)
+    detail = str(info.get("detail") or "")
+    payload = json.dumps(
+        {
+            "kind": ATTESTATION_IMPOSSIBLE_KIND,
+            "reason": reason,
+            "need": need,
+            "detail": detail,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "detected_at": info.get("detected_at"),
+            "consumed_by": "submit_gate",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return await attestation_service.create(
+        project_id,
+        agent_id=agent_id,
+        kind=ATTESTATION_IMPOSSIBLE_KIND,
+        task_id=task_id,
+        command_or_url=f"[reason={reason}] [need={need}] [detail={detail}]",
+        stdout=payload,
+        exit_code=None,
+    )
+
+
+async def _get_latest_fact(
+    project_id: str, task_id: str | None, kind: str
+) -> dict[str, Any] | None:
+    """最近一条未过期的平台事实行（按 *kind*），读不到 → None。
+
+    内部复用（``get_attestation_impossible`` / ``get_code_audit_soft_fail``）。
+    本身**不作放行判定** —— 消费方 ``resolve_*_kind`` 才把 None 解释为
+    「拿不到事实 ⇒ 不放行」（fail-closed 方向）。
+    """
+    if not task_id:
+        return None
+    await attestation_service.ensure_schema(project_id)
+    try:
+        conn = await _conn(project_id)
+    except ProjectDbError:
+        return None
+    tid = await canonical_task_id(project_id, task_id) or str(task_id)
+    now = int(time.time() * 1000)
+    cur = await conn.execute(
+        "SELECT id, agent_id, task_id, command_or_url, created_at, expires_at "
+        "FROM tool_attestations "
+        "WHERE project_id = ? AND task_id = ? AND kind = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY created_at DESC LIMIT 1",
+        [project_id, tid, kind, now],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if not row:
+        return None
+    keys = row.keys() if hasattr(row, "keys") else []
+    return {k: row[k] for k in keys}
+
+
+async def get_attestation_impossible(
+    project_id: str, task_id: str | None
+) -> dict[str, Any] | None:
+    """读取本任务已落库的 attestation_impossible 事实（可观测 / 审计用）。
+
+    只读，查询失败 → None。返回最近一条未过期事实行的关键列。
+
+    **fail-open 方向说明（勿误判为缺陷）**：本函数在查询失败时返回 None，是
+    「读不到」的中性表达——它本身不作放行/拦截判定。它的**放行判据**消费方
+    ``resolve_impossible_kind`` 恰好把 None 解释为「拿不到事实 ⇒ 不放行」，
+    对门禁是正确的 fail-closed 方向。不要把这里的 fail-open 改成抛异常或
+    「查不到就放行」。反过来，任何**直接**基于本函数返回值放行的新代码都须
+    自证拿到的是平台落库行。
+    """
+    return await _get_latest_fact(project_id, task_id, ATTESTATION_IMPOSSIBLE_KIND)
+
+
+async def get_code_audit_soft_fail(
+    project_id: str, task_id: str | None
+) -> dict[str, Any] | None:
+    """读取本任务已落库的 code_audit 软失败事实（可观测 / 审计用）。
+
+    与 :func:`get_attestation_impossible` 同向：只读、查询失败 → None；
+    None 是「读不到」的中性表达，放行判定在 :func:`resolve_soft_fail_kind`。
+    """
+    return await _get_latest_fact(project_id, task_id, CODE_AUDIT_SOFT_FAIL_KIND)
+
+
+async def record_code_audit_soft_fail(
+    project_id: str,
+    *,
+    agent_id: str,
+    task_id: str,
+    reason: str,
+) -> str:
+    """把「平台判定的 code_audit 软失败」写成 tool_attestations 事实行。
+
+    镜像 :func:`record_attestation_impossible`：由**平台**（submit 门禁，判据
+    是进程内审计尝试记录，非客户端输入）签发；结构化字段写进
+    ``command_or_url``（``[reason=<X>] [need=code_audit]``），完整 JSON 写
+    stdout。approve 侧由 :func:`resolve_soft_fail_kind` 服务端复核该行。
+
+    exit_code 留 NULL —— 这行不是执行结论（既非 PASS 也非 FAIL），不应被任何
+    执行凭证校验当成通过凭证。
+
+    审计查询：``SELECT * FROM tool_attestations WHERE
+    kind='code_audit_soft_fail'``（谁 / 何时 / 何任务 / 何原因）。
+    """
+    r = str(reason or "").strip() or "llm_failed"
+    payload = json.dumps(
+        {
+            "kind": CODE_AUDIT_SOFT_FAIL_KIND,
+            "reason": r,
+            "need": CODE_AUDIT_KIND,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "consumed_by": "submit_gate",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return await attestation_service.create(
+        project_id,
+        agent_id=agent_id,
+        kind=CODE_AUDIT_SOFT_FAIL_KIND,
+        task_id=task_id,
+        command_or_url=f"[reason={r}] [need={CODE_AUDIT_KIND}]",
+        stdout=payload,
+        exit_code=None,
+    )
+
+
+def evidence_has_attestation_impossible(evidence: dict | None) -> bool:
+    """True 当 evidence 带着「凭证物理无法签发」事实位。
+
+    ⚠️ ``evidence`` 可能是客户端原文（HTTP submit body），**不得**作为门禁
+    放行判据；门禁侧改用 :func:`resolve_impossible_kind` 做服务端复核。
+    """
+    if not isinstance(evidence, dict):
+        return False
+    stamp = evidence.get(ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY)
+    if not isinstance(stamp, dict):
+        return False
+    return bool(str(stamp.get("need") or "").strip())
+
+
+def drop_impossible_attestation_kinds(
+    needed: frozenset[str] | None, evidence: dict | None
+) -> tuple[frozenset[str] | None, bool]:
+    """**仅解析** evidence 里的 attestation_impossible 事实位（非门禁判据）。
+
+    返回 ``(needed, dropped)``；无事实位 / need 不在 needed 里则原样返回。
+
+    ⚠️ 安全警示（Layer 6 第 4 行安全修复）：``evidence`` 在 HTTP 路径是
+    **客户端原文**（``api/tasks.py`` 的 ``TaskSubmit.evidence``），任何能调
+    submit/approve 的调用方都能伪造 ``{"attestation_impossible":
+    {"need": "code_audit"}}`` 骗过门禁。因此本函数**不得**再作为任何门禁的
+    放行判据使用——门禁侧一律改走服务端复核 :func:`resolve_impossible_kind`
+    （读 ``tool_attestations`` 平台落库行）。此处保留为纯解析工具（含回归
+    测试的可观测面），不参与放行。
+    """
+    if not needed or not evidence_has_attestation_impossible(evidence):
+        return needed, False
+    stamp = evidence.get(ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY) or {}
+    need = str(stamp.get("need") or "").strip()
+    if not need or need not in needed:
+        return needed, False
+    return frozenset(k for k in needed if k != need), True
+
+
+# 平台事实行写进 ``command_or_url`` 的 ``[need=<kind>]`` 标记（同
+# [verdict=...] / [reason=...] 约定）。attestation_impossible 与
+# code_audit_soft_fail 两种事实行共用同一标记格式。
+_FACT_NEED_RE = re.compile(r"\[need=([^\]]+)\]")
+
+
+async def _resolve_fact_need(
+    project_id: str, task_id: str | None, kind: str
+) -> str | None:
+    """从平台落库事实行（*kind*）的 ``[need=<kind>]`` 解析出 need。
+
+    解析不出 / 无行 / 查询失败 ⇒ None。**fail-closed（放行判据方向）**：
+    None 一律表示「不剔除、保持原门禁」。本函数是「能否剔除某必需 kind」的
+    唯一判据来源，禁止把 None 当成已放行。
+    """
+    if not task_id:
+        return None
+    try:
+        row = await _get_latest_fact(project_id, task_id, kind)
+    except Exception:  # noqa: BLE001 — 拿不到事实即不放行（fail-closed）
+        return None
+    if not row:
+        return None
+    m = _FACT_NEED_RE.search(str(row.get("command_or_url") or ""))
+    if not m:
+        return None
+    need = m.group(1).strip()
+    return need or None
+
+
+async def resolve_impossible_kind(
+    project_id: str, task_id: str | None
+) -> str | None:
+    """服务端复核：本任务是否已有平台落库的「某 kind 物理无法签发」事实。
+
+    读 :func:`get_attestation_impossible`（``tool_attestations`` 事实行，由
+    submit 门禁的 :func:`record_attestation_impossible` **平台签发**），从该行
+    ``command_or_url`` 的 ``[need=<kind>]`` 解析出 kind 返回；解析不出 /
+    无行 / 查询失败 ⇒ ``None``。
+
+    **fail-closed（放行判据方向）**：本函数是「能否剔除某必需 kind」的**唯一
+    判据**，所以「查不到就不放行」——``None`` 一律表示**不剔除、保持原门禁**。
+    ``get_attestation_impossible`` 查询失败返回 None（同一方向），对 *观测*
+    是中性表达，在这里恰好构成正确的 fail-closed：拿不到平台事实 = 不放行。
+    这不是缺陷，禁止改成「查不到就当作已放行」。
+    """
+    return await _resolve_fact_need(
+        project_id, task_id, ATTESTATION_IMPOSSIBLE_KIND
+    )
+
+
+async def resolve_soft_fail_kind(
+    project_id: str, task_id: str | None
+) -> str | None:
+    """服务端复核：本任务是否已有平台签发的 code_audit 软失败事实行。
+
+    读 :func:`get_code_audit_soft_fail`（``tool_attestations`` 事实行，由
+    submit 门禁的 :func:`record_code_audit_soft_fail` **平台签发** —— 判据是
+    进程内审计尝试记录，非客户端输入），从 ``command_or_url`` 的
+    ``[need=<kind>]`` 解析出 kind 返回；解析不出 / 无行 / 查询失败 ⇒ ``None``。
+
+    **fail-closed**：``None`` = 不剔除、保持原门禁。调用方
+    （``drop_code_audit_kind_if_soft``）还要求返回值**恰等于** ``CODE_AUDIT_KIND``
+    才剔除（F3：不把「剔哪个 kind」交给行内容）。
+    """
+    return await _resolve_fact_need(
+        project_id, task_id, CODE_AUDIT_SOFT_FAIL_KIND
+    )
 
 
 # Max waiver rows per task (lifetime). Escape hatch must stay narrower than
@@ -1961,8 +2435,17 @@ async def check_task_attestations(
     needed = required_attestation_kinds(policy_id)
     from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
 
-    needed, _ = drop_code_audit_kind_if_soft(
+    # 报告 Layer 6 第 4 行（安全修复）：此处原先在漏斗之外再用
+    # ``drop_impossible_attestation_kinds(needed, evidence)`` 消费「物理无法
+    # 签发」事实位，但本函数的 ``evidence`` 取自 ``task.evidence`` —— HTTP
+    # ``POST /tasks/{id}/submit`` 会把**客户端原文**（``TaskSubmit.evidence``）
+    # 原样写进 task.evidence，故该路径同样可被伪造。现由漏斗内部做服务端
+    # 复核（``resolve_impossible_kind`` 读 tool_attestations 平台落库事实行）：
+    # 只有库里确有事实行才剔除 kind。evidence 仅继续供 soft-fail 盖章
+    # （同类既有缺陷，本次不修）。
+    needed, _ = await drop_code_audit_kind_if_soft(
         needed,
+        project_id,
         agent_id=expected_agent_id or str(task.get("assignee_id") or "") or None,
         task_id=task.get("id"),
         evidence=evidence if isinstance(evidence, dict) else None,

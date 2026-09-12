@@ -229,7 +229,15 @@ CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY = "code_audit_soft_fail"
 
 
 def evidence_has_code_audit_soft_fail(evidence: dict | None) -> bool:
-    """True when submit stamped a structured code-audit soft-fail on evidence."""
+    """True when submit stamped a structured code-audit soft-fail on evidence.
+
+    ⚠️ 安全警示（F1 修复）：``evidence`` 在 HTTP 路径是**客户端原文**
+    （``api/tasks.py`` 的 ``TaskSubmit.evidence``），任何能调 submit/approve 的
+    调用方都能伪造 ``{"code_audit_soft_fail": {"reason": "llm_failed"}}`` 骗过
+    门禁。因此本函数**不得**再作为任何门禁的放行判据使用——门禁侧一律走
+    服务端复核 ``resolve_soft_fail_kind``（读 ``tool_attestations`` 平台落库
+    行）。此处保留为纯判读工具（UI/兼容 + 回归测试的可观测面），不参与放行。
+    """
     if not isinstance(evidence, dict):
         return False
     stamp = evidence.get(CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY)
@@ -238,29 +246,56 @@ def evidence_has_code_audit_soft_fail(evidence: dict | None) -> bool:
     return str(stamp.get("reason") or "") in _SOFT_FAIL_ATTEMPT_REASONS
 
 
-def drop_code_audit_kind_if_soft(
+async def drop_code_audit_kind_if_soft(
     needed: frozenset[str] | None,
+    project_id: str,
     *,
     agent_id: str | None = None,
     task_id: str | None = None,
     evidence: dict | None = None,
 ) -> tuple[frozenset[str] | None, bool]:
-    """Approve/HTTP-time compat: drop CODE_AUDIT_KIND ONLY on a stamped soft-fail.
+    """Approve/HTTP-time compat: drop ``CODE_AUDIT_KIND`` only on a
+    **server-verified** platform fact row.
 
-    P0-3 (TEST_DSH_38) fail-loud: an in-memory llm_failed attempt no longer
-    drops the kind anywhere — submit rejects and demands a retry or an
-    explicit coordinator waive. This drop survives ONLY for the approve/HTTP
-    re-check of a task whose evidence carries the stamp (i.e. submitted under
-    legacy rules, or submitted under a valid waiver), so an approve is never
-    re-blocked on history the submit gate already decided. The ``agent_id`` /
-    ``task_id`` params are kept for signature compat but no longer trigger a
-    drop by themselves.
+    两条同构事实位，**都只认 ``tool_attestations`` 平台落库行**：
+
+    1. ``code_audit_soft_fail``（F1）——submit 门禁判定软失败时由平台签发。
+       此前本分支读客户端 ``evidence`` 盖章（``evidence_has_code_audit_soft_fail``）：
+       HTTP 路径的 ``evidence`` 是 ``api/tasks.py`` 的 ``TaskSubmit.evidence``
+       **客户端原文**，任何调用方自带
+       ``{"code_audit_soft_fail": {"reason": "llm_failed"}}`` 即可跳过 code_audit
+       门（llm_failed / no_model / no_callback 三值全中）⇒ 零 attestation 过门。
+       现改为服务端复核 ``resolve_soft_fail_kind(project_id, task_id)``。evidence
+       盖章仍由 submit 写入（UI/兼容用），但**不再是门禁判据**。
+    2. ``attestation_impossible``（报告 Layer 6 第 4 行）——
+       ``resolve_impossible_kind(project_id, task_id)`` 服务端复核。
+
+    **fail-closed**：拿不到平台事实（无行 / 查询失败 / 解析不出）⇒ 不剔除、
+    保持原门禁。``project_id`` 是**必需参数**——复核在漏斗内部完成，调用方无法
+    「忘记传参」退回旧洞。``agent_id`` / ``evidence`` 仅为签名兼容保留，不参与
+    判定。
+
+    **F3**：剔除的 kind 固定为 ``CODE_AUDIT_KIND``，要求解析出的 need **恰等于**
+    ``CODE_AUDIT_KIND`` 才剔除——不把「剔哪个 kind」交给事实行内容。
+
+    P0-3 (TEST_DSH_38) fail-loud: an in-memory llm_failed attempt never drops the
+    kind at submit.
     """
     if not needed or CODE_AUDIT_KIND not in needed:
         return needed, False
-    if evidence_has_code_audit_soft_fail(evidence):
-        leftover = frozenset(k for k in needed if k != CODE_AUDIT_KIND)
-        return leftover, True
+    # Lazy import: avoid a services↔services module-level import cycle
+    # (attestation.py lazily imports this module too).
+    from hiveweave.services.attestation import (
+        resolve_impossible_kind,
+        resolve_soft_fail_kind,
+    )
+
+    soft_need = await resolve_soft_fail_kind(project_id, task_id)
+    if soft_need == CODE_AUDIT_KIND:
+        return frozenset(k for k in needed if k != CODE_AUDIT_KIND), True
+    impossible_need = await resolve_impossible_kind(project_id, task_id)
+    if impossible_need == CODE_AUDIT_KIND:
+        return frozenset(k for k in needed if k != CODE_AUDIT_KIND), True
     return needed, False
 
 

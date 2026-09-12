@@ -229,6 +229,33 @@ async def _submit_preflight(
             task_id=str(task_id)[:8],
             policy_id=policy_id,
         )
+    # ── 报告 Layer 6 第 4 行（歪招典藏）：把「凭证物理上无法签发」做成结构化
+    # 事实、由门禁自己消化。典型：任务已 merge ⇒ 分支相对 MAIN 已无 diff ⇒
+    # request_code_audit 结构上发不出 PASS。这不是「质量不够所以豁免」，
+    # 因此不该教人去 waive_attestation（豁免入口保留，默认路径不再需要）。
+    # 检测 fail-closed：不可证（无 worktree / git 不可判 / 有 ISSUES 前科）
+    # 时返回 None，原门禁 + 人工豁免路径逐字不变。
+    impossible: dict | None = None
+    if needed and CODE_AUDIT_KIND in needed:
+        from hiveweave.services.attestation import detect_attestation_impossible
+
+        try:
+            impossible = await detect_attestation_impossible(
+                project_id, agent_id, task_id, needed
+            )
+        except Exception as _imp_e:  # noqa: BLE001 — 检测失败保持原门禁
+            log.debug(
+                "submit_attestation_impossible_probe_failed", error=str(_imp_e)
+            )
+            impossible = None
+        if impossible:
+            log.info(
+                "submit_attestation_impossible",
+                agent_id=agent_id,
+                task_id=str(task_id)[:8],
+                reason=impossible.get("reason"),
+                detail=impossible.get("detail"),
+            )
     attest_ids = list(params.attestation_ids or [])
 
     # Drop code_audit ids only when the policy does not require that kind
@@ -355,14 +382,28 @@ async def _submit_preflight(
         # Waiver 短路：coordinator 已显式豁免（CLI/脚本类任务正式出口）
         from hiveweave.services.attestation import has_valid_waiver
 
-        if not await has_valid_waiver(project_id, task_id):
+        # 门禁自行消化：物理无法签发的 kind 从本轮必需清单里剔除（边界见
+        # detect_attestation_impossible docstring —— 只有可证「无 diff 可审」
+        # 才命中；不可证/有 ISSUES 前科时 impossible=None，本清单不变）。
+        gate_needed = needed
+        if impossible and CODE_AUDIT_KIND in needed:
+            gate_needed = frozenset(
+                k for k in needed if k != CODE_AUDIT_KIND
+            )
+            log.info(
+                "submit_attestation_impossible_gate_self_consumed",
+                agent_id=agent_id,
+                task_id=str(task_id)[:8],
+                dropped=CODE_AUDIT_KIND,
+            )
+        if not await has_valid_waiver(project_id, task_id) and gate_needed:
             # TEST4: auto-attach recent matching attestations if LLM omitted ids
             if not attest_ids:
                 attest_ids = await attestation_service.find_recent_for_agent(
                     project_id,
                     agent_id=agent_id,
                     task_id=task_id,
-                    kinds=needed,
+                    kinds=gate_needed,
                 )
                 if attest_ids:
                     log.info(
@@ -375,7 +416,7 @@ async def _submit_preflight(
                 project_id,
                 attest_ids,
                 expected_agent_id=agent_id,
-                expected_kinds=needed,
+                expected_kinds=gate_needed,
                 task_id=task_id,
             )
             if not ok:
@@ -450,7 +491,7 @@ async def _submit_preflight(
                             )
                         ),
                     })
-                if audit_soft:
+                if audit_soft and CODE_AUDIT_KIND in gate_needed:
                     issues.append({
                         "code": "audit_soft_fail_gate",
                         "message": (
@@ -464,7 +505,11 @@ async def _submit_preflight(
                             "have a coordinator run waive_attestation(taskId=\""
                             f"{task_id}\", reason=\"audit unavailable\", "
                             "reasonKind=\"tool_failure\") — a real human "
-                            "decision."
+                            "decision. (A structurally IMPOSSIBLE audit — "
+                            "e.g. the branch has no diff left because it is "
+                            "already merged — is NOT this case: the gate "
+                            "records attestation_impossible(reason="
+                            "tool_limited) itself and needs no waiver.)"
                         ),
                     })
     elif params.tests_passed is not True:
@@ -513,6 +558,15 @@ async def _submit_preflight(
         evidence["files_changed"] = normalize_files_changed(params.files_changed)
     if params.test_output:
         evidence["test_output"] = params.test_output[:4000]
+    # ── F1：软失败「平台判定」点 ────────────────────────────────────────────
+    # 触发条件是 ``audit_soft`` = ``code_audit_soft_fail_pending(needed, agent_id,
+    # task_id)``，即 **平台**根据 policy 必需清单 + 进程内审计尝试记录
+    # (``get_last_audit_attempt``，由 run_code_audit 的 record_audit_attempt
+    # 写入) 判定，reason 亦取自该平台记录 —— **不是客户端输入**。
+    # 这里除写 evidence 盖章（UI/兼容用，approve 侧已不再信它）之外，还必须在
+    # 真实提交时补落一条**持久事实行**（见 submit_task_tool 的
+    # record_code_audit_soft_fail 调用）——那才是 approve/HTTP 门禁的服务端复核
+    # 判据。
     if audit_soft:
         from hiveweave.services.code_audit import (
             CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY,
@@ -876,6 +930,9 @@ async def _submit_preflight(
         "ui_verify": ui_verify,
         "skip_delivery_gate": skip_delivery_gate,
         "evidence": evidence,
+        "impossible": impossible,
+        # F1：平台判定的软失败（供提交时补落持久事实行；dry-run 不写库）。
+        "audit_soft": audit_soft,
     }
 
 
@@ -892,7 +949,11 @@ async def _submit_preflight(
     "request_code_audit soft-fails (llm_failed/no_model/no_callback), the "
     "gate stays CLOSED: retry once; if it keeps failing, ask your "
     "coordinator/superior to run waive_attestation(taskId, reason) — a "
-    "silent re-submit just gets rejected again. "
+    "silent re-submit just gets rejected again. If instead the audit is "
+    "STRUCTURALLY IMPOSSIBLE (your branch has no diff vs MAIN — e.g. the "
+    "task is already merged), the gate records a structured fact "
+    "attestation_impossible(reason=tool_limited) and consumes it itself: "
+    "no waiver needed. "
     "docs/explore tasks may use tags docs/explore. "
     "If taskId omitted, auto-detects your current running task. "
     "See PLATFORM MECHANISMS (system prompt) for gate semantics.",
@@ -984,10 +1045,19 @@ async def submit_task_tool(
     # ── dry-run：只读预检，列出全部缺失项，零写操作 ──
     if getattr(params, "dry_run", False):
         if preflight["ok"]:
+            _dr_note = ""
+            if preflight.get("impossible"):
+                _dr_note = (
+                    "\n[attestation_impossible] 本任务的 code_audit 凭证物理"
+                    "无法签发（reason=tool_limited，worktree 相对基准无 diff）"
+                    "——门禁已自行消化该 kind，无需人工豁免；提交时会落一条"
+                    "结构化事实位供审计。"
+                )
             return ToolResult.ok(
-                "submit_task dry-run: 所有前置条件已满足，可以提交。",
+                "submit_task dry-run: 所有前置条件已满足，可以提交。" + _dr_note,
                 dry_run=True,
                 missing=[],
+                impossible=preflight.get("impossible") or None,
             )
         return ToolResult.ok(
             "submit_task dry-run: 以下前置条件未满足，提交将被拒绝：\n"
@@ -1031,6 +1101,63 @@ async def submit_task_tool(
                 claim_check_lines = format_claim_check_lines(_checks)
         except Exception as e:  # noqa: BLE001
             log.debug("verdict_claim_check_failed", task_id=task_id, error=str(e))
+
+    # ── 报告 Layer 6 第 4 行：门禁自行消化的「凭证物理无法签发」事实位 ──
+    # 结构化事实落成 tool_attestations 行（kind=attestation_impossible，平台
+    # 签发），并同步进 evidence —— 事后可审计「谁在何时因何结构原因免检」，
+    # 而不是像豁免那样只留下「CEO 关了闸」。落库失败不回滚提交（事实行是
+    # 观测面，不是门禁判据）。
+    impossible_info = preflight.get("impossible")
+    if impossible_info:
+        from hiveweave.services.attestation import (
+            ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY,
+            record_attestation_impossible,
+        )
+
+        _imp_stamp: dict[str, Any] = {
+            "reason": impossible_info.get("reason"),
+            "need": impossible_info.get("need"),
+            "detail": impossible_info.get("detail"),
+            "detected_at": impossible_info.get("detected_at"),
+            "consumed_by": "submit_gate",
+        }
+        try:
+            _imp_id = await record_attestation_impossible(
+                project_id,
+                agent_id=agent_id,
+                task_id=task_id,
+                info=impossible_info,
+            )
+            _imp_stamp["attestation_id"] = _imp_id
+        except Exception as _rec_e:  # noqa: BLE001 — 观测面失败不阻断提交
+            log.warning(
+                "submit_record_attestation_impossible_failed", error=str(_rec_e)
+            )
+        evidence[ATTESTATION_IMPOSSIBLE_EVIDENCE_KEY] = _imp_stamp
+
+    # ── F1：软失败也走持久化平台事实（与 attestation_impossible 同构）──────
+    # 提交通过（非 dry-run）时，为平台判定的软失败补落一条
+    # tool_attestations 事实行（kind=code_audit_soft_fail，平台签发）。approve/
+    # HTTP 门禁只认这条落库行（``resolve_soft_fail_kind``），**不再信 evidence**
+    # ——否则任何调用方自带 ``{"code_audit_soft_fail": {"reason": "llm_failed"}}``
+    # 即可零 attestation 过门。落库失败不回滚提交（与 impossible 事实同语义：
+    # 观测面失败不阻断提交；缺失的后果只是 approve 侧更严——保持原门禁）。
+    if preflight.get("audit_soft"):
+        from hiveweave.services.attestation import record_code_audit_soft_fail
+        from hiveweave.services.code_audit import CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY
+
+        _soft_stamp = evidence.get(CODE_AUDIT_SOFT_FAIL_EVIDENCE_KEY) or {}
+        try:
+            await record_code_audit_soft_fail(
+                project_id,
+                agent_id=agent_id,
+                task_id=task_id,
+                reason=str(_soft_stamp.get("reason") or "llm_failed"),
+            )
+        except Exception as _soft_e:  # noqa: BLE001 — 观测面失败不阻断提交
+            log.warning(
+                "submit_record_code_audit_soft_fail_failed", error=str(_soft_e)
+            )
 
     try:
         # Auto-transition: if task is in 'created' or 'claimed' status,
@@ -1126,6 +1253,15 @@ async def submit_task_tool(
                 "\n[claim_check] blockingIssues 文件级主张机械复核"
                 "（事实位，不改变 verdict，仅供 reviewer 参考）：\n"
                 + "\n".join(claim_check_lines)
+            )
+        if impossible_info:
+            receipt += (
+                "\n[attestation_impossible] code_audit 凭证物理无法签发"
+                f"（reason={impossible_info.get('reason')}, "
+                f"detail={impossible_info.get('detail')}）：门禁已自行消化，"
+                "未走人工豁免；结构化事实位已落库（tool_attestations + "
+                "evidence）。如该事实判定有误，仍可用 waive_attestation 人工"
+                "覆盖或让上游重新指派任务。"
             )
         return ToolResult.ok(receipt)
     except Exception as e:

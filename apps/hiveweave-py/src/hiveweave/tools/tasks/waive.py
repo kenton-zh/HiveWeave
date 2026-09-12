@@ -79,6 +79,12 @@ class WaiveAttestationParams(BaseModel):
             "审批权；quality = 真实质量类豁免（凭证缺失但质量可接受）——"
             "发起人失审批权（第三方隔离，小团队唯一 REVIEW holder 例外）。"
             "拿不准就填 quality（默认收紧）。"
+            "注意：**凭证物理上无法签发**（如任务已 merge ⇒ 分支相对 MAIN "
+            "已无 diff ⇒ request_code_audit 结构上发不出 PASS）已由 submit "
+            "门禁自己检测并落结构化事实位 "
+            "attestation_impossible(reason=tool_limited)，默认路径不需要"
+            "调用本工具——本豁免入口保留，用于人工覆盖该事实判定，或用于"
+            "真正的工具/上游失败与质量类豁免。"
         ),
         json_schema_extra={"aliases": ["reasonKind", "reason_kind", "kind"]},
     )
@@ -131,7 +137,13 @@ async def _agent_has_open_verify(project_id: str, agent_id: str) -> bool:
     "VERIFY waive is CEO-only. Prefer attest_doc_review for document "
     "VERIFY unless CEO waives that one task. "
     "Never waive a verdict=FAIL conclusion — waiver covers MISSING attestation "
-    "only; a FAIL result must be reworked, not excused.",
+    "only; a FAIL result must be reworked, not excused. "
+    "This entry is RETAINED but is no longer the default path for a "
+    "credential that is physically impossible to issue (e.g. code_audit on "
+    "an already-merged branch with no diff): the submit gate now detects "
+    "that, records attestation_impossible(reason=tool_limited), and consumes "
+    "it itself. Use this tool to override that fact by hand, or for genuine "
+    "tool/upstream failures and real quality exemptions.",
     requires_workspace=False,
     security_level="standard",
 )

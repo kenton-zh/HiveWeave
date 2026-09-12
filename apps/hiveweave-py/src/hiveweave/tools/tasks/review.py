@@ -274,8 +274,9 @@ async def review_task_tool(
             needed = required_attestation_kinds(policy_id)
             from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
 
-            needed, _ = drop_code_audit_kind_if_soft(
+            needed, _ = await drop_code_audit_kind_if_soft(
                 needed,
+                project_id,
                 agent_id=str(task.get("assignee_id") or "") or None,
                 task_id=params.task_id,
                 evidence=evidence,
