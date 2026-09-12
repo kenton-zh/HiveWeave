@@ -143,11 +143,12 @@ export const ASSET_URLS = {
   OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png?v=chair2",
   OFFICE_FRONTDESK_SET: "/office-assets/office-frontdesk-set.png",
   /** 紫衣女孩动画表 v2（2026-09-08：MiniMax H3 本地视频生成抽帧，4×2 = 8 帧全
-   *  身坐姿 96×96：帧 0-3 打字循环、帧 4-7 坐姿呼吸。侧视朝左（与 v1 同向），
-   *  内容底 y=84 = anchor 0.875 鞋底；打字/坐姿两组共用同一联合 bbox 摆放，
-   *  切换动作不缩放不跳动。腿部仍由桌套件 front 片运行时遮挡。）
+   *  身坐姿 96×96：帧 0-3 打字循环、帧 4-7 坐姿呼吸。侧视朝右（与 v1/dev 同向，
+   *  B 位引擎翻转后朝左对桌；生成帧原始朝左，已整体镜像）。内容底 y=84 =
+   *  anchor 0.875 鞋底；打字/坐姿两组共用同一联合 bbox 摆放，切换动作不缩放
+   *  不跳动。腿部仍由桌套件 front 片运行时遮挡。）
    *  v1（4 帧打字）备份于 agent-purple-typing-sheet.png。 */
-  AGENT_PURPLE: "/office-assets/agent-purple-anim-sheet.png?v=h3v1",
+  AGENT_PURPLE: "/office-assets/agent-purple-anim-sheet.png?v=h3v2",
 } as const;
 
 /** 全部需预载的资产 URL（OfficeScene.mount 中统一 Assets.load） */
@@ -183,8 +184,8 @@ export const SHEET_LAYOUTS: Record<string, SheetLayout> = {
 };
 
 /**
- * 紫衣女孩动画帧表 v2（4×2 = 8 帧：0-3 打字循环、4-7 坐姿呼吸，均侧视朝左）。
- * working/idle/working→呼吸 在两套坐姿动作间切换；坐下/起身无独立帧，指向静态帧。
+ * 紫衣女孩动画帧表 v2（4×2 = 8 帧：0-3 打字循环、4-7 坐姿呼吸，均侧视朝右）。
+ * working/idle 在两套坐姿动作间切换；坐下/起身无独立帧，指向静态帧。
  */
 export const PURPLE_ANIM_SEQS: Record<AgentAnimKey, number[]> = {
   idle: [4, 5, 6, 7],
