@@ -267,13 +267,47 @@ async def on_tool_call(
     if step_id:
         await agent._run_ledger.mark_step_started(agent.id, step_id)
 
-    result = await agent._tool_executor.execute(
-        agent_id=agent.id,
-        tool_name=tool_name,
-        tool_args=tool_args,
-        workspace_path=workspace,
-        project_root=project_ws,
-    )
+    try:
+        result = await agent._tool_executor.execute(
+            agent_id=agent.id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            workspace_path=workspace,
+            project_root=project_ws,
+        )
+    except Exception as exc:
+        # 真根因修复（2026-09-13 TEST_DSH_55 P0-3，逐条见
+        # docs/platform-issue-research/verify-2026-09-13/issue-3.md §2.4）：
+        # execute() 过去**没有防护栏** —— 工具层任一未预期异常（实测主因是
+        # finalize_tool_result 里 assert_fact_complete 的硬抛 AssertionError，
+        # 55/115）会直接砸穿本函数，使下面的 record_step_end 被跳过 ⇒ 该行
+        # 永久滞留 status='running' ⇒ 数分钟后被 sweep 一律改判
+        # outcome_unknown（实测 115 步，其中 ≥48% 结果其实已知）。
+        # 现在：先把这次「结果未知」写进账本（runner_failed=True），
+        # 再**原样抛出**（裸 raise 保留 traceback）—— 上层 tool_exec 的
+        # [Tool Error] 路径与模型可见内容保持不变，不改变既有语义。
+        if step_id:
+            try:
+                await agent._run_ledger.record_step_end(
+                    agent_id=agent.id,
+                    step_id=step_id,
+                    status="failed",
+                    result_hash=None,
+                    result_size=0,
+                    error=(
+                        f"{type(exc).__name__}: {exc} —— 工具层异常，"
+                        "结果未知（可能已执行，勿直接重试）"
+                    ),
+                    result_excerpt=f"{type(exc).__name__}: {exc}",
+                    # ⚠ **不标 runner_failed**（审计 P0-3 第 1 条）：该格语义是
+                    # 「命令从未执行」⇒ 下游读成「无副作用、可直接重试」。而本
+                    # except 的触发点**在执行之后** ⇒ 命令可能已经执行过，标它
+                    # 就是把「可能已有副作用」误报成「必然无副作用」——正是本批
+                    # 要防的**副作用双发**。留 None（未确定）比标错安全。
+                )
+            except Exception as ledger_exc:
+                log.debug("run_ledger.step_end_failed", error=str(ledger_exc))
+        raise
 
     # ── Durable Run Ledger: record step end ──
     if step_id:
