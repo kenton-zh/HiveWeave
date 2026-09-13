@@ -446,6 +446,41 @@ def test_set_run_fact_persists_cache_drifts():
     )
 
 
+def test_set_run_fact_persists_first_mismatch_index_in_cache_drifts():
+    """issue-5 §3.2 ④(b)：first_mismatch_index 必须随 cache_drifts 落库。
+
+    路径 = `agent._cache_drifts_payload`（构造载荷）→ `set_run_fact`（写库）。
+    不放新列，直接进既有 JSON；此处锁死"下标被丢弃会转红"。
+    """
+    import json
+
+    from hiveweave.agents.agent import _cache_drifts_payload
+
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "completed", started=1)
+    ledger = RunLedger()
+
+    payload = _cache_drifts_payload(
+        {"drifts": ["history_rewritten"], "first_mismatch_index": 41}
+    )
+    with _patched_db(fake):
+        asyncio.run(
+            ledger.set_run_fact(
+                "a1", "r1",
+                cache_verdict="drift_zero_hit",
+                cache_drifts=payload,
+            )
+        )
+
+    row = fake.conn.execute(
+        "SELECT cache_verdict, cache_drifts FROM agent_runs WHERE id = 'r1'"
+    ).fetchone()
+    assert row[0] == "drift_zero_hit"
+    decoded = json.loads(row[1])
+    assert decoded["first_mismatch_index"] == 41
+    assert decoded["drifts"] == ["history_rewritten"]
+
+
 def test_set_run_fact_skips_none_drifts():
     """无漂移（None / 空）不写 —— 保持"未确定"语义，别把 NULL 写成 '[]'。"""
     fake = _FakeDb()

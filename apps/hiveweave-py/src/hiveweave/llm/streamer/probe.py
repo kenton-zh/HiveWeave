@@ -155,6 +155,7 @@ def compare_and_record(
             "gap_s": None,
             "prev_dialog_len": None,
             "dialog_len": fp["dialog_len"],
+            "first_mismatch_index": None,
         }
         _last_verdict[agent_id] = verdict
         return verdict
@@ -176,10 +177,21 @@ def compare_and_record(
         drifts.append("compacted_drift")
     prev_d = prev["dialog_hashes"]
     cur_d = fp["dialog_hashes"]
+    first_mismatch_index: int | None = None
     if prev_d != cur_d[: len(prev_d)]:
         # 上次首请求的对话主体未原样作为本次前缀重现 —— 中段被改写
         # 或上 run 的对话未正常落库追加。
         drifts.append("history_rewritten")
+        # issue-5 §3.2 ④(b)：算出**首个不一致位置**。本仓库实测的
+        # `history_rewritten` 假阳签名是「不一致点恒在末位」
+        # （发送版 user 消息带 exit_hint、落库版不带 ⇒ len(prev_d)-1）。
+        # 落了这个下标就能一眼区分「末位单点 ≠ 中段改写」，不必再靠推理。
+        limit = min(len(prev_d), len(cur_d))
+        first_mismatch_index = limit  # cur 比 prev 短 ⇒ 在 cur 耗尽处首次不一致
+        for i in range(limit):
+            if prev_d[i] != cur_d[i]:
+                first_mismatch_index = i
+                break
 
     verdict = {
         "verdict": "+".join(drifts) if drifts else "prefix_stable",
@@ -187,6 +199,7 @@ def compare_and_record(
         "gap_s": round(max(0.0, fp["ts"] - prev["ts"]), 1),
         "prev_dialog_len": prev["dialog_len"],
         "dialog_len": fp["dialog_len"],
+        "first_mismatch_index": first_mismatch_index,
     }
     _last_verdict[agent_id] = verdict
     return verdict

@@ -120,6 +120,35 @@ _MAIN_LOOP_STREAM_RETRIES = int(
     os.environ.get("HIVEWEAVE_MAIN_LOOP_STREAM_RETRIES", "2")
 )
 
+#: 平台→用户无 LLM 通告的**进程内幂等集**（issue-2 §4.1 修正③）。
+#: 402 余额熔断天然只响一次；429 月额度没有这个天然性 —— 停车是「每次必败
+#: 唤醒都重进」的（TEST_DSH_55 实测 `agent_waits.ref='quota_reset'` 24 行），
+#: 不去重会给用户刷最多 24 条近重复消息。键形如
+#: `platform-notice:quota:{project_id}:{reset_at_epoch}`，跨 agent 共享
+#: （同一项目同一配额窗口只发一条）。DB 侧另有一层查重兜底（进程重启后
+#: 仍不重复），此处是快路径。
+_sent_platform_notices: set[str] = set()
+
+
+def _cache_drifts_payload(probe: dict | None) -> str | None:
+    """把探针 verdict 的漂移明细 + 首个不一致下标序列化成 `cache_drifts` 值。
+
+    issue-5 §3.2 ④(b)：`first_mismatch_index` 必须随明细落库。为避免 schema
+    迁移，直接放进既有的 `cache_drifts` JSON：`{"drifts": [...],
+    "first_mismatch_index": N}`。无漂移时返回 None（保持"未确定"语义，
+    不把 NULL 写成 '[]' —— 与既有 test_set_run_fact_skips_none_drifts 一致）。
+    """
+    drifts = (probe or {}).get("drifts") or []
+    if not drifts:
+        return None
+    return json.dumps(
+        {
+            "drifts": drifts,
+            "first_mismatch_index": (probe or {}).get("first_mismatch_index"),
+        },
+        ensure_ascii=False,
+    )
+
 
 async def _flush_usage_at_loop_exit(agent: object, *, reason: str) -> None:
     """循环出口前把 sink 里「已推进但尚未落库」的 usage 交接给恢复路径落账。
@@ -1464,19 +1493,19 @@ class Agent:
                         # 一停就再也答不出"漂移的是哪一段前缀"。也可能出现
                         # cold_start（无可读缓存域）—— 与 drift 分开记，
                         # 免得把"必然零命中"当成"平台改写了前缀"去排查。
+                        # issue-5 §3.2 ④(b)：把探针新算出的
+                        # `first_mismatch_index`（首个不一致下标）一并落库。
+                        # 不放新列、不改 schema —— 直接放进既有的 `cache_drifts`
+                        # JSON 结构（`agent_runs.cache_drifts` 为 TEXT，无
+                        # 类型约束，存量行仍是旧数组形态，新行读得出下标即可）。
+                        # 语义：不一致点 == prev_dialog_len-1 ⇒ 末位单点（本仓
+                        # 已实测的假阳签名）；居中 ⇒ 真·中段改写。
                         if _probe and self._current_run_id:
                             await self._run_ledger.set_run_fact(
                                 self.id,
                                 self._current_run_id,
                                 cache_verdict=_probe.get("final"),
-                                cache_drifts=(
-                                    json.dumps(
-                                        _probe.get("drifts") or [],
-                                        ensure_ascii=False,
-                                    )
-                                    if _probe.get("drifts")
-                                    else None
-                                ),
+                                cache_drifts=_cache_drifts_payload(_probe),
                             )
                 except Exception as probe_err:
                     log.debug(
@@ -2480,9 +2509,10 @@ class Agent:
         error_msg: str,
         reset_at_epoch: float | None,
         reason: str = "daily_quota",
+        is_daily: bool = False,
     ) -> None:
         """Park agent until quota reset — stop doomed 429 retry loops (TEST20 P0-B)."""
-        return await _agent_recovery.park_after_quota_exhausted(self, inbox_ids=inbox_ids, error_msg=error_msg, reset_at_epoch=reset_at_epoch, reason=reason)
+        return await _agent_recovery.park_after_quota_exhausted(self, inbox_ids=inbox_ids, error_msg=error_msg, reset_at_epoch=reset_at_epoch, reason=reason, is_daily=is_daily)
 
     async def _count_recent_ask_gate_rejections(self, window_ms: int = 30 * 60 * 1000) -> int:
         """Count recent commit_turn rejections caused by UNREPLIED_ASKS (DB evidence).
@@ -3329,13 +3359,100 @@ class Agent:
         """
         return _agent_streaming.broadcast_agent_health(self, health, message)
 
-    async def _notify_user_balance_exhausted(self, error_msg: str) -> None:
-        """通知用户：账号余额耗尽，所有 agent 已暂停唤醒（TEST19 P0-2）。
+    async def _notify_user_balance_exhausted(
+        self,
+        error_msg: str,
+        *,
+        reason: str = "balance_402",
+        reset_at_epoch: float | None = None,
+    ) -> None:
+        """平台→用户无 LLM 通告：账号级失能（402 余额 / 429 月额度）。
 
         走 message_user 同款通道（ChatMessageService + status_event_bus），
-        消息落在触发 agent 的聊天窗口。失败静默吞掉 —— 通知是尽力而为，
-        熔断本身已由 broadcast_balance_exhausted 保证。
+        消息落在触发 agent 的聊天窗口，**不需要任何 Agent 回合** —— 这正是
+        TEST_DSH_55 事故里唯一能在「全员被额度打停」时仍触达用户的通道
+        （`recovery.py` 原有的 `_inbox.send_message(to_agent_id="user")` 收件人
+        不存在，是死通道）。
+
+        入参（issue-2 §4.1 修正②：文案必须参数化，不得把 402 事实写给 429）：
+        - ``reason``：``"balance_402"``（默认，保持 402 调用点零改动）或
+          ``"daily_quota"``（429 月/窗口额度耗尽）。
+        - ``reset_at_epoch``：配额重置时刻（epoch 秒），仅 daily_quota 有意义。
+
+        去重（issue-2 §4.1 修正③）：``reason="daily_quota"`` 时按
+        ``platform-notice:quota:{project_id}:{reset_at_epoch}`` 幂等；402 保持
+        原有语义（由全局熔断天然只发一次）。
+
+        **调用方注意**：本函数只发通知，**不**负责熔断。429 月额度的正确暂停
+        已由 ``broadcast_project_capacity_pause`` 完成；切勿在此调
+        ``broadcast_balance_exhausted``（那是 402 的 1 小时全局熔断，套在
+        8 天窗口上语义错误）。
         """
+        dedupe_key: str | None = None
+        if reason == "daily_quota":
+            # ⚠ 幂等键必须**量化**：`parse_quota_reset` 在 provider 只回相对
+            # `Retry-After`（或 HTTP-date）时给的是 now+secs ⇒ 每次调用 reset 都在
+            # 漂移（审计实测同窗口 4 次调用漂移 0/3/7/12 秒 ⇒ 秒级键会发 4 条、
+            # 等同无去重）。量化到 **UTC 小时桶**：秒级漂移被吸收，而相差 1 小时的
+            # 真窗口变化仍会重发（按"日"量化会把同一天的两个窗口误并）。
+            reset_token = (
+                time.strftime("%Y-%m-%dT%H", time.gmtime(float(reset_at_epoch)))
+                if reset_at_epoch
+                else "unknown"
+            )
+            dedupe_key = (
+                f"platform-notice:quota:{self.project_id}:{reset_token}"
+            )
+            if dedupe_key in _sent_platform_notices:
+                return
+            # 先占位再 await：两次并发调用会在 DB 查重的 await 窗口内**都**通过上面
+            # 的检查（TOCTOU）。失败路径必须归还占位，否则会把失能通告**闷掉**
+            # （宁可偶发重复，不可漏报）。
+            _sent_platform_notices.add(dedupe_key)
+            try:
+                from hiveweave.db import project as project_db
+
+                existing = await project_db.query_one(
+                    self.id,
+                    "SELECT 1 FROM chat_messages WHERE metadata LIKE ? LIMIT 1",
+                    [f"%{dedupe_key}%"],
+                )
+                if existing is not None:
+                    return
+            except Exception as e:
+                # 查重失败不阻断通知（宁可偶尔重复，不可把失能通告闷掉）。
+                log.debug(
+                    "platform_notice_dedupe_probe_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+
+        if reason == "daily_quota":
+            if reset_at_epoch:
+                local = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(float(reset_at_epoch))
+                )
+                days = max(
+                    1,
+                    int((float(reset_at_epoch) - time.time()) // 86400) + 1,
+                )
+                window = f"约 {days} 天后（{local}）重置"
+            else:
+                window = "重置时刻未知（请查 provider 控制台）"
+            content = (
+                "[PLATFORM] 账号 LLM 额度耗尽（HTTP 429，重置窗口较长），本项目所有 "
+                f"agent 已暂停唤醒，配额{window}。可更换 API key / 充值额度"
+                f"立即恢复。最近错误：{error_msg[:200]}"
+            )
+        else:
+            content = (
+                "[PLATFORM] 账号余额耗尽（HTTP 402），已全局暂停唤醒所有 "
+                f"agent 约 1 小时。请充值后等待熔断自动解除：{error_msg[:200]}"
+            )
+
+        metadata: dict = {"source": "system", "kind": "platform_notice"}
+        if dedupe_key:
+            metadata["dedupe_key"] = dedupe_key
         try:
             from hiveweave.services.chat_message import ChatMessageService
 
@@ -3343,29 +3460,24 @@ class Agent:
             await chat_service.save_message({
                 "agent_id": self.id,
                 "role": "assistant",
-                "content": (
-                    "[PLATFORM] 账号余额耗尽（HTTP 402），已全局暂停唤醒所有 "
-                    f"agent 约 1 小时。请充值后等待熔断自动解除：{error_msg[:200]}"
-                ),
+                "content": content,
                 "thinking": None,
                 "tool_calls": "[]",
                 "is_streaming": False,
                 "is_background": False,
-                "metadata": {"source": "system", "kind": "platform_notice"},
+                "metadata": metadata,
             })
             from hiveweave.realtime.event_bus import status_event_bus
 
             await status_event_bus.publish_chat_message(
                 agent_id=self.id,
-                message={
-                    "role": "assistant",
-                    "content": (
-                        "[PLATFORM] 账号余额耗尽（HTTP 402），已全局暂停唤醒 "
-                        f"所有 agent。请充值后等待熔断自动解除：{error_msg[:200]}"
-                    ),
-                },
+                message={"role": "assistant", "content": content},
             )
         except Exception as e:
+            # 发送失败必须归还占位（否则该 key 永久静音 = 失能通告被闷掉；
+            # 占位已在上面"先占位再 await"处写入，这里不再重复 add）。
+            if dedupe_key:
+                _sent_platform_notices.discard(dedupe_key)
             log.warning(
                 "notify_user_balance_failed",
                 agent_id=self.id,

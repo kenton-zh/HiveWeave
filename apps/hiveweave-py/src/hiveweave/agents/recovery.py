@@ -590,6 +590,7 @@ async def handle_error(
                 error_msg=error_msg,
                 reset_at_epoch=reset_at_epoch,
                 reason="daily_quota" if is_daily else "capacity",
+                is_daily=is_daily,
             )
             agent._cancel_safety_timer()
             await agent._go_idle()
@@ -621,6 +622,9 @@ async def handle_error(
                     error_msg=error_msg,
                     reset_at_epoch=float(reset_at) if reset_at else None,
                     reason="daily_quota",
+                    # is_daily 显式透传：长 Retry-After（非 is_daily）也会进
+                    # 本分支，用户通告只应对「月/窗口额度耗尽」发（见 park 内门禁）。
+                    is_daily=is_daily,
                 )
                 agent._cancel_safety_timer()
                 await agent._go_idle()
@@ -769,8 +773,15 @@ async def park_after_quota_exhausted(
     error_msg: str,
     reset_at_epoch: float | None,
     reason: str = "daily_quota",
+    is_daily: bool = False,
 ) -> None:
-    """Park agent until quota reset — stop doomed 429 retry loops (TEST20 P0-B)."""
+    """Park agent until quota reset — stop doomed 429 retry loops (TEST20 P0-B).
+
+    ``is_daily``：是否「月/窗口级配额耗尽」（``parse_quota_reset`` 的
+    ``is_daily_quota``，阈值 600 s）。仅当它为 True 时才向用户发无 LLM 通告
+    （issue-2 §4.1）：普通长 Retry-After 也会以 ``reason="daily_quota"`` 进
+    本函数，若只按 reason 判定，会把「等几分钟」误报成「8 天后重置 / 需换 key」。
+    """
     import time as _time
 
     from hiveweave.services.turn_result import WaitingOnItem
@@ -855,22 +866,36 @@ async def park_after_quota_exhausted(
             )
     except Exception as e:
         log.warning("quota_escalate_failed", agent_id=agent.id, error=str(e))
-    try:
-        # Notify user channel when possible
-        await agent._inbox.send_message(
-            from_agent_id=agent.id,
-            to_agent_id="user",
-            message=(
-                f"[QUOTA EXHAUSTED] Project LLM quota hit. "
-                f"Agents parked until {reset_blob}. "
-                f"Change model key in Settings or wait for reset."
-            ),
-            message_type="system",
-            priority="urgent",
-            wake=False,
-        )
-    except Exception:
-        pass
+
+    # ── 账号级额度耗尽 → 用户通告（issue-2 §4.1 建议①，TEST_DSH_55）──
+    # 走 `_notify_user_balance_exhausted`：ChatMessageService 直写 chat_messages
+    # + 事件推送，**不需要任何 LLM 回合** —— 全员被额度打停时唯一的送达路径。
+    #
+    # 只调「通知」，**绝不**调 `broadcast_balance_exhausted`：那是 402 专用的
+    # 1 小时**全局**熔断；429 是 8 天窗口，正确的暂停已由调用方
+    # `broadcast_project_capacity_pause(project_id, reset_at_epoch)` 按项目完成。
+    # 照搬 402 分支会给 8 天配额套上 1 小时全局熔断（issue-2 §4.1 修正①）。
+    #
+    # 门禁用显式 `is_daily`（而非 reason）—— 见函数 docstring。
+    if is_daily:
+        try:
+            await agent._notify_user_balance_exhausted(
+                error_msg,
+                reason="daily_quota",
+                reset_at_epoch=reset_at_epoch,
+            )
+        except Exception as e:
+            log.debug("quota_user_notice_failed", agent_id=agent.id, error=str(e))
+
+    # 死通道清理（issue-2 §3.2/§3.3）：此处原有
+    # `await agent._inbox.send_message(to_agent_id="user", ...)`，但收件人
+    # "user" 在 `agents` 表里**不存在** —— `InboxService.send_message` 经
+    # `get_project_db_for_agent` 解析收件人项目库时必抛 `ProjectDbError`
+    # （db/project.py:265-278），随后被 `except Exception: pass` 静默吞掉，
+    # 实测 `inbox.to_agent_id='user'` 恒为 0 行（TEST_DSH_55）。
+    # 「看似有守卫（try/except）」正是它骗过审计的原因；已删除，改由上方
+    # 真正可用的平台通告通道送达。**不要**再以 "user" 当 inbox 收件人。
+
     log.warning(
         "llm_quota_parked",
         agent_id=agent.id,

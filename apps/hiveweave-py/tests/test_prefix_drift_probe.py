@@ -452,3 +452,146 @@ def test_agents_are_isolated():
     compare_and_record("a1", _build_messages(), model_key=MODEL_KEY)
     v = compare_and_record("a2", _build_messages(), model_key=MODEL_KEY)
     assert v["verdict"] == "no_baseline"  # a2 不受 a1 基准影响
+
+
+# ── 10. first_mismatch_index（issue-5 §3.2 ④(b)）────────────────
+#
+# 为什么落这个下标：TEST_DSH_55 实测的 `history_rewritten` 是**假阳**，其
+# 签名是「不一致点恒在末位」（发送版 user 消息带 exit_hint、落库版不带 ⇒
+# index == prev_dialog_len-1）。落了它就能一眼区分「末位单点 ≠ 中段改写」。
+
+
+def test_first_mismatch_index_is_last_position_on_tail_only_drift():
+    """末位单点（本仓假阳签名）：index 必须恰为 prev_dialog_len-1。"""
+    h = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    # run1 首请求 dialog = [q1, a1, "go|exit_hint"]（末位带 in-flight 后缀）
+    compare_and_record(
+        "a1", _build_messages(history=h, user="go|exit_hint"), model_key=MODEL_KEY
+    )
+    # run2 历史里同一位置是**落库版**（无 exit_hint），随后追加了后续回合
+    h2 = h + [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "done"},
+    ]
+    v = compare_and_record(
+        "a1", _build_messages(history=h2, user="next"), model_key=MODEL_KEY
+    )
+    assert "history_rewritten" in v["drifts"]
+    assert v["prev_dialog_len"] == 3
+    assert v["first_mismatch_index"] == v["prev_dialog_len"] - 1, (
+        "末位单点的下标必须落在 prev_dialog_len-1 —— 这是区分假阳的判据"
+    )
+
+
+def test_first_mismatch_index_points_to_middle_on_true_rewrite():
+    """真·中段改写：index 必须指向被替换的那一条，而非末位。"""
+    h = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    compare_and_record("a1", _build_messages(history=h, user="x"), model_key=MODEL_KEY)
+    h_mid = [
+        h[0],
+        {"role": "assistant", "content": "a1-REWRITTEN"},
+        h[2],
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": "y"},
+    ]
+    v = compare_and_record(
+        "a1", _build_messages(history=h_mid, user="z"), model_key=MODEL_KEY
+    )
+    assert "history_rewritten" in v["drifts"]
+    assert v["first_mismatch_index"] == 1
+    assert v["first_mismatch_index"] != v["prev_dialog_len"] - 1
+
+
+def test_first_mismatch_index_when_current_is_strict_prefix():
+    """cur 比 prev 短且逐条前缀相同 ⇒ 首个不一致在 cur 耗尽处 = len(cur)。"""
+    compare_and_record(
+        "a1",
+        [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+        ],
+        model_key=MODEL_KEY,
+    )
+    v = compare_and_record(
+        "a1", [{"role": "user", "content": "q1"}], model_key=MODEL_KEY
+    )
+    assert "history_rewritten" in v["drifts"]
+    assert v["first_mismatch_index"] == 1
+
+
+def test_first_mismatch_index_none_when_stable_or_no_baseline():
+    """无漂移 / 无基准 ⇒ None（不得用 0 伪装成"第 0 位不一致"）。"""
+    v0 = compare_and_record("a1", _build_messages(), model_key=MODEL_KEY)
+    assert v0["verdict"] == "no_baseline"
+    assert v0["first_mismatch_index"] is None
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record("a1", _build_messages(history=h, user="q2"), model_key=MODEL_KEY)
+    v = compare_and_record(
+        "a1",
+        _build_messages(
+            history=h + [{"role": "user", "content": "q2"},
+                         {"role": "assistant", "content": "a2"}],
+            user="q3",
+        ),
+        model_key=MODEL_KEY,
+    )
+    assert v["verdict"] == "prefix_stable"
+    assert v["first_mismatch_index"] is None
+
+
+def test_first_mismatch_index_survives_readout():
+    """必须随 report_cache_readout 结果带出 —— 这是落库（cache_drifts）的来源。"""
+    h = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    compare_and_record("a1", _build_messages(history=h, user="go|hint"), model_key=MODEL_KEY)
+    compare_and_record(
+        "a1",
+        _build_messages(
+            history=h + [{"role": "user", "content": "go"},
+                         {"role": "assistant", "content": "done"}],
+            user="next",
+        ),
+        model_key=MODEL_KEY,
+    )
+    r = report_cache_readout("a1", input_tokens=1, cache_read=0, cache_creation=0)
+    assert r is not None
+    assert r["first_mismatch_index"] == r["prev_dialog_len"] - 1
+
+
+# ── 11. 落库载荷（agent.py `_cache_drifts_payload`）─────────────
+#
+# issue-5 §3.2 ④(b)：不改 schema，把 first_mismatch_index 放进既有
+# `cache_drifts` JSON。载荷构造函数在此单测，锁死"缺陷回来会转红"。
+
+
+def test_cache_drifts_payload_embeds_first_mismatch_index():
+    import json
+
+    from hiveweave.agents.agent import _cache_drifts_payload
+
+    payload = _cache_drifts_payload(
+        {"drifts": ["history_rewritten"], "first_mismatch_index": 41}
+    )
+    assert payload is not None
+    decoded = json.loads(payload)
+    assert decoded["drifts"] == ["history_rewritten"]
+    assert decoded["first_mismatch_index"] == 41, (
+        "first_mismatch_index 不得在下标字段缺失/被丢弃 —— 否则落库后仍答不出"
+        "「末位单点 vs 中段改写」"
+    )
+
+
+def test_cache_drifts_payload_none_without_drifts():
+    from hiveweave.agents.agent import _cache_drifts_payload
+
+    assert _cache_drifts_payload({"drifts": [], "first_mismatch_index": None}) is None
+    assert _cache_drifts_payload(None) is None
