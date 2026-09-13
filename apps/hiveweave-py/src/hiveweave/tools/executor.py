@@ -3248,6 +3248,7 @@ class ToolExecutor:
             # 模式直接走替代方案（不再空等 120s）。
             from hiveweave.services.approval import (
                 APPROVAL_TIMEOUT_HINT,
+                UNATTENDED_DENY_HINT,
                 approval_timeout_marked,
                 is_unattended_mode,
             )
@@ -3268,11 +3269,10 @@ class ToolExecutor:
                 _deny["fact"] = "runner_failed"
                 return _deny
             if await is_unattended_mode(_pid):
-                _deny = self._error(
-                    APPROVAL_TIMEOUT_HINT
-                    + "\n[unattended mode] 项目为无人值守模式，审批请求不"
-                    "等待审核。请改走可审计的替代方案通道或拆分目标。"
-                )
+                # 本分支没有发起过审批请求（直接走替代方案）⇒ 不得复用描述
+                # 「超时 120s、未批准也未拒绝」的 APPROVAL_TIMEOUT_HINT ——
+                # 那是给模型错误事实（TEST_DSH_55 报告 §3 第 6 条）。
+                _deny = self._error(UNATTENDED_DENY_HINT)
                 _deny["blocked"] = True
                 _deny["fact"] = "runner_failed"
                 return _deny

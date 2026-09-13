@@ -355,6 +355,7 @@ async def execute_registered_tool(
         from hiveweave.services.approval import (
             APPROVAL_TIMEOUT_HINT,
             APPROVAL_TIMEOUT_S,
+            UNATTENDED_DENY_HINT,
             PermissionRejected,
             PermissionTimeout,
             approval_timeout_marked,
@@ -386,14 +387,16 @@ async def execute_registered_tool(
             )
         # 无人值守模式：审批通道直接走替代方案（不再等 120s 空转）。
         if await is_unattended_mode(_pid):
+            # 本分支没有发起过审批请求（直接走替代方案）⇒ 不得复用描述
+            # 「超时 120s」的 APPROVAL_TIMEOUT_HINT（报告 §3 第 6 条）。
             return (
                 ToolResult.blocked_err(
-                    APPROVAL_TIMEOUT_HINT
-                    + "\n[unattended mode] 项目为无人值守模式，审批请求不"
-                    "等待审核。请改走可审计的替代方案通道或拆分目标。",
+                    UNATTENDED_DENY_HINT,
                     fact="runner_failed",
-                    timeout_kind="wait",
-                    timeout_ms=APPROVAL_TIMEOUT_S * 1000,
+                    # ⚠ 不得带超时字段（审计 audit-6 第 1 条）：本分支**没有等过**，
+                    # 带 `timeout_kind="wait"` + `timeout_ms=120000` 会与文案
+                    # 「本条未经 120s 超时」自相矛盾，且该字段机读落 run_steps 后
+                    # 会让超时统计多计一次**不存在的 120s 等待**。
                 )
                 .to_dict()
             )
