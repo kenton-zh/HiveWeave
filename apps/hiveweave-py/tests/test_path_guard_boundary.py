@@ -143,6 +143,31 @@ def test_precheck_blocks_foreign_tree_in_command(trees: dict[str, str]) -> None:
     assert "授权树根" in reason
 
 
+def test_precheck_names_unexpanded_variable_as_variable(
+    trees: dict[str, str]
+) -> None:
+    """未展开的 shell 变量不得被当成树 id 回显（TEST_DSH_55 §3 第 4 条实测）。
+
+    现场命令：``foreach ($sid in @('A053'..)) { $p = "...\\worktrees\\$sid\\..." }``
+    —— 平台比对的是**字面量** ``$sid``（PowerShell 的展开发生在子进程，预检看不到），
+    而旧文案写成「命令指向 worktree $sid（不是你所在的树）」，模型会把**模板变量**
+    读成**树 id**。新文案必须同时说清两件事：
+    ① 这是未展开的变量；② 展开后同样越界（否则模型会以为"展开就能过"）。
+    """
+    cmd = (
+        f'foreach ($sid in @("A045")) '
+        f'{{ $p = "{trees["project"]}/.hiveweave/worktrees/$sid/src" }}'
+    )
+    reason = precheck_command_string(cmd, trees["wt_a"])
+    assert reason is not None
+    assert reason.startswith("Command blocked:")
+    assert "未展开" in reason
+    assert "$sid" in reason  # 回显变量本身，便于模型定位
+    assert "展开后同样越界" in reason  # 关键：别让模型以为展开就能过
+    # 不得再冒充树 id（旧文案形态）
+    assert "worktree $sid（不是你所在的树）" not in reason
+
+
 def test_precheck_allows_own_tree_and_normal_commands(trees: dict[str, str]) -> None:
     assert precheck_command_string("python -m pytest -q", trees["wt_a"]) is None
     assert precheck_command_string(

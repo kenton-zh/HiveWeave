@@ -1846,7 +1846,19 @@ def precheck_command_string(command: str, workspace_path: str = "") -> str | Non
                 continue
             if path_guard.is_foreign_worktree_ref(t, workspace_path):
                 # 点名越出的是**哪棵树**（多树归因的最小事实，fixplan §10.5）
-                tid = path_guard.worktree_id_in_path(t) or "?"
+                raw_tid = path_guard.worktree_id_in_path(t)
+                # 未展开的 shell 变量（$sid / ${x}）不是树 id：原样回显
+                # 「worktree $sid」会让模型把**模板变量**读成**结论**
+                # （TEST_DSH_55 §3 第 4 条实测）。此时改为明说「请先展开」。
+                if "$" in t or (raw_tid and "$" in raw_tid):
+                    shown = raw_tid or t
+                    return (
+                        "Command blocked: 命令里的 worktree 引用含未展开的 "
+                        f"shell 变量（{shown}）—— 平台比对的是字面量，"
+                        "展开后同样越界（那棵树不属于你）。"
+                        f"{path_guard.OUT_OF_BOUNDARY_HINT}"
+                    )
+                tid = raw_tid or "?"
                 return (
                     f"Command blocked: 命令指向 worktree {tid}（不是你所在的树）。"
                     f"{path_guard.OUT_OF_BOUNDARY_HINT}"
