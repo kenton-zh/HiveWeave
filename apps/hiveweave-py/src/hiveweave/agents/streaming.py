@@ -283,7 +283,8 @@ async def on_tool_call(
         # 55/115）会直接砸穿本函数，使下面的 record_step_end 被跳过 ⇒ 该行
         # 永久滞留 status='running' ⇒ 数分钟后被 sweep 一律改判
         # outcome_unknown（实测 115 步，其中 ≥48% 结果其实已知）。
-        # 现在：先把这次「结果未知」写进账本（runner_failed=True），
+        # 现在：先把这次「结果未知」写进账本（**不标 runner_failed**，理由见
+        # 下方入参处的注释），
         # 再**原样抛出**（裸 raise 保留 traceback）—— 上层 tool_exec 的
         # [Tool Error] 路径与模型可见内容保持不变，不改变既有语义。
         if step_id:

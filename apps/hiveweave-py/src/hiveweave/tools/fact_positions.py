@@ -268,9 +268,11 @@ def finalize_tool_result(
         # `[Tool Error] AssertionError: shell tool 'X' failed without a fact
         # position` 形式炸出，并打断 agents/streaming.py 的 record_step_end ⇒
         # 115 步滞留 status='running' 后被 sweep 误判 outcome_unknown。
-        # 现改为与 blocked 分支同构：记 ERROR 日志（CI/审计可捞）+ 兜底保守
-        # `runner_failed`（语义=「命令从未执行」，对 agent 是「不是你的 bug」——
-        # 保守方向：宁可让它重试，不可让它误以为环境已损坏而放弃）。
+        # 现改为与 blocked 分支同构：记 ERROR 日志（CI/审计可捞）+ 兜底
+        # `outcome_unknown`（语义=「结果未知：已记录但完成结果未持久化」）。
+        # ⚠ **不得兜底 `runner_failed`**（=「命令从未执行」⇒ 下游读成「无副作用、
+        # 可直接重试」）：本函数的触发点在**执行之后**（normalize 尾），命令可能
+        # 已执行，标它会诱发**副作用双发**（审计 P0-3 第 1 条）。
         # **严格性仍由 commit gate 保留**：`test_fact_positions_coverage.py`
         # 对签名表本身的失配依旧以断言封死。
         try:
