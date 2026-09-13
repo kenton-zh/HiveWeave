@@ -275,7 +275,10 @@ def default_ttl_ms(kind: str, agent_id: str | None = None) -> int:
 #   B. 目标 > created+TTL → 不再假装：expires_at 封顶 TTL，note 里打
 #      wakeup_reason=ttl_cap 标记，唤醒文案明说目标未到、请续等或改用
 #      schedule_alarm。
-# 解析不了的 ref（quota_reset / alarm-<uuid> 等平台内部 timer）维持旧 TTL。
+# 解析不了的 ref（quota_reset / alarm-<uuid> 等平台内部 timer）：P0-B
+# （2026-09-13）起**也走退避阶梯**并标 wakeup_reason=ttl_expire。原先直接退基础
+# TTL ⇒ 阶梯对它们完全不可达（TEST_DSH_55 实测：同一张 quota_reset 票每 15min
+# 醒一次、连醒 19 次、19 个回合全部必败）。
 
 _WAKEUP_REASON_TAG = "[wakeup_reason="
 _TIME_ONLY_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?Z?$")
@@ -340,10 +343,18 @@ def _iso_utc(target_ms: int) -> str:
     )
 
 
-def _mark_wait_note(note: str | None, reason: str, target_ms: int) -> str:
-    """Append a machine-parseable wakeup_reason tag to a wait note."""
+def _mark_wait_note(note: str | None, reason: str, target_ms: int | None) -> str:
+    """Append a machine-parseable wakeup_reason tag to a wait note.
+
+    ``target_ms=None`` 用于「**无目标 ref** 的 TTL 到期」（P0-B，2026-09-13）：
+    这类票（``quota_reset`` / ``alarm-<uuid>``）本就没有目标时刻可写，标记只带
+    reason，供 :meth:`_timer_timeout_rounds` 计入退避轮次。
+    """
     base = str(note or "").strip()
-    tag = f"{_WAKEUP_REASON_TAG}{reason} target={_iso_utc(target_ms)}]"
+    if target_ms is None:
+        tag = f"{_WAKEUP_REASON_TAG}{reason}]"
+    else:
+        tag = f"{_WAKEUP_REASON_TAG}{reason} target={_iso_utc(target_ms)}]"
     return f"{base} | {tag}" if base else tag
 
 
@@ -613,6 +624,14 @@ class WaitContractService:
         （agent 主动重挂 / 事件唤醒后重挂）不算 —— 否则快速连挂会虚增档位。
         分组在 Python 侧做（ref 需归一化，SQL 表达不了）。查询失败返回空
         dict（退基础 TTL，不拦主流程）。
+
+        ⚠ **已知残留**（审计 P0-B 第 1 条，2026-09-13，**书面接受、本轮不修**）：
+        ``r:`` 类键（解析不出目标的 ref，如 quota_reset）在 30 天窗口内**跨冻结
+        世代继承** —— 同一 agent 若 30 天内被第二次冻结，新冻结的**首票**会直接
+        沿用上次累计的档位（最坏 ×96 = 24h），而额度恢复 / 换 key **没有解除口**
+        （``clear_balance_exhausted`` 只认 402）。触发条件罕见（需 30 天内两次
+        冻结）；断链归零或补出口需要先建「429 额度恢复」入口，属独立议题。
+        本轮收益已达成：「每次 15min、无限次」→「15m→1h→6h→24h 饱和」。
         """
         conn = await _conn(project_id)
         if conn is None:
@@ -622,11 +641,19 @@ class WaitContractService:
             "WHERE agent_id = ? AND kind = 'timer' "
             "AND cleared_at IS NOT NULL AND cleared_at >= ? "
             "AND expires_at IS NOT NULL AND cleared_at >= expires_at "
-            "AND note LIKE ?",
+            "AND (note LIKE ? OR note LIKE ?)",
             [
                 agent_id,
                 now - WAIT_TIMER_BACKOFF_HISTORY_MS,
-                f"%{_WAKEUP_REASON_TAG}ttl_cap%",
+                # P0-B（2026-09-13）：容纳**两类**「TTL 到期」标记 ——
+                # ttl_cap（有可解析目标但被封顶）与 ttl_expire（无目标 ref）。
+                # 原先只认 ttl_cap ⇒ quota_reset / alarm-<uuid> 这类票永远数不到
+                # 轮次 ⇒ 退避阶梯对它们不可达（19 次复读的组织侧成因）。
+                # ⚠ 必须给**精确字面量**，不能用 `ttl_` 前缀：LIKE 的 `_` 是
+                # 单字符通配符，`%wakeup_reason=ttl_%` 会连 `ttlXboom` 一起命中
+                # （审计 P0-B 第 2 条）。
+                f"%{_WAKEUP_REASON_TAG}ttl_cap target=%",
+                f"%{_WAKEUP_REASON_TAG}ttl_expire]",
             ],
         )
         rows = await cur.fetchall()
@@ -765,7 +792,27 @@ class WaitContractService:
                     if candidate is not None and candidate > now:
                         target_ms = candidate
                 if target_ms is None:
-                    exp = now + ttl_ms
+                    # P0-B（2026-09-13 TEST_DSH_55 实证）：无目标 ref
+                    # （quota_reset / alarm-<uuid> 等平台内部 timer）过去**直接退
+                    # 基础 TTL** —— 而退避阶梯只在「有可解析目标」分支求值 ⇒ 对
+                    # quota_reset 完全不可达：同一张票每 15min 醒一次、连醒 19 次
+                    # 全部必败（额度冻结窗口 8 天）。现接回阶梯：无目标也退避
+                    # （15min→1h→6h→24h，末档饱和），并打 ttl_expire 供计数。
+                    # ⚠ level=0 的乘数是 ×1 ⇒ 纯基础 TTL，**首票行为不变**。
+                    # ⚠ 必须限定 kind=="timer"：`target_ms is None` 对
+                    # agent/task/external 同样成立，而退避阶梯与 ttl_* 标记都是
+                    # **timer 专有**语义 —— 越界会污染非 timer 票的 note 与参数
+                    # 类型（test_locked_writers_part2 用不可绑定 note 构造中途失败
+                    # 时抓到的正是这一点）。
+                    if str(kind).lower() == "timer":
+                        eff_ttl = timer_backoff_ttl_ms(
+                            ttl_ms,
+                            timer_timeout_rounds.get(_timer_rounds_key(ref), 0),
+                        )
+                        exp = now + eff_ttl
+                        note = _mark_wait_note(note, "ttl_expire", None)
+                    else:
+                        exp = now + ttl_ms
                 else:
                     # P2-8：timer 有可解析目标时刻 —— ≤TTL 按目标排队；
                     # >TTL 封顶 TTL 并打 ttl_cap 标记（唤醒文案区分，

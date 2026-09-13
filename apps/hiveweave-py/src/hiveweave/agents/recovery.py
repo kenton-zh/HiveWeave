@@ -782,8 +782,10 @@ async def park_after_quota_exhausted(
 
     note = "LLM quota exhausted"
     if reset_at_epoch:
+        # 跨天场景下裸 HH:MM 会误导（"resume after 15:34" 看不出是哪天），
+        # 而该 note 现在还会被追加 `wakeup_reason=ttl_expire` 标记（P0-B）。
         local = _time.strftime(
-            "%H:%M", _time.localtime(float(reset_at_epoch))
+            "%Y-%m-%d %H:%M", _time.localtime(float(reset_at_epoch))
         )
         note = f"LLM quota exhausted; resume after {local}"
         # Arm cooldown until reset so early wakes stay blocked

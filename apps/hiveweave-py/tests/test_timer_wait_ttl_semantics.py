@@ -5,7 +5,9 @@ expires_at 一律 = created + 15min，agent 设 4h 后目标会被虚假唤醒�
 新语义（wait_contract.replace_waits）：
   A. 目标 ≤ created+TTL → expires_at = 目标时刻（按目标排队）；
   B. 目标 > created+TTL → expires_at 封顶 TTL，note 打 ttl_cap 标记；
-  C. 解析不了目标（quota_reset / alarm-<uuid> 等平台内部 timer）→ 维持旧 TTL。
+  C. 解析不了目标（quota_reset / alarm-<uuid> 等平台内部 timer）→ **首票**走
+     基础 TTL，此后按退避阶梯放大，并标 `wakeup_reason=ttl_expire`（P0-B
+     2026-09-13；原先一律退回基础 TTL ⇒ 阶梯不可达，实测连醒 19 次）。
 game_time 唤醒文案区分 wakeup_reason=target_reached | ttl_cap。
 
 B 方案（2026-09-11，雾屿 a728cba5 空转实测）：封顶额度按**真超时轮次**
@@ -144,8 +146,15 @@ async def test_timer_target_around_ttl_boundary(task_env):
     assert wait_wakeup_reason(created_b[0]) == "ttl_cap"
 
 
-async def test_unparseable_timer_ref_keeps_legacy_ttl(task_env):
-    """C：平台内部 timer（quota_reset 等）维持旧 TTL，不打标记。"""
+async def test_unparseable_timer_ref_starts_at_base_ttl(task_env):
+    """C：平台内部 timer（quota_reset 等）**首票**仍走基础 TTL。
+
+    （原名 `..._keeps_legacy_ttl` —— P0-B 后再叫「legacy TTL」已不准确：现在是
+    「首票 = 基础 TTL（阶梯 level 0 乘数 ×1）」，此后按档位放大。）
+    P0-B（2026-09-13 改）：原断言「不打标记」已不成立 —— 无目标 ref 现在也要打
+    `ttl_expire` 以便计入退避档位。**但首票仍是基础 TTL** 这条「防退避误伤新票」
+    的判定必须保留。
+    """
     pid = task_env["project_id"]
     wc = WaitContractService()
     before = _now_ms()
@@ -154,7 +163,7 @@ async def test_unparseable_timer_ref_keeps_legacy_ttl(task_env):
     )
     w = created[0]
     assert before + TTL_MS - 2000 <= w["expiresAt"] <= before + TTL_MS + 5000
-    assert wait_wakeup_reason(w) is None
+    assert wait_wakeup_reason(w) == "ttl_expire"
 
 
 async def test_numeric_note_not_taken_as_past_target(task_env, monkeypatch):
@@ -173,7 +182,9 @@ async def test_numeric_note_not_taken_as_past_target(task_env, monkeypatch):
     w = created[0]
     assert w["expiresAt"] > before  # 不再是 1970 的立即到期
     assert before + TTL_MS - 2000 <= w["expiresAt"] <= before + TTL_MS + 5000
-    assert wait_wakeup_reason(w) is None
+    # P0-B（2026-09-13）：无目标 ref 现在标 ttl_expire（关键：**不是**
+    # target_reached —— 后者会让唤醒文案谎称「目标已到」）
+    assert wait_wakeup_reason(w) == "ttl_expire"
     # 且真实唤醒路径不会立刻把它当 target_reached 发出去
     send = AsyncMock()
     trigger = AsyncMock()
@@ -324,6 +335,34 @@ async def test_timer_backoff_escalates_after_each_real_timeout(task_env):
         assert wait_wakeup_reason(w) == "ttl_cap", f"第 {i} 轮应仍标 ttl_cap"
         ttl = w["expiresAt"] - before
         assert want - 3000 <= ttl <= want + 5000, f"第 {i} 轮 ttl={ttl} want={want}"
+        await _simulate_real_timeout(pid, EXEC)
+
+
+async def test_timer_backoff_applies_to_unparseable_refs(task_env):
+    """P0-B（2026-09-13）：**无目标 ref**（quota_reset 等）也必须走退避阶梯。
+
+    现场（TEST_DSH_55）：额度冻结的 8 天窗口里，quota_reset 这张票每 15min 醒
+    一次、连醒 19 次、19 个回合全部必败。成因是退避阶梯只在「有可解析目标」
+    分支求值 ⇒ 对无目标 ref **完全不可达**。本测试钉住「无目标也退避」。
+
+    阳性对照（必须能转红）：把 wait_contract 里 target_ms is None 分支改回
+    `exp = now + ttl_ms` 并去掉 ttl_expire 标记 → 本用例在第 1 轮断言失败。
+    """
+    pid = task_env["project_id"]
+    wc = WaitContractService()
+    expected = [TTL_MS, TTL_MS * 4, TTL_MS * 24, TTL_MS * 96]
+    for i, want in enumerate(expected):
+        before = _now_ms()
+        created = await wc.replace_waits(
+            pid, EXEC, [{"kind": "timer", "ref": "quota_reset"}], phase="waiting"
+        )
+        assert len(created) == 1
+        w = created[0]
+        assert wait_wakeup_reason(w) == "ttl_expire", f"第 {i} 轮应标 ttl_expire"
+        ttl = w["expiresAt"] - before
+        assert want - 3000 <= ttl <= want + 5000, (
+            f"第 {i} 轮 ttl={ttl} want={want}（无目标 ref 未走退避阶梯）"
+        )
         await _simulate_real_timeout(pid, EXEC)
 
 
