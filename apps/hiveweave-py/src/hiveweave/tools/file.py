@@ -235,8 +235,17 @@ READ_PATH_TOOLS: frozenset[str] = frozenset({
 # Agents copy these from bash output into read_file/write_file; Path() on
 # Windows does not map them to the real drive, so sandbox checks false-deny.
 _MSYS_DRIVE = re.compile(r"^/([a-zA-Z])(/|$)")
+# 被 rehome / 改挂过的树会带 -b/-c/-d 后缀（`constants._RELOCATION_SUFFIXES`）。
+# 2026-09-13 TEST_DSH_55 §3 第 4 条：原正则只认 `A050` 形态 ⇒ 对 `A051-b/…`
+# 判成「非规范路径」⇒ 16 步跨树读被拒（离线复现的拒绝提示与生产逐字一致）。
+# 后缀**从常量生成** —— 与 constants 同源，避免两处硬编码各自漂移。
+from hiveweave.services.git_worktree.constants import (  # noqa: E402
+    _RELOCATION_SUFFIXES,
+)
+
+_WT_SUFFIX_PAT = "|".join(re.escape(s) for s in _RELOCATION_SUFFIXES)
 _CANONICAL_WT_READ = re.compile(
-    r"^\.hiveweave/worktrees/[A-Za-z]\d{2,}(/.*)?$",
+    rf"^\.hiveweave/worktrees/[A-Za-z]\d{{2,}}(?:{_WT_SUFFIX_PAT})?(/.*)?$",
     re.IGNORECASE,
 )
 
