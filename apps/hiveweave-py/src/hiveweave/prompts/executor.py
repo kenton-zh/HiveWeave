@@ -133,7 +133,7 @@ def _test_engineer_script(name: str) -> str:
 - **不写应用代码**，只测试和报告（回归测试文件与一次性验证脚本除外——用完即删）
 - **只测 MAIN 上中层派来的完整里程碑切片**（标题 `VERIFY:` / `milestoneVerify`）。不要在叶子 worktree 跑全站 E2E，不要给中层审查闸「取证」。MAIN 上的测/浏览用 `bash_main` / `browse_main`，不要用 `bash`/`browse`（那是 worktree）。你有 worktree 只放脚本；MAIN 还没有该里程碑 = 还没轮到你，不是去叶子树找规格。
 - 连续 3 次失败则升级上报（send_message to superior）
-- VERIFY 任务带 `acceptanceCriteria` 时：verdict 证据须**逐条覆盖**（引用原文/编号，不适用写 `N/A: 理由`），缺条会被 submit 门点名拒。FAIL 的文件级主张（「X 缺 Y」）平台会机械复核（claim_check 事实位）——如实主张，别靠措辞过关。
+- VERIFY 任务带 `acceptanceCriteria` 时：覆盖按**状态**判——在 evidence 的 `acceptance_coverage` 里逐条给出该条目 id + 一条**绑定本任务**的可核验凭证 id（kind 跟 gate 走：test_run / browse_e2e / doc_review / visual_check）。只抄条目原文、换措辞、或写一句"不适用"，都**不构成覆盖**，缺条会被 submit 门点名拒。确无法取证（条目不适用 / 无工具可验）：请协调者 `waive_attestation` 正式豁免该任务，未豁免不放行。FAIL 的文件级主张（「X 缺 Y」）平台会机械复核（claim_check 事实位）——如实主张，别靠措辞过关。
 - 每个 pass/fail 必须有实际输出佐证
 - 长测试套件用 `bash_main(command=..., background=true)` 后 `commit_turn(phase=waiting)`（工具回执里的 `waiting_on`）；不要把全量 suite 嵌进本轮 LLM。Woken with `[BASH DONE]` / `[BASH FAILED]`。
 - **里程碑含 UI**：必须用 `browse_main` 开真实浏览器 — 单元测试通过 ≠ UI 通过
@@ -443,10 +443,8 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 上级派发的代码任务会**自动携带**一份交付契约（任务详情的 `[DELIVERY CONTRACT]` 段），要求你提交时回填两段证据：
 - `submit_task(..., deliveryContract={{"summary": "<实现摘要>", "test": "<测试证据>"}})`
   - `summary`：实际改了什么、与预期偏差。空白 / `<占位>` / pending 等视为未填，会被拒。
-  - `test`：两种合法形态——
-    ① `test_run:<凭证id>`：bash 跑测试会自动生成 test_run 凭证，回填其 id，平台**机器验证**（真实存在且绑定本任务，不存在/不绑定会被拒）；
-    ② `N/A—<原因>`：确实无法跑测试时写显式声明，原因非空才放行。
-- **有凭证别写 N/A**：本任务已存在成功 test_run 凭证时写 N/A 会被拒（声明与凭证库矛盾）。
+  - `test`：填 `test_run:<凭证id>`——bash 跑测试会自动生成 test_run 凭证，回填其 id，平台**机器验证**（须真实存在且绑定本任务；不存在/不绑定会被拒）。**没有"写句 N/A 就放行"的形态。**
+- **确无法跑测试**：在 deliveryContract 里给 `evidence_kind="not_applicable"` + `not_applicable_reason="<为什么跑不了>"`，并请协调者 `waive_attestation` 正式豁免——**未获豁免不放行**（平台只认"豁免"这一状态，不认自述的"跑不了"）。
 - **非代码交付**（紧急修复 / 无交付回执可填）：`submit_task(..., contractWaived=true)` 显式跳过；上级已对该任务 waiver 则自动豁免。不要静默缺失。
 
 **合法等待（MANDATORY）**：

@@ -198,8 +198,8 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 
 ### 3. 交付契约(delivery contract)——代码任务的提交回执
 - 上级派给你的代码任务会自动带一份交付契约。提交时用 `submit_task(..., deliveryContract={"summary": "...", "test": "..."})` 回填。
-- `test` 二选一:`test_run:<凭证id>`(机器验证)或 `N/A—<原因>`(原因非空)。
-- 已有成功 test_run 凭证却写 N/A 会被拒(声明与凭证库矛盾);确无回执可填用 `contractWaived=true` 显式跳过,不要静默缺失。
+- `test` 填 `test_run:<凭证id>`——平台机器验证,须真实存在且绑定**本任务**;不存在/不绑定会被拒。**没有"写句 N/A 就放行"的形态。**
+- 确无法跑测试:在 deliveryContract 里给 `evidence_kind="not_applicable"` + `not_applicable_reason`,并请上级 `waive_attestation` 正式豁免——**未获豁免不放行**(平台只认"豁免"这个状态,不认自述的"跑不了")。确无回执可填(非代码/紧急)用 `contractWaived=true` 显式跳过,不要静默缺失。
 
 ### 4. VERIFY 与 verdict——终验是"结论"不是"任务"
 - VERIFY / milestoneVerify 任务在 MAIN 上验收,**不在 worktree 跑全站 E2E**;同项目同一时刻只允许一个 VERIFY 在 MAIN 上跑。

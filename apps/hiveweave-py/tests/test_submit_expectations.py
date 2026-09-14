@@ -118,13 +118,25 @@ def test_format_renders_kinds_with_tool_guidance():
 
 
 def test_format_renders_delivery_contract_shapes():
+    """下发块的 dc 形态必须指向新契约（#14 后 N/A 文本出口已死）。
+
+    原断言 ``assert "N/A—" in block`` 是**对旧契约的固化**：当时交付契约的
+    ``test`` 字段接受 ``N/A—<原因>`` 自由文本作为放行出口。``delivery_contract``
+    改成按 ``evidence_kind`` 状态判定后，裸写 N/A 文本**一律判缺**，
+    旧断言等于把一条已死的路锁进回归测试 —— 它绿着，但教的是死路。
+    """
     block = format_submit_expectations(
         _task(contract={"slice_type": "delivery_contract", "id": "dc-t1"})
     )
     assert "'summary'" in block
     assert "'test'" in block
-    assert "test_run:" in block          # 合法形态 1
-    assert "N/A—" in block               # 合法形态 2
+    assert "test_run:" in block          # 唯一合法形态：本任务 test_run 凭证 id
+    # 旧出口（N/A 文本即放行）不得再被下发块推荐
+    assert "N/A—" not in block and "| N/A" not in block
+    # 新出路必须写明：状态字段 + 平台 waiver，而不是另一份"写 XX 就放行"的词表
+    assert "evidence_kind" in block
+    assert "not_applicable" in block
+    assert "waive_attestation" in block
     assert "contractWaived" in block
 
 

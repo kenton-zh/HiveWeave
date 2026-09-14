@@ -36,7 +36,10 @@ QA_LEAD_BLOCK = """
    反馈给实现者（附复现步骤），不要攒到 submit 才说。
 3. 里程碑 submit：门禁自动跑冻结探针；FAIL 会拒收--你的职责是让实现者
    在此之前已经见过这些失败。VERIFY 收口前核对 acceptanceCriteria 逐条
-   覆盖（verdict 证据引原文/编号或 `N/A: 理由`），缺条会被 submit 门拒。
+   覆盖按**状态**判：在 evidence 的 `acceptance_coverage` 里逐条给出该条目
+   id + 一条绑定本任务的可核验凭证 id（kind 跟 gate 走：test_run /
+   browse_e2e / doc_review / visual_check）。抄原文、换措辞、或只写"不适用"
+   都不算覆盖，缺条会被 submit 门点名拒；条目不适用须平台 waiver 正式豁免。
    **review 收口语义**：结论是 FAIL 就传 decision=rework（退回实现者），
    并**附处方**--feedback 写明要改的文件或要补的凭证；处方不是路径形态时
    用 `prescriptionKind`（missing-evidence / state-mismatch / clause-violation

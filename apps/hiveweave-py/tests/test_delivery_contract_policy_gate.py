@@ -1,10 +1,15 @@
-"""T2.4：delivery_contract 的 R1 一致性检查与 verify_ids 口径对齐。
+"""T2.4：``has_successful_test_run`` 的 policy 感知语义（现为观测用，不参与放行）。
 
-场景（TEST_DSH_35 实测）：任务 policy 只认 browse_e2e（如 ui_browser_e2e），
-工作区存在历史成功 test_run 时，契约声明写 ``N/A—<原因>`` 应被接受 ——
-被 policy 排除的 kind 不得参与「声明与凭证库矛盾」判定。
-此前 ``has_successful_test_run`` 的独立 SQL 完全不看 policy_id，
-与 attestation 门对同一凭证给出相反评价。
+场景（TEST_DSH_35 实测）：任务 policy 只认 browse_e2e（如 ui_browser_e2e）时，
+``has_successful_test_run`` 不应把被 policy 排除的 kind（如 test_run）算作
+"有成功凭证"—— 独立 SQL 完全不看 policy_id，会让它与 attestation 门对同一
+凭证给出相反评价。
+
+注意（#14 之后）：``has_successful_test_run`` 已**不再参与提交放行判定** ——
+delivery contract 侧改为按 ``evidence_kind`` 状态判定，契约 ``test`` 字段里写
+``N/A—<原因>`` 文本**不再被接受**（须 ``evidence_kind="not_applicable"`` +
+``not_applicable_reason`` 并经平台 waiver）。本文件只锁该函数的 policy 感知
+行为，**不代表 N/A 文本仍是合法出口**。
 """
 from __future__ import annotations
 

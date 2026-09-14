@@ -142,8 +142,10 @@ class SubmitTaskParams(BaseModel):
         alias="deliveryContract",
         description=(
             "Delivery contract 回执 {summary, test}——仅当任务带 delivery "
-            "contract（slice_type=delivery_contract）时必填。test 引用 "
-            "test_run:<id>（平台机器验证）或写 N/A—原因。"
+            "contract（slice_type=delivery_contract）时必填。test 须引用"
+            "**本任务**的 test_run:<id>（平台机器验证，不绑定本任务同样被拒）；"
+            "确无法跑测试改用 evidence_kind=not_applicable + "
+            "not_applicable_reason，并经 waive_attestation 豁免——N/A 文本不放行。"
         ),
         json_schema_extra={
             "aliases": ["deliveryContract", "delivery_contract", "contract"]
@@ -870,10 +872,13 @@ async def _submit_preflight(
                     "Delivery contract 回执未填齐：缺 "
                     + ", ".join(missing)
                     + "。请补入 submit_task(..., deliveryContract={"
-                    "'summary': '<实现摘要>', 'test': 'test_run:<id> | N/A—原因'})。"
-                    "test 引用 test_run 凭证 id 由平台机器验证；无法跑测试写 "
-                    "N/A—原因。非代码交付可显式 contractWaived=true 跳过"
-                    "（不静默缺失）。"
+                    "'summary': '<实现摘要>', 'test': 'test_run:<本任务凭证id>'})。"
+                    "test 必须引用**本任务**的 test_run 凭证 id（平台机器验证，"
+                    "不绑定本任务同样被拒）。确无法跑测试：改用 "
+                    "deliveryContract={'evidence_kind': 'not_applicable', "
+                    "'not_applicable_reason': '<为什么跑不了>'}，并由协调者 "
+                    "waive_attestation 正式豁免——未豁免的 not_applicable 不放行。"
+                    "非代码交付可显式 contractWaived=true 跳过（不静默缺失）。"
                 ),
             })
         else:
@@ -885,8 +890,9 @@ async def _submit_preflight(
                     issues.append({
                         "code": "delivery_contract_incomplete",
                         "message": (
-                            "Delivery contract 测试证据 N/A 声明缺原因：写 "
-                            "N/A—为什么跑不了（原因非空）。"
+                            "Delivery contract 测试证据 N/A 文本不再被接受："
+                            "确无法跑测试请改交 evidence_kind='not_applicable' + "
+                            "not_applicable_reason，并经 waive_attestation 豁免。"
                         ),
                     })
                 elif await has_successful_test_run(
@@ -898,8 +904,8 @@ async def _submit_preflight(
                         "code": "delivery_contract_inconsistent",
                         "message": (
                             "Delivery contract 测试证据写 N/A，但本任务已存在"
-                            "成功（exit_code=0）的 test_run 凭证。声明与凭证库"
-                            "矛盾——应引用 test_run:<id>；确无关联请说明理由。"
+                            "成功（exit_code=0）的 test_run 凭证。应引用该凭证 "
+                            "test_run:<id>；N/A 文本已不再放行。"
                         ),
                     })
             else:
@@ -909,7 +915,7 @@ async def _submit_preflight(
                         "code": "delivery_contract_incomplete",
                         "message": (
                             "Delivery contract 测试证据格式无法识别：期望 "
-                            "'test_run:<attestationId>' 或 'N/A—原因'，"
+                            "'test_run:<本任务 attestationId>'，"
                             f"实际：{test_v[:80]!r}。"
                         ),
                     })
@@ -950,7 +956,7 @@ async def _submit_preflight(
     "attestationIds from browse (UI) or bash test runs (code). "
     "VERIFY task: MUST pass verdict=PASS|FAIL (+blockingIssues when FAIL). "
     "Tasks with a delivery contract (写树代码任务): MUST pass "
-    "deliveryContract={summary, test:'test_run:<id>' | 'N/A—<原因>'}. "
+    "deliveryContract={summary, test:'test_run:<id>' bound to THIS task}. "
     "GATE CONTRACT (code_audit_unit policy): if your code edits exceed 20 "
     "lines, a PASSING code_audit attestation (exit_code=0) is REQUIRED — "
     "submit without one is rejected (dry-run lists the missing kinds). If "

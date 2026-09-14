@@ -36,9 +36,11 @@ _KIND_SOURCE_TOOL = {
 }
 
 # deliveryContract 字段 → 下发时展示的填写形态（对齐 submit 侧拒绝文案）
+# 注意：没有"写 N/A 文本就放行"的形态 —— 不适用走 evidence_kind 状态 + 平台 waiver，
+# 形态见 format_submit_expectations 里 dc_fields 分支的说明。
 _DC_FIELD_SHAPE = {
     "summary": "<实现摘要：实际改了什么、与预期的偏差>",
-    "test": "test_run:<attestationId> | N/A—<跑不了的原因>",
+    "test": "test_run:<attestationId>（平台机器验证，须绑定本任务）",
 }
 
 # required_attestation_kinds 对未知 policy 的 fail-close 哨兵：不是真 kind，
@@ -126,6 +128,12 @@ def format_submit_expectations(task: dict[str, Any] | None) -> str:
         )
         lines.append(
             f"- 必填 deliveryContract={{{shapes}}}（空白/占位符视为未填）。"
+            f"`test` 必须引用**本任务**跑出来的 test_run 凭证 id，平台机器验证；"
+            f"不存在或未绑定本任务同样被拒。"
+            f"确无法跑测试：不要写 N/A 文本，改为提交 "
+            f"deliveryContract={{'evidence_kind': 'not_applicable', "
+            f"'not_applicable_reason': '<为什么跑不了>'}}，并请协调者 "
+            f"waive_attestation 正式豁免 —— 未豁免的 not_applicable 不放行。"
             f"非代码交付显式 contractWaived=true，不要静默省略。"
         )
     lines.append(

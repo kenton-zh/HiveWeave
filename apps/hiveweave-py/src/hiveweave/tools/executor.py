@@ -1724,8 +1724,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "aliases": ["delivery_contract", "contract"],
                 "description": (
                     "Required for delivery-contract (写树代码) tasks: "
-                    "{summary, test: 'test_run:<id>' | 'N/A—<原因>'}. Missing is "
-                    "a hard rejection."
+                    "{summary, test}. `test` must reference a test_run "
+                    "attestation bound to THIS task (machine-verified). "
+                    "Missing is a hard rejection. If tests truly cannot run, "
+                    "use evidence_kind='not_applicable' + not_applicable_reason "
+                    "and get a waiver — the text 'N/A' no longer passes."
                 ),
             },
             "contractWaived": {
