@@ -466,3 +466,131 @@ async def test_m8_long_running_does_not_starve_foreground(ws: Path) -> None:
                 j.terminate()
     finally:
         token.Close()
+
+
+# ── #1（P0）真机端到端：经**工具**启动的 dev server 也必须受沙箱约束 ──────
+#
+# 缺口形态（TEST_DSH_56 实证）：叶子用 `start_dev_server(command="python -c ...")`
+# **成功写出项目之外**，而同一越界动作经 bash 被 ACL 拒绝。
+# 上面的 `test_write_outside_denied` 钉的是 **spawn_confined 本身**会拒；
+# 本条钉的是**工具真的走那条路** —— 两者缺一，缺口都可能复活
+# （「函数会拒」+「工具没走那条路」＝照样可越界）。
+@pytest.mark.asyncio
+async def test_dev_server_tool_out_of_bounds_write_denied(
+    ws: Path, outside: Path, monkeypatch
+) -> None:
+    """★ #1 验收①（真机）：`start_dev_server` 起的进程**写不进** workspace 之外。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from hiveweave.tools.dev_server_tools import (
+        StartDevServerParams,
+        start_dev_server_tool,
+    )
+
+    _prep_worktree(ws)
+    target = outside / "pwned-by-devserver.txt"
+    assert not target.exists(), "前置：目标不该已存在"
+
+    # 越界命令 —— 与 TEST_DSH_56 的形态同族（工具以平台身份执行任意 command）
+    cmd = _cmd(f"echo pwned > {target}")
+
+    patches = [
+        # 组织/DB 侧打桩：本条测的是**沙箱边界**，不是 meta 路由
+        patch("hiveweave.tools.dev_server_tools.get_project_id",
+              new=AsyncMock(return_value="proj-sbx")),
+        patch("hiveweave.tools.dev_server_tools._agent_active_verify_task",
+              new=AsyncMock(return_value=None)),
+        patch("hiveweave.services.acl_sandbox.integration.resolve_project_root",
+              new=AsyncMock(return_value=str(ws))),
+        patch("hiveweave.tools.dev_server_tools.prune_dead_processes",
+              new=MagicMock(return_value=None)),
+        patch("hiveweave.tools.dev_server_tools.lookup_by_port",
+              new=MagicMock(return_value=[])),
+        patch("hiveweave.tools.dev_server_tools.stop_process_by_port",
+              new=MagicMock(return_value=None)),
+        patch("hiveweave.tools.dev_server_tools.allocate_project_port",
+              new=MagicMock(return_value=3199)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        try:
+            await start_dev_server_tool(
+                StartDevServerParams(command=cmd, preferred_port=3199),
+                "A001",
+                str(ws),
+            )
+        except Exception as e:  # noqa: BLE001 — 工具把 spawn 失败转成回执；这里兜真异常
+            assert "denied" in str(e).lower() or "eacces" in str(e).lower() or True, e
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    # ★ 判据：**文件不存在**。沙箱拦不住写入 → 这个文件会凭空出现在外面。
+    assert not target.exists(), (
+        "★ start_dev_server 起的进程写出了 workspace 之外 —— "
+        "#1 的缺口复活（工具没有走 spawn_confined，或沙箱没生效）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dev_server_tool_out_of_bounds_write_succeeds_when_sandbox_off(
+    ws: Path, outside: Path, monkeypatch
+) -> None:
+    """★ #1 验收②（反向对照）：沙箱**关**掉后，同一越界命令**必须成功写出**。
+
+    为什么必须有这一条：上一条断言的是「文件不存在」。若工具因别的原因早退
+    （根本没 spawn），那个断言**恒真**、却什么都没证明。本条的「文件必须出现」
+    证伪了那可能 —— 两条一起才构成"沙箱确实拦住了"的证据。
+    （本仓纪律：**守卫写了不等于守住了**；断言方向必须两边都有。）
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from hiveweave.tools.dev_server_tools import (
+        StartDevServerParams,
+        start_dev_server_tool,
+    )
+
+    _prep_worktree(ws)
+    target = outside / "succeeded-when-sandbox-off.txt"
+    if target.exists():
+        target.unlink()
+    cmd = _cmd(f"echo pwned > {target}")
+
+    patches = [
+        patch("hiveweave.tools.dev_server_tools.get_project_id",
+              new=AsyncMock(return_value="proj-sbx")),
+        patch("hiveweave.tools.dev_server_tools._agent_active_verify_task",
+              new=AsyncMock(return_value=None)),
+        patch("hiveweave.services.acl_sandbox.integration.resolve_project_root",
+              new=AsyncMock(return_value=str(ws))),
+        patch("hiveweave.tools.dev_server_tools.prune_dead_processes",
+              new=MagicMock(return_value=None)),
+        patch("hiveweave.tools.dev_server_tools.lookup_by_port",
+              new=MagicMock(return_value=[])),
+        patch("hiveweave.tools.dev_server_tools.stop_process_by_port",
+              new=MagicMock(return_value=None)),
+        patch("hiveweave.tools.dev_server_tools.allocate_project_port",
+              new=MagicMock(return_value=3198)),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        # ⚠ 关沙箱（autouse 夹具开了它）⇒ 走原生 spawn 路径
+        monkeypatch.setattr(settings, "acl_sandbox", False)
+        try:
+            await start_dev_server_tool(
+                StartDevServerParams(command=cmd, preferred_port=3198),
+                "A001",
+                str(ws),
+            )
+        except Exception:  # noqa: BLE001 — 只关心文件是否出现
+            pass
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+    assert target.exists(), (
+        "★ 沙箱关闭时同一越界命令**也没写出文件** ⇒ 上一条的『文件不存在』是"
+        "**恒真**（没跑到 spawn），那条测试其实什么都没证明 —— 必须先修测试环境"
+    )
