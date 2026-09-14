@@ -17,8 +17,10 @@ import asyncio
 import base64
 import html as html_mod
 import ipaddress
+import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1792,128 +1794,318 @@ def _validate_message_user_images(
     return resolved, None
 
 
-# E4 补（复盘 P0-1 G4「CEO 出口核验」）：完结断言词表——CEO 发布这些措辞
-# 时视为「交付结论」，须先通过账本一致性核验。自由文本用词表启发式
-# （与 submitGate 词表同风格）；平时进度汇报不受影响。
-_COMPLETION_ASSERT_NEEDLES: tuple[str, ...] = (
-    "交付完成",
-    "全部完成",
-    "已完成全部",
-    "交付完毕",
-    "发布完成",
-    "圆满完成",
-    "全部搞定",
-    "ship ready",
-)
+# ═══════════════════════════════════════════════════════════════════════
+# fixplan #8：交付状态是**算出来的**，不是**声明出来的**
+# ═══════════════════════════════════════════════════════════════════════
+# 前身（E4 补 / 复盘 P0-1 G4）是「CEO 出口核验」：用一张 8 词中英词表对
+# 消息正文做子串匹配，命中才查账本。09-14 实测该形态整体失效——同一语义
+# 换成「记录之X（不做完工判断）」/整段法文即绕过，且工具描述把触发条件
+# 写给了模型（等于绕过说明书）。
+#
+# 现形态：判据落在 **project_meta 的状态位**（唯一写者 = 本文件的
+# `mark_delivery_complete_tool`，其内部跑三条**状态查询**，不接受任何可
+# 影响判定的文本参数）。消息出口**不做任何文本判断**，只把真实状态挂到
+# chat_messages.metadata 供用户侧渲染徽章 ⇒ 谎报在用户侧一眼可辨。
+#
+# 三条实质判据（FAIL 终验 / approved 未 closed / 未读人工消息）本身是
+# 状态查询、完全可靠 —— 本次换的是「**何时**检查」，不是「检查什么」。
+DELIVERY_STATE_UNMARKED = "unmarked"   # project_meta.delivery_state IS NULL
+DELIVERY_STATE_COMPLETE = "complete"
+DELIVERY_STATE_BLOCKED = "blocked"     # 平台核验未通过时写入（非 agent 声明）
+
+# 政策码（DSH `blockedReason: {code, message}` 形态）：可断言、可统计、
+# 可渲染、可路由；message 只供人读。
+POLICY_LEDGER_FAIL_VERDICT = "LEDGER_FAIL_VERDICT"
+POLICY_LEDGER_APPROVED_OPEN = "LEDGER_APPROVED_OPEN"
+POLICY_INBOX_UNREAD_HUMAN = "INBOX_UNREAD_HUMAN"
+
+# 未读人工消息在回执里最多列举几条（只供人读；判定用 COUNT，不受此限）
+_DELIVERY_UNREAD_SAMPLE = 5
 
 
-async def _ceo_exit_assertion_block(agent_id: str, message: str) -> str | None:
-    """E4 补：CEO 完结断言前账本一致性核验（复盘致命链一 G4）。
+async def _delivery_context(
+    agent_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """解析 ``(agent_row, project_id)``；任一不可得 → ``(None, None)``。
 
-    命中「交付完成」类措辞且发送者为 CEO 时，检查项目账本：
-    open FAIL 终验 / approved 未 closed 任务 / CEO 自身未读 inbox——
-    任一命中即拒绝这条交付结论，要求先推动收口或如实说明现状
-    （不得声称全部完成）。非 CEO、非完结断言、查询失败 → fail-open 放行。
-
-    TEST_DSH_32 P3/P10：本核验为「对用户发送」通道层共用门
-    （message_user 与 send_message(recipients=[user]) 同一入口）；
-    未读计数只计**人工消息**（from≠system），系统 FYI 副本不污染
-    计数，且拒绝文案附未读清单一键收口。
+    交付状态是**项目级**事实（每项目一个），所以两者缺一不可。
     """
-    m = (message or "").strip()
-    if not m or not any(n in m.lower() for n in _COMPLETION_ASSERT_NEEDLES):
-        return None
     try:
         from hiveweave.services.org import OrgService
-        from hiveweave.services.policy import infer_role_family
 
         agent = await OrgService().get_agent(agent_id)
-        if not agent or infer_role_family(agent) != "ceo":
-            return None
+    except Exception as e:  # noqa: BLE001 — 身份解析故障 → 视为"未知"，不猜
+        log.debug("delivery_agent_lookup_failed", agent_id=agent_id, error=str(e))
+        return None, None
+    if not agent:
+        return None, None
+    try:
+        project_id = await get_project_id(agent_id)
+    except Exception:  # noqa: BLE001
+        project_id = None
+    return agent, project_id
 
-        from hiveweave.tools.helpers import get_project_id
+
+async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
+    """账本一致性**状态判据**（与消息文案完全无关）。
+
+    E4 补原有的三条判据**原样搬入**（判据本身不变，只把返回形态从自由
+    文本改成 ``[{code, message}]``，便于断言 / 统计 / 渲染 / 路由）：
+
+      · ``LEDGER_FAIL_VERDICT``  —— 未解决的 FAIL 终验
+      · ``LEDGER_APPROVED_OPEN`` —— approved 未 closed 的任务
+      · ``INBOX_UNREAD_HUMAN``   —— **自己**未读的人工消息（from≠system）
+
+    未读只计人工消息：系统副本（含平台自身的投递失败回执）不是 CEO 的
+    账（TEST_DSH_32 P3）。查询失败 / 无项目 → ``[]``（**fail-open**，与
+    原实现一致：判据故障不得把 CEO 卡成"永远标记不了"）。
+    """
+    blockers: list[dict[str, str]] = []
+    try:
+        from hiveweave.db import project as project_db
 
         project_id = await get_project_id(agent_id)
         if not project_id:
-            return None
+            return blockers
+        conn = await project_db.get_project_db_by_project_id(project_id)
+    except Exception as e:  # noqa: BLE001
+        log.debug("delivery_blockers_db_failed", agent_id=agent_id, error=str(e))
+        return blockers
 
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            "WHERE is_archived = 0 AND status NOT IN ('closed','cancelled') "
+            "AND upper(json_extract(evidence, '$.verdict')) = 'FAIL'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row and int(row["c"] or 0) > 0:
+            blockers.append({
+                "code": POLICY_LEDGER_FAIL_VERDICT,
+                "message": f"{row['c']} 个未解决的 FAIL 终验",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS c FROM tasks "
+            "WHERE is_archived = 0 AND status = 'approved'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row and int(row["c"] or 0) > 0:
+            blockers.append({
+                "code": POLICY_LEDGER_APPROVED_OPEN,
+                "message": f"{row['c']} 个 approved 未 closed 任务",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        cur = await conn.execute(
+            "SELECT id, from_agent_id, substr(message, 1, 80) AS preview "
+            "FROM inbox WHERE to_agent_id = ? AND read = 0 "
+            "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户') "
+            "ORDER BY created_at ASC LIMIT ?",
+            [agent_id, _DELIVERY_UNREAD_SAMPLE],
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if rows:
+            listing = "; ".join(
+                f"{str(r['from_agent_id'])[:8]}: {r['preview']}" for r in rows
+            )
+            blockers.append({
+                "code": POLICY_INBOX_UNREAD_HUMAN,
+                "message": f"你还有 {len(rows)}+ 条未读人工消息（{listing}）",
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return blockers
+
+
+async def _delivery_snapshot(agent_id: str) -> dict[str, Any]:
+    """标记时刻的核验快照（只供审计 / 展示，**不参与判定**）。
+
+    读数失败不阻断标记（快照是留痕，不是闸门）：标 ``degraded`` 让下游
+    知道这份快照不完整，而不是伪造一个全 0 的"干净"读数。
+    """
+    snap: dict[str, Any] = {
+        "tasks_total": 0,
+        "tasks_closed": 0,
+        "unread_human": 0,
+    }
+    try:
         from hiveweave.db import project as project_db
 
+        project_id = await get_project_id(agent_id)
         conn = await project_db.get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN status IN ('closed','cancelled') THEN 1 ELSE 0 END) "
+            "AS closed FROM tasks WHERE is_archived = 0"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            snap["tasks_total"] = int(row["total"] or 0)
+            snap["tasks_closed"] = int(row["closed"] or 0)
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS c FROM inbox "
+            "WHERE to_agent_id = ? AND read = 0 "
+            "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户')",
+            [agent_id],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            snap["unread_human"] = int(row["c"] or 0)
+    except Exception as e:  # noqa: BLE001
+        log.debug("delivery_snapshot_failed", agent_id=agent_id, error=str(e))
+        snap["degraded"] = True
+    return snap
 
-        blockers: list[str] = []
-        try:
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS c FROM tasks "
-                "WHERE is_archived = 0 AND status NOT IN ('closed','cancelled') "
-                "AND upper(json_extract(evidence, '$.verdict')) = 'FAIL'"
-            )
-            row = await cur.fetchone()
-            await cur.close()
-            if row and int(row["c"] or 0) > 0:
-                blockers.append(f"{row['c']} 个未解决的 FAIL 终验")
-        except Exception:
-            pass
-        try:
-            cur = await conn.execute(
-                "SELECT COUNT(*) AS c FROM tasks "
-                "WHERE is_archived = 0 AND status = 'approved'"
-            )
-            row = await cur.fetchone()
-            await cur.close()
-            if row and int(row["c"] or 0) > 0:
-                blockers.append(f"{row['c']} 个 approved 未 closed 任务")
-        except Exception:
-            pass
-        # TEST_DSH_32 P3：未读只计人工消息（from≠system）——系统副本
-        # （含平台自身投递失败回执）不是 CEO 的账；并列出可操作清单一键收口。
-        try:
-            cur = await conn.execute(
-                "SELECT id, from_agent_id, substr(message, 1, 80) AS preview "
-                "FROM inbox WHERE to_agent_id = ? AND read = 0 "
-                "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户') "
-                "ORDER BY created_at ASC LIMIT 5",
-                [agent_id],
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-            if rows:
-                listing = "; ".join(
-                    f"{str(r['from_agent_id'])[:8]}: {r['preview']}"
-                    for r in rows
-                )
-                blockers.append(
-                    f"你还有 {len(rows)}+ 条未读人工消息（{listing}）"
-                )
-        except Exception:
-            pass
-        if blockers:
-            return (
-                "message_user rejected（账本一致性核验）: 发布『全部完成』类"
-                "交付结论时项目账本仍不干净——" + "；".join(blockers)
-                + "。请先推动收口，或如实向用户说明现状（不得声称全部完成）。"
-                "（本核验对 message_user 与 send_message(to user) 一视同仁，"
-                "无旁路。）"
-            )
-    except Exception as e:
-        log.debug("ceo_exit_assertion_check_failed", agent_id=agent_id, error=str(e))
-    return None
+
+async def _read_delivery_state(project_id: str | None) -> dict[str, Any]:
+    """读项目级交付状态位（**只读**；写者是 `mark_delivery_complete`）。
+
+    ``delivery_state IS NULL`` / 列不存在 / 无行 / 读失败 → ``state=None``
+    ——**未知不猜**（老项目因此显示"未标记完工"而不是"未完成"，避免误伤）。
+    """
+    empty: dict[str, Any] = {"state": None, "at": None, "snapshot": None}
+    if not project_id:
+        return empty
+    try:
+        from hiveweave.db import project as project_db
+
+        conn = await project_db.get_project_db_by_project_id(str(project_id))
+        cur = await conn.execute(
+            "SELECT delivery_state, delivered_at, delivery_snapshot "
+            "FROM project_meta WHERE project_id = ?",
+            [str(project_id)],
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if not row:
+            return empty
+        snapshot = row["delivery_snapshot"]
+        if snapshot:
+            try:
+                snapshot = json.loads(snapshot)
+            except (TypeError, ValueError):
+                pass  # 坏 JSON 原样透出；判定不用快照
+        return {
+            "state": row["delivery_state"] or None,
+            "at": row["delivered_at"],
+            "snapshot": snapshot,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.debug("delivery_state_read_failed", project_id=project_id, error=str(e))
+        return empty
+
+
+async def _write_delivery_state(
+    project_id: str, state: str, snapshot: dict[str, Any]
+) -> None:
+    """写交付状态位 —— **全平台唯一写者**（`mark_delivery_complete`）。
+
+    ``delivered_at`` 存 ISO-8601（`delivery_state` 系三列按详案定为
+    TEXT，与 `created_at INTEGER` 的既有惯例刻意不同：这是给人看、可读
+    的时刻，不是排序用的毫秒）。project_meta 行缺失时 UPSERT 建行。
+    """
+    from datetime import datetime, timezone
+
+    from hiveweave.db import project as project_db
+
+    conn = await project_db.get_project_db_by_project_id(str(project_id))
+    now_ms = int(time.time() * 1000)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    await conn.execute(
+        "INSERT INTO project_meta (project_id, delivery_state, delivered_at, "
+        "delivery_snapshot, updated_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "delivery_state = excluded.delivery_state, "
+        "delivered_at = excluded.delivered_at, "
+        "delivery_snapshot = excluded.delivery_snapshot, "
+        "updated_at = excluded.updated_at",
+        [str(project_id), state, stamp, json.dumps(snapshot, ensure_ascii=False), now_ms],
+    )
+    await conn.commit()
+
+
+async def delivery_badge_metadata(agent_id: str) -> dict[str, Any] | None:
+    """交付状态徽章（挂 ``chat_messages.metadata``，用户侧渲染）。
+
+    **零文本判断**：结果只取决于 project_meta 的状态位 + 三条账本判据，
+    与消息正文完全无关 —— 中文 / 英文 / 法文 / 西班牙文 / 否定句 / 复述
+    旧拒绝文案，回执与 metadata 逐字相同（详案 §六.1 反措辞守卫）。
+
+    仅 **CEO** 的消息带徽章（徽章语义 = "这次交付声明是否已被平台核验"）；
+    非 CEO / 身份或项目解析不出来 → ``None``（**不加、不拦**，行为与改动
+    前一致）。任何异常 → ``None``（徽章是观测面，不引入新故障面）。
+
+    ⚠ **不拦消息**是刻意的：徽章与正文并排 ⇒ 谎报在用户侧一眼可辨。
+    "a gate the agent can write to is not a gate"（译：agent 能自己写进去
+    的闸门，不算闸门）—— 拦反而把状态变成可博弈的措辞游戏。
+    """
+    try:
+        agent, project_id = await _delivery_context(agent_id)
+        if not agent or not project_id:
+            return None
+        from hiveweave.services.policy import infer_role_family
+
+        if infer_role_family(agent) != "ceo":
+            return None
+        state = await _read_delivery_state(project_id)
+        badge: dict[str, Any] = {
+            "delivery_state": state.get("state") or DELIVERY_STATE_UNMARKED,
+        }
+        if state.get("at"):
+            badge["delivery_at"] = state["at"]
+        if state.get("state") == DELIVERY_STATE_COMPLETE:
+            badge["delivery_snapshot"] = state.get("snapshot")
+        else:
+            # 未标记 / blocked：把**当前**真实阻塞项一并给出（比快照新）
+            badge["delivery_blockers"] = await _delivery_blockers(agent_id)
+        return badge
+    except Exception as e:  # noqa: BLE001
+        log.debug("delivery_badge_failed", agent_id=agent_id, error=str(e))
+        return None
+
+
+def delivery_badge_line(badge: dict[str, Any] | None) -> str:
+    """把徽章压成一行给人/给 agent 读的文案（工具回执用）。"""
+    if not badge:
+        return ""
+    state = badge.get("delivery_state")
+    if state == DELIVERY_STATE_COMPLETE:
+        return f"交付状态：✅ 已标记交付完成（{badge.get('delivery_at') or '已核验'}）。"
+    if state == DELIVERY_STATE_BLOCKED:
+        return "交付状态：⚠️ 未标记完工（上次核验未通过，账本仍有未收口项）。"
+    return "交付状态：⚠️ 未标记完工（用户侧会看到该徽章）。"
 
 
 @tool(
     "message_user",
     "Send a message directly to the human user. The message appears in "
-    "the user's chat window. Note: if the CEO posts a 'all done' style "
-    "completion conclusion, it triggers the ledger-consistency gate — "
-    "the message is rejected while open FAIL verifications, un-closed "
-    "approved tasks, or unread inbox remain.",
+    "the user's chat window. Your project's delivery state is attached to "
+    "the message as a badge the user sees (`delivery_state` in metadata): "
+    "「未标记完工」 until you call mark_delivery_complete and the platform "
+    "verifies the ledger, then 「交付完成」 with a timestamp. The message "
+    "itself is never filtered or reworded — say exactly what the real "
+    "status is.",
     requires_workspace=False,
     security_level="standard",
 )
 async def message_user_tool(
     params: MessageUserParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
-    """Send a message to the human user."""
+    """Send a message to the human user.
+
+    fixplan #8：本出口**不做文本判断、不拦截**（旧的 8 词完结断言词表已
+    下线）——行为只取决于项目交付状态位。详见
+    ``deliverables/fix8-delivery-state-design-2026-09-14.md``。
+    """
     if not params.message:
         return ToolResult.err("message_user requires 'message' (body text)")
 
@@ -1932,10 +2124,11 @@ async def message_user_tool(
         if images_err:
             return ToolResult.err(images_err)
 
-    # E4 补：CEO 完结断言前账本一致性核验（复盘 G4）——先拦再发。
-    block = await _ceo_exit_assertion_block(agent_id, params.message)
-    if block:
-        return ToolResult.err(block)
+    # fixplan #8：本出口**不做任何文本判断**（旧形态的 8 词中英词表已下线）。
+    # 只读项目交付状态位，把**真实状态**挂到 metadata 上 ⇒ 无论这条消息写
+    # 什么（措辞/语言/否定句/复述旧拒绝文案），行为与 metadata 逐字一致。
+    # 不拦截：徽章与正文并排，谎报在用户侧一眼可辨。
+    badge = await delivery_badge_metadata(agent_id)
 
     from hiveweave.services.chat_message import ChatMessageService
 
@@ -1949,12 +2142,18 @@ async def message_user_tool(
         "is_streaming": False,
         "is_background": False,
     }
+    metadata: dict[str, Any] = {}
     if images:
         # 落库路径取证：message_user 直接写 chat_messages（用户 Chat 面板
         # 的消息源），不经 inbox 中转 —— images 列直接落这条消息即可，
         # metadata.source 标记来源供追溯。
         payload["images"] = images
-        payload["metadata"] = {"source": "agent_to_user"}
+        metadata["source"] = "agent_to_user"
+    if badge:
+        # 交付状态只走 metadata（**不往正文插文本** —— 不污染 agent 的表达）
+        metadata.update(badge)
+    if metadata:
+        payload["metadata"] = metadata
     await chat_service.save_message(payload)
 
     # Push via WebSocket so the frontend updates in real-time
@@ -1967,6 +2166,8 @@ async def message_user_tool(
         }
         if images:
             ws_message["images"] = images
+        if badge:
+            ws_message["metadata"] = badge
         await status_event_bus.publish_chat_message(
             agent_id=agent_id,
             message=ws_message,
@@ -1974,7 +2175,91 @@ async def message_user_tool(
     except Exception as evt_err:
         log.debug("message_user_event_push_failed", error=str(evt_err))
 
-    return ToolResult.ok("Message sent to user.")
+    return ToolResult.ok("Message sent to user. " + delivery_badge_line(badge))
+
+
+class MarkDeliveryCompleteParams(BaseModel):
+    """Parameters for mark_delivery_complete tool.
+
+    ⚠ **刻意不含任何参数**：交付判定的输入只有平台状态位与账本行，
+    agent 无法用措辞/理由/自述影响结果（"agent 能自己写进去的闸门，
+    不算闸门"）。新增参数前先回答：它能不能改变判定？
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+@tool(
+    "mark_delivery_complete",
+    "把本项目标记为「交付完成」。平台会在此刻核验项目账本（未解决的 "
+    "FAIL 终验 / approved 未 closed 的任务 / 你自己的未读人工消息）；"
+    "核验通过才写入完成状态，不通过会列出待收口项并记为 blocked。"
+    "目标真正达成时才调用它（困难、不确定、还有有用的工作可做，都不算"
+    "完成）。未标记时你发给用户的消息会带「未标记完工」徽章。仅 CEO 可用。",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def mark_delivery_complete_tool(
+    params: MarkDeliveryCompleteParams, agent_id: str, workspace: str, ctx=None
+) -> ToolResult:
+    """显式动作把「交付完成」落成项目级状态位（fixplan #8）。
+
+    与 DSH `dsh-goal` 同形：``complete`` 是**动作**、状态是 **enum**、
+    核验在**动作内部**（不是消费者侧的行内文本启发式）。
+
+    - 判定输入 = project_meta 状态位 + 三条账本状态查询；**没有**文本参数
+    - 拒绝时写 ``delivery_state='blocked'`` + policy codes 快照（可断言、
+      可统计、可路由），而不是只返回一段文案
+    - 仅 CEO（`infer_role_family == "ceo"`）；能力硬门另在
+      `services/policy.py::TOOL_CAPABILITY`（DOC_WRITE 为 ceo 独有）
+    """
+    agent, project_id = await _delivery_context(agent_id)
+    if not agent or not project_id:
+        return ToolResult.err(
+            "无法定位你的身份/项目，交付状态未写入（请稍后重试或向用户"
+            "如实说明现状）。"
+        )
+    from hiveweave.services.policy import infer_role_family
+
+    if infer_role_family(agent) != "ceo":
+        return ToolResult.err("仅 CEO 可标记交付完成。")
+
+    blockers = await _delivery_blockers(agent_id)
+    if blockers:
+        snapshot = {
+            "policy_codes": [b["code"] for b in blockers],
+            "blockers": [b["message"] for b in blockers],
+        }
+        try:
+            await _write_delivery_state(
+                project_id, DELIVERY_STATE_BLOCKED, snapshot
+            )
+        except Exception as e:  # noqa: BLE001 — 写失败不掩盖拒绝原因
+            log.debug(
+                "delivery_blocked_write_failed", agent_id=agent_id, error=str(e)
+            )
+        return ToolResult.err(
+            "交付状态未达完成（已记为 blocked）："
+            + "；".join(b["message"] for b in blockers)
+            + "。请先推动收口，或如实向用户说明现状（此时不写入完成状态）。"
+        )
+
+    snapshot = await _delivery_snapshot(agent_id)
+    try:
+        await _write_delivery_state(
+            project_id, DELIVERY_STATE_COMPLETE, snapshot
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("delivery_state_write_failed", agent_id=agent_id, error=str(e))
+        return ToolResult.err(
+            f"核验已通过，但交付状态写入失败（{e}）。请重试；"
+            "在此之前用户侧仍会看到「未标记完工」徽章。"
+        )
+    return ToolResult.ok(
+        f"已标记交付完成（核验快照：tasks {snapshot.get('tasks_closed')}/"
+        f"{snapshot.get('tasks_total')} closed，未读人工消息 "
+        f"{snapshot.get('unread_human')} 条）。"
+    )
 
 
 # ── webfetch ─────────────────────────────────────────────

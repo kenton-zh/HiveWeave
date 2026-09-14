@@ -32,11 +32,13 @@ def _msg_env():
     chat_cls.return_value.save_message = saved
     bus = MagicMock()
     bus.publish_chat_message = AsyncMock()
+    # fixplan #8：本夹具原先 patch `_ceo_exit_assertion_block`（8 词完结断言
+    # 词表）。该判据已下线（改为 project_meta.delivery_state 状态位），函数
+    # 物理删除 ⇒ 不再需要 patch。这里的 agent_id 不是真 agent、无项目库 ⇒
+    # `delivery_badge_metadata` 返回 None ⇒ payload 不带交付徽章，下面的
+    # images 断言（metadata == {"source": "agent_to_user"}）逐字不变。
     with patch(
         "hiveweave.services.chat_message.ChatMessageService", chat_cls
-    ), patch(
-        "hiveweave.tools.misc_tools._ceo_exit_assertion_block",
-        AsyncMock(return_value=None),
     ), patch(
         "hiveweave.realtime.event_bus.status_event_bus", bus
     ):

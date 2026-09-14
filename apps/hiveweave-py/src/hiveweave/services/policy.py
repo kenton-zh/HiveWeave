@@ -155,6 +155,13 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     # 审计 P1）。与 bash 同门 BASH_SHELL：executor/中层 preset 均含
     # BASH_SHELL 不受影响；HR 无 BASH_SHELL 被挡属合理收紧。
     "python_script": frozenset({Capability.BASH_SHELL}),
+    # fixplan #8 交付状态位（CEO 专属出口）。
+    # ⚠ 走**能力硬门**、不进 `EXEMPT_TOOLS`：`EXEMPT_TOOLS` 的语义是
+    # 「豁免能力硬门」（未映射工具对全家族放行，见 tool_capability_check），
+    # 而本工具是**状态写者** —— 把状态写者放进豁免集，等于把「谁能改交付
+    # 状态位」从硬门降成约定。`message_user` 能豁免只因它纯通信。
+    # DOC_WRITE 仅 ceo 家族持有 ⇒ 一条映射同时给出 CEO-only 硬门。
+    "mark_delivery_complete": frozenset({Capability.DOC_WRITE}),
     # 交付冒烟预跑 = 按任务契约启动项目服务并跑探针脚本，同为执行通道，
     # 归 TEST_RUN 门（QA/executor/中层均有 TEST_RUN；CEO/HR 无，合理收紧）。
     "run_smoke": frozenset({Capability.TEST_RUN}),

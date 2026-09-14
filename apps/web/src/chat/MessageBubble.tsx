@@ -658,6 +658,34 @@ function MessageBubbleInner({
           <span className="inline-block w-[3px] h-4 rounded-full bg-g-blue ml-1 align-middle hw-stream-cursor" />
         )}
 
+        {/* fixplan #8：交付状态徽章（后端挂 metadata.delivery_state）。
+            「谎报在用户侧一眼可辨」就靠这一块 —— 缺了它，后端"不拦、只标注"
+            的设计等于没落地（拆了旧闸门、换上用户看不见的标注 = 净亏）。 */}
+        {!isUser && msg.deliveryBadge && (
+          <div
+            data-testid="delivery-badge"
+            className={
+              "mt-1.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
+              (msg.deliveryBadge.state === "complete"
+                ? "bg-emerald-50 text-emerald-700"
+                : "bg-amber-50 text-amber-700")
+            }
+            title={(msg.deliveryBadge.blockers || []).join("\n")}
+          >
+            {msg.deliveryBadge.state === "complete"
+              ? `交付状态：已核验完成${
+                  msg.deliveryBadge.deliveredAt
+                    ? `（${msg.deliveryBadge.deliveredAt}）`
+                    : ""
+                }`
+              : `交付状态：未标记完工${
+                  (msg.deliveryBadge.blockers || []).length > 0
+                    ? `（${(msg.deliveryBadge.blockers || []).length} 项待收口）`
+                    : ""
+                }`}
+          </div>
+        )}
+
         {/* P1 附件区：正文（含光标）之后 —— 图片合并 gallery，file 附件出 chip。 */}
         {galleryImages.length > 0 && (
           <ImageGallery images={galleryImages} align={isUser ? "end" : "start"} />

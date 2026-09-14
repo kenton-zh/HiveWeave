@@ -143,10 +143,12 @@ READONLY_TOOLS = EXECUTOR_BASE_TOOLS
 READWRITE_TOOLS = EXECUTOR_BASE_TOOLS | frozenset({
     "run_command",
     "request_code_audit",
+    "mark_delivery_complete",  # #8：CEO 专属状态写者（见 policy.TOOL_CAPABILITY）
 })
 
 ALL_TOOLS = READWRITE_TOOLS | COORDINATOR_BUILDER_TOOLS | HR_TOOLS | frozenset({
     "run_command",
+    "mark_delivery_complete",  # #8：与 CEO_TOOLS 同步（full mode）
     "git_worktree_create", "git_worktree_merge", "git_worktree_remove",
     "create_task", "dispatch_task", "review_task",
     "hire_agent", "dismiss_agent", "transfer_agent",

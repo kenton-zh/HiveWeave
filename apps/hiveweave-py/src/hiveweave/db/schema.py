@@ -166,11 +166,27 @@ PROJECT_DB_TABLES = [
         -- （权威定义见 services/delivery_plane.py::DELIVERY_PLANES）。
         -- 视觉门（ui_browser_e2e / code_audit_visual）遇非 web 平面降档。
         delivery_plane TEXT DEFAULT '',
+        -- fixplan #8 交付状态位（权威写者 = tools/misc_tools.py::
+        -- mark_delivery_complete_tool，唯一；message_user 只读）。
+        -- ⚠ **刻意不带 DEFAULT**：语义是「NULL = 未标记（未知）」，
+        -- 带 DEFAULT 会让 SQLite 把升级前的存量行回填成那个值，让"未知"
+        -- 伪装成"已判定"（09-12 run_steps.started 的实测教训）。
+        -- delivery_state: NULL | 'complete' | 'blocked'
+        --   （'blocked' 由平台在核验失败时写入，代表"账本仍有未收口项"）
+        -- delivery_snapshot: 标记时刻的核验快照 JSON（closed 计数/未读/政策码）
+        delivery_state TEXT,
+        delivered_at TEXT,
+        delivery_snapshot TEXT,
         updated_at INTEGER
     )
     """,
     # fixplan §6 #12：存量库补 delivery_plane（懒迁移；正典已含该列，新库不跑）。
     """ALTER TABLE project_meta ADD COLUMN delivery_plane TEXT DEFAULT ''""",
+    # fixplan #8：存量库补交付状态位三列。⚠ 与 delivery_plane 不同，
+    # **绝不带 DEFAULT**（NULL = 未标记，见上方建表注释）。
+    """ALTER TABLE project_meta ADD COLUMN delivery_state TEXT""",
+    """ALTER TABLE project_meta ADD COLUMN delivered_at TEXT""",
+    """ALTER TABLE project_meta ADD COLUMN delivery_snapshot TEXT""",
     """
     CREATE TABLE IF NOT EXISTS inbox (
         id TEXT PRIMARY KEY,

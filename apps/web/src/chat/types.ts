@@ -44,6 +44,24 @@ export type ContextMarkerKind = "compaction" | "prune";
  * 注意：后端 chat_messages 表/接口当前**没有** attachments 字段（只有
  * images TEXT），该字段是前端先行建模 —— 后端回传待接（见 P1 完成报告）。
  */
+/**
+ * fixplan #8：平台计算的**交付状态徽章**。
+ *
+ * 后端三条用户可见出口（`message_user` / `send_message(to=用户)` / `question`）
+ * 都会把它挂进 `chat_messages.metadata`，**与消息正文完全无关** ——
+ * 所以换措辞/换语言/否定句都不会影响它（这正是它取代"8 词出口门禁"的理由：
+ * 那是文本判据，改个说法就绕过了）。
+ *
+ * 缺省（无该字段）= 老消息 / 非 CEO 消息 ⇒ **不渲染**，不破坏现状。
+ */
+export interface DeliveryBadge {
+  state: "unmarked" | "complete" | "blocked";
+  /** `complete` 时的核验时间（ISO-8601）。 */
+  deliveredAt?: string;
+  /** 未通过核验时的待收口项（给人读的一句话）。 */
+  blockers?: string[];
+}
+
 export interface AttachmentRef {
   kind: "image" | "file";
   /** 显示名（剥路径，只留文件名）。 */
@@ -63,6 +81,8 @@ export interface ChatMessage {
   images?: string[];
   /** 结构化附件（图片走 gallery，file 走文件 chip）。后端回传待接。 */
   attachments?: AttachmentRef[];
+  /** fixplan #8 交付状态徽章（后端 metadata.delivery_state）。缺省不渲染。 */
+  deliveryBadge?: DeliveryBadge;
   timestamp: number;
   toolCalls?: ToolCall[];
   isBackground?: boolean;

@@ -118,6 +118,12 @@ async def execute_question(
                 opts.append(f"- {o}")
         options_text = "\n\n选项:\n" + "\n".join(opts)
     try:
+        # fixplan #8：这是**第三条**用户可见出口（前两条 = message_user /
+        # send_message(to=用户)）。不挂徽章 ⇒ 把完工结论塞进 question 就能
+        # 跳过徽章，前两条白堵。徽章走**同一个** helper ⇒ 三条出口状态必然一致。
+        from hiveweave.tools.misc_tools import delivery_badge_metadata
+
+        _badge = await delivery_badge_metadata(agent_id) or {}
         await chat_msg.save_message({
             "agent_id": agent_id,
             "role": "assistant",
@@ -125,6 +131,7 @@ async def execute_question(
             "is_streaming": False,
             "is_background": False,
             "is_read": True,
+            "metadata": {"source": "agent_to_user", "kind": "question", **_badge},
         })
     except Exception as exc:
         log.warning("question.chat_message_failed", error=str(exc))

@@ -76,6 +76,35 @@ def match_agent_recipient(
     return None, False
 
 
+def is_user_recipient(ref: object) -> bool:
+    """收件人是否指向**人类用户**（结构化身份判定）。
+
+    fixplan #8：本文件此前自带一张自由文本别名表
+    ``{"user","用户","boss","老板"}``，与平台**唯一权威的人类身份集合**
+    ``services/wake_policy._USER_IDS``（``{"user","human","operator","用户"}``，
+    注释明写 *system aliases — not NL parsing*）**漂移**：
+
+    · ``human`` / ``operator`` 在权威集里算人类，在这里却被当 agent 名解析
+      ⇒ 同一身份出现两条路径（模型写 ``recipients=["human"]`` 送不到用户）；
+    · ``boss`` / ``老板`` 反过来是私有别名。
+
+    收口成一个身份判定后，"这条消息算不算发给用户"不再取决于措辞，且
+    ``send_message(to=用户)`` 与 ``message_user`` 必然挂同一份交付状态徽章
+    （否则本出口就是绕过徽章的侧门）。
+    """
+    # 惰性 import：与本文件其余 wake_policy 用法一致（避免 tools 包加载期耦合）
+    from hiveweave.services.wake_policy import is_user_sender
+
+    return isinstance(ref, str) and is_user_sender(ref)
+
+
+def _user_recipients(recipients: list) -> tuple[list[str], list]:
+    """按**身份**切分收件人：``(人类用户, 其余)``。"""
+    users = [r for r in recipients if is_user_recipient(r)]
+    others = [r for r in recipients if not is_user_recipient(r)]
+    return users, others
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section 1: Messaging tools
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,8 +126,11 @@ async def _send_message_core(
 
     Handles:
     - JSON-string recipients (LLM sometimes sends ``'["HR"]'`` as a string).
-    - User aliases (``user``, ``用户``, ``boss``, ``老板``) -- writes to
-      ``chat_messages`` so the message appears in the user's Chat window.
+    - Human user recipients resolved by **structured identity**
+      (`services/wake_policy._USER_IDS`: ``user`` / ``human`` / ``operator``
+      / ``用户``) -- writes to ``chat_messages`` so the message appears in the
+      user's Chat window, with the project delivery-state badge attached.
+      （fixplan #8 前：本文件自持别名表 ``{"user","用户","boss","老板"}``。）
     - Agent resolution: short_id -> UUID -> name -> role (with warning on role
       fallback). UUID matching is required — platform messages embed full ids
       and the tool schema advertises UUID recipients (TEST19 evening P1).
@@ -181,33 +213,29 @@ async def _send_message_core(
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project_id")
 
-    # ── Handle "user" / "用户" as a special recipient ────
-    user_aliases = {"user", "用户", "boss", "老板"}
-    user_recipients = [
-        r for r in recipients if r.strip().lower() in user_aliases
-    ]
-    agent_recipients = [
-        r for r in recipients if r.strip().lower() not in user_aliases
-    ]
+    # ── Handle the human user as a structured recipient identity ────
+    # fixplan #8：判据从「自由文本别名表」改为**身份判定**（见
+    # `is_user_recipient`）。此前 `recipients=["owner"]` 一类写法会落到
+    # agent 解析分支 —— 要么送给某个 agent、要么整体报 "No active
+    # recipients found"，用户一个徽章都看不到；而 `human`/`operator`
+    # 这两个权威人类身份反而送不到用户。收口后"发给用户"只有一条路径。
+    user_recipients, agent_recipients = _user_recipients(recipients)
 
     results: list[dict[str, Any]] = []
     if user_recipients:
-        # TEST_DSH_32 P10（核验下沉通道层）：send_message(to user) 与
-        # message_user 走同一道 CEO 完结断言门——正门侧门一把锁，消灭
-        # 「5 连拒后旁路送达」的通道不对称。
-        try:
-            from hiveweave.tools.misc_tools import _ceo_exit_assertion_block
+        # fixplan #8（TEST_DSH_32 P10 的续）：本出口与 message_user 走
+        # **同一份交付状态徽章**（`delivery_badge_metadata`）—— 只给
+        # message_user 挂徽章而放过这里，就等于留了一条"换个出口发完工
+        # 结论"的侧门。⚠ **不拦消息**：真实状态与正文并排，谎报在用户侧
+        # 一眼可辨；拦反而把状态退回成可博弈的措辞游戏。
+        from hiveweave.tools.misc_tools import delivery_badge_metadata
 
-            gate = await _ceo_exit_assertion_block(agent_id, message)
-            if gate:
-                return ToolResult.err(gate)
-        except Exception as gate_err:
-            log.debug("send_message_user_gate_check_failed", error=str(gate_err))
+        badge = await delivery_badge_metadata(agent_id)
 
         from hiveweave.services.chat_message import ChatMessageService
 
         chat_service = ChatMessageService()
-        await chat_service.save_message({
+        user_payload: dict[str, Any] = {
             "agent_id": agent_id,
             "role": "assistant",
             "content": message,
@@ -215,13 +243,22 @@ async def _send_message_core(
             "tool_calls": "[]",
             "is_streaming": False,
             "is_background": False,
-        })
+        }
+        if badge:
+            user_payload["metadata"] = badge
+        await chat_service.save_message(user_payload)
         # Push via WebSocket so the frontend updates in real-time
         from hiveweave.realtime.event_bus import status_event_bus
 
+        user_ws_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": message,
+        }
+        if badge:
+            user_ws_message["metadata"] = badge
         await status_event_bus.publish_chat_message(
             agent_id=agent_id,
-            message={"role": "assistant", "content": message},
+            message=user_ws_message,
         )
         results.append({"to": "user", "message_id": "user-msg"})
 

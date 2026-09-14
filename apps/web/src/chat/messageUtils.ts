@@ -1,5 +1,6 @@
 import type {
   AttachmentRef,
+  DeliveryBadge,
   ChatMessage,
   ContextMarkerKind,
   MsgSegment,
@@ -425,6 +426,34 @@ function normalizeAttachments(raw: unknown): AttachmentRef[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+/** metadata.delivery_state → DeliveryBadge；形状不对 ⇒ undefined（不抛错、不猜）。
+ *
+ * fixplan #8：这是「谎报在用户侧一眼可辨」的**落地点** —— 后端刻意不拦消息，
+ * 只把**真实计算出的**交付状态挂上来；前端负责让用户看见。
+ * ⚠ 缺了这个渲染，后端那半边等于没落地（拆了旧闸门、换上用户看不见的标注）。 */
+function normalizeDeliveryBadge(meta: any): DeliveryBadge | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const raw = (meta as Record<string, unknown>).delivery_state;
+  if (raw !== "unmarked" && raw !== "complete" && raw !== "blocked") {
+    return undefined;
+  }
+  const badge: DeliveryBadge = { state: raw };
+  const at = (meta as Record<string, unknown>).delivery_at;
+  if (typeof at === "string" && at) badge.deliveredAt = at;
+  const blockers = (meta as Record<string, unknown>).delivery_blockers;
+  if (Array.isArray(blockers)) {
+    const msgs = blockers
+      .map((b) =>
+        b && typeof b === "object" && typeof (b as any).message === "string"
+          ? String((b as any).message)
+          : "",
+      )
+      .filter((s) => s.length > 0);
+    if (msgs.length > 0) badge.blockers = msgs;
+  }
+  return badge;
+}
+
 export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
   if (!Array.isArray(dbMessages)) return [];
   return dbMessages.map((m: any) => {
@@ -436,6 +465,7 @@ export function mapDbToChatMessages(dbMessages: any[]): ChatMessage[] {
       _thinking: m.thinking || undefined,
       images: typeof m.images === "string" ? tryParseImages(m.images) : m.images,
       attachments: normalizeAttachments(meta?.attachments),
+      deliveryBadge: normalizeDeliveryBadge(meta),
       timestamp: m.createdAt ?? m.created_at ?? Date.now(),
       toolCalls: m.toolCalls ?? m.tool_calls
         ? tryParseToolCalls(m.toolCalls ?? m.tool_calls)

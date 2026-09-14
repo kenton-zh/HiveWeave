@@ -650,3 +650,68 @@ describe("mapDbToChatMessages attachments 透传（后端回传待接的 metadat
     expect(m.attachments).toBeUndefined();
   });
 });
+
+describe("fixplan #8 交付状态徽章（后端 metadata.delivery_state → ChatMessage.deliveryBadge）", () => {
+  const mapOne = (meta: unknown) =>
+    mapDbToChatMessages([
+      { id: "m1", role: "assistant", content: "hi", metadata: JSON.stringify(meta) },
+    ])[0];
+
+  it("unmarked ⇒ state=unmarked（CEO 未标记时用户看到的那一枚）", () => {
+    const m = mapOne({ delivery_state: "unmarked" });
+    expect(m.deliveryBadge).toEqual({ state: "unmarked" });
+  });
+
+  it("complete ⇒ 带核验时间", () => {
+    const m = mapOne({ delivery_state: "complete", delivery_at: "2026-09-14T21:30:00+08:00" });
+    expect(m.deliveryBadge).toEqual({
+      state: "complete",
+      deliveredAt: "2026-09-14T21:30:00+08:00",
+    });
+  });
+
+  it("blocked ⇒ 带待收口项（只收 message 字段，坏条目丢弃）", () => {
+    const m = mapOne({
+      delivery_state: "blocked",
+      delivery_blockers: [
+        { code: "LEDGER_APPROVED_OPEN", message: "1 个 approved 未 closed 任务" },
+        { code: "X" },
+        "garbage",
+      ],
+    });
+    expect(m.deliveryBadge).toEqual({
+      state: "blocked",
+      blockers: ["1 个 approved 未 closed 任务"],
+    });
+  });
+
+  it("无 metadata / 无该字段 ⇒ undefined（不破坏现状）", () => {
+    expect(mapOne({}).deliveryBadge).toBeUndefined();
+    expect(mapOne({ delivery_state: "not-a-state" }).deliveryBadge).toBeUndefined();
+    expect(mapOne({ delivery_state: 123 }).deliveryBadge).toBeUndefined();
+    const noMeta = mapDbToChatMessages([{ id: "m2", role: "assistant", content: "x" }])[0];
+    expect(noMeta.deliveryBadge).toBeUndefined();
+  });
+
+  it("★ 徽章与正文措辞无关（这正是它取代 8 词门禁的理由）", () => {
+    const phrases = [
+      "全部完成",
+      "All done",
+      "Terminé",
+      "记录之三（不做完工判断）",
+      "我不宣称全部完成",
+    ];
+    const badges = phrases.map((p) => {
+      const m = mapDbToChatMessages([
+        {
+          id: "m3",
+          role: "assistant",
+          content: p,
+          metadata: JSON.stringify({ delivery_state: "unmarked" }),
+        },
+      ])[0];
+      return JSON.stringify(m.deliveryBadge);
+    });
+    expect(new Set(badges).size).toBe(1);
+  });
+});

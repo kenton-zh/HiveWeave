@@ -2117,15 +2117,28 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": [],
     },
+    # fixplan #8：交付状态**写者**。无参数 —— 状态是算出来的，不是声明的。
+    "mark_delivery_complete": {
+        "description": (
+            "CEO only. Mark this project's delivery as complete. The platform "
+            "re-verifies three ledger facts (open FAIL verdicts, approved-but-"
+            "not-closed tasks, your own unread human inbox) and records the "
+            "computed state. Takes NO arguments — the state is computed, not "
+            "declared."
+        ),
+        "properties": {},
+        "required": [],
+    },
     "message_user": {
         "description": (
             "Send a message to the human operator. Assistant text is not "
             "delivered — only this tool is. CEO终验 uses this. "
-            "CEO only: posting a '全部完成/交付完成' conclusion triggers a "
-            "ledger consistency gate — if any open FAIL 终验, approved-not-"
-            "closed task, or your own unread inbox remain, the message is "
-            "REJECTED; finish those first or state the real status (never "
-            "claim all-done prematurely)."
+            "Every such message carries a platform-computed delivery badge "
+            "the user sees alongside your text (delivery_state in metadata). "
+            "The badge shows the platform's **verified** delivery state and, "
+            "once mark_delivery_complete has verified the ledger, the "
+            "verification timestamp. Nothing is blocked and your text is never "
+            "filtered or reworded — the badge is what the user sees."
         ),
         "properties": {
             "message": {"type": "string", "aliases": ["content", "body", "text"]},
