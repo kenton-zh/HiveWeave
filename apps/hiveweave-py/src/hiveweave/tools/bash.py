@@ -3036,6 +3036,42 @@ async def _issue_test_run_attestation(
     return note
 
 
+def _wrap_routed_background_result(routed: dict, agent_id: str) -> ToolResult:
+    """把 dev-server 路由侧的结果重新包成 ``ToolResult``（**事实位原样透传**）。
+
+    L3 收口：``routed`` 已带权威 fact（保留端口=``bad_args`` / spawn 故障=
+    ``runner_failed``），重包时**必须原样透传** —— 丢掉它会退回「无证据的默认
+    分类」，正是本批要消灭的形态。
+
+    ⚠ **非法组合守卫**（2026-09-14，与 #17 同源）：``blocked=True`` 配**调用方成因**
+    的 fact（``bad_args`` / ``command_failed``）会撞 ``_BLOCKED_FACT_KINDS``
+    不变式抛 ``ValueError``。本函数上方注释自己写着「保留端口=bad_args」⇒
+    **形态可达**（`#17` 已在 `:3230`/`:3532` 两处修过同款）。
+    守卫方式必须是「**保留 fact、去掉 blocked**」—— 保留端口是**调用方参数错**，
+    不是平台护栏拒绝；**绝不能**悄悄改成 ``runner_failed``（那是把 L6 撤销，
+    会让 agent 收到「不是你的 bug」并对同一组参数原地重撞）。
+    """
+    if routed.get("success"):
+        return ToolResult.ok(routed.get("output") or "")
+    err_msg = routed.get("error") or "Dev server spawn failed"
+    fact = routed.get("fact")
+    if routed.get("blocked"):
+        if fact in ("runner_failed", "outcome_unknown") or fact is None:
+            return ToolResult.blocked_err(err_msg, fact=fact or "runner_failed")
+        # 非法组合：调用方成因的格不能被标成「平台护栏拒绝」（L6/L19）。
+        log.warning(
+            "routed_fact_not_blockable",
+            agent_id=agent_id,
+            fact=fact,
+            action=(
+                "路由侧给了 blocked=True + 调用方成因的 fact —— 已按「保留事实位、"
+                "去掉 blocked」归一（与保留端口同款语义），**没有**改成 runner_failed"
+            ),
+        )
+        return ToolResult.err(err_msg, fact=fact)
+    return ToolResult.err(err_msg, fact=fact)
+
+
 async def _bash_background(
     *,
     params: BashParams,
@@ -3086,16 +3122,7 @@ async def _bash_background(
             agent_id=agent_id,
         )
         if routed is not None:
-            if routed.get("success"):
-                return ToolResult.ok(routed.get("output") or "")
-            err_msg = routed.get("error") or "Dev server spawn failed"
-            # L3 收口：`routed` 已带权威 fact（保留端口=bad_args / spawn 故障=
-            # runner_failed），重新包成 ToolResult 时**必须原样透传** ——
-            # 丢掉它会退回「无证据的默认分类」，本批要消灭的正是这个。
-            _routed_fact = routed.get("fact")
-            if routed.get("blocked"):
-                return ToolResult.blocked_err(err_msg, fact=_routed_fact)
-            return ToolResult.err(err_msg, fact=_routed_fact)
+            return _wrap_routed_background_result(routed, agent_id)
 
     attest_task = getattr(params, "task_id", None) or verify_tid
     orig_command = params.command or ""

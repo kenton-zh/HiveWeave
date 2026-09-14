@@ -142,6 +142,54 @@ async def test_reserved_port_attribution_is_not_empty(monkeypatch):
     assert "bad_args" in attr
 
 
+def test_routed_background_result_never_builds_an_invalid_combination():
+    """dev-server 路由侧同款：`blocked=True` + 调用方成因的 fact 必须被归一。
+
+    这是 #17 的**同源形态** —— `_bash_background` 里原来的写法是
+    `ToolResult.blocked_err(err_msg, fact=routed.get("fact"))`，而它上方注释
+    自己写着「保留端口=bad_args」⇒ 一旦路由侧真的产出该组合就撞同一条不变式崩。
+
+    ⚠ 归一方向必须是「**保留 fact、去掉 blocked**」：
+      · 保留端口是**调用方参数错**，标 blocked 会给 agent 发「不是你的 bug」
+        信号并让它原地重撞（L6/L19）；
+      · 但也**不能**悄悄改成 `runner_failed` —— 那是把 L6 撤销。
+    """
+    from hiveweave.tools.bash import _wrap_routed_background_result
+
+    # ① 原来会崩的组合：保留 fact、去掉 blocked
+    r = _wrap_routed_background_result(
+        {"success": False, "error": "reserved port 4000", "fact": "bad_args", "blocked": True},
+        "a1",
+    )
+    d = r.to_dict()
+    assert d["fact"] == "bad_args", "必须保留路由侧给的权威事实位"
+    assert d.get("blocked") is not True, "调用方成因不得被标成平台护栏拒绝（L6/L19）"
+    assert d["success"] is False
+
+    # ② 合法组合原样透传（blocked 是平台侧成因）
+    r2 = _wrap_routed_background_result(
+        {"success": False, "error": "spawn failed", "fact": "runner_failed", "blocked": True},
+        "a1",
+    )
+    assert r2.to_dict().get("blocked") is True
+    assert r2.to_dict()["fact"] == "runner_failed"
+
+    # ③ blocked 但没给 fact ⇒ 默认 runner_failed（平台护栏出口的既有语义）
+    r3 = _wrap_routed_background_result(
+        {"success": False, "error": "blocked", "blocked": True}, "a1"
+    )
+    assert r3.to_dict()["fact"] == "runner_failed"
+
+    # ④ 非 blocked 的失败与成功路径不变
+    r4 = _wrap_routed_background_result(
+        {"success": False, "error": "x", "fact": "command_failed"}, "a1"
+    )
+    assert r4.to_dict()["fact"] == "command_failed"
+    assert r4.to_dict().get("blocked") is not True
+    r5 = _wrap_routed_background_result({"success": True, "output": "ok"}, "a1")
+    assert r5.to_dict()["success"] is True
+
+
 def test_blocked_err_still_rejects_caller_fault_facts():
     """钉住不变式本身：**不许**用「放宽 `_BLOCKED_FACT_KINDS`」修上面的崩溃。
 
