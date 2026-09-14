@@ -2814,12 +2814,48 @@ def reset_self_repeat_hits_for_tests() -> None:
         _LAST_SEEN_SIG.clear()
 
 
+async def _emit_unclassified_sample(
+    sample: object, tool_name: str, agent_id: str
+) -> None:
+    """把「事实位归因判不出来」的样本落 ``agent_events``（fixplan #15）。
+
+    为什么需要这一步：``finalize_tool_result`` 是**同步函数、拿不到 agent_id**，
+    所以它只把样本挂在 ``out["unclassified_sample"]`` 上。**消费方就是这里** ——
+    与 #13 的 ``llm/unknown_error_samples.flush_unknown_samples`` 对称
+    （那边由 ``http_stream`` 的错误收口落库）。
+
+    ⚠ 样本**必须从结果里 pop 掉**（见调用点）：它是内部诊断字段，混进模型可见的
+    工具回执只会让模型困惑，还可能被它当成一个可用参数。
+    ⚠ best-effort：绝不因它影响工具回执。
+    """
+    try:
+        if not isinstance(sample, dict) or not sample:
+            return
+        from hiveweave.services.event_audit import event_audit
+
+        await event_audit.log(
+            agent_id=agent_id,
+            project_id="",
+            event_type="fact_position_unclassified_sample",
+            payload={**sample, "tool": tool_name},
+        )
+    except Exception as e:  # noqa: BLE001 — 诊断旁支，绝不能挂掉工具回执
+        log.warning("fact_position_sample_emit_failed", error=str(e)[:200])
+
+
 async def _f10_result_hooks(
     result: dict[str, Any],
     tool_name: str,
     tool_args: dict[str, Any],
     agent_id: str,
 ) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
+    # #15：先取走归因样本（无论成功/失败都取），再走其余 hook。
+    # pop 而不是 get —— 见 `_emit_unclassified_sample` 的 docstring。
+    _sample = result.pop("unclassified_sample", None)
+    if _sample:
+        await _emit_unclassified_sample(_sample, tool_name, agent_id)
     if not result or result.get("success"):
         return result
     try:

@@ -376,18 +376,36 @@ def attribution_of(result: dict) -> str:
     于 blocked 判定，否则"bash 写法在受限 shell 不认"会被报成"平台护栏拒绝
     （权限/沙箱/安全）"，把撞坑 Agent 指向错误的排查方向（DSH postmortem
     0004：宽泛签名 → 误归因，同构缺陷）。
+
+    ⚠ 位的**读取与优先级**由 ``tools/fact_positions.fact_from_bits()`` **单一
+    实现**（#15，2026-09-14：判据只许有一份，免得两处各自演化成"哪份才是漏的"）。
+    本函数只负责把事实位翻成**给人看的一句话**（含方言专项文案）。
     """
     try:
-        if result.get("dialect_failed"):
-            return (
-                "runner_failed: shell 方言不兼容 —— 命令从未执行。"
-                "改写为 pwsh 写法（见错误原文的等价表）或直接调 pwsh 工具；"
-                "不要用不同的 unix flag 重试"
-            )
-        if result.get("runner_failed"):
+        # 延迟 import：`services` → `tools` 的方向只在调用期发生，避免模块级环。
+        from hiveweave.tools.fact_positions import fact_from_bits
+
+        kind = fact_from_bits(result)
+        if kind == "runner_failed":
+            if result.get("dialect_failed"):
+                return (
+                    "runner_failed: shell 方言不兼容 —— 命令从未执行。"
+                    "改写为 pwsh 写法（见错误原文的等价表）或直接调 pwsh 工具；"
+                    "不要用不同的 unix flag 重试"
+                )
             return "runner_failed: 命令未执行（执行器/方言/权限/审批）"
-        if result.get("command_failed"):
+        if kind == "command_failed":
             return "command_failed: 命令执行了但失败（业务/测试未过）"
+        # #15：`bad_args` 被 L6 从 blocked 改判出来后（保留端口等）**没有对应文案**
+        # ⇒ 归因退回空串，撞坑 Agent 拿不到方向。补上它。
+        # 判据读**事实位**而非文本：位是声明出来的状态，与措辞/语言无关
+        # （``bad_args`` 不会出现在布尔位里 —— 布尔位只有 dialect/runner/command，
+        # 故这里直接读 ``fact``）。
+        if str(result.get("fact") or "") == "bad_args" or kind == "bad_args":
+            return (
+                "bad_args: 调用方参数错（平台无责）—— 换个参数即可通过，"
+                "别用同一组参数重试"
+            )
         if result.get("blocked"):
             return "blocked: 平台护栏拒绝（权限/沙箱/安全）"
     except Exception:  # noqa: BLE001 — 归因是旁支，绝不能因它挂掉工具回执

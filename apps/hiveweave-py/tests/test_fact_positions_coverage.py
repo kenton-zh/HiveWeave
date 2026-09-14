@@ -508,3 +508,273 @@ class TestToolResultInvariants:
 
         d = ToolResult.ok("out").to_dict()
         assert "runner_failed" not in d
+
+
+class TestAttributionLadder:
+    """#15（2026-09-14）：归因阶梯 = **布尔位 → 文本签名表 → 代码作用域 → 不猜**。
+
+    本仓判据（用户钦定）：**状态判据**（事实位 / DB 行 / 权限位）与措辞无关
+    ⇒ 可用；**文本判据**（自由文本子串 / 正则）随措辞与语言整体失效 ⇒ 只配
+    当兜底。此前的形态恰好相反：先跑签名表，把「命令有没有跑」这个**状态**
+    交给错误文案回答。
+
+    本类的每条断言都写成「判据被删掉就转红」的形态（阳性对照见各自 docstring）。
+    """
+
+    @pytest.mark.parametrize(
+        ("bits", "blocked", "error", "expected"),
+        [
+            # 验收①：文案换成**法文/陌生措辞**，只要有位 ⇒ 归因不变
+            ({"dialect_failed": True}, True,
+             "La commande a echoue: dialecte inconnu", "runner_failed"),
+            ({"dialect_failed": True}, False,
+             "Le dialecte du shell n'est pas reconnu", "runner_failed"),
+            ({"runner_failed": True}, True,
+             "Erreur inconnue du lanceur (code 42)", "runner_failed"),
+            ({"runner_failed": True}, False,
+             "Echec du lanceur: aucune sortie", "runner_failed"),
+            # 命令跑了但没过：位是 command_failed ⇒ 与文本措辞无关
+            ({"command_failed": True}, False,
+             "La compilation a echoue avec 3 erreurs", "command_failed"),
+            # 位优先于文本：文案里明明有 runner 签名，但位说 command_failed
+            ({"command_failed": True}, False,
+             "Error: Command blocked: system-level destructive command",
+             "command_failed"),
+        ],
+    )
+    def test_bits_win_over_foreign_text(self, bits, blocked, error, expected):
+        """位在 ⇒ 归因由位决定，**与文案语言/措辞无关**（位是第一层）。
+
+        阳性对照（**实测转红**）：删掉 `finalize_tool_result` 里的
+        `bit_fact = fact_from_bits(r)`（改成只看文本）⇒ 前四条以法文文案不命中
+        签名表而落 `outcome_unknown` 转红；最后一条（文案有 runner 签名但位说
+        command_failed）则以 `runner_failed` 转红 —— 正是"文本判据越俎代庖"。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash", {"success": False, "error": error, "blocked": blocked, **bits}
+        )
+        assert out["fact"] == expected, (
+            f"位 {bits}（blocked={blocked}）应判 {expected}，实测 {out['fact']!r} "
+            f"—— 归因被文案措辞决定了（位优先没生效）"
+        )
+
+    def test_dialect_bit_has_priority_over_command_bit(self):
+        """位的**优先级**与 `attribution_of` 同源：dialect > runner > command。"""
+        from hiveweave.tools.fact_positions import fact_from_bits, state_bits
+
+        assert fact_from_bits({"dialect_failed": True, "command_failed": True}) == (
+            "runner_failed"
+        )
+        assert fact_from_bits({"runner_failed": True, "command_failed": True}) == (
+            "runner_failed"
+        )
+        # 位存在但为 False ⇒ **不是**命中（"说了否" ≠ "没说"）
+        assert fact_from_bits({"runner_failed": False, "command_failed": False}) is None
+        assert fact_from_bits({"runner_failed": None}) is None
+        assert state_bits({"error": "x"}) == {}
+
+    def test_missing_bits_and_unknown_text_is_unclassified(self):
+        """验收③：位缺失 + 文案陌生 ⇒ `outcome_unknown`（**不猜**）+ fail-loud 样本。
+
+        为什么**不落** `runner_failed`：后者语义=「命令从未执行」⇒ 下游读成
+        「无副作用、可直接重试」；而本函数的触发点在**执行之后**（normalize 尾）
+        ⇒ 会诱发**副作用双发**（`test_p0_3_orphan_root_cause.py` 同款论证）。
+
+        阳性对照（**实测转红**）：把兜底那行改回
+        `kind = "runner_failed"` / `out["fact"] = "runner_failed"` ⇒ 本用例在
+        `assert out["fact"] == "outcome_unknown"` 处转红。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash",
+            {"success": False, "blocked": True,
+             "error": "Quelque chose d'inconnu s'est produit (code 42)"},
+        )
+        assert out["fact"] == "outcome_unknown"
+        assert out["runner_failed"] is False
+        assert out["blocked"] is True
+
+        sample = out["unclassified_sample"]
+        assert sample["tool"] == "bash"
+        assert sample["error_preview"].startswith("Quelque chose")
+        assert len(sample["error_preview"]) <= 200
+        # 「当时是护栏拒绝，但**没有任何归因位**」—— 这才是要被人看见的形态
+        assert "blocked" in sample["bits_present"]
+
+    def test_blocked_without_fact_does_not_raise(self):
+        """blocked=True 且无 fact **不得抛**（fail loud 但不 fail hard）。
+
+        实测（2026-09-14，改动前）：`ToolResult.__post_init__` 会硬抛
+        `ValueError: blocked result must declare its fact kind`，而本函数在
+        executor 的 dispatch `try/except` **之外**被调用 ⇒ 未捕获异常会炸掉整条
+        工具调用（与 `test_p0_3_orphan_root_cause.py` 的 115 步孤儿步同构，
+        只是炸点更靠前）。当时该分支因此是**不可达**的死代码。
+
+        阳性对照（**实测转红**）：把构造处的保守占位去掉
+        （`fact=raw.get("fact")` 而不是 `... or ("outcome_unknown" if ...)`）
+        ⇒ 本用例以 `ValueError` 转红。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash", {"success": False, "blocked": True, "error": "inconnu"}
+        )
+        assert out["fact"] == "outcome_unknown"
+        # 且**不得**把它标成「命令从未执行」（那是"放心重试"信号）
+        assert out["runner_failed"] is False
+
+        # 变体：连 `success` 键都没有（默认 True）—— 同样不得抛
+        # （此前 `ToolResult.__post_init__` 会在这一形态上硬抛）
+        out = finalize_tool_result("bash", {"blocked": True, "error": "inconnu"})
+        assert out["blocked"] is True
+        assert out["fact"] == "outcome_unknown"
+
+    def test_blocked_never_carries_caller_fault_fact(self):
+        """blocked=True 时，`command_failed` 位**不得**变成事实位。
+
+        判据来源：`tools/result.py::_BLOCKED_FACT_KINDS` —— blocked 只接受平台侧
+        成因的两格（`runner_failed` / `outcome_unknown`）；标成调用方成因会让
+        agent 收到「不是你的 bug」信号并原地重撞（L6/L19）。本归因路径是**写**
+        fact（绕过了构造期不变式）⇒ 必须自己守这条。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash",
+            {"success": False, "blocked": True, "command_failed": True, "error": "x"},
+        )
+        assert out["fact"] in ("runner_failed", "outcome_unknown")
+        assert out["blocked"] is True
+
+    def test_non_blocked_failure_honors_declared_bit(self):
+        """非 blocked 失败 + 裸位（无 fact）⇒ 位**必须被认账**，不得被抹成 unknown。
+
+        实测（2026-09-14，改动前）：`{"success": False, "runner_failed": True}`
+        经收口后 `fact="outcome_unknown"`、`runner_failed=False` —— 调用方显式
+        声明的位被 `finalize_fact_dict` 按 fact 重算时**抹掉**（位丢失面）。
+
+        阳性对照（**实测转红**）：删掉 `elif bit_fact is not None:` 那一支 ⇒
+        本用例落 `outcome_unknown` 转红。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash", {"success": False, "error": "boom", "runner_failed": True}
+        )
+        assert out["fact"] == "runner_failed"
+        assert out["runner_failed"] is True
+
+        out = finalize_tool_result(
+            "bash", {"success": False, "error": "boom", "command_failed": True}
+        )
+        assert out["fact"] == "command_failed"
+        assert out["command_failed"] is True
+
+    def test_unclassified_sample_redacts_secrets(self):
+        """样本**不得**把 key/token 写进去（脱敏复用 `util/redact.py`）。
+
+        阳性对照（**实测转红**）：把 `note_unclassified_sample` 里的
+        `redact_secrets(...)` 去掉 ⇒ 本用例以原文里出现 `sk-…` / `token=…`
+        的值转红。
+        """
+        from hiveweave.tools.fact_positions import note_unclassified_sample
+
+        payload = note_unclassified_sample(
+            tool="bash",
+            error=(
+                "curl failed: Authorization: Bearer sk-abcdefghijklmnop "
+                "token=SECRETVALUE api_key=AKIA123456"
+            ),
+        )
+        preview = payload["error_preview"]
+        for secret in ("SECRETVALUE", "sk-abcdefghijklmnop", "AKIA123456"):
+            assert secret not in preview, f"密钥 {secret!r} 泄漏进样本：{preview!r}"
+        assert "***" in preview  # 键名保留、值被吃掉（便于排查）
+
+    def test_attribution_of_shares_bit_priority(self):
+        """`attribution_of` 与 `fact_from_bits` **同一判据**（不许两处各自演化）。
+
+        阳性对照：让 `attribution_of` 自己写一遍 if（顺序写成
+        command → runner）⇒ 本用例在 `runner+command` 那一行转红。
+        """
+        from hiveweave.services.failure_signature import attribution_of
+        from hiveweave.tools.fact_positions import fact_from_bits
+
+        cases = [
+            {"dialect_failed": True},
+            {"runner_failed": True},
+            {"command_failed": True},
+            {"runner_failed": True, "command_failed": True},
+            {"dialect_failed": True, "runner_failed": True, "command_failed": True},
+            {"blocked": True},
+            {},
+        ]
+        for case in cases:
+            kind = fact_from_bits(case)
+            attr = attribution_of(dict(case))
+            if kind is None:
+                assert attr == "" or attr.startswith("blocked:"), (case, attr)
+            else:
+                assert attr.startswith(f"{kind}:"), (
+                    f"{case} 的位判据给出 {kind!r}，但 attribution_of 说 {attr!r}"
+                )
+
+
+class TestOverWideSignatureFixed:
+    """#15 修法 5：过宽签名 —— 裸 `"port"` 子串改成**词边界**。
+
+    实测反例（改动前）：本表是子串匹配 ⇒ `"port" in "ImportError" / "support"`
+    恒真 ⇒ `ImportError: cannot import name 'x'` 被判成 `bad_args`
+    （「调用方参数错」）⇒ 把 agent 指向改参数这条错路。
+    """
+
+    def test_port_word_is_not_substring_matched(self):
+        """`import`/`support`/`report` 等词里的 "port" **不得**被误命中。
+
+        阳性对照（**实测转红**）：把 `_SIGNATURE_ORDER` 的 `_Sig("regex", r"\\bport\\b")`
+        改回子串条目 `_Sig("substr", "port")` ⇒ 本用例三条断言全部转红
+        （且模块 import 期的 gate 也会先炸）。
+        """
+        assert fp.classify_error_text("ImportError: cannot import name 'x'") is None
+        assert fp.classify_error_text("Error: operation not supported") is None
+        assert fp.classify_error_text("Error: report generation failed") is None
+        assert fp.classify_error_text("transport layer is not important") is None
+
+    def test_real_reserved_port_messages_still_hit_bad_args(self):
+        """真·保留端口文案（两条产出点）必须**仍判** `bad_args`。
+
+        阳性对照：把词边界写成 `\\bports?\\b` 之外的过窄形态（如 `^port$`）
+        ⇒ 本用例转红（真命中被一起挡掉）。
+        """
+        from hiveweave.services.process_registry import (
+            check_command_reserved_ports,
+            prepare_spawn_command,
+        )
+
+        guarded = check_command_reserved_ports("npm run dev -- --port 4000")
+        assert guarded, "保留端口必须被拦（否则本用例失去意义）"
+        assert fp.classify_error_text(guarded) == "bad_args", guarded
+
+        _cmd, _env, prep_err, _im = prepare_spawn_command(
+            "npm run dev -- --port 4000", project_id=None, preferred_port=3000
+        )
+        assert prep_err, "保留端口必须产出 prep_err（否则本用例失去意义）"
+        assert fp.classify_error_text(prep_err) == "bad_args", prep_err
+
+    def test_classify_blocked_fact_takes_bits_first(self):
+        """纯函数入口也要位优先；位为 None 时保持**严格**（fail loud）。"""
+        from hiveweave.tools.fact_positions import classify_blocked_fact
+
+        # 位在 ⇒ 不看文案（法文也一样）
+        assert classify_blocked_fact(
+            "bash", "texte inconnu", bits={"dialect_failed": True}
+        ) == "runner_failed"
+        # 位缺失 + 签名命中 ⇒ 走第二层（保持既有行为）
+        assert classify_blocked_fact("bash", "Port 4000 is reserved") == "bad_args"
+        # 位缺失 + 无签名 ⇒ 仍 fail loud（严格性由这条守住）
+        with pytest.raises(AssertionError, match="no fact evidence"):
+            classify_blocked_fact("bash", "断言失败 1 != 2")
+

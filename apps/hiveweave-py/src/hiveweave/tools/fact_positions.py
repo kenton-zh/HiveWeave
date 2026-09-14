@@ -16,6 +16,33 @@ DSH 一致：**先判 runner（命令从未执行），再判 denial（护栏拦
 两边都不是时**不许静默归类**，而是 fail loud —— 静默归类等于把误标从
 15 处搬到 1 处，还更隐蔽。
 
+## 归因顺序：**状态位优先，文本只配当第二层**（#15，2026-09-14）
+
+判据来源二分（用户 2026-09-14 钦定）：
+
+  · **状态判据**（DB 行 / 系统边界 / 权限位 / **事实位**）与措辞、语言**无关**
+    ⇒ 可用；
+  · **文本判据**（自由文本的子串 / 正则）随措辞与语言**整体失效**
+    （换法文、换同义词即绕过）⇒ 只能兜底，不能当第一层。
+
+本模块此前的形态正是后者：归因**先跑签名表**，把「命令有没有跑」这个**状态**
+交给错误文案回答。修后的阶梯（**顺序即判据**，前两层判不出来才向下走）：
+
+  1. **布尔位**（构造点知道的事实）：``dialect_failed`` → ``runner_failed``；
+     ``runner_failed`` → ``runner_failed``；``command_failed`` → ``command_failed``。
+     位名与顺序**逐字同源**于 ``services/failure_signature.py::attribution_of``，
+     两边共用 :func:`fact_from_bits` 单一实现 —— 不许各自演化。
+  2. **文本签名表**（`RUNNER_FAILURE_SIGNATURES` / `BAD_ARGS_SIGNATURES`）：
+     只在**位缺失**时才参考；它是**兜底观测**，不是判据本体。
+  3. **代码作用域**：``timeout_kind == "wait"``（审批窗口等待）。
+  4. 三者都不命中 ⇒ **不猜**，落 ``outcome_unknown``（语义＝「结果未知」）。
+
+⚠ 第 4 步**不得**落 ``runner_failed``：后者语义是「命令从未执行」⇒ 下游读成
+「无副作用、可直接重试」，而本模块的触发点在**执行之后**（executor 的
+normalize 尾）⇒ 可能诱发**副作用双发**（见 :func:`finalize_tool_result` 的
+长注释与 ``tests/test_p0_3_orphan_root_cause.py``）。归不到证据时，保守方向
+是「结果未知、别盲目重试」，而不是「放心重试」。
+
 ## 与 L6 的分工
 
 `bad_args` 不是「runner 失败的一种」，是**调用方责任**：模型把路径/端口写错，
@@ -33,10 +60,12 @@ DSH 一致：**先判 runner（命令从未执行），再判 denial（护栏拦
 from __future__ import annotations
 
 import re
+from typing import Literal, NamedTuple
 
 import structlog
 
 from hiveweave.tools.result import FactKind
+from hiveweave.util.redact import redact_secrets
 
 log = structlog.get_logger(__name__)
 
@@ -82,17 +111,39 @@ RUNNER_FAILURE_SIGNATURES: tuple[str, ...] = (
 BAD_ARGS_SIGNATURES: tuple[str, ...] = (
     "疑似重复 worktree 前缀路径",
     "duplicate worktree prefix",
-    "port",                                # dev-server 保留端口（换 3000+ 即可）
     "出界",                                 # 路径越界类参数错
 )
+# ⚠ 原表里有一条裸 `"port"`（dev-server 保留端口），已**删除**：本表的匹配是
+# 子串匹配 ⇒ `"port" in "ImportError" / "unsupported" / "important" / "report"`
+# 全部命中 ⇒ 任何含 import/支持/report 的错误都被归成「调用方参数错」，把 agent
+# 指向改参数这条错路（实测：`ImportError: cannot import name 'x'` → bad_args）。
+# 该条改为**词边界**判据，见下方 `_SIGNATURE_ORDER` 的 `regex` 条目 ——
+# 保留端口文案（`Port 4000 is reserved …` / `not --port 4000.`）仍命中。
+
+#: 一条签名判据。
+#:
+#: ``kind="substr"`` 是**归一化后的子串**匹配（对齐 DSH 的 `fatalSignatures`
+#: 语义，也是本表历史语义）；``kind="regex"`` 是 ``re.search``（用于需要
+#: **词边界/数字边界**的形态 —— 子串匹配会误命中，见上面 `"port"` 的反例）。
+#: 两种都跑在**归一化文本**上（小写 + 单空格）。
+class _Sig(NamedTuple):
+    kind: Literal["substr", "regex"]
+    value: str
+
+
+def _substr(*needles: str) -> tuple[_Sig, ...]:
+    """把「子串型签名表」转成判据条目（保持表的可读性，见上两张 `_SIGNATURES`）。"""
+    return tuple(_Sig("substr", n) for n in needles)
+
 
 #: `fact` 与签名的对应表（顺序即判据顺序，对齐 DSH「先 runner 再 denial」）。
 #:
-#: 顺序不可随意调换：`bad_args` 的 "port" 等签名较宽，若排在 runner 签名
-#: 前面，会把「端口保留导致的 spawn 失败」之类的 runner 故障误判成参数错。
-_SIGNATURE_ORDER: tuple[tuple[FactKind, tuple[str, ...]], ...] = (
-    ("runner_failed", RUNNER_FAILURE_SIGNATURES),
-    ("bad_args", BAD_ARGS_SIGNATURES),
+#: 顺序不可随意调换：`bad_args` 的签名较宽（词边界的 `port` 也会命中
+#: 「端口保留导致的 spawn 失败」文案里的 port），若排在 runner 签名前面，
+#: 会把那类 runner 故障误判成参数错。
+_SIGNATURE_ORDER: tuple[tuple[FactKind, tuple[_Sig, ...]], ...] = (
+    ("runner_failed", _substr(*RUNNER_FAILURE_SIGNATURES)),
+    ("bad_args", _substr(*BAD_ARGS_SIGNATURES) + (_Sig("regex", r"\bport\b"),)),
 )
 
 _NORM_RE = re.compile(r"\s+")
@@ -103,18 +154,98 @@ def _normalize(text: str) -> str:
     return _NORM_RE.sub(" ", (text or "")).strip().lower()
 
 
+# ── 第一层判据：布尔位（状态）────────────────────────────────────
+#
+# 位名**只此三个**（与 `services/failure_signature.py::attribution_of` 的读取
+# 集合逐字一致；不许在此之外发明位名，也不许让两边各自演化）。
+_DIALECT_BIT = "dialect_failed"
+_RUNNER_BIT = "runner_failed"
+_COMMAND_BIT = "command_failed"
+#: 落样本时要一并记录「当时有哪些位」（含 `blocked` —— 它不是归因位，
+#: 但「blocked=True 却没有任何归因位」正是我们要看见的形态）。
+_SAMPLE_BITS: tuple[str, ...] = (
+    _DIALECT_BIT, _RUNNER_BIT, _COMMAND_BIT, "blocked",
+)
+
+#: 位 → 事实位（顺序即优先级；`dialect_failed` 语义 = 方言不兼容 ⇒ 命令从未执行）。
+_BIT_FACTS: tuple[tuple[str, FactKind], ...] = (
+    (_DIALECT_BIT, "runner_failed"),
+    (_RUNNER_BIT, "runner_failed"),
+    (_COMMAND_BIT, "command_failed"),
+)
+
+
+def _bits_mapping(source: dict | object) -> dict[str, object]:
+    """把结果 dict / `ToolResult` 归一成**位视图**（只读，不造 KeyError）。
+
+    对 `ToolResult`：取 `extra`（裸位经 `to_dict` 会落在这里）+ 字段位
+    ``blocked``（它不是 extra，但样本里必须能看出「当时是护栏拒绝」）。
+
+    ⚠ **不读** `runner_failed`/`command_failed` **派生属性**：它们不是「声明的
+    位」，而是 `fact` 的视图 —— 在 fact 还是占位值时它们恒 `False`，读进来
+    会把「没有位」谎报成「位存在且为假」（实测踩过：样本的 `bits_present`
+    里凭空出现两个 False 位）。
+    """
+    if isinstance(source, dict):
+        return source
+    mapping: dict[str, object] = {}
+    extra = getattr(source, "extra", None)
+    if isinstance(extra, dict):
+        mapping.update(extra)
+    blocked = getattr(source, "blocked", None)
+    if blocked is not None:
+        mapping.setdefault("blocked", blocked)
+    return mapping
+
+
+def state_bits(source: dict | object) -> dict[str, bool]:
+    """读出**存在的**归因状态位（缺位**不补** `False` —— 「没说」≠「说了否」）。
+
+    只含 :data:`_BIT_FACTS` 里的三个位；值统一成 `bool`（位可能是 `None`/真值）。
+    """
+    mapping = _bits_mapping(source)
+    bits: dict[str, bool] = {}
+    for bit, _fact in _BIT_FACTS:
+        value = mapping.get(bit)
+        if value is not None:
+            bits[bit] = bool(value)
+    return bits
+
+
+def fact_from_bits(source: dict | object) -> FactKind | None:
+    """**第一层判据**：状态位 → 事实位；位缺失返回 `None`（**不猜**）。
+
+    与 ``services/failure_signature.py::attribution_of`` **同一判据**（顺序：
+    ``dialect_failed`` > ``runner_failed`` > ``command_failed``）—— 该函数改为
+    调用本函数，避免「一处改了另一处没改」的经典复发（本仓纪律：同一判据只有
+    一份实现）。
+    """
+    bits = state_bits(source)
+    for bit, fact in _BIT_FACTS:
+        if bits.get(bit):
+            return fact
+    return None
+
+
 def classify_error_text(error: str) -> FactKind | None:
-    """按签名表归类错误的成因；**无签名命中时返回 None**（不猜）。
+    """**第二层判据**：按签名表归类错误的成因；**无签名命中时返回 None**（不猜）。
 
     调用方拿到 None 必须显式处理（fail loud / 保留未确定），不得默认
     归到某一格 —— 那正是「无证据归类」。
+
+    ⚠ 本函数只该在**布尔位缺失**时被调用（:func:`fact_from_bits` 先跑）：
+    文本判据随措辞与语言整体失效，把它当第一层等于把归因交给文案。
     """
     norm = _normalize(error)
     if not norm:
         return None
     for fact, signatures in _SIGNATURE_ORDER:
         for sig in signatures:
-            if _normalize(sig) in norm:
+            if sig.kind == "substr":
+                hit = _normalize(sig.value) in norm
+            else:  # regex：词边界类（见 `_SIGNATURE_ORDER` 的 `\bport\b`）
+                hit = re.search(sig.value, norm) is not None
+            if hit:
                 return fact
     return None
 
@@ -124,20 +255,30 @@ def classify_blocked_fact(
     error: str,
     *,
     timeout_kind: str | None = None,
+    bits: dict | object | None = None,
 ) -> FactKind:
-    """`blocked` 结果的事实位归因 —— 单一判据入口。
+    """`blocked` 结果的事实位归因 —— 单一判据入口（**位优先**）。
 
-    顺序严格照 DSH（`packages/sandbox/sandbox/src/index.ts:109-115`）：
-    1. **先判 runner**：命令从未执行；
-    2. 再判 `bad_args`：调用方参数错（平台无责）；
+    阶梯（#15，2026-09-14；顺序即判据）：
+    1. **布尔位**（`dialect_failed` > `runner_failed` > `command_failed`）——
+       状态判据，与措辞/语言无关，故排第一；
+    2. 文本签名表（`classify_error_text`）：位缺失才参考，先 runner 再 bad_args
+       （顺序对齐 DSH `packages/sandbox/sandbox/src/index.ts:109-115`）；
     3. 审批等待（`timeout_kind == "wait"`）：平台侧流程阻塞 ⇒ runner；
     4. 全不命中 ⇒ **AssertionError**（fail loud，绝不静默归类）。
+
+    ``bits`` 是位视图（结果 dict 或 `ToolResult` 均可，缺省 `None` = 没有位）。
+    本函数保持**严格**（判不出来就抛）—— 运行时的 fail-soft 兜底在
+    :func:`finalize_tool_result`，两者分工见那里的长注释。
 
     ``timeout_kind == "wait"`` 属平台侧（审批窗口等待），语义是「命令从未
     派发」，故归 runner_failed —— 这是**代码作用域归属**，不靠文案匹配
     （对齐 DSH `packages/guard/timeout-policy/src/index.ts:69-73` 的
     「a nested outer deadline reads as undefined here」同款思路）。
     """
+    bit_fact = fact_from_bits(bits) if bits is not None else None
+    if bit_fact is not None:
+        return bit_fact
     kind = classify_error_text(error)
     if kind is not None:
         return kind
@@ -145,10 +286,67 @@ def classify_blocked_fact(
         return "runner_failed"
     raise AssertionError(
         f"blocked tool result has no fact evidence: tool={tool_name!r} "
-        f"error={error!r:.200} — 签名表未命中时不得静默归类；"
-        f"要么补 RUNNER_FAILURE_SIGNATURES/BAD_ARGS_SIGNATURES，"
-        f"要么让构造点显式声明 fact（见 fixplan 批次 2 §1.4c）"
+        f"error={error!r:.200} — 布尔位与签名表都没命中时不得静默归类；"
+        f"要么让构造点声明布尔位/fact，要么补 RUNNER_FAILURE_SIGNATURES/"
+        f"BAD_ARGS_SIGNATURES（见 fixplan 批次 2 §1.4c / #15）"
     )
+
+
+# ── 判不出来时的 fail-loud 样本（#15 修法 3）──────────────────────
+#
+# 「降级静默」才是病灶：归因退化成 outcome_unknown 时没人知道，直到某天下游的
+# stall/重试分流全失灵。故留一条**带原始文案**的样本 ⇒ ①观测「判不出来」的真实
+# 比例（这是**平台可控**的指标）；②拿到真实文案后**在判据层重建**，而不是靠人
+# 猜上游会怎么写。
+#
+# 落库范式镜像 `llm/unknown_error_samples.py`（同一套「同步记样本 + 调用方落库」
+# 分层）：本函数是**同步**的且**拿不到 agent_id**（agent_id 是调用方作用域的信息）
+# ⇒ 不为记录而给它新增参数、也不猜 id：就地 log + 把 payload 放进结果
+# （`out["unclassified_sample"]`），由拿得到 agent_id 的调用方落 agent_events。
+UNCLASSIFIED_SAMPLE_EVENT = "fact_position_unclassified_sample"
+#: 样本里保留的文案长度（够了：判据特征词都在前 200 字内）。
+_SAMPLE_PREVIEW = 200
+
+
+def note_unclassified_sample(
+    *,
+    tool: str,
+    error: str = "",
+    status: object = None,
+    bits: dict | object | None = None,
+) -> dict:
+    """记一条「布尔位缺失 + 文本未命中」的样本，返回可落库 payload。
+
+    payload 形状：``{tool, error_preview(≤200 字), status, bits_present}``。
+
+    ⚠ 本函数**必须永不抛异常**：它挂在归因路径上，抛异常会把一次「判不出来」
+    升级成「整条工具调用炸掉」。
+    ⚠ **脱敏是硬要求**：任何情况都不得把 key/token 写进样本 —— 复用
+    `util/redact.py` 的唯一实现（不新增第 N 份密钥匹配面）。
+    """
+    try:
+        mapping = _bits_mapping(bits) if bits is not None else {}
+        payload: dict = {
+            "tool": tool,
+            "error_preview": redact_secrets(str(error or ""))[:_SAMPLE_PREVIEW],
+            "status": status,
+            "bits_present": sorted(
+                k for k in _SAMPLE_BITS if mapping.get(k) is not None
+            ),
+        }
+        log.error(
+            UNCLASSIFIED_SAMPLE_EVENT,
+            action=(
+                "事实位归因判不出来（位缺失 + 文本未命中）⇒ 落 outcome_unknown。"
+                "**别急着往签名表补词**：先看这条文案属于哪类，优先把判据改成"
+                "状态判据（让构造点声明布尔位 / fact）"
+            ),
+            **payload,
+        )
+        return payload
+    except Exception as e:  # noqa: BLE001 — 见 docstring：绝不抛
+        log.debug("unclassified_sample_note_failed", error=str(e)[:200])
+        return {}
 
 
 def assert_fact_complete(tool_name: str, result: dict) -> None:
@@ -196,23 +394,41 @@ def finalize_tool_result(
     失败**，恰好全在它覆盖之外。故本函数必须在**两条执行器各自的
     normalize 尾**都被调用。
 
-    `judge_blocked=True` 时对 blocked 结果按签名表补齐事实位（无签名
-    则 fail loud）；`judge_blocked=False` 用于只做形状归一、不参与
-    事实位归因的调用点。
+    **归因阶梯（#15，2026-09-14；顺序即判据）**：`judge_blocked=True`、结果
+    **失败**且**未声明 fact** 时补位，顺序＝
+    **布尔位 → 文本签名表 → 代码作用域（`timeout_kind=="wait"`）→ 不猜
+    （`outcome_unknown`）**；位缺失且文本未命中时另落一条 fail-loud 样本
+    （见 :func:`note_unclassified_sample`，payload 同时进
+    `out["unclassified_sample"]` 供调用方落库）。
+
+    `judge_blocked=False` 用于只做形状归一、不参与事实位归因的调用点。
     """
     from hiveweave.tools.result import ToolResult, finalize_fact_dict
 
+    unclassified: dict = {}
     if isinstance(raw, ToolResult):
         r = raw
+        declared = r.fact is not None
     elif isinstance(raw, dict):
         # blocked 必须显式透传：进 extra 会被 ToolResult 字段恒胜覆盖抹掉
         # （审计 P2，潜伏陷阱）。
+        _declared = raw.get("fact") or None  # "" 视为未声明（免得构造期报 unknown）
+        declared = _declared is not None
+        _blocked = bool(raw.get("blocked"))
+        # ⚠ blocked=True 且未声明 fact 时，`ToolResult.__post_init__` 的不变式会
+        # **硬抛** ValueError（`blocked result must declare its fact kind`，实测
+        # 2026-09-14）—— 而本函数在 dispatch 的 try/except 之外被调用 ⇒ 未捕获
+        # 异常会炸掉整条工具调用（与下方 assert_fact_complete 的 P0-3 同构，
+        # 只是炸点更靠前）。故先用一个**与兜底同格**的保守占位
+        # （`outcome_unknown`）过不变式，随后由真实归因覆盖；两者同格 ⇒
+        # 归因全不命中时也不会泄漏出比兜底更乐观的语义（尤其**不会**变成
+        # 「命令从未执行」那种"放心重试"信号）。
         r = ToolResult(
             success=raw.get("success", True),
             output=raw.get("output", ""),
             error=raw.get("error"),
-            blocked=bool(raw.get("blocked")),
-            fact=raw.get("fact"),
+            blocked=_blocked,
+            fact=_declared or ("outcome_unknown" if _blocked else None),
             extra={
                 k: v
                 for k, v in raw.items()
@@ -222,7 +438,7 @@ def finalize_tool_result(
     else:
         return ToolResult.ok(str(raw)).to_dict()
 
-    # 事实位归因：blocked 却无 fact ⇒ 按签名表判。
+    # 事实位归因：失败且**未声明 fact** 时按阶梯补位（#15：**位优先**）。
     #
     # ⚠️ 判不出来时**不能把 AssertionError 抛到运行时**（独立审计 P1，2026-09-11）：
     # 本函数在 executor 的第 4 步、**dispatch 的 try/except 之外**被调用
@@ -230,38 +446,90 @@ def finalize_tool_result(
     # agent 拿到的是「平台崩了」而不是「这个工具被拦住了」——
     # 这比"归错格"更糟。反例：`file.py` 的 `"Unknown error"` 不命中任何签名。
     #
-    # 故此处 **fail loud 但不 fail hard**：签名表失配是**平台侧需修**的信号，
-    # 记 ERROR 日志（可被 CI/审计捞），但运行时归到保守的 `runner_failed`
-    # （语义 =「命令从未执行」，对 agent 而言是「不是你的 bug」——
-    # 保守方向：宁可让它重试，不可让它误以为环境已损坏而放弃）。
+    # 故此处 **fail loud 但不 fail hard**：判据失配是**平台侧需修**的信号，
+    # 记 ERROR 日志 + 落样本（CI/审计可捞），运行时归到 `outcome_unknown`。
+    # ⚠ 兜底**不得**是 `runner_failed`：语义 =「命令从未执行」⇒ 下游读成
+    # 「无副作用、可直接重试」，而本函数的触发点在**执行之后**（normalize 尾）
+    # ⇒ 会诱发**副作用双发**（审计 P0-3 第 1 条）。归不到证据时，保守方向是
+    # 「结果未知、别盲目重试」，不是「放心重试」。
     #
-    # **严格性由 commit gate 保留**：`test_fact_positions_coverage.py` 对
-    # 签名表本身的失配仍以断言封死；`classify_blocked_fact()` 作为**纯测试
-    # 入口**依旧 fail loud（生产路径走本函数的兜底）。
-    if judge_blocked and r.blocked and r.fact is None:
-        try:
-            r.fact = classify_blocked_fact(
-                tool_name,
-                r.error or "",
-                timeout_kind=getattr(r, "timeout_kind", None),
+    # **严格性由 commit gate 保留**：`test_fact_positions_coverage.py` 对签名表
+    # 本身的失配仍以断言封死；`classify_blocked_fact()` 作为**纯函数入口**依旧
+    # fail loud（生产路径走本函数的 fail-soft 兜底）。
+    if judge_blocked and not declared and not r.success:
+        bit_fact = fact_from_bits(r)
+        if r.blocked:
+            # blocked 只接受**平台侧成因**的两格（`tools/result.py::_BLOCKED_FACT_KINDS`）：
+            # 位是调用方声明的，可能是调用方成因（`command_failed`）—— 那种位在
+            # blocked 语义下**不可用**（标它会向 agent 发「不是你的 bug」信号并
+            # 原地重撞，L6/L19），故丢弃该位、继续向下走阶梯。
+            kind: FactKind | None = (
+                bit_fact
+                if bit_fact in ("runner_failed", "outcome_unknown")
+                else None
             )
-        except AssertionError:
-            log.error(
-                "fact_position_signature_miss",
+            if kind is None:
+                # 第二层：文本签名表（位缺失才参考 —— 它随措辞/语言整体失效）
+                kind = classify_error_text(r.error or "")
+            if kind is None and (r.extra or {}).get("timeout_kind") == "wait":
+                # 第三层：代码作用域归属（审批窗口等待 ⇒ 命令从未派发），非文案
+                #
+                # ⚠ 必须从 ``extra`` 读，不能读 ``r.timeout_kind`` 字段 ——
+                # 构造点从来没有填过那个 dataclass 字段，值一直是走 ``extra``
+                # 传的（``bash.py`` 的字段白名单把它放进返回 dict，而
+                # ``ToolResult.__init__`` 只把未声明的 kwargs 收进 extra）。
+                # #15 审计实测：``ToolResult.err(..., timeout_kind="wait").timeout_kind
+                # is None`` ⇒ 只读字段会让这一层**在生产上永不可达**，
+                # 于是审批窗口等待类 blocked 结果会悄悄落到 outcome_unknown。
+                kind = "runner_failed"
+            if kind is None:
+                # 第四层：**不猜**。落 `outcome_unknown`（=「结果未知」），并留样本。
+                unclassified = note_unclassified_sample(
+                    tool=tool_name,
+                    error=r.error or "",
+                    status=(r.extra or {}).get("status"),
+                    bits=r,
+                )
+                kind = "outcome_unknown"
+            r.fact = kind
+        elif bit_fact is not None:
+            # 非 blocked 的失败（shell 家族）：位是**状态**，构造点说了就得认账。
+            # 此前这里无条件走 outcome_unknown ⇒ 会把调用方显式声明的
+            # `runner_failed`/`command_failed` 位**抹掉**（`finalize_fact_dict`
+            # 按 fact 重算派生键）⇒ 下游读不到那位（#15 的位丢失面）。
+            r.fact = bit_fact
+            log.info(
+                "fact_position_resolved_from_bits",
                 tool=tool_name,
-                error_preview=(r.error or "")[:200],
-                fallback="runner_failed",
+                fact=bit_fact,
+                bits=sorted(state_bits(r)),
+            )
+    elif judge_blocked and declared and not r.success:
+        # **只观测、不夺声明权**（#15 审计 7(a)）：构造点声明了 fact 时，
+        # 位核对/文本核验/样本**全被跳过**（见上面的 `if ... and not declared`）。
+        # 这是 #15 要治的「自我声明当证据」在同一层重新开口 —— 我们不改变归因
+        # （构造点比通用判据更懂上下文，硬覆盖会更糟），但**声明与位冲突必须留痕**，
+        # 否则「声明即免检」永远没人知道它判错了。
+        bit_fact_declared = fact_from_bits(r)
+        if bit_fact_declared is not None and r.fact != bit_fact_declared:
+            log.warning(
+                "fact_position_declared_conflicts_with_bits",
+                tool=tool_name,
+                declared=r.fact,
+                bits_fact=bit_fact_declared,
+                bits=sorted(state_bits(r)),
                 action=(
-                    "签名表未命中 —— 请把该文案补进 "
-                    "RUNNER_FAILURE_SIGNATURES / BAD_ARGS_SIGNATURES，"
-                    "或在构造点显式声明 fact（fixplan 批次 2 §1.4c）"
+                    "构造点声明的 fact 与它自己给的布尔位不一致 —— 归因**按声明**"
+                    "（未改动），但请核对构造点是不是写错了。"
                 ),
             )
-            r.fact = "runner_failed"
 
     out = r.to_dict()
+    if unclassified:
+        # 调用方拿得到 agent_id ⇒ 由它落 agent_events（本函数是同步的、不猜 id）
+        out["unclassified_sample"] = unclassified
     if tool_name in SHELL_SECURITY_LEVEL_TOOLS or judge_blocked:
-        # ⚠ 同上方 :227-236 已确立的原则（**fail loud 但不 fail hard**）：
+        # ⚠ 同上方事实位归因段（:442-459）已确立的原则（**fail loud 但不 fail hard**）：
         # `assert_fact_complete` 过去在这里**硬抛 AssertionError**，而本函数在
         # executor 的第 4 步、**dispatch 的 try/except 之外**被调用 ⇒ 未捕获异常
         # 会砸穿整条工具调用。实测（TEST_DSH_55 P0-3）：55 步以
@@ -295,6 +563,16 @@ def finalize_tool_result(
             # runner_failed 等于给「可能已有副作用」的步骤发安全重试通行证
             # （审计 P0-3 第 1 条；本仓库纪律：事实位错标 ⇒ 副作用双发）。
             out["fact"] = "outcome_unknown"
+            # #15 审计：这条兜底（非 blocked 且构造点漏声明 fact）过去**只记日志、
+            # 不产样本** ⇒ fail-loud 有两条通道、其中一条是哑的。统一到同一条：
+            # 判不出来就产样本，由调用方（`_f10_result_hooks`）落 agent_events。
+            if "unclassified_sample" not in out:
+                out["unclassified_sample"] = note_unclassified_sample(
+                    tool=tool_name,
+                    error=str(out.get("error") or ""),
+                    status=None,
+                    bits=None,
+                )
     # 裸字典路径可能带进陈旧的 runner_failed/command_failed —— 由 fact 统一
     return finalize_fact_dict(out)
 
@@ -315,13 +593,18 @@ def _assert_signature_table_wellformed() -> None:
         assert _fact in ("runner_failed", "bad_args"), _fact
         assert _sigs, f"FactKind {_fact!r} 的签名表为空 —— 它永远不会被命中"
         for _sig in _sigs:
-            assert _sig.strip(), f"FactKind {_fact!r} 含空签名"
-            assert _sig == _sig.strip(), (
-                f"签名 {_sig!r} 有首尾空白 —— 匹配前会归一，声明侧也必须归一"
+            assert _sig.kind in ("substr", "regex"), _sig
+            assert _sig.value.strip(), f"FactKind {_fact!r} 含空签名"
+            assert _sig.value == _sig.value.strip(), (
+                f"签名 {_sig.value!r} 有首尾空白 —— 匹配前会归一，声明侧也必须归一"
             )
-            assert _sig.lower() == _sig, (
-                f"签名 {_sig!r} 未小写 —— 匹配是大小写不敏感的，声明侧必须统一"
-            )
+            if _sig.kind == "substr":
+                assert _sig.value.lower() == _sig.value, (
+                    f"签名 {_sig.value!r} 未小写 —— 子串匹配是大小写不敏感的，"
+                    f"声明侧必须统一（regex 型不受此限）"
+                )
+            else:
+                re.compile(_sig.value)  # 语法错必须在 import 期就炸（fail loud）
     # 2) 顺序铁律：runner 签名必须排在 bad_args 之前（DSH「先 runner 再 denial」）
     _order = [f for f, _ in _SIGNATURE_ORDER]
     assert _order.index("runner_failed") < _order.index("bad_args"), (
@@ -330,6 +613,19 @@ def _assert_signature_table_wellformed() -> None:
     # 3) `classify_error_text` 对空/无签名输入必须返回 None（不猜）
     assert classify_error_text("") is None
     assert classify_error_text("完全无关的一段文本") is None
+    # 4) 词边界判据必须**真的**带词边界（否则又退回裸子串："port" in "import"）
+    for _false_hit in (
+        "importerror: cannot import name 'x'",
+        "operation not supported",
+        "report generation failed",
+    ):
+        assert classify_error_text(_false_hit) is None, (
+            f"{_false_hit!r} 被误命中 —— bad_args 的 port 判据退回子串形态了"
+            f"（它会把 import/support/report 全归成「调用方参数错」）"
+        )
+    assert classify_error_text("Port 4000 is reserved for HiveWeave") == "bad_args", (
+        "保留端口文案必须仍判 bad_args —— 词边界不能把真命中一起挡掉"
+    )
 
 
 _assert_signature_table_wellformed()
