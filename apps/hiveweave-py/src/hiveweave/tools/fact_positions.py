@@ -579,7 +579,14 @@ def finalize_tool_result(
                     tool=tool_name,
                     error=str(out.get("error") or ""),
                     status=None,
-                    bits=None,
+                    # ⚠ 传 `r` 而不是 `out`：`to_dict()` 会先 pop 派生键
+                    # （runner_failed/command_failed…），`out` 里已经没有位了。
+                    # 传 `r` 才能拿到构造点声明的原始位 —— 而**这正是本分支要诊断的
+                    # 场景**（「构造点漏声明 fact」时，它到底声明了哪些位）。
+                    # 与 blocked 分支的 `bits=r` 对称（此前这里传 None ⇒ 样本里
+                    # `bits_present={}`，把「显式声明 False」与「啥也没说」混为一谈，
+                    # 正是 `bits_present` 带值要解决的那个歧义）。
+                    bits=r,
                 )
     # 裸字典路径可能带进陈旧的 runner_failed/command_failed —— 由 fact 统一
     return finalize_fact_dict(out)
