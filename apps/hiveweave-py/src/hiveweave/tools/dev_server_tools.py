@@ -310,9 +310,23 @@ async def start_dev_server_tool(
         log_file.close()
         return ToolResult.blocked_err(f"Error: {seal_reason}")
 
-    try:
+    # ── #1（P0）：**受限 agent 的 spawn 必须进沙箱** ────────────────────
+    # 此前本工具直接 `spawn_project_process` ⇒ 以**平台身份、无沙箱**执行任意
+    # `params.command`。实证（TEST_DSH_56）：叶子用 start_dev_server 成功写出
+    # 项目之外，而同一越界动作经 pwsh 被 ACL 拒绝 —— 干净对照。
+    # 形态照 `tools/bash.py` 的 dev-server 路：**同一个功能此前只有那条在沙箱内**；
+    # 两条路各写一份正是本条的根因（"沙箱路由是每个工具自己的约定"）。
+    from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
+    from hiveweave.services.acl_sandbox.integration import (
+        acl_sandbox_active,
+        build_confined_argv,
+        resolve_project_root,
+    )
+    from hiveweave.services.acl_sandbox.service import spawn_confined
+
+    def _native_spawn():
         # env 只在显式传入时转发（旧测试桩签名无 env；None 传下去也无意义）
-        proc, spawn_err, meta = spawn_project_process(
+        return spawn_project_process(
             cmd,
             cwd=work_cwd,
             project_id=project_id,
@@ -321,6 +335,35 @@ async def start_dev_server_tool(
             stderr=STDOUT,
             **({"env": params.env} if params.env else {}),
         )
+
+    try:
+        if acl_sandbox_active():
+            project_root = await resolve_project_root(project_id)
+            sres = await spawn_confined(
+                argv=build_confined_argv(cmd),
+                workdir=work_cwd,
+                workspace_path=work_cwd,
+                agent_id=agent_id or "unknown",
+                project_id=project_id,
+                project_workspace_path=project_root,
+                entry="dev_server",
+                long_running=True,
+            )
+            if sres is not None:
+                # ⚠ **复用** bash.py 的 Popen-like shim，不复制第二份：同一个 shim
+                # 出现两次就会各自演化（本条的根因正是"同一功能两条路各写一份"）。
+                from hiveweave.tools.bash import _ConfinedDevProc
+
+                proc = _ConfinedDevProc(sres["job"])
+                spawn_err = None
+                meta = {"command": cmd, "cwd": work_cwd, "pid": proc.pid}
+            else:
+                # `spawn_confined` 返回 None 仅两种情形：**非 Windows / 沙箱配置关**
+                # ⇒ 回落原生路径（与 bash 同语义）。⚠ 这与"沙箱**不可用**"不同，
+                # 后者走下面的 SandboxUnavailableError = fail-closed。
+                proc, spawn_err, meta = _native_spawn()
+        else:
+            proc, spawn_err, meta = _native_spawn()
         if spawn_err or proc is None:
             log_file.close()
             tail = _read_log_tail(log_path)
@@ -329,6 +372,19 @@ async def start_dev_server_tool(
                 msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
             return ToolResult.err(msg)
         cmd = meta.get("command") or cmd
+    except SandboxUnavailableError as e:
+        # ── 中间验收（计划 §三 #1 修法第 2 段）：**fail-closed** ──────────────
+        # 沙箱不可用时**直接干净拒绝**，绝不静默降级为原生 spawn ——
+        # 「以为在沙箱里、其实在沙箱外」是本条最坏的形态（比明确的拒绝糟得多）。
+        # 对齐 bash.py 的同款分支（`return e.to_tool_dict()`）。
+        log_file.close()
+        log.warning(
+            "start_dev_server_sandbox_unavailable",
+            error=str(e),
+            command=cmd[:120],
+            cwd=work_cwd[:120],
+        )
+        return e.to_tool_dict()
     except Exception as e:
         log_file.close()
         tail = _read_log_tail(log_path)

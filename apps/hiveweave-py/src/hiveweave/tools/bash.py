@@ -694,6 +694,23 @@ class _ConfinedDevProc:
         except Exception:  # noqa: BLE001
             pass
 
+    def poll(self) -> int | None:
+        """Popen-like 存活探测：仍在跑 ⇒ ``None``；已退出 ⇒ ``0``。
+
+        ⚠ 为什么补在这里而不是让调用方各写一份：`dev_server_tools` 的
+        `start_dev_server` 需要 `poll()`（判"起来后是否立刻退出"），而 bash 路不需要
+        —— 于是本 shim 此前没有它。**但同一个 shim 出现两份就会各自演化**
+        （这正是 #1 的根因：同一个 dev-server 功能两条路各写一份 spawn）。
+        ⇒ 需求差异用**加方法**吸收，不复制类型。
+
+        退出码不可得（沙箱 job 只给存活位）⇒ 已退出一律返回 ``0``；调用方只判
+        `is not None`（"是否已退出"），不要拿这个 ``0`` 当"成功"。
+        """
+        try:
+            return 0 if self.job.is_exited() else None
+        except Exception:  # noqa: BLE001 — 探测失败按"仍在跑"处理，不误杀
+            return None
+
 # Self-destructive command patterns (契约 02 — 7 patterns)
 # Match semantics mirror Elixir check_self_destructive/1:
 #   patterns 1-2 use word-boundary-anchored regex
