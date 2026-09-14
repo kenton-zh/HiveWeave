@@ -300,10 +300,16 @@ async def create_task_tool(
 
         title = params.title
         source = "agent"
+        # ⚠ 必须在 if **之外**给初值：`kind=kind` 在下面的 create_task 调用里
+        # （块外）使用，只在块内赋值会让 `milestone_verify=False` 时 NameError。
+        kind: str | None = None
         if params.milestone_verify:
             from hiveweave.services.policy import infer_role_family
             from hiveweave.services.org import OrgService
-            from hiveweave.services.tasks.verify import is_verify_title
+            from hiveweave.services.tasks.verify import (
+                VERIFY_KIND,
+                ensure_verify_display_prefix,
+            )
 
             me = await OrgService().resolve_agent(agent_id)
             family = infer_role_family(me or {})
@@ -312,8 +318,10 @@ async def create_task_tool(
                     "milestoneVerify is for coordinators/CEO arranging MAIN QA, "
                     "not leaf self-service."
                 )
-            if not is_verify_title(title):
-                title = f"VERIFY: {title}"
+            # #11：判定来源是 `kind`；标题前缀**只是展示**（幂等加，去掉它
+            # 不改变任何门的行为）。
+            title = ensure_verify_display_prefix(title)
+            kind = VERIFY_KIND
             source = "system"
         task_id = await ts.create_task(
             project_id=project_id,
@@ -331,6 +339,7 @@ async def create_task_tool(
             source=source,
             contract_json=params.contract_json,
             policy_id=policy_id,
+            kind=kind,
         )
         task = await ts.get_task(project_id, task_id)
         st = (task or {}).get("status") or "created"

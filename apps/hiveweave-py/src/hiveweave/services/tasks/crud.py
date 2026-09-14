@@ -51,27 +51,18 @@ def _strip_platform_reserved_tags(
     return clean if clean else None
 
 
-# 伪造标题拒绝（H1 收口，2026-08-13）：大小写不敏感 + 括号/全角冒号形态，
-# 与 is_verify_title 的判定面一致再放宽一层（小写伪造也拦）。
-_FORGED_VERIFY_RE = re.compile(r"^[【\[]?\s*VERIFY\s*[:：]", re.IGNORECASE)
-
-
-def _reject_forged_verify_title(title: str | None, *, source: str) -> None:
-    """VERIFY: prefix is system-only (verify_spawn). Agents must not mint it.
-
-    H1 收口：括号/全角冒号形态经 is_verify_title 同样拒绝；
-    大小写不敏感拒绝保留（旧行为——防小写伪造在判定收紧后成为隐形 VERIFY）。
-    """
-    if source == "system":
-        return
-    raw = (title or "").lstrip()
-    if _FORGED_VERIFY_RE.match(raw):
-        raise ValueError(
-            "title prefix 'VERIFY:' is reserved for platform milestone QA. "
-            "Coordinators/CEO: create_task/dispatch_task with milestoneVerify=true "
-            "(source=system). Do not type VERIFY: yourself."
-        )
-
+# ⚠ 2026-09-14（#11）：**这里原先有一道「伪造 VERIFY 标题」拒绝门，已删除。**
+# 它存在的唯一理由是「标题前缀 = VERIFY 判据」—— agent 起个 `VERIFY: xxx`
+# 的标题就能拿到 VERIFY 的隔离门 / MAIN 证据闸 / 串行锁（提权）。
+# 判据改成 `kind` 之后：
+#   · `kind` **不是工具参数**，agent 侧传不进来（结构性防护，见 create_task
+#     docstring）⇒ 原来的提权路径**结构上不存在**了；
+#   · 标题退化为**纯展示** ⇒ 起个像 VERIFY 的标题什么都不影响（验收②）。
+# ⇒ 那道门挡的是一个无害动作，而且会**阻止验收②要求的场景被建出来**（普通任务
+# 加 `VERIFY:` 前缀必须能存在）。删。
+# ⚠ 真正的授权门不是它，而是 `milestone_verify` 路径上的**调用方身份校验**
+# （`family in ("ceo","coordinator")`，见 tools/tasks/create.py / dispatch.py）。
+# 删掉的只是「按标题拒绝」，不是「按身份拒绝」。
 
 class CrudMixin:
     """create / get / list / resolve / update / dedup helpers."""
@@ -130,7 +121,6 @@ class CrudMixin:
         task_id = str(uuid.uuid4())
 
         # VERIFY: 前缀 + 保留 tag 均为系统专属。agent/user 不得伪造。
-        _reject_forged_verify_title(title, source=source)
         tags = _strip_platform_reserved_tags(tags, source=source, title=title)
 
         explicit_policy = (policy_id or "").strip() or None
@@ -675,9 +665,9 @@ class CrudMixin:
             )
             if resolved_parent:
                 updates["parent_task_id"] = resolved_parent
-        # update_task has no source kw — treat as agent/user path.
-        if "title" in updates:
-            _reject_forged_verify_title(updates.get("title"), source="agent")
+        # ⚠ #11：原先这里有一句 `if "title" in updates: _reject_forged_verify_title(...)`，
+        # 随伪造门一起删除（改标题已不构成提权 —— 判定读 `kind`，见 create_task 上方
+        # 那段说明）。删时留下了一个空 `if` 体，已一并清掉。
         if "tags" in updates:
             updates["tags"] = _strip_platform_reserved_tags(
                 updates.get("tags"),

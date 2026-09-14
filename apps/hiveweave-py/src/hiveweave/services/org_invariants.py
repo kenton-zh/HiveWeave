@@ -268,7 +268,7 @@ def staffing_advisory(
         return None
     is_verify = None
     try:
-        from hiveweave.services.tasks.verify import is_verify_title as _ivt
+        from hiveweave.services.tasks.verify import is_verify_task as _ivt
 
         is_verify = _ivt
     except Exception:
@@ -279,7 +279,7 @@ def staffing_advisory(
             continue
         status = str(t.get("status") or "").strip().lower()
         try:
-            if is_verify is not None and is_verify(t.get("title")):
+            if is_verify is not None and is_verify(t):
                 continue  # VERIFY 是 QA 岗位，不是 executor 待派活
         except Exception:
             pass
@@ -383,7 +383,7 @@ def qa_depth_advisory(
         return None
     is_verify = None
     try:
-        from hiveweave.services.tasks.verify import is_verify_title as _ivt
+        from hiveweave.services.tasks.verify import is_verify_task as _ivt
 
         is_verify = _ivt
     except Exception:
@@ -398,7 +398,7 @@ def qa_depth_advisory(
         ):
             continue
         try:
-            if is_verify(t.get("title")):
+            if is_verify(t):
                 open_verify += 1
         except Exception:
             pass

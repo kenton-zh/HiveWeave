@@ -463,13 +463,18 @@ async def _assignee_has_open_tasks(workspace_path: str, short_id: str) -> bool:
                 pass
 
 
-def _row_is_verify_task(title: str | None, tags_raw: Any) -> bool:
-    """True for VERIFY children (title prefix only — TEST19 教训: agent 自由
-    tag "verify" 不得触发 VERIFY 特殊路径；H1 收口走 is_verify_title)."""
-    del tags_raw
-    from hiveweave.services.tasks.verify import is_verify_title
+def _row_is_verify_task(kind: Any) -> bool:
+    """True for VERIFY children（读 `kind`）。
 
-    return is_verify_title(title)
+    TEST19 教训: agent 自由 tag "verify" 不得触发 VERIFY 特殊路径。
+    #11（2026-09-14）: **标题完全不参与判定**（原来是标题前缀）。
+
+    取 `kind` 而不是整行 dict：本文件的查询是**窄 SELECT**（只取用得到的列，
+    见两处 `SELECT t.kind FROM tasks t`），故调用方直接把 `t.kind` 传进来。
+    """
+    from hiveweave.services.tasks.verify import is_verify_task
+
+    return is_verify_task({"kind": kind})
 
 
 async def _assignee_needs_write_worktree(
@@ -491,7 +496,7 @@ async def _assignee_needs_write_worktree(
     try:
         placeholders = ", ".join("?" * len(_IN_FLIGHT_AFTER_MERGE_STATUSES))
         cur = await conn.execute(
-            f"SELECT t.title, t.tags FROM tasks t "
+            f"SELECT t.kind FROM tasks t "
             f"JOIN agents a ON a.id = t.assignee_id "
             f"WHERE a.short_id = ? AND COALESCE(t.is_archived, 0) = 0 "
             f"AND t.status IN ({placeholders})",
@@ -500,9 +505,8 @@ async def _assignee_needs_write_worktree(
         rows = await cur.fetchall()
         await cur.close()
         for row in rows or []:
-            title = row[0] if not hasattr(row, "keys") else row["title"]
-            tags = row[1] if not hasattr(row, "keys") else row["tags"]
-            if not _row_is_verify_task(title, tags):
+            kind = row[0] if not hasattr(row, "keys") else row["kind"]
+            if not _row_is_verify_task(kind):
                 return True
         return False
     except Exception as e:
@@ -540,7 +544,7 @@ async def _assignee_is_verify_only(
     try:
         placeholders = ", ".join("?" * len(_IN_FLIGHT_AFTER_MERGE_STATUSES))
         cur = await conn.execute(
-            f"SELECT t.title, t.tags FROM tasks t "
+            f"SELECT t.kind FROM tasks t "
             f"JOIN agents a ON a.id = t.assignee_id "
             f"WHERE a.short_id = ? AND COALESCE(t.is_archived, 0) = 0 "
             f"AND t.status IN ({placeholders})",
@@ -550,9 +554,8 @@ async def _assignee_is_verify_only(
         await cur.close()
         saw_verify = False
         for row in rows or []:
-            title = row[0] if not hasattr(row, "keys") else row["title"]
-            tags = row[1] if not hasattr(row, "keys") else row["tags"]
-            if _row_is_verify_task(title, tags):
+            kind = row[0] if not hasattr(row, "keys") else row["kind"]
+            if _row_is_verify_task(kind):
                 saw_verify = True
             else:
                 return False

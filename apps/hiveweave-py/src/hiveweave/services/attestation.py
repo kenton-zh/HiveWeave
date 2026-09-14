@@ -22,7 +22,6 @@ from hiveweave.db.project import (
     ensure_project_db,
     get_workspace_write_lock,
 )
-from hiveweave.services.tasks.verify import is_verify_title
 
 log = structlog.get_logger(__name__)
 
@@ -2491,10 +2490,11 @@ async def check_verify_baseline(
 
     Returns error string or None if OK / not applicable.
     """
-    title = task.get("title") or ""
-    # TEST19 教训: 只认系统 VERIFY: 前缀, 不认 agent 自由 tag "verify"。
-    # H1 收口: 判定统一走 is_verify_title（覆盖 【】/[]/全角冒号形态）。
-    is_verify = is_verify_title(title)
+    # TEST19 教训: 不认 agent 自由 tag "verify"。
+    # #11: 判定统一走 is_verify_task（读 `kind` 字段，与标题无关）。
+    from hiveweave.services.tasks.verify import is_verify_task
+
+    is_verify = is_verify_task(task)
     if not is_verify:
         return None
 

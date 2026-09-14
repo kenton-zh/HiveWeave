@@ -40,6 +40,7 @@ async def _mk_blocked_verify(ts: TaskService, pid: str) -> tuple[str, str]:
         parent_task_id=parent_id,
         tags=VERIFY_TAGS,
         source="system",
+        kind="verify",  # #11：VERIFY 种类显式写在字段上（标题只作展示）
     )
     await ts.block_task(pid, verify_id, BLOCK_REASON)
     return parent_id, verify_id
@@ -188,6 +189,7 @@ async def test_retry_ignores_assigned_or_non_blocked(task_env):
         parent_task_id=parent_id,
         tags=VERIFY_TAGS,
         source="system",
+        kind="verify",  # #11：VERIFY 种类显式写在字段上（标题只作展示）
     )
     await ts.claim_task(pid, other_id, EXEC)
     await ts.start_task(pid, other_id)

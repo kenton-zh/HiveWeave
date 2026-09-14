@@ -88,7 +88,9 @@ async def _spawn_closed_verify(
     pid = env["project_id"]
     # VERIFY: 前缀是 system 保留（伪造门 crud.py），系统 spawn 走 source="system"
     tid = await ts.create_task(
-        pid, title, "verify it", creator_id=COORD, source="system"
+        pid, title, "verify it", creator_id=COORD, source="system",
+        # #11：判定改读 `kind`（标题只作展示）⇒ 造 VERIFY 任务必须显式写它
+        kind="verify",
     )
     await ts.claim_task(pid, tid, claimer)  # created → claimed（写 claimed_at + 事件）
     await ts.start_task(pid, tid)
@@ -174,7 +176,8 @@ async def test_reassign_counts_both_segments(task_env):
     t0 = 3_000_000_000_000
     pid = env["project_id"]
     tid = await ts.create_task(
-        pid, "VERIFY: rework", "v", creator_id=COORD, source="system"
+        pid, "VERIFY: rework", "v", creator_id=COORD, source="system",
+        kind="verify",
     )
     await ts.claim_task(pid, tid, EXEC1)
     await ts.reassign_task(

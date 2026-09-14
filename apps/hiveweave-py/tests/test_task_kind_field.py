@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+import ast
+import pathlib
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -165,7 +167,67 @@ async def test_column_exists_in_a_freshly_created_db(env):
     assert "kind" in cols
 
 
-# ── 3. 存量回填（#11 阶段 B 前半） ──────────────────────────────
+# ── 4. 「迁移必须有终点」的机械守卫（#11 翻转） ─────────────────
+
+
+def test_title_judgment_has_no_runtime_call_site():
+    """AST 守卫：`is_verify_title` **只允许**出现在回填迁移模块里。
+
+    #11 的计划原话：「回填完成后 `is_verify_title` **只保留在迁移脚本里、运行时
+    不再调用**」。光删掉定义不够 —— 有人随时可以在某个服务里重新 import 它
+    （那个名字没了就写个新的文本判据），所以这条守卫盯的是**引用面**。
+
+    ⚠ 用 **AST** 而不是 grep：docstring / 注释里提到这个名字（本仓大量存在，
+    因为它们要解释"为什么删掉它"）**不算调用**。grep 会把它们全部误报。
+    """
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "hiveweave"
+    allowed = {"services/tasks/migrate_verify_kind.py"}
+    offenders: list[str] = []
+    for py in sorted(src.rglob("*.py")):
+        rel = py.relative_to(src).as_posix()
+        if rel in allowed:
+            continue
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "is_verify_title":
+                offenders.append(f"{rel}:{node.lineno}")
+            elif isinstance(node, ast.Attribute) and node.attr == "is_verify_title":
+                offenders.append(f"{rel}:{node.lineno}")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "is_verify_title":
+                        offenders.append(f"{rel}:{node.lineno} (import)")
+    assert not offenders, (
+        "运行时仍在引用标题判据 is_verify_title（#11 要求运行时零调用）：\n  "
+        + "\n  ".join(offenders)
+        + "\n判定应改用 is_verify_task(task)（读 `kind` 字段）。"
+    )
+
+
+def test_title_regex_lives_only_in_the_migration_module():
+    """旧标题正则只能留在迁移模块里（避免"删了定义、换个地方又写一份"）。"""
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "hiveweave"
+    hits: list[str] = []
+    for py in sorted(src.rglob("*.py")):
+        rel = py.relative_to(src).as_posix()
+        text = py.read_text(encoding="utf-8")
+        # 注释/docstring 里点名"原先定义过 _VERIFY_TITLE_RE"是允许的（解释性），
+        # 故这里只禁**赋值**（真正再造一份判据表）。
+        if "_VERIFY_TITLE_RE = " in text and "_LEGACY_VERIFY_TITLE_RE" not in text:
+            hits.append(rel)
+    assert hits == [], f"这些文件又造了一份标题判据表：{hits}"
+
+
+def test_verify_module_no_longer_defines_the_title_judgment():
+    """`verify.py` 本身不能再有旧判据的定义（它是运行时模块）。"""
+    import hiveweave.services.tasks.verify as v
+
+    assert not hasattr(v, "is_verify_title"), (
+        "verify.py 仍定义着 is_verify_title —— 它已迁到迁移模块，运行时模块不该再有"
+    )
+    assert not hasattr(v, "_VERIFY_TITLE_RE")
+    # 反向：新判据必须在
+    assert hasattr(v, "is_verify_task") and hasattr(v, "VERIFY_KIND")
 
 
 async def _insert_raw(env, *, task_id: str, title: str, created_at: int,

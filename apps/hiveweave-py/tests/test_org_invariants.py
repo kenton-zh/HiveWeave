@@ -305,7 +305,7 @@ def test_qa_depth_advisory_no_leaf_qa():
         {"id": "ceo", "status": "active", "role": "ceo"},
         {"id": "lead", "status": "active", "role": "qa_lead"},
     ]
-    tasks = [{"title": "VERIFY: m1", "status": "created"}]
+    tasks = [{"title": "VERIFY: m1", "status": "created", "kind": "verify"}]
     note = qa_depth_advisory(agents=agents, tasks=tasks)
     assert note is not None
     assert "no active leaf QA" in note
@@ -318,8 +318,8 @@ def test_qa_depth_advisory_single_qa_multiple_verifies():
         {"id": "q1", "status": "active", "role": "test_engineer"},
     ]
     tasks = [
-        {"title": "VERIFY: m1", "status": "created"},
-        {"title": "VERIFY: m2", "status": "running"},
+        {"title": "VERIFY: m1", "status": "created", "kind": "verify"},
+        {"title": "VERIFY: m2", "status": "running", "kind": "verify"},
     ]
     note = qa_depth_advisory(agents=agents, tasks=tasks)
     assert note is not None
@@ -333,6 +333,6 @@ def test_qa_depth_advisory_sufficient_depth_none():
         {"id": "q1", "status": "active", "role": "test_engineer"},
         {"id": "q2", "status": "active", "role": "test_engineer"},
     ]
-    tasks = [{"title": "VERIFY: m1", "status": "created"}]
+    tasks = [{"title": "VERIFY: m1", "status": "created", "kind": "verify"}]
     assert qa_depth_advisory(agents=agents, tasks=tasks) is None
     assert qa_depth_advisory(agents=agents, tasks=None) is None

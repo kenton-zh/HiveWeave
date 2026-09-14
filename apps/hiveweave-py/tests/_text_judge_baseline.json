@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 130,
+ "_total": 129,
  "_by_tier": {
   "table": 25,
-  "regex": 105
+  "regex": 104
  },
  "_suffixes": [
   "_NEEDLES",
@@ -52,10 +52,9 @@
   "services/process_registry.py",
   "services/skill_registry.py",
   "services/tasks/acceptance.py",
-  "services/tasks/crud.py",
+  "services/tasks/migrate_verify_kind.py",
   "services/tasks/timeline.py",
   "services/tasks/verdict_claim_check.py",
-  "services/tasks/verify.py",
   "services/venv_setup.py",
   "services/wait_contract.py",
   "services/worktree_review.py",
@@ -142,19 +141,19 @@
   },
   "services/attestation.py::_FACT_NEED_RE": {
    "tier": "regex",
-   "line": 1789
+   "line": 1788
   },
   "services/attestation.py::_HEX_REF_RE": {
    "tier": "regex",
-   "line": 338
+   "line": 337
   },
   "services/attestation.py::_TEST_COMMAND_RE": {
    "tier": "regex",
-   "line": 294
+   "line": 293
   },
   "services/attestation.py::_UUID_RE": {
    "tier": "regex",
-   "line": 331
+   "line": 330
   },
   "services/command_guard.py::_REGEX_META": {
    "tier": "regex",
@@ -376,9 +375,9 @@
    "tier": "regex",
    "line": 22
   },
-  "services/tasks/crud.py::_FORGED_VERIFY_RE": {
+  "services/tasks/migrate_verify_kind.py::_LEGACY_VERIFY_TITLE_RE": {
    "tier": "regex",
-   "line": 56
+   "line": 51
   },
   "services/tasks/timeline.py::_ECHO_STATUS_RE": {
    "tier": "regex",
@@ -387,10 +386,6 @@
   "services/tasks/verdict_claim_check.py::_CLAIM_PATTERNS": {
    "tier": "table",
    "line": 29
-  },
-  "services/tasks/verify.py::_VERIFY_TITLE_RE": {
-   "tier": "regex",
-   "line": 30
   },
   "services/venv_setup.py::_SAFE_DEP_RE": {
    "tier": "regex",

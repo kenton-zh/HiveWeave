@@ -10,7 +10,7 @@ import structlog
 
 from .constants import TERMINAL_STATUSES
 from .db import _query
-from .verify import is_verify_title
+from .verify import is_verify_task
 
 log = structlog.get_logger(__name__)
 
@@ -67,7 +67,7 @@ async def maybe_nudge_ceo_ship_ready(project_id: str, task: dict | None) -> None
     """Best-effort: VERIFY close, or last open task closed (waived QA)."""
     if not task or not project_id:
         return
-    verify = is_verify_title(task.get("title"))
+    verify = is_verify_task(task)
     if not verify:
         try:
             if await _has_remaining_open_tasks(project_id):
@@ -114,5 +114,5 @@ async def nudge_ceo_ship_ready(project_id: str, task: dict) -> None:
         project_id=project_id[:8],
         ceo_id=ceo_id[:8],
         task_id=(task_id or "")[:8],
-        verify=is_verify_title(task.get("title")),
+        verify=is_verify_task(task),
     )

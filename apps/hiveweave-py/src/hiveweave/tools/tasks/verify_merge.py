@@ -12,7 +12,7 @@ import structlog
 
 from hiveweave.services import task as _task_svc
 from hiveweave.services.tasks.review import ReworkPrescriptionAbsent
-from hiveweave.services.tasks.verify import is_verify_title
+from hiveweave.services.tasks.verify import is_verify_task
 from hiveweave.tools import helpers as _helpers
 from hiveweave.tools.tasks.verify_spawn import (
     VERIFY_STALE_COOLDOWN_MS,
@@ -294,8 +294,8 @@ async def nudge_verify_tasks_after_merge(
         key=lambda x: (x.get("created_at") or 0, x.get("id") or ""),
     ):
         # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不触发）；
-        # H1 收口: 判定统一走 is_verify_title（覆盖 【】/[]/全角冒号形态）。
-        if not is_verify_title(t.get("title")):
+        # #11: 判定统一走 is_verify_task（读 kind 字段，与标题无关）。
+        if not is_verify_task(t):
             continue
         # 审计 O2：只剩 created/claimed —— running 的 VERIFY 已在跑，merge
         # nudge 不得再骚扰（它会被 except_id 自豁免而重复 send+trigger）。
@@ -326,7 +326,7 @@ async def nudge_verify_tasks_after_merge(
             continue
         has_verify_child = any(
             (c.get("parent_task_id") == tid)
-            and is_verify_title(c.get("title"))
+            and is_verify_task(c)
             # 在途 VERIFY 才算（对齐 verify_spawn._spawn_post_approve_verify_task）：
             # 已 closed/approved 的子任务不再阻止父任务收口。
             and c.get("status") not in ("closed", "approved")

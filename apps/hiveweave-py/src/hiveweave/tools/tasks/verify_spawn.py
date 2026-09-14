@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from hiveweave.services import task as _task_svc
-from hiveweave.services.tasks.verify import VERIFY_KIND, is_verify_title
+from hiveweave.services.tasks.verify import VERIFY_KIND, is_verify_task
 from hiveweave.tools import helpers as _helpers
 
 log = structlog.get_logger(__name__)
@@ -297,7 +297,7 @@ async def _spawn_post_approve_verify_task(
     # cycles indefinitely.
     # TEST19 教训: 只认前缀 —— agent 自由 tag "verify" 不构成 VERIFY。
     parent_title = parent_task.get("title") or ""
-    if is_verify_title(parent_title):
+    if is_verify_task(parent_task):
         log.info(
             "verify_chain_stopped",
             parent_task_id=parent_id,
@@ -316,7 +316,7 @@ async def _spawn_post_approve_verify_task(
         # TEST19 教训: 只认系统 VERIFY: 前缀（agent 自由 tag verify 不算）
         if (
             t.get("parent_task_id") == parent_id
-            and is_verify_title(t.get("title"))
+            and is_verify_task(t)
             and t.get("status") not in ("closed", "approved")
         ):
             try:
@@ -1057,7 +1057,7 @@ async def maybe_reassign_stalled_verify(
     notified). Fail-open: log and return False on error so generic stall
     can still fire.
     """
-    if not is_verify_title(task.get("title")):
+    if not is_verify_task(task):
         return False
     status = str(task.get("status") or "")
     if status not in _VERIFY_EXECUTOR_STALL_STATUSES:

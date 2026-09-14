@@ -418,6 +418,9 @@ async def dispatch_task_tool(
     policy_id: str | None = None
     title: str | None = None
     source = "agent"
+    # ⚠ 与 create.py 同款：`kind` 在下面的 `ds.dispatch_task` 调用（块外）使用，
+    # 只在块内赋值会让非 milestone 路径 NameError。
+    kind: str | None = None
     plane_reason: str | None = None
     # P0 修复（report TEST_DSH_54 §3-4 / Layer 6「路坏型」）：`_dispatch_tags`
     # 必须在**两个分支之前**绑定。
@@ -461,7 +464,10 @@ async def dispatch_task_tool(
         if params.milestone_verify:
             from hiveweave.services.org import OrgService
             from hiveweave.services.policy import infer_role_family
-            from hiveweave.services.tasks.verify import is_verify_title
+            from hiveweave.services.tasks.verify import (
+                VERIFY_KIND,
+                ensure_verify_display_prefix,
+            )
 
             me = await OrgService().resolve_agent(agent_id)
             family = infer_role_family(me or {})
@@ -471,8 +477,9 @@ async def dispatch_task_tool(
                     "not leaf self-service."
                 )
             title = (params.task or "")[:100]
-            if not is_verify_title(title):
-                title = f"VERIFY: {title}"
+            # #11：判定来源是 `kind`；标题前缀**只是展示**（见 create.py 同款说明）。
+            title = ensure_verify_display_prefix(title)
+            kind = VERIFY_KIND
             source = "system"
     elif params.milestone_verify:
         return ToolResult.err(
@@ -513,6 +520,7 @@ async def dispatch_task_tool(
         policy_id=policy_id,
         title=title,
         source=source,
+        kind=kind,
         depends_on=params.depends_on,
         parent_task_id=params.parent_task_id,
         acceptance_criteria=params.acceptance_criteria,

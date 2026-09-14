@@ -25,11 +25,11 @@ import structlog
 from hiveweave.db.project import readonly_project_conn
 
 from .db import _ensure_schema
-from .verify import is_verify_title
+from .verify import is_verify_task
 
 log = structlog.get_logger(__name__)
 
-# closed 任务内存过滤 is_verify_title 前的最大扫描行数
+# closed 任务内存过滤 is_verify_task 前的最大扫描行数
 _SCAN_LIMIT = 2000
 # IN (?) 分块（SQLite 参数上限防御，同 timeline._chunked）
 _CHUNK = 500
@@ -176,15 +176,15 @@ async def verify_efficiency_report(
         async with _read_tx(conn):
             closed = await _fetchall(
                 conn,
-                "SELECT id, title, assignee_id, created_at, claimed_at, "
+                "SELECT id, title, kind, assignee_id, created_at, claimed_at, "
                 "closed_at, updated_at FROM tasks "
                 "WHERE status = 'closed' AND is_archived = 0 "
                 "ORDER BY closed_at DESC LIMIT ?",
                 [_SCAN_LIMIT],
             )
-            # VERIFY 判定收口 is_verify_title（LIKE 覆不了 【VERIFY: 形态）
+            # VERIFY 判定收口 is_verify_task（读 kind；标题已不参与判定，见 #11）
             selected = [
-                t for t in closed if is_verify_title(t.get("title"))
+                t for t in closed if is_verify_task(t)
             ][: max(0, limit)]
             # P2-1 可观测：触顶且过滤后不足 limit → 更老 VERIFY 可能被截断
             truncated = len(closed) >= _SCAN_LIMIT and len(selected) < max(

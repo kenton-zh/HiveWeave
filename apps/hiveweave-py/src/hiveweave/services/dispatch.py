@@ -164,7 +164,8 @@ class DispatchService:
                             depends_on: list[str] | None = None,
                             parent_task_id: str | None = None,
                             acceptance_criteria: list | None = None,
-                            tags: list[str] | None = None) -> dict:
+                            tags: list[str] | None = None,
+                            kind: str | None = None) -> dict:
         """Coordinator dispatches a task to a subordinate.
 
         1. Create a Task Ledger entry via :class:`TaskService` — obtains
@@ -304,6 +305,9 @@ class DispatchService:
                 parent_task_id=parent_task_id,
                 acceptance_criteria=acceptance_criteria,
                 tags=tags,
+                # #11：VERIFY 的种类由**创建方**决定（平台路径传 'verify'）。
+                # 复用既有任务（existing_task_id）时不覆盖那行的 kind。
+                kind=kind,
             )
 
         # Ensure executor/builder-coordinator worktree + pin paths in the message
