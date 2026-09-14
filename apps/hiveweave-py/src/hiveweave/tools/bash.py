@@ -3224,10 +3224,18 @@ async def _shell_tool_impl(
         raw_cmd, project_id=project_id
     )
     if reserved_err:
-        # H3: 保留端口是平台护栏拒绝（复审 P2-1）
         # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，
         # 判 runner_failed 会让它收到「不是你的 bug」并原地重撞同一端口。
-        return ToolResult.blocked_err(reserved_err, fact="bad_args")
+        # ⚠ 2026-09-14 修**真崩溃**：L6 改判时只把 fact 换成 bad_args、**没换构造器**，
+        # 而 `blocked_err` 的 `__post_init__` 不变式会抛
+        # `ValueError: blocked=True cannot carry fact='bad_args'`（bad_args 是调用方
+        # 成因，被 `_BLOCKED_FACT_KINDS` 明确排除 —— 标 blocked 会向 agent 发
+        # 「不是你的 bug」信号并原地重撞，正是 L6 要治的病）。
+        # 后果：agent 跑 `--port 4000` 拿到的是 Python traceback 而不是端口指引；
+        # 且 executor 的 `except` 会早退成**无 fact 的裸 dict**（漏斗旁路）。
+        # ⇒ `ToolResult.err` 的 docstring 本来就写明「bad_args 走这里而**不是**
+        # blocked_err」：这次只是让代码回到它自己声明的契约上。
+        return ToolResult.err(reserved_err, fact="bad_args")
     cmd = _strip_trailing_ampersand(cmd)
 
     exec_ws = workspace or ""
@@ -3526,10 +3534,18 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         params.command, project_id=project_id
     )
     if reserved_err:
-        # H3: 保留端口是平台护栏拒绝（复审 P2-1）
         # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，
         # 判 runner_failed 会让它收到「不是你的 bug」并原地重撞同一端口。
-        return ToolResult.blocked_err(reserved_err, fact="bad_args")
+        # ⚠ 2026-09-14 修**真崩溃**：L6 改判时只把 fact 换成 bad_args、**没换构造器**，
+        # 而 `blocked_err` 的 `__post_init__` 不变式会抛
+        # `ValueError: blocked=True cannot carry fact='bad_args'`（bad_args 是调用方
+        # 成因，被 `_BLOCKED_FACT_KINDS` 明确排除 —— 标 blocked 会向 agent 发
+        # 「不是你的 bug」信号并原地重撞，正是 L6 要治的病）。
+        # 后果：agent 跑 `--port 4000` 拿到的是 Python traceback 而不是端口指引；
+        # 且 executor 的 `except` 会早退成**无 fact 的裸 dict**（漏斗旁路）。
+        # ⇒ `ToolResult.err` 的 docstring 本来就写明「bad_args 走这里而**不是**
+        # blocked_err」：这次只是让代码回到它自己声明的契约上。
+        return ToolResult.err(reserved_err, fact="bad_args")
 
     exec_ws = workspace or ""
     verify_tid: str | None = getattr(params, "task_id", None)
