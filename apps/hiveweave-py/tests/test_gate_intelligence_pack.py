@@ -9,7 +9,9 @@
   verified / refuted / skipped 三例 + 只附事实位不拒绝
 - 任务5 doc_review 分档（全文档放行 / 缺失拒 / 代码任务不进分档）+
   reviewer filesChanged 替代 evidence.files_changed
-- 任务6 acceptance_criteria 覆盖门（缺条拒 / 原文全覆盖过 / 编号+N/A 过）
+- 任务6 acceptance_criteria 覆盖门（缺条拒；#14 后**文本一律不算覆盖**——
+  原文照抄/编号/裸 N/A 全拒，结构化 id + 凭证判据见
+  tests/test_acceptance_state_gate.py）
 """
 from __future__ import annotations
 
@@ -594,37 +596,50 @@ def test_parse_acceptance_items_shapes():
     assert parse_acceptance_items(dicts) == ["t1", "t2"]
 
 
-def test_uncovered_items_missing_full_and_na():
+def test_uncovered_items_state_judgment():
+    """#14：判据是「结构化 id 声明 + 已核验凭证」，**文本一律不算覆盖**。
+
+    同步形态不做核验 ⇒ 未传 ``verified_ids`` 时 fail-closed（门禁走 async 版
+    ``uncovered_acceptance_items_verified``，见 tests/test_acceptance_state_gate.py）。
+    """
     criteria = ["导出 CSV 功能可用", "边界情况有测试覆盖"]
-    # 全缺
-    missing = uncovered_acceptance_items(criteria, {"summary": "跑了一遍"})
-    assert len(missing) == 2
-    assert "条目1" in missing[0] and "导出 CSV" in missing[0]
-    # 原文全覆盖 → 空
+    # 全缺：含照抄原文 / 编号引用 / 裸 N/A 三种旧"覆盖"文本形态
+    # （同步形态 fail-closed，故 gap 里多一条「未接线」自诊断）
+    for ev in (
+        {"summary": "跑了一遍"},
+        {"summary": "验证完成：导出 CSV 功能可用；边界情况有测试覆盖"},
+        {"summary": "条目1 实测通过；条目2 N/A: 本环境无边界数据集"},
+    ):
+        gaps = uncovered_acceptance_items(criteria, ev)
+        assert len(gaps) == 3, (ev, gaps)
+        assert [g for g in gaps if g.startswith("条目")] == [
+            "条目1: 导出 CSV 功能可用", "条目2: 边界情况有测试覆盖",
+        ], gaps
+    # 结构化声明 + 调用方已核验的凭证 id ⇒ 覆盖
     covered = uncovered_acceptance_items(
         criteria,
-        {"summary": "验证完成：导出 CSV 功能可用；边界情况有测试覆盖"},
+        {"acceptance_coverage": {
+            "1": {"attestation_ids": ["a1"]},
+            "2": {"attestation_ids": ["a2"]},
+        }},
+        verified_ids={"a1", "a2"},
     )
     assert covered == []
-    # 编号 + N/A 混合 → 过
-    mixed = uncovered_acceptance_items(
-        criteria,
-        {"summary": "条目1 实测通过；条目2 N/A: 本环境无边界数据集"},
-    )
-    assert mixed == []
-    # 无编号裸 N/A：只豁免 1 条，另一条仍点名
+    # 只声明了 id、凭证未核验 ⇒ 该条仍点名（声明 ≠ 自述放行）
     partial = uncovered_acceptance_items(
-        criteria, {"summary": "第一项没测。N/A: 环境不可用"}
+        criteria,
+        {"acceptance_coverage": {"1": {"attestation_ids": ["a1"]}}},
+        verified_ids={"a1"},
     )
-    assert len(partial) == 1, partial
-    # 拒绝文案带处方
-    msg = format_acceptance_coverage_error(missing)
-    assert "N/A" in msg and "条目N" in msg
+    assert len(partial) == 1 and "条目2" in partial[0], partial
+    # 拒绝文案带处方（指结构化的覆盖声明）
+    msg = format_acceptance_coverage_error(partial)
+    assert "acceptance_coverage" in msg and "test_run" in msg and "N/A" in msg
 
 
 @pytest.mark.asyncio
 async def test_service_submit_rejects_uncovered_checklist(env):
-    """E1 处：清单缺覆盖 → ValueError 点名缺条；覆盖后放行。"""
+    """E1 处：清单缺覆盖 → ValueError 点名缺条；文本形态一律不算覆盖（#14）。"""
     svc = TaskService()
     pid = env["project_id"]
     criteria = ["导出 CSV 功能可用", "边界情况有测试覆盖"]
@@ -638,20 +653,21 @@ async def test_service_submit_rejects_uncovered_checklist(env):
     assert "条目1" in msg and "条目2" in msg, msg
     assert (await svc.get_task(pid, vid))["status"] == "running"
 
-    # 原文全覆盖 → 提交通过
-    await svc.submit_task(
-        pid, vid,
-        evidence={
-            "verdict": "PASS",
-            "summary": "导出 CSV 功能可用；边界情况有测试覆盖",
-        },
-    )
-    assert (await svc.get_task(pid, vid))["status"] == "submitted"
+    # 照抄条目原文 / 编号引用 / 裸 N/A 三种旧"覆盖"形态 → 全部仍被拒
+    for ev in (
+        {"verdict": "PASS",
+         "summary": "导出 CSV 功能可用；边界情况有测试覆盖"},
+        {"verdict": "PASS", "summary": "第1条 通过；第2条 N/A：无数据集"},
+    ):
+        with pytest.raises(ValueError):
+            await svc.submit_task(pid, vid, evidence=ev)
+        assert (await svc.get_task(pid, vid))["status"] == "running"
 
 
 @pytest.mark.asyncio
-async def test_service_submit_allows_na_and_index_coverage(env):
-    """编号引用 + 显式 N/A 覆盖 → 放行；空清单任务不受影响。"""
+async def test_service_submit_na_and_index_text_rejected(env):
+    """#14（改断言）：编号引用 + 显式 N/A 文本**不再放行**（放行须平台凭证/
+    waiver 行）；无清单任务不受门影响。"""
     svc = TaskService()
     pid = env["project_id"]
     criteria = ["导出 CSV 功能可用", "边界情况有测试覆盖"]
@@ -659,20 +675,106 @@ async def test_service_submit_allows_na_and_index_coverage(env):
         env, svc, title="VERIFY: 导出2", tags=["verify"],
         acceptance_criteria=criteria,
     )
-    await svc.submit_task(
-        pid, vid,
-        evidence={
-            "verdict": "PASS",
-            "blocking_issues": [],
-            "summary": "条目1 通过；条目2 N/A: 本环境无边界数据集，已人工抽查",
-        },
-    )
-    assert (await svc.get_task(pid, vid))["status"] == "submitted"
+    with pytest.raises(ValueError) as ei:
+        await svc.submit_task(
+            pid, vid,
+            evidence={
+                "verdict": "PASS",
+                "blocking_issues": [],
+                "summary": "条目1 通过；条目2 N/A: 本环境无边界数据集，已人工抽查",
+            },
+        )
+    assert "acceptance_coverage" in str(ei.value)
+    assert (await svc.get_task(pid, vid))["status"] == "running"
 
     # 无 acceptance_criteria 的 VERIFY 不受门影响
     vid2 = await _mk_running_task(env, svc, title="VERIFY: 无清单", tags=["verify"])
     await svc.submit_task(pid, vid2, evidence={"verdict": "PASS"})
     assert (await svc.get_task(pid, vid2))["status"] == "submitted"
+
+
+# ── #14 端到端（"修了≠生效"的判据）：声明 id + 本任务执行凭证 ⇒ 真提交成功 ─
+
+
+@pytest.mark.asyncio
+async def test_service_submit_covered_by_task_credentials(env):
+    """逐条声明 id + 各自锚一条**本任务真 test_run 凭证** ⇒ submitted。"""
+    svc = TaskService()
+    pid = env["project_id"]
+    criteria = ["导出 CSV 功能可用", "边界情况有测试覆盖"]
+    vid = await _mk_running_task(
+        env, svc, title="VERIFY: 导出3", tags=["verify"],
+        acceptance_criteria=criteria,
+    )
+    a1 = await att_module.attestation_service.create(
+        pid, agent_id=EXEC_ID, kind="test_run", task_id=vid,
+        command_or_url="uv run pytest tests/test_export.py -q", exit_code=0,
+        stdout="54 passed",
+    )
+    a2 = await att_module.attestation_service.create(
+        pid, agent_id=EXEC_ID, kind="test_run", task_id=vid,
+        command_or_url="uv run pytest tests/test_edge.py -q", exit_code=0,
+        stdout="9 passed",
+    )
+    await svc.submit_task(
+        pid, vid,
+        evidence={
+            "verdict": "PASS",
+            # 措辞与条目原文完全无关 —— 判据不看文本
+            "summary": "both items verified against the real runs",
+            "acceptance_coverage": {
+                "1": {"attestation_ids": [a1]},
+                "2": {"attestation_ids": [a2]},
+            },
+        },
+    )
+    assert (await svc.get_task(pid, vid))["status"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_service_submit_ui_item_covered_by_browse_e2e(env):
+    """误拒方向：UI 类 VERIFY（policy=ui_browser_e2e）由 browse_e2e 覆盖 ⇒ 提交成功。"""
+    svc = TaskService()
+    pid = env["project_id"]
+    vid = await _mk_running_task(
+        env, svc, title="VERIFY: 登录页", tags=["verify"],
+        policy_id="ui_browser_e2e",
+        acceptance_criteria=["登录页可点通并截图"],
+    )
+    aid = await att_module.attestation_service.create(
+        pid, agent_id=EXEC_ID, kind="browse_e2e", task_id=vid,
+        command_or_url="browse http://localhost:3000", exit_code=0, stdout="ok",
+    )
+    await svc.submit_task(
+        pid, vid,
+        evidence={"verdict": "PASS",
+                  "acceptance_coverage": {"1": {"attestation_ids": [aid]}}},
+    )
+    assert (await svc.get_task(pid, vid))["status"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_service_submit_soft_policy_accepts_execution_kinds(env):
+    """soft policy（VERIFY 常态 coordinator_review）下 browse_e2e 也构成覆盖 ——
+
+    回落"全部执行类 kind"而不是只认 test_run，避免真交付被误拒。"""
+    svc = TaskService()
+    pid = env["project_id"]
+    vid = await _mk_running_task(
+        env, svc, title="VERIFY: 冒烟", tags=["verify"],
+        acceptance_criteria=["冒烟脚本可跑通"],
+    )
+    aid = await att_module.attestation_service.create(
+        pid, agent_id=EXEC_ID, kind="browse_e2e", task_id=vid,
+        command_or_url="browse http://localhost:3000/smoke", exit_code=0,
+        stdout="ok",
+    )
+    await svc.submit_task(
+        pid, vid,
+        evidence={"verdict": "PASS",
+                  "acceptance_coverage": {"1": {"attestation_ids": [aid]}}},
+    )
+    assert (await svc.get_task(pid, vid))["status"] == "submitted"
 
 
 # ── 审计修复：P0-1 tool_failure 自批放行 / P1-1 穿越防御 / P2 注入防御 ─

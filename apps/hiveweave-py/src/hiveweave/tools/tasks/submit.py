@@ -579,13 +579,16 @@ async def _submit_preflight(
             "task_id": task_id,
         }
 
-    # ── 门禁智能化包任务1/6：E1 verdict 门 + 验收清单覆盖 → 并入聚合预检 ──
+    # ── 门禁智能化包任务1/6 + #14：E1 verdict 门 + 验收清单覆盖 → 并入聚合预检 ──
     # 服务层硬门保持不变（API 直提仍会被 services.tasks.submit 拒绝）；此处
     # 用同一套判定函数提前算进「一次报全」回执，免去 verdict 问题逐轮撞门。
+    # #14：覆盖判据 = `acceptance_coverage` 的 id 声明 + 平台执行凭证核验
+    # （kinds 按任务 policy 取；soft/未知回落全部执行类 kind），文本/措辞无关。
     if is_verify:
         from hiveweave.services.tasks.acceptance import (
+            acceptance_coverage_kinds,
             format_acceptance_coverage_error,
-            uncovered_acceptance_items,
+            uncovered_acceptance_items_verified,
         )
         from hiveweave.services.tasks.verify import verdict_evidence_gaps
 
@@ -597,8 +600,13 @@ async def _submit_preflight(
                     "（verdict ∈ {PASS, FAIL}；FAIL 还需非空 blockingIssues）。"
                 ),
             })
-        _uncovered = uncovered_acceptance_items(
-            task.get("acceptance_criteria"), evidence
+        _uncovered = await uncovered_acceptance_items_verified(
+            project_id,
+            task_id,
+            task.get("acceptance_criteria"),
+            evidence,
+            expected_agent_id=agent_id,
+            kinds=await acceptance_coverage_kinds(task),
         )
         if _uncovered:
             issues.append({

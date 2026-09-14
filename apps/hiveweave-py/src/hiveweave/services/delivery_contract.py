@@ -15,7 +15,20 @@
 
 回执流向:executor 把「实现摘要 / 测试证据」填进
 ``evidence.delivery_contract = {summary, test}``,submit preflight 校验回执
-完整性 + 测试凭证 id 机器验证(或 ``N/A — 原因`` 自声明留痕转审)。
+完整性 + 测试凭证 id 机器验证。
+
+#14(修前双向可绕):``test`` 原按**自由文本前缀**判「是否有测试证据」——
+写 ``N/A—任意理由`` 即放行(理由非空即可)。现改为**显式字段 + 平台状态**:
+
+- ``test: "test_run:<凭证 id>"`` —— 机器核验(调用方 ``verify_ids``);
+- 确无测试证据 ⇒ 走**平台 waiver 行**(coordinator ``waive_attestation``,
+  落 ``tool_attestations``、可审计、有终身上限),并显式声明
+  ``evidence_kind="not_applicable"`` + ``not_applicable_reason`` 留痕。
+
+⚠ ``not_applicable`` 的权威是**平台 waiver 行**,不是自述字段:调用方在进
+本检查前已用 ``has_valid_waiver`` 短路(``tools/tasks/submit.py``),因此走到
+:func:`delivery_contract_missing` 的 ``not_applicable`` 一律判缺——裸写
+``N/A—随便什么`` 不再放行。
 """
 
 from __future__ import annotations
@@ -35,10 +48,31 @@ REQUIRED_REPLY_FIELDS = ("summary", "test")
 # 占位类前缀:视为「还没填」(对齐规格"占位符不留")。
 _PLACEHOLDER_LEADS = ("<", "[tbd]", "[todo]", "pending", "(待填)", "占位")
 
-# 测试证据的两种合法形态:
-# 1) test_run:<attestation_id> —— 机器验证(推荐)
-# 2) N/A — <原因> —— 显式声明跑不了测试,原因非空即放行(留痕转审)
+# 测试证据的唯一合法形态:``test_run:<attestation_id>`` —— 机器验证(推荐)。
 _TEST_EVIDENCE_PREFIX = "test_run:"
+
+# #14:测试证据的**显式字段**(不再用自由文本前缀判"有没有测试证据")。
+#   evidence_kind = "test_run"       —— 配 test_run:<凭证 id>(机器核验);
+#   evidence_kind = "not_applicable" —— 配 not_applicable_reason,且**必须**
+#                                      有本任务的平台 waiver 行(调用方短路);
+#   evidence_kind = "not_applicable" 且已进本检查 ⇒ 本任务**无**有效 waiver
+#   ⇒ 判缺(fail-closed)。
+EVIDENCE_KIND_FIELD = "evidence_kind"
+EVIDENCE_KIND_TEST_RUN = "test_run"
+EVIDENCE_KIND_NOT_APPLICABLE = "not_applicable"
+NOT_APPLICABLE_REASON_FIELD = "not_applicable_reason"
+
+# 拒绝文案里的字段名(调用方把字段名原样拼进回执,故把处方写进字段名)。
+_TEST_REQUIRED_HINT = (
+    "test(需 'test_run:<凭证id>' 由平台机器核验;确无测试证据须由上级 "
+    "`waive_attestation` 落平台 waiver 行后显式声明 evidence_kind="
+    "'not_applicable' + not_applicable_reason —— 裸写 N/A—原因 不再放行)"
+)
+_NOT_APPLICABLE_HINT = (
+    "test(evidence_kind='not_applicable' 只由**平台 waiver 行**批准,本任务"
+    "当前无有效 waiver:先 coordinator `waive_attestation`,并填非空 "
+    "not_applicable_reason)"
+)
 
 
 def build_default_contract(task_id: str) -> dict[str, Any]:
@@ -73,8 +107,10 @@ def build_default_contract(task_id: str) -> dict[str, Any]:
                 "type": "manual_review",
                 "note": (
                     "测试证据：提交前回填到 evidence.delivery_contract.test——"
-                    "引用 test_run 凭证 id（test_run:<id>，平台机器验证），"
-                    "无法跑测试写 N/A—原因"
+                    "写 test_run:<凭证 id>（平台机器验证）；确无测试证据时，先由"
+                    "上级 coordinator waive_attestation 落平台 waiver 行，再写 "
+                    "evidence_kind='not_applicable' + not_applicable_reason="
+                    "（裸写 N/A—原因 不再放行）"
                 ),
             },
         ],
@@ -113,32 +149,61 @@ def delivery_contract_missing(evidence: dict[str, Any]) -> list[str]:
     """回执缺失/占位的字段名列表(空 list = 通过)。
 
     ``evidence`` 为 submit 的 evidence dict,期望含 ``delivery_contract``
-    子对象 ``{summary, test}``。
+    子对象 ``{summary, test[, evidence_kind, not_applicable_reason]}``。
+    ⚠ ``evidence_kind`` 与 ``test`` **同级**(都在 ``delivery_contract`` 里),
+    不是 ``test`` 的子对象 —— 调用方把 ``test`` 当字符串读并走
+    ``test_run:<id>`` 机器核验,dict 形态的 ``test`` 会让该分支失效(故本门
+    对嵌套形态 fail-closed 判缺)。
+
+    #14 判据(不再是自由文本):
+    - ``summary``:非占位;
+    - ``test``:必须是 ``test_run:<凭证 id>``(由调用方机器核验) —— 其余一切
+      自由文本(含 ``N/A—任意理由``)判缺;
+    - ``evidence_kind="not_applicable"``:权威是**平台 waiver 行**,调用方已
+      在进本检查前用 ``has_valid_waiver`` 短路 ⇒ 走到这里即代表本任务无有效
+      waiver,故一律判缺(处方写进返回的字段名,调用方原样拼进回执)。
     """
     rc = evidence.get("delivery_contract")
     if not isinstance(rc, dict):
         return list(REQUIRED_REPLY_FIELDS)
     missing: list[str] = []
-    for f in REQUIRED_REPLY_FIELDS:
-        val = rc.get(f)
-        if isinstance(val, str) and not _is_placeholder(val):
-            continue
-        missing.append(f)
+    sval = rc.get("summary")
+    if not (isinstance(sval, str) and not _is_placeholder(sval)):
+        missing.append("summary")
+    tval = rc.get("test")
+    tstr = tval.strip() if isinstance(tval, str) else ""
+    kind = str(rc.get(EVIDENCE_KIND_FIELD) or "").strip().lower()
+    if parse_test_evidence_attestation_id(tstr):
+        pass  # test_run:<id> —— 凭证由调用方 verify_ids 机器核验
+    elif kind == EVIDENCE_KIND_NOT_APPLICABLE:
+        reason = str(rc.get(NOT_APPLICABLE_REASON_FIELD) or "").strip()
+        missing.append(
+            _NOT_APPLICABLE_HINT if len(reason) >= 2 else _TEST_REQUIRED_HINT
+        )
+    else:
+        missing.append(_TEST_REQUIRED_HINT)
     return missing
 
 
 def test_evidence_is_na(value: str) -> bool:
-    """测试证据是否为显式 N/A 声明(原因非空则视为合法自声明)。"""
+    """``value`` 是否为旧式 ``N/A`` 自由文本声明。
+
+    ⚠ **不再构成放行判据**(#14):自由文本前缀曾是唯一开关,写
+    ``N/A—任意理由`` 即过。现保留本函数仅供**观测/透出**(调用方 diagnostics
+    与既有测试),门禁一律以 :func:`delivery_contract_missing` 为准。
+    """
     low = value.strip().lower()
     return low.startswith("n/a") or low.startswith("na —") or low.startswith("na-")
 
 
 def test_evidence_reason(value: str) -> str:
-    """提取 N/A 声明的原因部分(分隔符之后)。
+    """提取旧式 ``N/A`` 声明的原因部分(分隔符之后)。
 
-    裸 ``N/A``(无分隔符/分隔符后为空或仍是 n/a)视为无原因 → 空串,
-    由调用方判"缺原因"。合法例:``N/A — 仓库无测试基建``、
-    ``n/a- 只有手工冒烟``。
+    裸 ``N/A``(无分隔符/分隔符后为空或仍是 n/a)视为无原因 → 空串。
+    合法例:``N/A — 仓库无测试基建``、``n/a- 只有手工冒烟``。
+
+    ⚠ 与 :func:`test_evidence_is_na` 同:#14 后**不再参与放行判定**,仅供
+    诊断/透出;放行要 ``test_run:<凭证 id>`` 或平台 waiver 行。
     """
     v = str(value or "").strip()
     for sep in ("—", "-", ":", ","):

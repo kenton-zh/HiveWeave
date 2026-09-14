@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
-from .acceptance import format_acceptance_coverage_error, uncovered_acceptance_items
+from .acceptance import (
+    acceptance_coverage_kinds,
+    format_acceptance_coverage_error,
+    uncovered_acceptance_items_verified,
+)
 from .verify import normalize_verdict, verdict_evidence_gaps
 
 log = structlog.get_logger(__name__)
@@ -48,12 +52,20 @@ class SubmitMixin:
         # 带强制判定字段，否则硬拒提交（transition 之前拦截）。
         if task and self._is_verify_task(task):
             self._validate_verdict_evidence(evidence)
-            # 任务6（门禁智能化包）：VERIFY 任务带非空 acceptance_criteria 时，
-            # verdict evidence 必须逐条体现覆盖（条目原文/编号可匹配，或显式
-            # 「N/A: <理由>」）。缺覆盖 → 拒绝并列出缺哪几条 + 处方。清单为空
-            # 的任务不受影响；check_evidence_verifiable 的 VERIFY 跳过保持不动。
-            gaps = uncovered_acceptance_items(
-                task.get("acceptance_criteria"), evidence
+            # 任务6（门禁智能化包）/#14：VERIFY 任务带非空 acceptance_criteria 时，
+            # verdict evidence 必须用 `acceptance_coverage` **逐条按 id 声明覆盖**，
+            # 且声明锚在平台可核验的执行凭证上（本任务 + 正确 kind + 未过期 +
+            # exit_code=0）——判据是"id 集合包含 + 凭证核验"，与措辞/语言无关；
+            # 不适用的条目须先由 coordinator/CEO waive_attestation 落平台 waiver 行。
+            # 缺覆盖 → 拒绝并列出缺哪几条 + 处方。清单为空的任务不受影响；
+            # check_evidence_verifiable 的 VERIFY 跳过保持不动。
+            gaps = await uncovered_acceptance_items_verified(
+                project_id,
+                task_id,
+                task.get("acceptance_criteria"),
+                evidence,
+                expected_agent_id=str(task.get("assignee_id") or "") or None,
+                kinds=await acceptance_coverage_kinds(task),
             )
             if gaps:
                 raise ValueError(format_acceptance_coverage_error(gaps))

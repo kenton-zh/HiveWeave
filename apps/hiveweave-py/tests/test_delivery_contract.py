@@ -5,7 +5,8 @@
 - 注入端:dispatch 给写树 assignee 默认生成 dc 契约(VERIFY/非写树跳过、
   已有契约不覆盖)
 - 校验端:submit preflight 单一 check(delivery_contract_incomplete)
-  —— 回执缺失 / 测试凭证机器验证 / N/A 声明 / contractWaived / 存量兼容
+  —— 回执缺失 / 测试凭证机器验证 / #14 后 N/A 自由文本不再放行(只认平台
+  waiver 行) / contractWaived / 存量兼容
 细胞测试:build_default_contract / delivery_contract_missing / test_evidence_*
 """
 
@@ -115,6 +116,54 @@ def test_delivery_contract_missing():
     assert dcv.delivery_contract_missing(
         {"delivery_contract": {"summary": "done", "test": "test_run:1"}}
     ) == []
+
+
+def test_delivery_contract_na_is_no_longer_a_pass():
+    """#14 细胞测试：自由文本 N/A 与 not_applicable 自述都**判缺**。
+
+    放行出口是 ``test_run:<id>``（机器核验）或**平台 waiver 行**（调用方在进
+    本检查前 ``has_valid_waiver`` 短路）——本函数自身只认前者。
+    """
+    # 自由文本 N/A（含任意理由）→ 缺 test
+    miss = dcv.delivery_contract_missing(
+        {"delivery_contract": {"summary": "done", "test": "N/A — 随便什么"}}
+    )
+    assert len(miss) == 1 and miss[0].startswith("test"), miss
+    assert "waiver" in miss[0]  # 处方：走平台 waiver 行
+    # 显式字段 not_applicable + 理由 → 仍缺（权威是平台 waiver 行，不在本函数手里）
+    miss2 = dcv.delivery_contract_missing(
+        {"delivery_contract": {
+            "summary": "done",
+            "test": "",
+            "evidence_kind": "not_applicable",
+            "not_applicable_reason": "无测试基建",
+        }}
+    )
+    assert len(miss2) == 1 and "waiver" in miss2[0], miss2
+    # not_applicable 缺理由 → 退回通用处方
+    miss3 = dcv.delivery_contract_missing(
+        {"delivery_contract": {
+            "summary": "done", "test": "", "evidence_kind": "not_applicable",
+        }}
+    )
+    assert len(miss3) == 1 and miss3[0].startswith("test"), miss3
+    # summary 仍按占位判定（与 test 独立）
+    miss4 = dcv.delivery_contract_missing(
+        {"delivery_contract": {"summary": "pending", "test": "test_run:1"}}
+    )
+    assert miss4 == ["summary"]
+    # 嵌套形态（evidence_kind 放进 test 子对象里）⇒ 调用方读不到 test_run、
+    # 本门也判缺（fail-closed）——显式字段必须与 test 同级。
+    miss5 = dcv.delivery_contract_missing(
+        {"delivery_contract": {
+            "summary": "done",
+            "test": {
+                "evidence_kind": "not_applicable",
+                "not_applicable_reason": "无测试基建",
+            },
+        }}
+    )
+    assert len(miss5) == 1 and miss5[0].startswith("test"), miss5
 
 
 def test_test_evidence_parsing():
@@ -272,20 +321,69 @@ async def test_preflight_fake_test_run_token_rejected(env):
 
 
 @pytest.mark.asyncio
-async def test_preflight_na_reason_passes(env):
+async def test_preflight_na_text_rejected_without_platform_waiver(env):
+    """#14：自由文本 ``N/A—原因`` 不再放行（旧出口=前缀匹配自由文本）。
+
+    放行出口只剩**平台状态**：本任务存在有效 waiver 行（coordinator 签发），
+    调用方 ``has_valid_waiver`` 短路——不是 agent 自述理由。
+    """
     _, tid, task = await _mk_task(env, contract=_dc_contract())
     res = await _preflight(
         env, task, {"delivery_contract": {"summary": "done",
                                           "test": "N/A — 仓库无测试基建"}}
     )
-    assert "delivery_contract_incomplete" not in {
+    assert "delivery_contract_incomplete" in {
         i["code"] for i in res["issues"]
     }
-    # N/A 缺原因 → issue
-    res2 = await _preflight(
+    # 同一份 evidence：有平台 waiver 行 ⇒ 放行
+    with patch("hiveweave.services.attestation.has_valid_waiver",
+               AsyncMock(return_value=True)):
+        res2 = await _preflight(
+            env, task, {"delivery_contract": {"summary": "done",
+                                              "test": "N/A — 仓库无测试基建"}}
+        )
+    assert "delivery_contract_incomplete" not in {
+        i["code"] for i in res2["issues"]
+    }
+    # 裸 N/A（无原因）同样拒（旧行为也拒，但走的是另一条分支）
+    res3 = await _preflight(
         env, task, {"delivery_contract": {"summary": "done", "test": "N/A"}}
     )
     assert "delivery_contract_incomplete" in {
+        i["code"] for i in res3["issues"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_preflight_not_applicable_field_needs_waiver(env):
+    """显式字段 ``evidence_kind=not_applicable`` 也只是**声明**：无平台 waiver 行仍拒。"""
+    _, tid, task = await _mk_task(env, contract=_dc_contract())
+    res = await _preflight(
+        env, task,
+        {"delivery_contract": {
+            "summary": "done",
+            "test": "",
+            "evidence_kind": "not_applicable",
+            "not_applicable_reason": "仓库无测试基建",
+        }},
+    )
+    codes = {i["code"] for i in res["issues"]}
+    assert "delivery_contract_incomplete" in codes
+    msg = " ".join(i["message"] for i in res["issues"])
+    assert "waiver" in msg, msg
+    # 有平台 waiver 行 ⇒ 短路放行
+    with patch("hiveweave.services.attestation.has_valid_waiver",
+               AsyncMock(return_value=True)):
+        res2 = await _preflight(
+            env, task,
+            {"delivery_contract": {
+                "summary": "done",
+                "test": "",
+                "evidence_kind": "not_applicable",
+                "not_applicable_reason": "仓库无测试基建",
+            }},
+        )
+    assert "delivery_contract_incomplete" not in {
         i["code"] for i in res2["issues"]
     }
 
@@ -343,8 +441,14 @@ async def test_preflight_waiver_short_circuit(env):
 
 
 @pytest.mark.asyncio
-async def test_preflight_na_but_successful_test_run_exists_rejected(env):
-    # R1 回执一致性:任务存在成功 test_run 凭证,executor 却写 N/A → 拦
+async def test_preflight_na_rejected_even_with_successful_test_run(env):
+    """#14（改断言）：任务有成功 test_run 凭证时写 N/A ⇒ 仍拒，且落在
+
+    ``delivery_contract_incomplete``（自由文本 N/A 在**回执形状**阶段就被判缺）
+    —— 修前此处走 R1 一致性分支报 ``delivery_contract_inconsistent``；旧分支
+    以「自由文本 N/A 合法」为前提，已随 #14 失效（该分支的语义被更强的
+    "N/A 一律缺、放行只认平台 waiver 行" 覆盖）。
+    """
     _, tid, task = await _mk_task(env, contract=_dc_contract())
     await attestation_service.create(
         env["project_id"], agent_id=EXEC, kind="test_run",
@@ -354,22 +458,23 @@ async def test_preflight_na_but_successful_test_run_exists_rejected(env):
         env, task, {"delivery_contract": {"summary": "done",
                                           "test": "N/A — 没跑测试"}}
     )
-    assert "delivery_contract_inconsistent" in {
+    assert "delivery_contract_incomplete" in {
         i["code"] for i in res["issues"]
     }
 
 
 @pytest.mark.asyncio
-async def test_preflight_na_without_test_run_still_passes(env):
-    # R1 互补:任务确无成功 test_run 凭证时,N/A(带原因)仍放行
+async def test_preflight_na_without_test_run_still_rejected(env):
+    """#14（改断言）：任务确无 test_run 凭证时，``N/A—原因`` **仍拒**。
+
+    修前此例断言"放行"（自由文本理由即豁免）；现放行出口是平台 waiver 行，
+    见 ``test_preflight_na_text_rejected_without_platform_waiver``。
+    """
     _, tid, task = await _mk_task(env, contract=_dc_contract())
     res = await _preflight(
         env, task, {"delivery_contract": {"summary": "done",
                                           "test": "N/A — 仓库无测试基建"}}
     )
-    assert "delivery_contract_inconsistent" not in {
-        i["code"] for i in res["issues"]
-    }
-    assert "delivery_contract_incomplete" not in {
+    assert "delivery_contract_incomplete" in {
         i["code"] for i in res["issues"]
     }
