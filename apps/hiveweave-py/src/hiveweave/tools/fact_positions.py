@@ -579,10 +579,13 @@ def finalize_tool_result(
                     tool=tool_name,
                     error=str(out.get("error") or ""),
                     status=None,
-                    # ⚠ 传 `r` 而不是 `out`：`to_dict()` 会先 pop 派生键
-                    # （runner_failed/command_failed…），`out` 里已经没有位了。
-                    # 传 `r` 才能拿到构造点声明的原始位 —— 而**这正是本分支要诊断的
-                    # 场景**（「构造点漏声明 fact」时，它到底声明了哪些位）。
+                    # ⚠ 传 `r`（构造点声明的原始位），**禁止改成 `bits=out`**。
+                    # `to_dict()` / `finalize_fact_dict()` 会**按 `fact` 重新派生**
+                    # 派生键 ⇒ `out` 里 `runner_failed` **永远存在且永远为 False**
+                    # （哪怕构造点从没声明过它）。若传 `out`，样本就会显示
+                    # 「构造点显式声明 runner_failed=False」，而真相是
+                    # **归因结果伪装成了构造点的声明** —— 诊断反而被引向反面，
+                    # 比不记还糟。
                     # 与 blocked 分支的 `bits=r` 对称（此前这里传 None ⇒ 样本里
                     # `bits_present={}`，把「显式声明 False」与「啥也没说」混为一谈，
                     # 正是 `bits_present` 带值要解决的那个歧义）。
