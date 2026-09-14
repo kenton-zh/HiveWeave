@@ -797,7 +797,15 @@ async def test_tool_receipt_retry_queue_wording():
         result = await request_code_audit_tool(
             RequestCodeAuditParams(task_id="t-1"), AGENT_ID, r"C:\fake\wt",
         )
-    text = result.output or ""
+    # TEST_DSH_55 P0 三态：已受理·等待结果 ⇒ 不报成功；诊断走 error
+    # （判定未放宽：由「必为 ok」收紧为「必为 accepted_pending 且信号齐全」）
+    assert result.success is False
+    assert result.fact == "outcome_unknown"
+    assert result.blocked is True
+    assert result.extra["audit_state"] == "accepted_pending"
+    assert result.extra["wait_for_notice"] is True
+    assert result.extra["action_required"] is False
+    text = result.error or ""
     assert "已排队自动重试" in text
     assert "第 2 次" in text
     assert "无需申请豁免" in text
@@ -820,7 +828,12 @@ async def test_tool_receipt_retry_queue_wording():
         result2 = await request_code_audit_tool(
             RequestCodeAuditParams(task_id="t-1"), AGENT_ID, r"C:\fake\wt",
         )
-    text2 = result2.output or ""
+    # 重试耗尽 = 平台不再接管 ⇒ 终局失败（不是「已受理」）
+    assert result2.success is False
+    assert result2.extra["audit_state"] == "failed"
+    assert result2.extra["action_required"] is True
+    assert result2.blocked is False
+    text2 = result2.error or ""
     assert "已达上限" in text2
     assert "waive_attestation" in text2
 
@@ -1270,7 +1283,11 @@ async def test_resequence_receipt_wording():
         result = await request_code_audit_tool(
             RequestCodeAuditParams(task_id="t-1"), AGENT_ID, r"C:\fake\wt",
         )
-    text = result.output or ""
+    # TEST_DSH_55 P0 三态：耗尽后人工重试 = 新一轮已受理 ⇒ accepted_pending
+    assert result.success is False
+    assert result.extra["audit_state"] == "accepted_pending"
+    assert result.extra["wait_for_notice"] is True
+    text = result.error or ""
     assert "新一轮重试序列" in text
     assert "第 1 次" in text
 

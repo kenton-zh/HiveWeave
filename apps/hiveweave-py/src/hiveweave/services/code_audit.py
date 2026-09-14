@@ -36,6 +36,77 @@ _AUDIT_LLM_CONCURRENCY = max(1, int(os.environ.get("HIVEWEAVE_AUDIT_LLM_CONCURRE
 _audit_llm_gate: asyncio.Semaphore | None = None
 
 
+# ── 三态契约（TEST_DSH_55 取证，2026-09-14）────────────────────────────
+# 为什么必须有三态：34 次调用全报 success ⇒ ``run_steps.status`` 全
+# ``'completed'``，其中 11 次（32%）结果文本写的却是「审计未执行: llm_failed」
+# ⇒ agent 读到「成功」却拿不到凭证，**重发 11 次**。旧文案里写着「无需循环
+# 重试」——说不服，因为它看到的**信号**是成功。
+#
+# 判据（借 deepseek-harness ``SubagentResult`` 三条判据，**不借**其字段名/
+# 枚举值；对位物是我们自己的 ``success`` / ``fact`` / 结果契约）：
+#   ① 非 completed 的终止原因 ⇒ 不得当作成功上报；
+#   ② 诊断信息与产出分离（走 error + 结构化字段，不塞进 output 让消费者猜）；
+#   ③ 未知终止原因按失败处理（fail-closed）。
+AUDIT_STATE_READY = "ready"
+AUDIT_STATE_ACCEPTED_PENDING = "accepted_pending"
+AUDIT_STATE_FAILED = "failed"
+
+#: 第三态的语义标记：等待期间 agent 的动作是「等通知」，不是「重发」。
+#: 由工具壳写进结果契约（``wait_for_notice``），门禁 / UI / 后续消费者直接
+#: 读这个信号，无需解析回执文本。
+AUDIT_WAIT_FOR_NOTICE = True
+
+
+def audit_outcome_state(result: dict) -> str:
+    """三态判据**唯一入口**：``run_code_audit`` 的返回 dict → 状态。
+
+    - ``audited=True`` **且有凭证** ⇒ ready
+    - 已入队且未耗尽（含"耗尽后人工重试 → 新一轮重试序列"）⇒ accepted_pending
+    - 其余 ⇒ failed。**fail-closed**（判据③）：判定不出的终局一律按失败，
+      绝不回落到「当成功」。
+
+    ⚠ ``ready`` **必须同时要求 `attestation_id` 存在**（独立审计 P0，2026-09-14）：
+    有出口会 ``audited=True`` 但**不发凭证** —— 典型是 ``ROLLED_BACK``
+    （diff 已回滚，回执自己写着「不发新的 PASS 凭证」）。只判 ``audited``
+    会让它落到 ready ⇒ ``success=True`` ⇒ ``round_made_progress`` 判真
+    （``doom_loop.py``）⇒ ``tool_loop`` 清零全部 stall 计数 ⇒ **同源无限重发**
+    ——正是本批要治的病，在另一个出口原样存在。
+    依据：三个真发凭证的出口（PASS / 缓存命中 / 常规）**都带 `attestation_id`**，
+    故该条件不会误伤正常路径（守卫见 tests/test_code_audit_rolled_back_state.py）。
+    """
+    if result.get("audited") and result.get("attestation_id"):
+        return AUDIT_STATE_READY
+    if result.get("retry_queued") and not result.get("retry_exhausted"):
+        return AUDIT_STATE_ACCEPTED_PENDING
+    return AUDIT_STATE_FAILED
+
+
+def audit_failure_fact(result: dict) -> str:
+    """``failed`` 态的事实位判据**唯一入口**：``reason`` → 四格词表成员。
+
+    只服务 ``AUDIT_STATE_FAILED``（``ready`` / ``accepted_pending`` 由
+    :func:`audit_outcome_state` 处置，不进这里）。返回值是
+    ``tools/result.py`` 的 ``FactKind`` 字面值；此处**不 import** ``FactKind``
+    —— ``services`` 不依赖 ``tools``（模块 docstring 的既有拓扑），翻译由
+    工具壳 ``_soft_fail_result`` 完成。
+
+    判据：**兜底 except 的触发点在 ``run_code_audit`` 执行之后**
+    （``reason == "error"`` 的出口），审计可能已部分跑过 / 已有副作用 ⇒ 标
+    ``outcome_unknown``（「结果未知 · 不许盲目重试」）。若标 ``runner_failed``
+    （=「命令从未执行」），下游会读成「无副作用，可安全重试」⇒ **副作用双发**
+    ——这正是 ``tools/result.py`` 词表与 ``fact_positions.py`` 兜底格
+    （同为 ``outcome_unknown``）反复钉的纪律。
+
+    其余 ``failed`` 原因（``no_worktree`` / ``no_callback`` / ``no_model`` /
+    ``llm_failed`` 未入队 / 重试耗尽）都是**平台前提缺失**：审计从未产出结论
+    ⇒ ``runner_failed``（「站在 agent 视角不是你的 bug」）。
+    """
+    reason = str(result.get("reason") or "")
+    if reason == "error":
+        return "outcome_unknown"
+    return "runner_failed"
+
+
 def _get_audit_gate() -> asyncio.Semaphore:
     global _audit_llm_gate
     if _audit_llm_gate is None:
@@ -849,6 +920,15 @@ async def run_code_audit(
       - ``{"audited": False, "reason": "no_worktree" | "no_callback" | "no_model" | "llm_failed" | "error"}``
         （llm_failed 且成功入队时附 ``retry_queued`` / ``retry_attempts``）
       - ``{"audited": True, "verdict": "PASS" | "ISSUES", ...}``
+
+    ⚠ **本层只返回数据，不构造工具结果**（模块 docstring 的既有拓扑）：返回的
+    dict 由工具壳翻译成 ``ToolResult``。**``audited=False`` 一律不是成功**
+    ——``audited=False`` 的出口没有任何一条能报 ``success=True``，工具壳
+    （``tools/code_audit.py`` 的 ``_soft_fail_result`` 唯一漏斗）也不得再把它
+    包成成功结果。缺陷（TEST_DSH_55）正是从这条缝漏出去的：34 次调用全被
+    包成 ``success=True`` ⇒ ``run_steps.status`` 全 ``'completed'``，其中 11 次
+    拿不到凭证的 agent 读到「成功」而重发。判据见 :func:`audit_outcome_state`
+    与 :func:`audit_failure_fact`。
     """
     try:
         from hiveweave.services.worktree_review import agent_worktree_path

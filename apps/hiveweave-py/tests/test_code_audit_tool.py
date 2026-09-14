@@ -427,10 +427,18 @@ async def test_tool_shell_ctx_none_soft_fails():
             RequestCodeAuditParams(task_id="task-1"), "agent-1", r"C:\fake\wt"
         )
 
-    assert result.success is True  # soft-fail: ok 带 reason，不是 err
-    assert "no_callback" in (result.output or "")
-    assert "retry" in (result.output or "").lower()
-    assert "submit_task" in (result.output or "")
+    # TEST_DSH_55 P0 三态：未审计 ⇒ **不报成功**（旧断言为 success is True，
+    # 那是「失败也报成功」的旧契约形态）。判定未放宽：由「必为 ok」收紧为
+    # 「必为 failed 态且诊断可读」（诊断改走 error —— 判据②诊断与产出分离）。
+    assert result.success is False
+    assert result.fact == "runner_failed"
+    assert result.blocked is False
+    assert result.extra["audit_state"] == "failed"
+    assert result.extra["action_required"] is True
+    text = result.error or ""
+    assert "no_callback" in text
+    assert "retry" in text.lower()
+    assert "submit_task" in text
     assert run_mock.await_args.kwargs["call_llm"] is None
     assert run_mock.await_args.kwargs["oneshot_llm"] is None
 
@@ -454,8 +462,15 @@ async def test_tool_shell_llm_failed_next_action_points_to_waive():
             RequestCodeAuditParams(task_id="task-1"), "agent-1", r"C:\fake\wt"
         )
 
-    assert result.success is True
-    text = result.output or ""
+    # TEST_DSH_55 P0 三态：未入队（平台未接管）⇒ failed 态，不报成功。
+    # 判定未放宽：旧「success is True」由「必为 ok」收紧为「必为 failed 且
+    # 结构性给出 action_required」；文案断言原样保留，仅改读 error 字段
+    # （判据②诊断与产出分离）。
+    assert result.success is False
+    assert result.fact == "runner_failed"
+    assert result.extra["audit_state"] == "failed"
+    assert result.extra["action_required"] is True
+    text = result.error or ""
     assert "llm_failed" in text
     assert "retry" in text.lower()
     assert "submit_task" in text
