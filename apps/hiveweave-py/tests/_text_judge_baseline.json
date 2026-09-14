@@ -1,0 +1,596 @@
+{
+ "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
+ "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
+ "_total": 130,
+ "_by_tier": {
+  "table": 25,
+  "regex": 105
+ },
+ "_suffixes": [
+  "_NEEDLES",
+  "_PATTERNS",
+  "_KEYWORDS",
+  "_SIGNATURES",
+  "_PHRASES",
+  "_MARKERS",
+  "_WORDS",
+  "_TOKENS",
+  "_TERMS"
+ ],
+ "_min_bounds": {
+  "table": 15,
+  "regex": 70
+ },
+ "_scanner_fingerprint": "70622e3f8bfbfdce",
+ "_files": [
+  "agents/agent.py",
+  "agents/trigger.py",
+  "api/auth.py",
+  "api/chat.py",
+  "api/debug.py",
+  "conversation/token_utils.py",
+  "llm/error_codes.py",
+  "llm/provider.py",
+  "llm/retry.py",
+  "prompts/identity.py",
+  "services/attestation.py",
+  "services/command_guard.py",
+  "services/eval_seal.py",
+  "services/failure_signature.py",
+  "services/git_worktree/conflict_predict.py",
+  "services/git_worktree/constants.py",
+  "services/git_worktree/dispatch_pin.py",
+  "services/git_worktree/integrity.py",
+  "services/git_worktree/paths.py",
+  "services/git_worktree/porcelain.py",
+  "services/git_worktree/reconcile.py",
+  "services/git_worktree/service_merge.py",
+  "services/mcp_supervisor.py",
+  "services/names.py",
+  "services/offturn.py",
+  "services/org.py",
+  "services/policy.py",
+  "services/process_registry.py",
+  "services/skill_registry.py",
+  "services/tasks/acceptance.py",
+  "services/tasks/crud.py",
+  "services/tasks/timeline.py",
+  "services/tasks/verdict_claim_check.py",
+  "services/tasks/verify.py",
+  "services/venv_setup.py",
+  "services/wait_contract.py",
+  "services/worktree_review.py",
+  "tools/bash.py",
+  "tools/executor.py",
+  "tools/fact_positions.py",
+  "tools/file.py",
+  "tools/grep.py",
+  "tools/image_gen_tools.py",
+  "tools/misc_tools.py",
+  "tools/security.py",
+  "tools/subagent.py",
+  "tools/tasks/waive.py"
+ ],
+ "entries": {
+  "agents/agent.py::_MAIN_LOOP_UPSTREAM_KEYWORDS": {
+   "tier": "table",
+   "line": 112
+  },
+  "agents/trigger.py::_WATCHDOG_CONTEXT_MARKERS": {
+   "tier": "table",
+   "line": 47
+  },
+  "api/auth.py::_ID_PATTERN": {
+   "tier": "regex",
+   "line": 125
+  },
+  "api/chat.py::_EXPERT_CMD_RE": {
+   "tier": "regex",
+   "line": 54
+  },
+  "api/debug.py::_TABLE_NAME_RE": {
+   "tier": "regex",
+   "line": 419
+  },
+  "conversation/token_utils.py::_CJK_RE": {
+   "tier": "regex",
+   "line": 54
+  },
+  "llm/error_codes.py::_CONTEXT_RE": {
+   "tier": "regex",
+   "line": 38
+  },
+  "llm/error_codes.py::_QUOTA_RE": {
+   "tier": "regex",
+   "line": 35
+  },
+  "llm/provider.py::_IMAGE_CAPABILITY_DENIAL_PHRASES": {
+   "tier": "table",
+   "line": 265
+  },
+  "llm/retry.py::_CAPACITY_NEEDLES": {
+   "tier": "table",
+   "line": 105
+  },
+  "llm/retry.py::_COMPILED_REGION_PATTERNS": {
+   "tier": "table",
+   "line": 179
+  },
+  "llm/retry.py::_COMPILED_RETRYABLE_PATTERNS": {
+   "tier": "table",
+   "line": 87
+  },
+  "llm/retry.py::_REGION_FASTFAIL_PATTERNS": {
+   "tier": "table",
+   "line": 171
+  },
+  "llm/retry.py::_RETRYABLE_MESSAGE_PATTERNS": {
+   "tier": "table",
+   "line": 60
+  },
+  "llm/retry.py::_WINDOW_NEEDLES": {
+   "tier": "table",
+   "line": 134
+  },
+  "prompts/identity.py::_CHINESE_TRAINED_MARKERS": {
+   "tier": "table",
+   "line": 72
+  },
+  "services/attestation.py::_AUDIT_VERDICT_RE": {
+   "tier": "regex",
+   "line": 2685
+  },
+  "services/attestation.py::_FACT_NEED_RE": {
+   "tier": "regex",
+   "line": 1789
+  },
+  "services/attestation.py::_HEX_REF_RE": {
+   "tier": "regex",
+   "line": 338
+  },
+  "services/attestation.py::_TEST_COMMAND_RE": {
+   "tier": "regex",
+   "line": 294
+  },
+  "services/attestation.py::_UUID_RE": {
+   "tier": "regex",
+   "line": 331
+  },
+  "services/command_guard.py::_REGEX_META": {
+   "tier": "regex",
+   "line": 52
+  },
+  "services/command_guard.py::_STOPPROC_PID_RE": {
+   "tier": "regex",
+   "line": 856
+  },
+  "services/command_guard.py::_TASKKILL_PID_RE": {
+   "tier": "regex",
+   "line": 855
+  },
+  "services/command_guard.py::_WIN_VAR_RE": {
+   "tier": "regex",
+   "line": 880
+  },
+  "services/command_guard.py::_WMIC_PID_RE": {
+   "tier": "regex",
+   "line": 857
+  },
+  "services/eval_seal.py::_LOOPBACK_HOST": {
+   "tier": "regex",
+   "line": 51
+  },
+  "services/failure_signature.py::_WS_RE": {
+   "tier": "regex",
+   "line": 37
+  },
+  "services/git_worktree/conflict_predict.py::_CONFLICT_LINE_RE": {
+   "tier": "regex",
+   "line": 31
+  },
+  "services/git_worktree/conflict_predict.py::_DEGRADED_MARKERS": {
+   "tier": "table",
+   "line": 34
+  },
+  "services/git_worktree/constants.py::REGENERABLE_PATTERNS": {
+   "tier": "table",
+   "line": 52
+  },
+  "services/git_worktree/constants.py::_CONFLICT_MARKER_RE": {
+   "tier": "regex",
+   "line": 166
+  },
+  "services/git_worktree/constants.py::_SLUG_INVALID": {
+   "tier": "regex",
+   "line": 145
+  },
+  "services/git_worktree/constants.py::_SLUG_SPACE": {
+   "tier": "regex",
+   "line": 144
+  },
+  "services/git_worktree/constants.py::_SLUG_TRIM": {
+   "tier": "regex",
+   "line": 146
+  },
+  "services/git_worktree/constants.py::_TASK_BRANCH_RE": {
+   "tier": "regex",
+   "line": 180
+  },
+  "services/git_worktree/constants.py::_UNTRACKED_FILE_LINE_RE": {
+   "tier": "regex",
+   "line": 158
+  },
+  "services/git_worktree/constants.py::_UNTRACKED_OVERWRITE_RE": {
+   "tier": "regex",
+   "line": 152
+  },
+  "services/git_worktree/constants.py::_WT_LIST_RE": {
+   "tier": "regex",
+   "line": 149
+  },
+  "services/git_worktree/dispatch_pin.py::_WT_REF": {
+   "tier": "regex",
+   "line": 11
+  },
+  "services/git_worktree/integrity.py::_EXCEPT_START_RE": {
+   "tier": "regex",
+   "line": 34
+  },
+  "services/git_worktree/integrity.py::_EXPLICIT_MARKERS": {
+   "tier": "table",
+   "line": 39
+  },
+  "services/git_worktree/integrity.py::_FALLBACK_ASSIGN_RE": {
+   "tier": "regex",
+   "line": 36
+  },
+  "services/git_worktree/integrity.py::_PASS_ONLY_RE": {
+   "tier": "regex",
+   "line": 35
+  },
+  "services/git_worktree/paths.py::_WORKTREE_SEG_RE": {
+   "tier": "regex",
+   "line": 19
+  },
+  "services/git_worktree/porcelain.py::_Z_RECORD_RE": {
+   "tier": "regex",
+   "line": 13
+  },
+  "services/git_worktree/reconcile.py::_HW_SID_BRANCH_RE": {
+   "tier": "regex",
+   "line": 27
+  },
+  "services/git_worktree/service_merge.py::_TASK_BRANCH_RE": {
+   "tier": "regex",
+   "line": 1130
+  },
+  "services/mcp_supervisor.py::_SAFE_RE": {
+   "tier": "regex",
+   "line": 40
+  },
+  "services/names.py::_FLOWER_NAME_RE": {
+   "tier": "regex",
+   "line": 27
+  },
+  "services/offturn.py::_SECRET_RE": {
+   "tier": "regex",
+   "line": 363
+  },
+  "services/offturn.py::_SK_RE": {
+   "tier": "regex",
+   "line": 366
+  },
+  "services/org.py::_SHORT_ID_NUM_RE": {
+   "tier": "regex",
+   "line": 90
+  },
+  "services/org.py::_SHORT_ID_RE": {
+   "tier": "regex",
+   "line": 89
+  },
+  "services/policy.py::_HW_WRITE_MARKERS": {
+   "tier": "table",
+   "line": 252
+  },
+  "services/process_registry.py::_APP_SERVER_FAMILY_RE": {
+   "tier": "regex",
+   "line": 73
+  },
+  "services/process_registry.py::_FLASK_RUN_FAMILY_RE": {
+   "tier": "regex",
+   "line": 86
+  },
+  "services/process_registry.py::_GUNICORN_BIND_PORT_RE": {
+   "tier": "regex",
+   "line": 63
+  },
+  "services/process_registry.py::_GUNICORN_FAMILY_RE": {
+   "tier": "regex",
+   "line": 101
+  },
+  "services/process_registry.py::_HTTP_SERVER_POS_PORT_RE": {
+   "tier": "regex",
+   "line": 55
+  },
+  "services/process_registry.py::_IMAGE_KILL_RE": {
+   "tier": "regex",
+   "line": 152
+  },
+  "services/process_registry.py::_JEST_RE": {
+   "tier": "regex",
+   "line": 687
+  },
+  "services/process_registry.py::_KILL_VERB_RE": {
+   "tier": "regex",
+   "line": 131
+  },
+  "services/process_registry.py::_PORT_ENV_RE": {
+   "tier": "regex",
+   "line": 48
+  },
+  "services/process_registry.py::_PORT_FLAG_RE": {
+   "tier": "regex",
+   "line": 44
+  },
+  "services/process_registry.py::_PYTEST_RE": {
+   "tier": "regex",
+   "line": 688
+  },
+  "services/process_registry.py::_RESERVED_PORT_REF_RE": {
+   "tier": "regex",
+   "line": 141
+  },
+  "services/process_registry.py::_SPAWN_BLOCKING_VERB_RE": {
+   "tier": "regex",
+   "line": 125
+  },
+  "services/process_registry.py::_UVICORN_FAMILY_RE": {
+   "tier": "regex",
+   "line": 111
+  },
+  "services/process_registry.py::_UVICORN_HELP_RE": {
+   "tier": "regex",
+   "line": 121
+  },
+  "services/process_registry.py::_UV_DEP_FLAG_RE": {
+   "tier": "regex",
+   "line": 96
+  },
+  "services/process_registry.py::_VITEST_RE": {
+   "tier": "regex",
+   "line": 686
+  },
+  "services/process_registry.py::_VITE_BARE_RE": {
+   "tier": "regex",
+   "line": 67
+  },
+  "services/skill_registry.py::_API_KEY_ENV_RE": {
+   "tier": "regex",
+   "line": 835
+  },
+  "services/skill_registry.py::_API_KEY_OPTIONAL_CONTEXT_RE": {
+   "tier": "regex",
+   "line": 838
+  },
+  "services/skill_registry.py::_API_KEY_PHRASE_RE": {
+   "tier": "regex",
+   "line": 842
+  },
+  "services/tasks/acceptance.py::_NA_RE": {
+   "tier": "regex",
+   "line": 20
+  },
+  "services/tasks/acceptance.py::_WS_RE": {
+   "tier": "regex",
+   "line": 22
+  },
+  "services/tasks/crud.py::_FORGED_VERIFY_RE": {
+   "tier": "regex",
+   "line": 56
+  },
+  "services/tasks/timeline.py::_ECHO_STATUS_RE": {
+   "tier": "regex",
+   "line": 76
+  },
+  "services/tasks/verdict_claim_check.py::_CLAIM_PATTERNS": {
+   "tier": "table",
+   "line": 29
+  },
+  "services/tasks/verify.py::_VERIFY_TITLE_RE": {
+   "tier": "regex",
+   "line": 30
+  },
+  "services/venv_setup.py::_SAFE_DEP_RE": {
+   "tier": "regex",
+   "line": 144
+  },
+  "services/wait_contract.py::_TIME_ONLY_RE": {
+   "tier": "regex",
+   "line": 284
+  },
+  "services/worktree_review.py::_BARE_WORKTREE_PREFIX_RE": {
+   "tier": "regex",
+   "line": 30
+  },
+  "services/worktree_review.py::_PATH_TOKEN_RE": {
+   "tier": "regex",
+   "line": 956
+  },
+  "services/worktree_review.py::_PORCELAIN_LINE_RE": {
+   "tier": "regex",
+   "line": 265
+  },
+  "services/worktree_review.py::_WORKTREE_PREFIX_RE": {
+   "tier": "regex",
+   "line": 26
+  },
+  "tools/bash.py::SELF_DESTRUCTIVE_PATTERNS": {
+   "tier": "table",
+   "line": 702
+  },
+  "tools/bash.py::_ACCESS_DENIED_RE": {
+   "tier": "regex",
+   "line": 120
+  },
+  "tools/bash.py::_ALLOWED_HW_SUBDIRS": {
+   "tier": "regex",
+   "line": 771
+  },
+  "tools/bash.py::_AMPERSAND_RE": {
+   "tier": "regex",
+   "line": 1311
+  },
+  "tools/bash.py::_ANSI_ESCAPE_RE": {
+   "tier": "regex",
+   "line": 128
+  },
+  "tools/bash.py::_APP_SERVER_TOKEN_RE": {
+   "tier": "regex",
+   "line": 179
+  },
+  "tools/bash.py::_ATTEST_FOOTER_RE": {
+   "tier": "regex",
+   "line": 2803
+  },
+  "tools/bash.py::_BLOCKING_VERB_RE": {
+   "tier": "regex",
+   "line": 168
+  },
+  "tools/bash.py::_CLOSED_PIPE_TAIL_RE": {
+   "tier": "regex",
+   "line": 1555
+  },
+  "tools/bash.py::_COMMAND_TASK_ID_RE": {
+   "tier": "regex",
+   "line": 2479
+  },
+  "tools/bash.py::_DEV_SERVER_TRIGGER_RE": {
+   "tier": "regex",
+   "line": 135
+  },
+  "tools/bash.py::_FLASK_TOKEN_RE": {
+   "tier": "regex",
+   "line": 183
+  },
+  "tools/bash.py::_GUNICORN_TOKEN_RE": {
+   "tier": "regex",
+   "line": 184
+  },
+  "tools/bash.py::_HIVEWEAVE_FILE_OPS": {
+   "tier": "regex",
+   "line": 729
+  },
+  "tools/bash.py::_HIVEWEAVE_REF": {
+   "tier": "regex",
+   "line": 741
+  },
+  "tools/bash.py::_HIVEWEAVE_TEST_EXCLUDE_RE": {
+   "tier": "regex",
+   "line": 747
+  },
+  "tools/bash.py::_HW_LOGS_REF": {
+   "tier": "regex",
+   "line": 780
+  },
+  "tools/bash.py::_HW_MERGE_QUARANTINE_REF": {
+   "tier": "regex",
+   "line": 809
+  },
+  "tools/bash.py::_HW_WRITE_MARKERS": {
+   "tier": "table",
+   "line": 791
+  },
+  "tools/bash.py::_SHELL_KEYWORDS": {
+   "tier": "table",
+   "line": 1317
+  },
+  "tools/bash.py::_STATIC_SERVER_TOKEN_RE": {
+   "tier": "regex",
+   "line": 185
+  },
+  "tools/bash.py::_TEST_CMD_RE": {
+   "tier": "regex",
+   "line": 114
+  },
+  "tools/bash.py::_TRAILING_AMP_RE": {
+   "tier": "regex",
+   "line": 173
+  },
+  "tools/bash.py::_UNIX_SHORT_FLAG_RE": {
+   "tier": "regex",
+   "line": 1290
+  },
+  "tools/bash.py::_UVICORN_HELP_RE": {
+   "tier": "regex",
+   "line": 174
+  },
+  "tools/bash.py::_UVICORN_TOKEN_RE": {
+   "tier": "regex",
+   "line": 178
+  },
+  "tools/executor.py::_SAFE_NAME_RE": {
+   "tier": "regex",
+   "line": 60
+  },
+  "tools/executor.py::_SENSITIVE_KEY_RE": {
+   "tier": "regex",
+   "line": 2631
+  },
+  "tools/fact_positions.py::BAD_ARGS_SIGNATURES": {
+   "tier": "table",
+   "line": 82
+  },
+  "tools/fact_positions.py::RUNNER_FAILURE_SIGNATURES": {
+   "tier": "table",
+   "line": 47
+  },
+  "tools/fact_positions.py::_NORM_RE": {
+   "tier": "regex",
+   "line": 98
+  },
+  "tools/file.py::SENSITIVE_PATTERNS": {
+   "tier": "table",
+   "line": 203
+  },
+  "tools/file.py::_CANONICAL_WT_READ": {
+   "tier": "regex",
+   "line": 247
+  },
+  "tools/file.py::_MSYS_DRIVE": {
+   "tier": "regex",
+   "line": 237
+  },
+  "tools/file.py::_REPORTS_ID_RE": {
+   "tier": "regex",
+   "line": 621
+  },
+  "tools/grep.py::_RG_LINE_RE": {
+   "tier": "regex",
+   "line": 40
+  },
+  "tools/image_gen_tools.py::_SLUG_RE": {
+   "tier": "regex",
+   "line": 36
+  },
+  "tools/misc_tools.py::_COMPLETION_ASSERT_NEEDLES": {
+   "tier": "table",
+   "line": 1798
+  },
+  "tools/misc_tools.py::_SHORT_ID_RE": {
+   "tier": "regex",
+   "line": 203
+  },
+  "tools/security.py::SENSITIVE_PATTERNS": {
+   "tier": "table",
+   "line": 17
+  },
+  "tools/subagent.py::_UPSTREAM_FAILURE_KEYWORDS": {
+   "tier": "table",
+   "line": 447
+  },
+  "tools/tasks/waive.py::_BULK_TASK_TOKENS": {
+   "tier": "table",
+   "line": 24
+  }
+ }
+}
