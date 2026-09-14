@@ -317,7 +317,10 @@ def note_unclassified_sample(
 ) -> dict:
     """记一条「布尔位缺失 + 文本未命中」的样本，返回可落库 payload。
 
-    payload 形状：``{tool, error_preview(≤200 字), status, bits_present}``。
+    payload 形状：``{tool, error_preview(≤200 字), status, bits_present}``；
+    ``bits_present`` 是 ``{位名: bool}`` —— **带值**，只记名字会把「构造点显式
+    声明为 False」读成「位已置真」，而 True/False 恰恰是判据的分叉点（同一个坑
+    见 :func:`_bits_mapping` 的 docstring）。
 
     ⚠ 本函数**必须永不抛异常**：它挂在归因路径上，抛异常会把一次「判不出来」
     升级成「整条工具调用炸掉」。
@@ -330,9 +333,14 @@ def note_unclassified_sample(
             "tool": tool,
             "error_preview": redact_secrets(str(error or ""))[:_SAMPLE_PREVIEW],
             "status": status,
-            "bits_present": sorted(
-                k for k in _SAMPLE_BITS if mapping.get(k) is not None
-            ),
+            # 名字 + 值：只记名字是**半个判据** —— 「构造点显式说了 False」与
+            # 「说了 True」在归因上指向完全相反的结论，而两者都会出现在这个
+            # 列表里（`state_bits` 的语义是「位存在」≠「位为真」）。
+            "bits_present": {
+                k: bool(mapping[k])
+                for k in sorted(_SAMPLE_BITS)
+                if mapping.get(k) is not None
+            },
         }
         log.error(
             UNCLASSIFIED_SAMPLE_EVENT,

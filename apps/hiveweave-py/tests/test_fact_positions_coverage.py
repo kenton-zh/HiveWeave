@@ -601,8 +601,84 @@ class TestAttributionLadder:
         assert sample["tool"] == "bash"
         assert sample["error_preview"].startswith("Quelque chose")
         assert len(sample["error_preview"]) <= 200
-        # 「当时是护栏拒绝，但**没有任何归因位**」—— 这才是要被人看见的形态
-        assert "blocked" in sample["bits_present"]
+        # 「当时是护栏拒绝，但**没有任何归因位**」—— 这才是要被人看见的形态。
+        # 且必须是**带值的**位视图：只记名字会把「显式声明为 False」读成
+        # 「位已置真」（`state_bits` 的语义是「位存在」，不是「位为真」）。
+        assert sample["bits_present"] == {"blocked": True}
+
+    def test_wait_timeout_is_code_scoped_even_via_result_dict(self):
+        """第三层（代码作用域）在 **dict 通道**必须真的可达。
+
+        实测（2026-09-14，改动前）：dict 分支把 `timeout_kind` 收进 `extra`，
+        判定却读 dataclass 字段 ⇒ 恒 `None` ⇒ 该层是**死代码**，审批窗口等待
+        类 blocked 结果会悄悄落到 `outcome_unknown` 并刷样本。
+
+        阳性对照（**实测转红**）：把该层改回只读字段形态
+        （`getattr(r, "timeout_kind", None) == "wait"`）⇒ 本用例第一段在
+        `assert out["fact"] == "runner_failed"` 处转红（实测得 `outcome_unknown`）。
+        ⚠ 本用例的文案必须**一条签名都不命中**（第一版用了含「审批」的文案，
+        结果被**第二层文本表**接走 ⇒ 假绿，PC9 实测没转红才发现）。
+        """
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        out = finalize_tool_result(
+            "bash",
+            {
+                "success": False,
+                "blocked": True,
+                "error": "Attente de validation par un operateur distant",
+                "timeout_kind": "wait",
+            },
+        )
+        # 命令从未派发 ⇒ runner_failed；这是**代码作用域**归属，不是文案命中
+        assert out["fact"] == "runner_failed"
+        assert out["blocked"] is True
+        assert "unclassified_sample" not in out, "命中代码作用域就不该落样本"
+
+        # 反面：非 `wait` 的超时**不得**被这一层吃掉（它只覆盖"审批等待"这一特例）
+        out = finalize_tool_result(
+            "bash",
+            {
+                "success": False,
+                "blocked": True,
+                "error": "inconnu",
+                "timeout_kind": "command",
+            },
+        )
+        assert out["fact"] == "outcome_unknown"
+        assert "unclassified_sample" in out
+
+    def test_declared_fact_conflicting_with_bits_is_logged(self):
+        """构造点声明的 fact 与它自己给的位冲突时必须**留痕**（只观测，不改归因）。
+
+        为什么不能直接改归因：构造点比通用判据更懂上下文（比如它刚读了一个
+        结构化返回），硬覆盖会更糟；但「声明即免检」是个开口 —— 判错了永远
+        没人知道。故只记 WARNING。
+
+        阳性对照（**实测转红**）：把 `fact_position_declared_conflicts_with_bits`
+        那条 `log.warning` 删掉（或删掉整个 `elif judge_blocked and declared ...`
+        分支）⇒ 本用例转红。
+        """
+        from structlog.testing import capture_logs
+
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        with capture_logs() as logs:
+            out = finalize_tool_result(
+                "bash",
+                {
+                    "success": False,
+                    "fact": "outcome_unknown",
+                    "runner_failed": True,  # 与声明打架
+                    "error": "boom",
+                },
+            )
+        # 归因**按声明**（不改动）
+        assert out["fact"] == "outcome_unknown"
+        assert any(
+            e.get("event") == "fact_position_declared_conflicts_with_bits"
+            for e in logs
+        ), [e.get("event") for e in logs]
 
     def test_blocked_without_fact_does_not_raise(self):
         """blocked=True 且无 fact **不得抛**（fail loud 但不 fail hard）。
