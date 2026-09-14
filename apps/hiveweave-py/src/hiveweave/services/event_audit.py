@@ -13,7 +13,6 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Any
 
 import structlog
 
@@ -88,6 +87,16 @@ class EventAudit:
         try:
             payload_json = json.dumps(payload)
         except (TypeError, ValueError):
+            # ⚠ 这条兜底过去是**静默**的：不可序列化的 payload 会被整条替换成
+            # {"error": "..."}，把真正有用的字段（如 llm_unknown_error_sample 的
+            # body_preview）一起丢掉，而且没人知道。凡「悄悄丢数据」都补一条 warning
+            # —— 否则失效只在很久以后以"某类事件怎么一条都没有"的形式暴露。
+            logger.warning(
+                "event_audit.payload_not_serializable",
+                agent_id=agent_id,
+                event_type=event_type,
+                keys=sorted(payload.keys()) if isinstance(payload, dict) else None,
+            )
             payload_json = json.dumps(
                 {"error": "payload not serializable"}
             )

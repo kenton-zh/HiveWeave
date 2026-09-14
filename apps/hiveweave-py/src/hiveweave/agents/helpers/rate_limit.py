@@ -162,6 +162,12 @@ def is_rate_limit_error(error: BaseException | None) -> bool:
 
     Rate limits must not increment consecutive-error give-up — they are
     temporary quota pressure, not agent failure.
+
+    Prefer structured ``RetryableError(status=429)``. Message fallback uses
+    phrase needles + **word-bounded** ``429`` compounds — bare ``"429"`` alone
+    must not count (fixplan-16items §三 #13：裸数字是最宽的误报源，
+    ``"requested 14290 tokens"`` / ``"line 429"`` / 任务号全都命中）。
+    与 ``is_balance_error`` 的 402 判据同构。
     """
     if error is None:
         return False
@@ -174,14 +180,23 @@ def is_rate_limit_error(error: BaseException | None) -> bool:
         pass
     msg = str(error).lower()
     needles = (
-        "429",
         "accountratelimit",
         "rate limit",
         "ratelimitexceeded",
         "too many requests",
         "rate_limit",
     )
-    return any(n in msg for n in needles)
+    if any(n in msg for n in needles):
+        return True
+    # 词边界复合形态：`http 429` / `status_code: 429` / `错误码 429`
+    # ⚠ 窗口 `[^\d]{0,12}` 限长是刻意的：它允许 `status_code: ` 这类插入，
+    # 但**不允许把远处的数字拉过来**（否则又变回裸子串）。
+    # ⚠ 数字用 `(?<!\d)429(?!\d)` 而不是 `\b429\b`：`_` 算 word char，所以
+    # `\b` 会让 `ERR_429` / `code=ERR_429` 命中不了（审计实测的边界漏洞），
+    # 而 `(?<!\d)` 既能对 `ERR_429` 生效、又照样排除 `14290` / `4291`。
+    return bool(
+        re.search(r"(?:http|status|error|code|错误码)[^\d]{0,12}(?<!\d)429(?!\d)", msg)
+    )
 
 
 def is_account_rate_limit(error: BaseException | None) -> bool:

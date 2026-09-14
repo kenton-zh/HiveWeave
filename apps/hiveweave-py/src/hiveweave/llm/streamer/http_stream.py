@@ -23,6 +23,10 @@ from hiveweave.llm.retry import (
     classify_http_error,
     is_region_unavailable_error,
 )
+from hiveweave.llm.unknown_error_samples import (
+    flush_unknown_samples,
+    note_unknown_sample,
+)
 
 from .constants import (
     CONTINUE_SENTINEL,
@@ -295,6 +299,7 @@ class HttpStreamMixin:
                     delta_id=delta_id,
                     round_num=round_num,
                     budget_deadline=budget_deadline,
+                    provider_name=provider_name,
                 )
             finally:
                 sem.release()
@@ -324,6 +329,15 @@ class HttpStreamMixin:
                 "partial_usage": getattr(e, "partial_usage", None),
             }
         except PermanentError as e:
+            # fixplan #13：本方法作用域内的样本（典型是下面的图像能力短语表失配）
+            # **不在** `_do_streaming_request` 的 flush 覆盖内 —— 那是**另一个方法**，
+            # 且只在抛异常时才 flush。不在这里补一次的话，该样本要等本 agent
+            # **下一次**流异常才被顺带带走；若此后不再报错就永不落库（只剩日志）。
+            # 重复 flush 是安全的：缓冲区里该 agent 的样本为空时直接返回 0。
+            try:
+                await flush_unknown_samples(agent_id)
+            except Exception:
+                pass
             # 不可重试错误（401/400 等）→ 不报告熔断器
             # （客户端配置问题，非 provider 故障，不应触发熔断）
             # error_status 必须保留: agent 层靠它区分 402 余额耗尽
@@ -331,6 +345,27 @@ class HttpStreamMixin:
             # 图像能力自判定：请求带了图、400 且错误文本确为「图像不支持」→
             # 这是首轮探测，标记负缓存 + 剥图重试一次（让模型自己「判定」，
             # 不再依赖人工勾选 supports_images）。仅此一次，不再递归。
+            #
+            # fixplan-16items §三 #13：这张短语表**未命中**时同样要 fail-loud。
+            # 「带了图 + 400 但短语表不认识」= 表可能漏了新厂商的措辞
+            # （`provider.py:265-289` 自陈「无结构化字段，这仍是高精短语匹配」）。
+            # 记样本**不改行为**（剥图判定仍走下面原 `if`）；放在 `if` 之前是为了
+            # 只在「失配」时记 —— 命中时不记（那是正常路径，不是未知）。
+            if (
+                not stripped_retry
+                and had_images
+                and e.status == 400
+                and not _looks_like_image_unsupported_error(str(e))
+            ):
+                note_unknown_sample(
+                    source="image_capability_phrase_table",
+                    status=e.status,
+                    body=str(e),
+                    provider=provider_name,
+                    model=provider.model_name,
+                    agent_id=agent_id,
+                    extra={"had_images": True, "stripped_retry": False},
+                )
             if (
                 not stripped_retry
                 and had_images
@@ -405,6 +440,7 @@ class HttpStreamMixin:
         delta_id: str,
         round_num: int,
         budget_deadline: float | None = None,
+        provider_name: str | None = None,
     ) -> dict:
         """执行 HTTP 流式请求（同步 httpx 跑在线程池里，事件边收边推）。
 
@@ -577,14 +613,30 @@ class HttpStreamMixin:
                             raw["http_status"],
                             raw.get("body", ""),
                             headers=raw.get("headers", {}),
+                            provider=provider_name,
+                            model=provider.model_name,
+                            agent_id=agent_id,
                         )
                     # 无 http_status 的异常文本形态：仅 region/不可用类
                     # 确定性永久失败 fast-fail（403 地域类误入退避曾慢死
                     # 476s，TEST_DSH_47 #8）；未知措辞保持可重试，避免
                     # opaque 网关瞬态错误被误判成 Permanent 秒死。
+                    #
+                    # ⚠ 这里是**最高价值的未知桶**（连 status 都没有，只能看文案）
+                    # ⇒ 必须 fail-loud 留样本（fixplan #13 修法 2）。本分支的 note
+                    # 由本方法的 `except BaseException` 里的 flush 覆盖（同一个方法）。
                     err_text = raw.get("error", "Unknown HTTP error")
                     if is_region_unavailable_error(err_text):
                         raise PermanentError(err_text)
+                    note_unknown_sample(
+                        source="transport_raw_default",
+                        status=None,
+                        body=err_text,
+                        provider=provider_name,
+                        model=provider.model_name,
+                        agent_id=agent_id,
+                        extra={"transport_raw": True},
+                    )
                     raise RetryableError(err_text)
 
                 got_event = True
@@ -668,11 +720,25 @@ class HttpStreamMixin:
                             agent_id=agent_id,
                             error=error_content,
                         )
-                        raise classify_http_error(None, error_content)
+                        raise classify_http_error(
+                            None,
+                            error_content,
+                            provider=provider_name,
+                            model=provider.model_name,
+                            agent_id=agent_id,
+                        )
         except BaseException as e:
             if not abandon_executor:
                 abandon_executor = True
                 _close_http_client()
+            # fixplan-16items §三 #13 修法 2：把本轮「分类层认不出来」的样本
+            # 落 agent_events（本方法拿得到 agent_id，分类函数拿不到）。
+            # ⚠ 必须在 raise 之前 await；且 flush 自身绝不抛（否则会**覆盖掉
+            # 正在抛出的原始错误**，让排查失去线索）。best-effort，失败不影响。
+            try:
+                await flush_unknown_samples(agent_id)
+            except Exception:
+                pass
             # 45 轮 P1：断流/超时 raise 路径保住已收 usage（budget_cut
             # 返回路径此前已保，raise 路径随异常丢弃）——挂异常对象，由
             # _stream_single_round 的错误收口带出、tool_loop 并入账本。

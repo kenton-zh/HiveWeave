@@ -45,11 +45,22 @@ _CONTEXT_RE = re.compile(
 def classify_error(
     status: int | None = None,
     body: str = "",
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    agent_id: str | None = None,
 ) -> ErrorCode:
     """按 HTTP 状态码 + 响应体文案分类为稳定错误码。
 
     分类优先级：QUOTA 文案 > RATE_LIMIT(429) > AUTH(401/403) >
     CONTEXT(400+文案) > SERVER(5xx) > INVALID_REQUEST(4xx) > UNKNOWN。
+
+    **判据来源分层（fixplan #13）**：状态码 = **第一层**（结构化、与措辞
+    和语言无关）；`_QUOTA_RE` / `_CONTEXT_RE` 文案 = **第二层 fallback**。
+    fallback 未命中而落到 ``UNKNOWN`` 时**必须留样本**（见下），否则上游换
+    措辞/换语言导致的降级是静默的。
+
+    ``provider`` / ``model`` 只用于记录样本，不参与判定。
     """
     if status == 402 or (body and _QUOTA_RE.search(body)):
         return ErrorCode.QUOTA
@@ -66,16 +77,39 @@ def classify_error(
     if status is not None and status >= 500:
         return ErrorCode.SERVER
     if status is None and body:
-        # 流内错误（HTTP 200 但 body 含 error）——按文案分类
+        # 流内错误（HTTP 200 但 body 含 error）——只能按文案分类。
+        # ⇒ 这里是 fallback 的**唯一位置**：两条正则都不中就是真的不认识。
         if _CONTEXT_RE.search(body):
             return ErrorCode.CONTEXT_WINDOW
         if _QUOTA_RE.search(body):
             return ErrorCode.QUOTA
+    # 无任何正面识别信号 ⇒ fail-loud 留样本（fixplan #13 修法 2）。
+    # ⚠ 只有 `status is None` 落到这里才是「fallback 失配」；status 落在
+    # 其它值（如 1xx/3xx 异常态）是另一类问题，一并记录便于发现新错误族。
+    from hiveweave.llm.unknown_error_samples import note_unknown_sample
+
+    note_unknown_sample(
+        source="classify_error",
+        status=status,
+        body=body,
+        provider=provider,
+        model=model,
+        agent_id=agent_id,
+    )
     return ErrorCode.UNKNOWN
 
 
 def is_retryable_code(code: ErrorCode) -> bool:
-    """稳定码→可重试判定（取代散落的状态码+正则匹配）。"""
+    """稳定码→可重试判定（取代散落的状态码+正则匹配）。
+
+    ⚠ ``UNKNOWN`` 的归属是**显式决策**，不是"不在列表里所以不可重试"的省略
+    —— 见 :data:`hiveweave.llm.retry.UNKNOWN_SIGNAL_IS_RETRYABLE` 的注释
+    （其中写明与 ``llm/streamer/http_stream.py`` 传输层分支默认相反，以及为什么）。
+    """
+    if code is ErrorCode.UNKNOWN:
+        from hiveweave.llm.retry import UNKNOWN_SIGNAL_IS_RETRYABLE
+
+        return UNKNOWN_SIGNAL_IS_RETRYABLE
     return code in (
         ErrorCode.RATE_LIMIT,
         ErrorCode.SERVER,

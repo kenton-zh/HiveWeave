@@ -47,7 +47,6 @@
   "services/git_worktree/service_merge.py",
   "services/mcp_supervisor.py",
   "services/names.py",
-  "services/offturn.py",
   "services/org.py",
   "services/policy.py",
   "services/process_registry.py",
@@ -69,7 +68,8 @@
   "tools/misc_tools.py",
   "tools/security.py",
   "tools/subagent.py",
-  "tools/tasks/waive.py"
+  "tools/tasks/waive.py",
+  "util/redact.py"
  ],
  "entries": {
   "agents/agent.py::_MAIN_LOOP_UPSTREAM_KEYWORDS": {
@@ -110,27 +110,27 @@
   },
   "llm/retry.py::_CAPACITY_NEEDLES": {
    "tier": "table",
-   "line": 105
+   "line": 127
   },
   "llm/retry.py::_COMPILED_REGION_PATTERNS": {
    "tier": "table",
-   "line": 179
+   "line": 201
   },
   "llm/retry.py::_COMPILED_RETRYABLE_PATTERNS": {
    "tier": "table",
-   "line": 87
+   "line": 109
   },
   "llm/retry.py::_REGION_FASTFAIL_PATTERNS": {
    "tier": "table",
-   "line": 171
+   "line": 193
   },
   "llm/retry.py::_RETRYABLE_MESSAGE_PATTERNS": {
    "tier": "table",
-   "line": 60
+   "line": 82
   },
   "llm/retry.py::_WINDOW_NEEDLES": {
    "tier": "table",
-   "line": 134
+   "line": 156
   },
   "prompts/identity.py::_CHINESE_TRAINED_MARKERS": {
    "tier": "table",
@@ -271,14 +271,6 @@
   "services/names.py::_FLOWER_NAME_RE": {
    "tier": "regex",
    "line": 27
-  },
-  "services/offturn.py::_SECRET_RE": {
-   "tier": "regex",
-   "line": 363
-  },
-  "services/offturn.py::_SK_RE": {
-   "tier": "regex",
-   "line": 366
   },
   "services/org.py::_SHORT_ID_NUM_RE": {
    "tier": "regex",
@@ -538,15 +530,15 @@
   },
   "tools/fact_positions.py::BAD_ARGS_SIGNATURES": {
    "tier": "table",
-   "line": 82
+   "line": 111
   },
   "tools/fact_positions.py::RUNNER_FAILURE_SIGNATURES": {
    "tier": "table",
-   "line": 47
+   "line": 76
   },
   "tools/fact_positions.py::_NORM_RE": {
    "tier": "regex",
-   "line": 98
+   "line": 149
   },
   "tools/file.py::SENSITIVE_PATTERNS": {
    "tier": "table",
@@ -590,6 +582,14 @@
   },
   "tools/tasks/waive.py::_BULK_TASK_TOKENS": {
    "tier": "table",
+   "line": 24
+  },
+  "util/redact.py::_SECRET_RE": {
+   "tier": "regex",
+   "line": 18
+  },
+  "util/redact.py::_SK_RE": {
+   "tier": "regex",
    "line": 24
   }
  }

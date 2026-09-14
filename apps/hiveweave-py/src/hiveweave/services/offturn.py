@@ -8,7 +8,6 @@ wait, and wakes the agent. Do not nest this work inside streamer HARD 570
 from __future__ import annotations
 
 import asyncio
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -16,6 +15,8 @@ from pathlib import Path
 from typing import TypeVar
 
 import structlog
+
+from hiveweave.util.redact import redact_secrets
 
 try:
     from hiveweave.services.wake_policy import OFFTURN_COMPLETION_MESSAGE_TYPE
@@ -360,15 +361,8 @@ def _job_wake_on_complete(job_id: str) -> bool:
     return bool(job.wake_on_complete)
 
 
-_SECRET_RE = re.compile(
-    r"(?i)((?:api[_-]?key|token|secret|authorization|bearer)\s*[=:]\s*(?:bearer\s+)?)\S+"
-)
-_SK_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
-
-
-def _redact(text: str) -> str:
-    t = _SECRET_RE.sub(r"\1***", text or "")
-    return _SK_RE.sub("sk-***", t)
+_redact = redact_secrets
+"""保留旧名（调用点很多）。实现已收口到 ``util/redact.py`` —— 单一脱敏面。"""
 
 
 def _format_body(

@@ -49,6 +49,28 @@ RETRYABLE_STATUSES: frozenset[int] = frozenset(range(500, 600)) | frozenset({429
 `status >= 500` 一律可重试策略。
 """
 
+UNKNOWN_SIGNAL_IS_RETRYABLE: bool = False
+"""「没有任何结构化信号」时 `classify_http_error` 的默认分类。
+
+**这是显式决策，不是省略**（fixplan-16items §三 #13：「UNKNOWN 归入"可重试"
+还是"永久"要**显式定，不许默认**」）。当前 = 永久（不重试），与既有测试
+`tests/test_retry_message_classify.py::test_unknown_error_without_status_is_permanent`
+（注释「不盲目重试」）一致。
+
+⚠ **另有一处默认与它相反，且那是有意的** ——
+`llm/streamer/http_stream.py` 的「传输层裸错误」分支（`raw` 里既无
+`http_status` 也非地域类）默认**重试**，理由是 opaque 网关的瞬态错误被判
+Permanent 会秒死（该处有独立注释与 TEST_DSH_47 #8 的实测依据）。两者分界：
+
+  · **本常量** = 「上游给了错误体，但我们不认识它」⇒ 重试多半还是同样的拒绝
+    （对应 SSE `error` chunk 与测试里的 `unrecognized provider error`）；
+  · **那一处** = 「连接层压根没给结构化信息」⇒ 多半是瞬态。
+
+⇒ 改任一处**必须同时看另一处**。两处的默认值由
+`tests/test_unknown_error_classification_contract.py` 钉在同一个测试里，
+改动即转红。
+"""
+
 # 消息内容级可重试模式（厂商无关，移植自 opencode retry.ts RETRYABLE_MESSAGE_PATTERNS）。
 # 适用场景：网关在 HTTP 200 / 非标准 4xx body 里包瞬态错误文本（如
 # "upstream server error"、"rate limit reached"），仅靠状态码无法识别。
@@ -196,6 +218,10 @@ def classify_http_error(
     status: int | None,
     body: str,
     headers: dict[str, str] | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    agent_id: str | None = None,
 ) -> RetryableError | PermanentError:
     """把一次 HTTP/流错误分类为可重试或永久错误。
 
@@ -203,6 +229,10 @@ def classify_http_error(
     或 body 内容命中可重试模式 → RetryableError；否则 PermanentError。
     用于 ``streamer/http_stream.py`` 的非 200 分支和流中 error chunk ——
     兜住多厂商「状态码正常但 body 包瞬态错误」的情况。
+
+    ``provider`` / ``model`` / ``agent_id`` **只用于记录未识别样本**（见下），
+    不参与判定。``agent_id`` 是给**进程级共享的样本缓冲**做归属用的 —— 不给
+    会让并发 agent 的样本挂错人（归因错位）。
     """
     snippet = body[:500]
     if status is not None:
@@ -214,7 +244,32 @@ def classify_http_error(
     # 快死拖成 476s 慢死。
     if is_region_unavailable_error(body):
         return PermanentError(message, status=status)
-    if (status is not None and is_retryable_status(status)) or matches_retryable_message(body):
+    status_retryable = status is not None and is_retryable_status(status)
+    text_retryable = matches_retryable_message(body)
+    if status_retryable or text_retryable:
+        return RetryableError(message, status=status, headers=headers or {})
+    # ── 走到这里 = 没有任何正面识别信号 ─────────────────────────────
+    # fixplan #13 修法 2：文本 fallback **未命中**时必须 fail-loud 留样本，
+    # 否则上游换措辞/换语言后分类静默退化成 UNKNOWN、无人知晓。
+    # 判据：只有当**连状态码这一层也没有**（或状态码不属已知客户端错误家族）时
+    # 才算「真的不认识」—— status 落在 4xx（非 429）是**已识别**的客户端错误，
+    # 不是 fallback 失配。
+    if not (status is not None and 400 <= status < 500):
+        from hiveweave.llm.unknown_error_samples import note_unknown_sample
+
+        note_unknown_sample(
+            source="classify_http_error",
+            status=status,
+            body=body,
+            provider=provider,
+            model=model,
+            agent_id=agent_id,
+            extra={
+                "status_retryable": status_retryable,
+                "text_retryable": text_retryable,
+            },
+        )
+    if UNKNOWN_SIGNAL_IS_RETRYABLE:
         return RetryableError(message, status=status, headers=headers or {})
     return PermanentError(message, status=status)
 
