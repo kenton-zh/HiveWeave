@@ -35,15 +35,24 @@ def test_sandbox_env_cache_overrides() -> None:
 
 
 def test_sandbox_env_no_secret_key(monkeypatch) -> None:
-    """密钥绝不进受限子进程 env（显式断言，审计#1-4 钉）。"""
+    """密钥绝不进受限子进程 env（显式断言，审计#1-4 钉）。
+
+    2026-09-14 收窄断言：GitSpawn 加固（`util/win_subprocess.apply_git_hardening`）
+    往沙箱 env 注入 `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` —— 这是 git
+    官方 env 机制的**固定槽位键名**，原断言 `"KEY" not in k.upper()` 会把
+    这些平台常量误判成密钥。排除该前缀后守卫强度不变：真密钥
+    （`*_API_KEY` / `*_SECRET`）不以该前缀开头，仍被挡。
+    """
     monkeypatch.setenv("HIVEWEAVE_OPENCODE_API_KEY", "super-secret")
     monkeypatch.setenv("ARK_API_KEY", "ark-secret")
     monkeypatch.setenv("PATH", "C:\\bin")
     env = _build_sandbox_env(r"D:\ws", r"D:\ws\.hiveweave-cache", r"D:\ws\tmp")
     assert "HIVEWEAVE_OPENCODE_API_KEY" not in env
     assert "ARK_API_KEY" not in env
-    # 任一 *KEY* / *SECRET* 变量都不该进白名单
+    # 任一 *KEY* / *SECRET* 变量都不该进白名单（git 加固的固定槽位键除外）
     for k in env:
+        if k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            continue
         assert "KEY" not in k.upper()
         assert "SECRET" not in k.upper()
 
