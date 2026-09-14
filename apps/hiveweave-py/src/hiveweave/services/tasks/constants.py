@@ -45,6 +45,10 @@ _MISSING_COLUMNS = [
     ("implementer_worktree", "TEXT"),
     # TEST21 M5: owner parked — pause task-stall nudges while agent is parked
     ("owner_parked", "INTEGER DEFAULT 0"),
+    # 2026-09-14（#11）：任务种类（闭合枚举）。**无 DEFAULT** —— 语义是
+    # 「未知 = NULL」；带 DEFAULT 会把升级前的存量行回填成那个值，让"未知"
+    # 伪装成"已判定"。回填见 services/tasks/migrate_verify_kind.py。
+    ("kind", "TEXT"),
 ]
 
 # Progress floors driven by lifecycle events (LLM may only raise further)

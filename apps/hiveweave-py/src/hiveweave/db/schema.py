@@ -322,6 +322,15 @@ PROJECT_DB_TABLES = [
         reviewer_id TEXT,
         implementer_id TEXT,
         implementer_worktree TEXT,
+        -- 2026-09-14（#11）：任务**种类**——闭合枚举，非成员 ⇒ None（**不猜**，
+        -- 对齐 `services/delivery_plane.py::normalize_delivery_plane` 的范式）。
+        -- NULL = 普通任务（含存量未回填）；'verify' = 系统 spawn 的 VERIFY 任务。
+        -- ⚠ **不带 DEFAULT**：本列语义是「未知 = NULL」，给 DEFAULT 会让"未知"
+        -- 伪装成"已判定"，而升级前的存量行会被 SQLite 回填成那个 DEFAULT
+        -- （本仓纪律：新列的迁移形态本身就是判据）。
+        -- 它取代了此前用**任务标题**判 VERIFY 的文本判据（标题只作展示）——
+        -- 标题判据的病灶：改标题即可翻转验收门与串行锁（#11）。
+        kind TEXT,
         owner_parked INTEGER DEFAULT 0
     )
     """,

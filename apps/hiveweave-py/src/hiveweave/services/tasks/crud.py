@@ -90,7 +90,7 @@ class CrudMixin:
         "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
         "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
         "is_archived, due_at, wait_kind, wake_at, policy_id, reviewer_id, "
-        "contract_json, implementer_id, implementer_worktree, owner_parked"
+        "contract_json, implementer_id, implementer_worktree, owner_parked, kind"
     )
 
     async def create_task(self, project_id: str, title: str, description: str,
@@ -104,8 +104,18 @@ class CrudMixin:
                           source: str = "agent",
                           evidence: dict | None = None,
                           contract_json: dict | None = None,
-                          policy_id: str | None = None) -> str:
+                          policy_id: str | None = None,
+                          kind: str | None = None) -> str:
         """Create a task. JSON-serializes list/dict fields. Returns task_id.
+
+        ``kind``：任务**种类**（闭合枚举，非成员 ⇒ None）。普通任务留 None；
+        **系统 spawn 的 VERIFY 任务必须显式传 ``kind="verify"``**
+        （见 ``services/tasks/verify.py::VERIFY_KIND``）。它是 VERIFY 判定的
+        **唯一权威来源**（#11：取代了原先按**任务标题**判的文本判据）。
+
+        ⚠ **agent 侧不得可传**：`kind` 不是工具参数，只能由平台内部路径写。
+        否则缺口就从「改标题」变成「传 kind」—— 验收问句「能否写一个绕过它的
+        调用方？」必须答"不能"。
 
         Assign = claim: if ``assignee_id`` is set and the task is not VERIFY,
         insert as ``claimed`` (with ``claimed_at``). Unassigned drafts and
@@ -247,9 +257,9 @@ class CrudMixin:
             "creator_id, status, priority, progress, tags, parent_task_id, depends_on, "
             "acceptance_criteria, evidence, expected_modules, blocked_reason, source, "
             "retry_count, created_at, claimed_at, submitted_at, closed_at, updated_at, "
-            "is_archived, due_at, wait_kind, policy_id, contract_json) "
+            "is_archived, due_at, wait_kind, policy_id, contract_json, kind) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "0, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?)",
+            "0, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, ?)",
             [task_id, project_id, title, description, assignee_id, creator_id,
              status, priority, json.dumps(tags) if tags else None, parent_task_id,
              json.dumps(depends_on) if depends_on else None,
@@ -257,7 +267,7 @@ class CrudMixin:
              json.dumps(evidence) if evidence else None,
              json.dumps(expected_modules) if expected_modules else None,
              blocked_reason, source, now_ms, claimed_at, now_ms, due_at,
-             wait_kind, policy_id, contract_blob]),
+             wait_kind, policy_id, contract_blob, kind]),
             (event_sql, event_params),
         ])
         await publish_task_event(project_id, task_id, event_type, status, event_ts)

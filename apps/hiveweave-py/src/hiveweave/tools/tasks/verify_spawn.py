@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from hiveweave.services import task as _task_svc
-from hiveweave.services.tasks.verify import is_verify_title
+from hiveweave.services.tasks.verify import VERIFY_KIND, is_verify_title
 from hiveweave.tools import helpers as _helpers
 
 log = structlog.get_logger(__name__)
@@ -498,6 +498,9 @@ async def _spawn_post_approve_verify_task(
         tags=verify_tags,
         source="system",
         evidence=verify_evidence,
+        # #11：VERIFY 的种类**显式写在字段上**（唯一权威来源），不再靠标题前缀。
+        # 这是系统 spawn 路径 —— agent 侧拿不到这个参数（它不是工具参数）。
+        kind=VERIFY_KIND,
     )
 
     # Pin reviewer_id = CEO creator at spawn (TEST11 audit H5) so review

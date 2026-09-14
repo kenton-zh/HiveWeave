@@ -33,6 +33,14 @@ _VERIFY_TITLE_RE = re.compile(r"^[【\[]?\s*VERIFY\s*[:：]")
 def is_verify_title(title: str | None) -> bool:
     """True if *title* denotes a VERIFY task —— 唯一权威判定入口。
 
+    ⚠ **已废弃（2026-09-14，#11）**：本判据的病灶是「用**任务标题**判种类」——
+    改标题即可翻转全部验收门与串行锁（真验收写成「验收：xxx」⇒ 不被认；
+    普通任务加 `VERIFY:` 前缀 ⇒ 伪装）。它现在**只由回填迁移脚本使用**
+    （`services/tasks/migrate_verify_kind.py`），**运行时不得再调用**
+    （守卫：`tests/test_verify_kind_judgment.py` 用 AST 断言运行时零调用）。
+
+    运行时一律改用 :func:`is_verify_task`（读 `kind` 字段 = 状态判据）。
+
     锚定行首：``VERIFY`` 前最多一个全/半角开括号，后接全/半角冒号。
     支持 ``VERIFY: …``、``【VERIFY: …】``、``[VERIFY: …]``、``VERIFY：…``。
     不误伤「收到 VERIFY 通知 / 关于 VERIFY 的讨论」等普通标题。
@@ -40,6 +48,37 @@ def is_verify_title(title: str | None) -> bool:
     唯一可靠信号。
     """
     return isinstance(title, str) and bool(_VERIFY_TITLE_RE.match(title))
+
+
+#: 任务种类的闭合枚举（`tasks.kind`）。非成员 ⇒ None（**不猜**）。
+#: 对齐 `services/delivery_plane.py::normalize_delivery_plane` 的范式。
+VERIFY_KIND = "verify"
+_TASK_KINDS: frozenset[str] = frozenset({VERIFY_KIND})
+
+
+def task_kind(task: dict | None) -> str | None:
+    """任务的种类；**非法/缺失 ⇒ None**（"未知"，不是"普通任务"）。
+
+    判据是**状态**（DB 列），与任务标题、措辞、语言**完全无关** ——
+    这正是它取代 :func:`is_verify_title` 的理由。
+    """
+    if not isinstance(task, dict):
+        return None
+    raw = task.get("kind")
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    return s if s in _TASK_KINDS else None
+
+
+def is_verify_task(task: dict | None) -> bool:
+    """True 仅当这是**系统 spawn 的 VERIFY 任务**（读 `kind`，**不读标题**）。
+
+    取代 :func:`is_verify_title` 的运行时判定。`kind IS NULL` 时**按普通任务
+    处理**（不是"猜它是 VERIFY"）—— 存量未回填的行会落进这里，由
+    `log.warning` 显形（见调用方），而不是被静默当成任一种。
+    """
+    return task_kind(task) == VERIFY_KIND
 
 
 def normalize_verdict(value: Any) -> str | None:
