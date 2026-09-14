@@ -163,3 +163,145 @@ async def test_column_exists_in_a_freshly_created_db(env):
     cur = await conn.execute("SELECT name FROM pragma_table_info('tasks')")
     cols = {r[0] for r in await cur.fetchall()}
     assert "kind" in cols
+
+
+# ── 3. 存量回填（#11 阶段 B 前半） ──────────────────────────────
+
+
+async def _insert_raw(env, *, task_id: str, title: str, created_at: int,
+                      kind: str | None = None) -> None:
+    """直接插一行（绕开 create_task，好控制 created_at / kind）。"""
+    from hiveweave.services.tasks.db import _execute
+
+    await _execute(
+        env["project_id"],
+        "INSERT INTO tasks (id, project_id, title, description, creator_id, "
+        "status, created_at, updated_at, kind) VALUES (?,?,?,?,?,?,?,?,?)",
+        [task_id, env["project_id"], title, "", "a1", "created",
+         created_at, created_at, kind],
+    )
+
+
+async def _kinds(env) -> dict[str, str | None]:
+    from hiveweave.services.tasks.db import _query
+
+    return {
+        r["id"]: r["kind"]
+        for r in await _query(env["project_id"], "SELECT id, kind FROM tasks")
+    }
+
+
+@pytest.mark.asyncio
+async def test_backfill_promotes_only_pre_cutover_rows(env):
+    """回填只动 cutover **之前**创建的行 —— 这是"不能重跑"的那条界限。"""
+    from hiveweave.services.tasks.migrate_verify_kind import (
+        CUTOVER_MS,
+        backfill_verify_kind,
+    )
+
+    before, after = CUTOVER_MS - 1_000, CUTOVER_MS + 1_000
+    await _insert_raw(env, task_id="legacy-verify",
+                      title="VERIFY: 老验收", created_at=before)
+    await _insert_raw(env, task_id="legacy-bracket",
+                      title="【VERIFY: 老验收2】", created_at=before)
+    await _insert_raw(env, task_id="legacy-normal",
+                      title="普通任务", created_at=before)
+    # ⚠ 关键：cutover 之后新建、标题恰好像 VERIFY 的**普通任务** —— 不得升格。
+    # 若升格，agent 只要起个这样的名字就白拿 VERIFY 的隔离门/串行锁（#11 的伪造）。
+    await _insert_raw(env, task_id="new-looking",
+                      title="VERIFY: 我自己起的名字", created_at=after)
+    await _insert_raw(env, task_id="new-real",
+                      title="新验收", created_at=after, kind=VERIFY_KIND)
+
+    stats = await backfill_verify_kind(env["project_id"])
+    assert stats["backfilled"] == 2, "只应回填两条存量"
+    assert stats["post_cutover_matches"] == 1, "cutover 后的同名行要被记 warning（fail-loud）"
+
+    kinds = await _kinds(env)
+    assert kinds["legacy-verify"] == VERIFY_KIND
+    assert kinds["legacy-bracket"] == VERIFY_KIND
+    assert kinds["legacy-normal"] is None, "存量普通任务必须保持 NULL"
+    assert kinds["new-looking"] is None, (
+        "★ cutover 之后新建的普通任务不得被回填升格 —— 回填一旦重跑就会造成"
+        "「起个像 VERIFY 的标题就拿到 VERIFY 门」的伪造面。"
+    )
+    assert kinds["new-real"] == VERIFY_KIND
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent(env):
+    """重跑是 no-op（幂等 ⇒ 可以安全地放在每次 `_ensure_schema` 里）。"""
+    from hiveweave.services.tasks.migrate_verify_kind import (
+        CUTOVER_MS,
+        backfill_verify_kind,
+    )
+
+    await _insert_raw(env, task_id="v1", title="VERIFY: x",
+                      created_at=CUTOVER_MS - 1)
+    assert (await backfill_verify_kind(env["project_id"]))["backfilled"] == 1
+    assert (await backfill_verify_kind(env["project_id"]))["backfilled"] == 0
+    assert (await _kinds(env))["v1"] == VERIFY_KIND
+
+
+@pytest.mark.asyncio
+async def test_backfill_reproduces_the_old_judgment_exactly(env):
+    """验收③的行为侧：回填**照抄**旧判据，连它的误判一起抄。
+
+    否则等于在迁移里偷偷改行为 —— 而这类改动没有任何显式信号。
+
+    · 「验收：M4」在**旧**判据下**不**被认（这正是 #11 的病灶）⇒ 回填也不认。
+    · 「VERIFY: 名义上是验收但其实是个普通活」在旧判据下**被认** ⇒ 回填也认。
+    """
+    from hiveweave.services.tasks.migrate_verify_kind import (
+        CUTOVER_MS,
+        backfill_verify_kind,
+        is_legacy_verify_title,
+    )
+
+    assert is_legacy_verify_title("验收：M4 收口") is False
+    assert is_legacy_verify_title("VERIFY: x") is True
+    assert is_legacy_verify_title("VERIFY：x") is True
+    assert is_legacy_verify_title("[VERIFY: x]") is True
+
+    t = CUTOVER_MS - 1
+    await _insert_raw(env, task_id="colon-cn", title="验收：M4 收口", created_at=t)
+    await _insert_raw(env, task_id="fake-verify", title="VERIFY: 名义上是验收但其实是个普通活",
+                      created_at=t)
+    await backfill_verify_kind(env["project_id"])
+
+    kinds = await _kinds(env)
+    assert kinds["colon-cn"] is None, (
+        "旧判据认不出的形态，回填也必须认不出 —— 否则行为不一致"
+    )
+    assert kinds["fake-verify"] == VERIFY_KIND, (
+        "旧判据认得出的形态，回填也必须认 —— 照抄包括它的误判（当时的实际行为）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_positive_control_clearing_kind_can_be_restored(env):
+    """验收④阳性对照：把 `kind` 全清回 NULL ⇒ 回填能复原。
+
+    （等价于"回填漏跑了"这个最危险的情形，能不能被救回来。）
+    """
+    from hiveweave.services.tasks.db import _execute
+    from hiveweave.services.tasks.migrate_verify_kind import (
+        CUTOVER_MS,
+        backfill_verify_kind,
+    )
+
+    await _insert_raw(env, task_id="v1", title="VERIFY: 甲",
+                      created_at=CUTOVER_MS - 1)
+    await _insert_raw(env, task_id="v2", title="VERIFY: 乙",
+                      created_at=CUTOVER_MS - 1)
+    await backfill_verify_kind(env["project_id"])
+    assert (await _kinds(env))["v1"] == VERIFY_KIND
+
+    # 模拟"回填漏跑/被清空"（真实事故形态：库整代重建回到基础列）
+    await _execute(env["project_id"], "UPDATE tasks SET kind = NULL")
+    assert set((await _kinds(env)).values()) == {None}
+
+    stats = await backfill_verify_kind(env["project_id"])
+    assert stats["backfilled"] == 2, "清空后回填必须能复原"
+    assert (await _kinds(env))["v1"] == VERIFY_KIND
+    assert (await _kinds(env))["v2"] == VERIFY_KIND

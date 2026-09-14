@@ -114,6 +114,28 @@ async def _ensure_schema(project_id: str) -> None:
             log.warning("tasks_column_migration_failed",
                         column=col_name, error=str(exc))
     if not pending:
+        # #11 阶段 B 前半：**存量 VERIFY 的 kind 回填**。
+        #
+        # 为什么必须在这里做：阶段 B 的翻转让运行时判定改读 `kind` ⇒ 不回填
+        # 会让存量 VERIFY 全部被当成普通任务，**门静默敞开且不报错**。
+        #
+        # ⚠ 一次性语义由 `migrate_verify_kind.CUTOVER_MS`（时间锚）保证，
+        # **不是**由本函数外层的 `_migrated` 保证 —— 那个标记是 `(workspace,
+        # 连接世代)` 键，每次新世代都会重跑，而回填**不能重跑**（重跑会把
+        # cutover 之后新建的、标题恰好像 VERIFY 的普通任务静默升格）。
+        # 回填自身幂等 ⇒ 放在这个位置是安全的。
+        #
+        # 失败时 `pending=True`（不落标记）⇒ 下次重试，而不是静默跳过。
+        try:
+            from .migrate_verify_kind import backfill_verify_kind
+
+            _stats = await backfill_verify_kind(project_id)
+            if _stats.get("backfilled"):
+                log.info("verify_kind_backfilled", **_stats)
+        except Exception as exc:  # noqa: BLE001 — 失败要重试，不能静默
+            pending = True
+            log.warning("verify_kind_backfill_failed", error=str(exc)[:200])
+    if not pending:
         _migrated.add(key)
 
 
