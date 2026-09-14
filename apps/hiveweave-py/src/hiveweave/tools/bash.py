@@ -3414,11 +3414,31 @@ def _shell_tool_result(
     if blocked:
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
-        # blocked 只接受平台侧成因的格；未给或给了调用方成因的格时回落
-        # runner_failed（护栏类出口默认就是「命令从未执行」）。
-        if _fact not in ("runner_failed", "outcome_unknown"):
-            _fact = "runner_failed"
-        return ToolResult.blocked_err(err_msg, fact=_fact, **_kw)
+        # blocked 只接受**平台侧成因**的格（`result.py::_BLOCKED_FACT_KINDS`）。
+        if _fact in ("runner_failed", "outcome_unknown"):
+            return ToolResult.blocked_err(err_msg, fact=_fact, **_kw)
+        if _fact is None:
+            # 护栏出口没声明格 ⇒ 回落 runner_failed 是**对的**（平台护栏出口
+            # 默认就是「命令从未执行」）。已有测试钉住这条
+            # （test_fact_positions_coverage.py:181/263）。
+            return ToolResult.blocked_err(err_msg, fact="runner_failed", **_kw)
+        # ⚠ **非法组合**：blocked=True 配**调用方成因**的格（bad_args /
+        # command_failed）。此处**原先**是静默改写成 runner_failed —— 那是**反向**
+        # 的（把「你的参数错」说成「命令从未执行」），正是 L6/L19 要治的方向，
+        # 而且没有任何日志。
+        # 2026-09-14 收敛：与 `_wrap_routed_background_result` 用**同一条策略** ——
+        # **保留事实位、去掉 blocked**（参数错不是平台护栏拒绝），绝不改写 fact。
+        # 今天该路径不可达（动态 blocked_err 构造点均已守卫），但三条处置曾经各不
+        # 相同、其中一条静默反向 —— 这正是"看似有守卫比没有守卫更危险"的形态。
+        log.warning(
+            "blocked_fact_not_blockable",
+            fact=_fact,
+            action=(
+                "blocked=True 配了调用方成因的 fact ⇒ 保留 fact、去掉 blocked"
+                "（不再静默改写成 runner_failed）。护栏出口确实没声明格时才回落。"
+            ),
+        )
+        return ToolResult.err(err_msg, fact=_fact, **_kw)
     return ToolResult.err(err_msg, fact=_fact, **_kw)
 
 

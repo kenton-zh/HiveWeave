@@ -190,6 +190,54 @@ def test_routed_background_result_never_builds_an_invalid_combination():
     assert r5.to_dict()["success"] is True
 
 
+def test_shell_tool_result_converges_the_illegal_combination():
+    """`_shell_tool_result` 对同一非法组合的处置已**收敛**（不再静默反向）。
+
+    这是本条修完 #17 后由复审查出的**第三处**处置 —— 三处曾经各不相同：
+      · `_wrap_routed_background_result` ⇒ 保留 fact、去掉 blocked（对）；
+      · `finalize_tool_result`            ⇒ 丢弃调用方成因的位、继续阶梯（可接受）；
+      · `_shell_tool_result`              ⇒ **保留 blocked、把 fact 静默改写成
+        runner_failed** —— 方向**相反**（把「你的参数错」说成「命令从未执行」，
+        正是 L6/L19 要治的病）且**无任何日志**。
+
+    现在三处统一为「保留 fact、去掉 blocked」。⚠ 关键：**护栏出口确实没声明格
+    （`fact is None`）时仍回落 runner_failed** —— 那是既有语义、有测试钉住，
+    不能一起改掉（改了会让护栏出口变成 bad_args-free 的裸 err）。
+    """
+    from hiveweave.tools.bash import _shell_tool_result
+
+    def _call(fact: str | None, *, blocked: bool = True):
+        return _shell_tool_result(
+            success=False,
+            blocked=blocked,
+            output="",
+            error="boom",
+            banner="",
+            suffix="",
+            public={} if fact is None else {"fact": fact},
+        )
+
+    # ① 非法组合：保留 fact、去掉 blocked（不再改成 runner_failed）
+    d = _call("bad_args").to_dict()
+    assert d["fact"] == "bad_args", "不得把调用方成因改写成 runner_failed（方向相反）"
+    assert d.get("blocked") is not True
+
+    # ② 护栏出口没声明格 ⇒ 既有回落语义**保持不变**（有测试钉住）
+    d2 = _call(None).to_dict()
+    assert d2["fact"] == "runner_failed"
+    assert d2.get("blocked") is True
+
+    # ③ 平台侧成因原样透传
+    d3 = _call("outcome_unknown").to_dict()
+    assert d3["fact"] == "outcome_unknown"
+    assert d3.get("blocked") is True
+
+    # ④ 非 blocked 路径不受影响
+    d4 = _call("command_failed", blocked=False).to_dict()
+    assert d4["fact"] == "command_failed"
+    assert d4.get("blocked") is not True
+
+
 def test_blocked_err_still_rejects_caller_fault_facts():
     """钉住不变式本身：**不许**用「放宽 `_BLOCKED_FACT_KINDS`」修上面的崩溃。
 
