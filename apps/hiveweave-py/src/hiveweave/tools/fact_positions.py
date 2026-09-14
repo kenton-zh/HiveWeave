@@ -579,13 +579,18 @@ def finalize_tool_result(
                     tool=tool_name,
                     error=str(out.get("error") or ""),
                     status=None,
-                    # ⚠ 传 `r`（构造点声明的原始位），**禁止改成 `bits=out`**。
-                    # `to_dict()` / `finalize_fact_dict()` 会**按 `fact` 重新派生**
-                    # 派生键 ⇒ `out` 里 `runner_failed` **永远存在且永远为 False**
-                    # （哪怕构造点从没声明过它）。若传 `out`，样本就会显示
-                    # 「构造点显式声明 runner_failed=False」，而真相是
-                    # **归因结果伪装成了构造点的声明** —— 诊断反而被引向反面，
-                    # 比不记还糟。
+                    # ⚠ 传 `r`（构造点声明的原始位），**禁止改成 `bits=out`** ——
+                    # 错法随取样点而变，两种都要防：
+                    # ① **就地**用 `out`：`to_dict()` 已把派生键 pop 掉
+                    #    （实测 `bits=out` → `['blocked', 'dialect_failed']`）
+                    #    ⇒ 恰好**丢掉**最该留的 `runner_failed`（丢证据）；
+                    # ② 把取样**挪到 `finalize_fact_dict()` 之后**再传 `out`
+                    #    （这是看似的顺理成章改动）：那时派生键按 `fact`
+                    #    **重新派生**，`runner_failed` 的 False 是**由归因结果倒推**
+                    #    出来的、并非构造点的声明 ⇒ 样本会显示「构造点显式声明
+                    #    runner_failed=False」，即**归因结果伪装成构造点的声明**
+                    #    —— 把诊断引向反面，比不记还糟。
+                    # ⇒ 无论取样点挪到哪，都只传 `r`（位在 `extra` 里，`to_dict` 不清它）。
                     # 与 blocked 分支的 `bits=r` 对称（此前这里传 None ⇒ 样本里
                     # `bits_present={}`，把「显式声明 False」与「啥也没说」混为一谈，
                     # 正是 `bits_present` 带值要解决的那个歧义）。
