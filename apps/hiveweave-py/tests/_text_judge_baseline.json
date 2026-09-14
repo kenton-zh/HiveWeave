@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 128,
+ "_total": 130,
  "_by_tier": {
   "table": 24,
-  "regex": 104
+  "regex": 106
  },
  "_suffixes": [
   "_NEEDLES",
@@ -34,6 +34,7 @@
   "llm/retry.py",
   "prompts/identity.py",
   "services/attestation.py",
+  "services/code_audit.py",
   "services/command_guard.py",
   "services/eval_seal.py",
   "services/failure_signature.py",
@@ -154,6 +155,18 @@
   "services/attestation.py::_UUID_RE": {
    "tier": "regex",
    "line": 330
+  },
+  "services/code_audit.py::_SEVERITY_ANY_MARKER_RE": {
+   "tier": "regex",
+   "line": 698
+  },
+  "services/code_audit.py::_SEVERITY_BRACKET_RE": {
+   "tier": "regex",
+   "line": 667
+  },
+  "services/code_audit.py::_SEVERITY_PREFIX_RE": {
+   "tier": "regex",
+   "line": 658
   },
   "services/command_guard.py::_REGEX_META": {
    "tier": "regex",
@@ -281,7 +294,7 @@
   },
   "services/policy.py::_HW_WRITE_MARKERS": {
    "tier": "table",
-   "line": 252
+   "line": 259
   },
   "services/process_registry.py::_APP_SERVER_FAMILY_RE": {
    "tier": "regex",
@@ -367,13 +380,9 @@
    "tier": "regex",
    "line": 842
   },
-  "services/tasks/acceptance.py::_NA_RE": {
-   "tier": "regex",
-   "line": 20
-  },
   "services/tasks/acceptance.py::_WS_RE": {
    "tier": "regex",
-   "line": 22
+   "line": 63
   },
   "services/tasks/migrate_verify_kind.py::_LEGACY_VERIFY_TITLE_RE": {
    "tier": "regex",
@@ -521,7 +530,7 @@
   },
   "tools/executor.py::_SENSITIVE_KEY_RE": {
    "tier": "regex",
-   "line": 2631
+   "line": 2647
   },
   "tools/fact_positions.py::BAD_ARGS_SIGNATURES": {
    "tier": "table",
@@ -561,7 +570,7 @@
   },
   "tools/misc_tools.py::_SHORT_ID_RE": {
    "tier": "regex",
-   "line": 203
+   "line": 205
   },
   "tools/security.py::SENSITIVE_PATTERNS": {
    "tier": "table",

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -647,6 +648,92 @@ def _parse_issues(text: str) -> list[str]:
     return issues
 
 
+# ── #12：severity 解析（fail-safe 的判据来源）─────────────────────
+#
+# ⚠ 这两条**仍然是文本判据** —— 计划 §三 #12 已澄清：真正止血的是
+# **fail-safe 语义**（"未知 ⇒ 按 high 拦"），不是"把 `[high]` 换成 `SEVERITY:`"
+# 这个形式本身。形式的价值只在于：`None` 成了**明确的"未知"**，从而让调用方
+# 能把"未知"当 high，而不是像旧的 `"[high]" in issue` 那样把"未知"静默当
+# "不是 high"（fail-open）。
+_SEVERITY_PREFIX_RE = re.compile(
+    r"SEVERITY\s*[:：]\s*(high|medium|low)\b", re.IGNORECASE
+)
+#: 旧括号形态 —— **影子期保留兼容**：此刻真闸门用的还是它（`"[high]" in issue`），
+#: 一旦让模型改写新前缀而闸门还没切，闸门就瞎了。切"真拦"时一并退场。
+#: ⚠ **只认 ASCII 方括号**，与旧判据的"已识别集合"**严格一致**：
+#: 全角 `【high】` / 中文 `高` / 法文 一律**落 `unparsed`**，由 fail-safe 兜住 ——
+#: 那正是旧判据漏掉、我们要量的那一批。若在这里宽容地认下全角形态，
+#: `unparsed` 就会**少算**，shadow 的结论跟着偏乐观。
+_SEVERITY_BRACKET_RE = re.compile(r"\[(high|medium|low)\]", re.IGNORECASE)
+
+
+def parse_issue_severity(issue: str) -> str | None:
+    """解析一条 issue 的 severity；**解析不出 ⇒ None**（"未知"，交调用方 fail-safe）。
+
+    判定顺序（**只认首个**，其后文本一律忽略）：
+      ① 显式前缀 ``SEVERITY:high|medium|low``（全/半角冒号皆可）；
+      ② 旧括号形态 ``[high]`` / ``【high】``（兼容期）；
+      ③ 都没有 ⇒ ``None``。
+
+    ⚠ ①命中即返回 —— 这正是计划要的冲突规则：``SEVERITY:low … 【high】`` 按 **low**，
+      后面的 `【high】` 不再影响判定（`severity_conflict()` 会把这次"忽略后文"报出来）。
+    """
+    text = issue or ""
+    m = _SEVERITY_PREFIX_RE.search(text)
+    if m:
+        return m.group(1).lower()
+    m = _SEVERITY_BRACKET_RE.search(text)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+#: **宽口径**的 severity 标记 —— 只给 :func:`severity_conflict` 用，**不参与识别**。
+#: 为什么两个模式职责不同：
+#:   · 识别集（`_SEVERITY_PREFIX_RE` / `_SEVERITY_BRACKET_RE`）要**严格** ——
+#:     它决定 `unparsed`，宽一分就少算一分真实的"未知率"；
+#:   · 冲突检测要**宽** —— 它的职责是"**注意到并上报**后文里还有别的 severity 说法
+#:     被忽略了"，而不是替谁做判定。宽口径漏报，日志就变成沉默。
+#: 计划 §三 #12 举的例子正是全角 `【high】`，所以这里必须含全角与中文档位。
+_SEVERITY_ANY_MARKER_RE = re.compile(
+    r"[\[【(（]\s*(high|medium|low|高|中|低)\s*[\]】(）)]", re.IGNORECASE
+)
+
+
+def severity_conflict(issue: str) -> bool:
+    """该条是否"首个 SEVERITY: 前缀与后文标记**不一致**"（**只用于留痕**）。
+
+    ⚠ 用**宽口径** `_SEVERITY_ANY_MARKER_RE` 扫后文：目的是把"我们忽略了后文"
+    这件事**报出来**（验收④要求有日志），不是再做一次判定。判定早已由
+    :func:`parse_issue_severity` 的"只认首个前缀"定下。
+    """
+    text = issue or ""
+    m = _SEVERITY_PREFIX_RE.search(text)
+    if not m:
+        return False
+    prefix_level = m.group(1).lower()
+    rest = text[m.end():]
+    b = _SEVERITY_ANY_MARKER_RE.search(rest)
+    return bool(b and b.group(1).lower() != prefix_level)
+
+
+def count_issue_severities(issues: list[str]) -> dict[str, int]:
+    """→ ``{high, medium, low, unparsed, conflicts}``。
+
+    ``unparsed`` = **fail-safe 会新拦下来**的那一批（旧判据对它们视而不见）。
+    """
+    out = {"high": 0, "medium": 0, "low": 0, "unparsed": 0, "conflicts": 0}
+    for issue in issues:
+        level = parse_issue_severity(issue)
+        if level is None:
+            out["unparsed"] += 1
+        else:
+            out[level] += 1
+        if severity_conflict(issue):
+            out["conflicts"] += 1
+    return out
+
+
 def _parse_cached_issues(raw: object) -> list[str]:
     """audit_cache.top_issues（JSON 数组字符串或 list）→ 非空 issue 行列表。
 
@@ -1140,9 +1227,66 @@ async def run_code_audit(
         # 41+08 双跑 P0-2（审计门 27.3%）：只有 high 级问题才锁门——
         # medium/low 记录为警告不阻塞（41 实测 24 次 ISSUES 中 4 次无 high
         # 仍被锁死）。ISSUES 判定保留诚实；门禁语义 = 「有 high 才拦」。
+        #
+        # ⚠ #12（2026-09-14）：**旧判据 `"[high]" in issue` 是 fail-open 的**——
+        # 它把"severity 写成了别的形态（`【high】`/`高`/法文）"静默当成"不是 high"
+        # ⇒ 改个标点或换语言即放行。下面同时算出 **fail-safe** 判定
+        # （**解析不出 ⇒ 视为 high**），但**只记录不拦**（shadow 试运行，见模块 docstring）。
         high_count = sum(1 for i in issues if "[high]" in i.lower())
         blocking = verdict == "ISSUES" and high_count > 0
         exit_code = 1 if blocking else 0
+
+        _counts = count_issue_severities(issues)
+        _failsafe_high = _counts["high"] + _counts["unparsed"]
+        shadow_blocking = verdict == "ISSUES" and _failsafe_high > 0
+        _total_issues = len(issues) or 0
+        _unparsed_ratio = (
+            round(_counts["unparsed"] / _total_issues, 3) if _total_issues else 0.0
+        )
+        # 量的是**平台可控指标**（"分类一致率/误判率"），不是重试率那类上游指标。
+        # `would_flip` = 上线 fail-safe 后**新增被拦**的任务数（误拦率的分母）。
+        log.warning(
+            "code_audit_severity_shadow",
+            verdict=verdict,
+            issues_total=_total_issues,
+            legacy_high=high_count,
+            failsafe_high=_failsafe_high,
+            unparsed=_counts["unparsed"],
+            unparsed_ratio=_unparsed_ratio,
+            conflicts=_counts["conflicts"],
+            legacy_blocking=blocking,
+            shadow_blocking=shadow_blocking,
+            would_flip=(shadow_blocking and not blocking),
+        )
+        if _counts["conflicts"]:
+            # 计划 §三 #12 验收④：冲突用例要**有日志说明忽略了后文**。
+            log.warning(
+                "code_audit_severity_conflict_ignored",
+                conflicts=_counts["conflicts"],
+                rule="只认首个 SEVERITY: 前缀，其后文本一律忽略",
+            )
+        try:
+            from hiveweave.services.event_audit import event_audit
+
+            await event_audit.log(
+                agent_id=agent_id,
+                project_id=project_id,
+                event_type="code_audit_severity_shadow",
+                payload={
+                    "verdict": verdict,
+                    "issues_total": _total_issues,
+                    "legacy_high": high_count,
+                    "failsafe_high": _failsafe_high,
+                    "unparsed": _counts["unparsed"],
+                    "unparsed_ratio": _unparsed_ratio,
+                    "conflicts": _counts["conflicts"],
+                    "legacy_blocking": blocking,
+                    "shadow_blocking": shadow_blocking,
+                    "would_flip": shadow_blocking and not blocking,
+                },
+            )
+        except Exception:  # noqa: BLE001 — 观测旁支绝不挂掉审计
+            pass
 
         # Lazy import: tools.executor pulls the whole tool registry.
         from hiveweave.tools.executor import ToolExecutor
