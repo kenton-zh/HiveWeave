@@ -297,7 +297,16 @@ def _build_sandbox_env(
     env["PYTHONPATH"] = (
         f"{shim_dir}{os.pathsep}{existing_pp}" if existing_pp else shim_dir
     )
-    return env
+    # GitSpawn 加固（2026-09-14，security-gitspawn-hiveweave-exposure 报告
+    # P1-1）：本函数是 agent 受限命令的**唯一** env 构造点 —— bash/pwsh/
+    # dev server/python_script 全部经 spawn_confined → ConfinedRunner 的
+    # CreateProcessAsUserW，**绕过 util/win_subprocess 漏斗**（故
+    # test_spawn_funnel_guard.py 扫不到这条路）。不在此补注入 ⇒ agent 自己
+    # 在 pwsh 里跑的 `git status` 仍是裸的，P1-1 静默失效。
+    # 位置放在最后：加固键不得被上方 TEMP/PYTHONPATH 等强制写回挤掉。
+    from hiveweave.util.win_subprocess import apply_git_hardening
+
+    return apply_git_hardening(env)
 
 
 def _is_windows() -> bool:
