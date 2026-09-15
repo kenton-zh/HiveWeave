@@ -75,6 +75,45 @@ def _read_log_tail(log_path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> str:
         return ""
 
 
+def _early_exit_receipt(
+    exit_code: int, cmd: str, log_path: Path
+) -> ToolResult:
+    """健康窗口内进程已退出 ⇒ 回执按**事实**区分成败（fixplan #4）。
+
+    旧行为：一律 ``err("Dev server exited (code=N)")`` —— 一次性命令
+    ``exit=0`` 也报 failed ⇒ agent 无法从回执判断成败（须额外探针确认，
+    多花一轮），反向风险是误信 failed 而重试 ⇒ **重复副作用**。
+
+    新行为（正反两侧事实都如实说，两侧都不谎报）：
+
+    - ``exit_code=0`` ⇒ ``ok(exit_code=0, server_listening=False)``——
+      命令**成功**跑完了；但服务没起来（没进 LISTEN）。「长驻服务秒退」
+      不会被误报成"服务器在跑"：正文明说 it is NOT running now。
+    - ``exit_code≠0`` ⇒ ``err(fact="command_failed", exit_code=N)``——
+      对齐 bash.py 的事实位语义：命令**执行了且失败**（不是
+      ``runner_failed`` 的"从未执行"），stall/重试判断不被骗。
+
+    两种回执都带 ``exit_code`` 与日志尾。
+    """
+    tail = _read_log_tail(log_path)
+    suffix = f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}" if tail else ""
+    if exit_code == 0:
+        return ToolResult.ok(
+            "Command completed successfully (exit_code=0) but exited "
+            "immediately without listening on any port. If you intended to "
+            f"start a long-running dev server, it is NOT running now. "
+            f"Command was: {cmd}{suffix}",
+            exit_code=0,
+            server_listening=False,
+        )
+    return ToolResult.err(
+        f"Dev server command failed (exit_code={exit_code}). "
+        f"Command was: {cmd}{suffix}",
+        fact="command_failed",
+        exit_code=exit_code,
+    )
+
+
 class StartDevServerParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -405,13 +444,7 @@ async def start_dev_server_tool(
         await asyncio.sleep(0.4)
         if proc.poll() is not None:
             log_file.close()
-            tail = _read_log_tail(log_path)
-            msg = (
-                f"Dev server exited (code={proc.returncode}). Command was: {cmd}"
-            )
-            if tail:
-                msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-            return ToolResult.err(msg)
+            return _early_exit_receipt(proc.returncode, cmd, log_path)
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port),
