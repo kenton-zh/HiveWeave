@@ -335,10 +335,42 @@ class TestMatrix12SeverityFailsafe:
         assert counts["conflicts"] == 1
         assert counts["low"] == 1 and counts["unparsed"] == 0
 
-    def test_failsafe_composition_source_guard(self):
-        """源码守卫：fail-safe 合成式不得退回 ``unparsed`` 不计入的形态。"""
-        src = (_SRC_ROOT / "services" / "code_audit.py").read_text(encoding="utf-8")
-        assert '_counts["high"] + _counts["unparsed"]' in src
+    def test_failsafe_composition_stays_wide(self):
+        """守卫：fail-safe 的合成式必须**仍然是宽的**（"未知 ⇒ 拦"）——
+        任何把 `unparsed` 排除出去的改动都要在这里转红。
+
+        2026-09-15 改写：原实现是
+        ``assert '_counts["high"] + _counts["unparsed"]' in src`` ——
+        **对源码做文本子串断言**，本项目明令禁用的形态（换变量名/换写法即失效，
+        而且它只证明"那句话还在源码里"，**不证明判定真的这么算**）。
+        现在判定式已收敛到生产单一定义点 ``shadow_decision()``，
+        故本守卫直接断言**结论**（状态判据，与措辞无关）。
+        """
+        from hiveweave.services.code_audit import shadow_decision
+
+        # 全角 / 中文 / 外语 / 无标记 ⇒ "未知" ⇒ 必须仍被判 blocking
+        for issue in ("【high】", "高", "élevé", "src/a.py:1 输入未校验"):
+            dec = shadow_decision("ISSUES", [issue])
+            assert dec["legacy_high"] == 0, "旧判据本就漏掉它（这正是 #12 的洞）"
+            assert dec["failsafe_high"] >= 1, f"未知必须计入 fail-safe high: {issue!r}"
+            assert dec["shadow_blocking"] is True
+            assert dec["would_flip"] is True, "旧不拦 + 新拦 ⇒ 必须记 would_flip"
+
+        # 明确 low ⇒ 不拦（fail-safe 只兜"未知"，不兜"已知是 low"）
+        dec = shadow_decision("ISSUES", ["SEVERITY:low 命名建议"])
+        assert dec["failsafe_high"] == 0 and dec["shadow_blocking"] is False
+
+        # verdict=PASS ⇒ 两套判据都不拦
+        dec = shadow_decision("PASS", ["【high】不该出现在 PASS 里"])
+        assert dec["legacy_blocking"] is False and dec["shadow_blocking"] is False
+
+        # ⚠ 已知残余（**故意钉住当前宽口径**）：无 file:line 的叙述行也落
+        # `unparsed` ⇒ 也计入 fail-safe high。这是**误拦源**，但收窄它
+        # （如"只对带 file:line 的行兜底"）会重新打开 #12 的洞 ⇒ 只能靠改
+        # `_parse_issues` 的过滤来治。若将来真那么改，**更新本断言**即可 ——
+        # 那是有意的改进，不是收窄 fail-safe。
+        dec = shadow_decision("ISSUES", ["Checked independently: the payload is fine."])
+        assert dec["failsafe_high"] == 1, "叙述行同样落 unparsed（当前宽口径）"
 
 
 # ── #13：上游错误分类 status 优先 ───────────────────────────────────

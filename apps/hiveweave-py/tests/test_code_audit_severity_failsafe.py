@@ -158,3 +158,56 @@ async def test_shadow_records_failsafe_decision_without_blocking(
         "误拦率会在没有任何数据的情况下直接生效"
     )
     assert shadow["would_flip"] is True, "这条正是上线后会新被拦下的样本"
+    # ⚠ 第二轮复审 P2：上面只断 6 个键，剩下 4 个**拼错名字就会静默出货**
+    # （观测字段错名 ⇒ 数据看着有、指标算错）。故断言完整键集合 + 剩余取值。
+    # structlog 自己会往条目里加 `event`/`log_level`，比较时剔除。
+    payload_keys = set(shadow) - {"event", "log_level"}
+    assert payload_keys == {
+        "verdict", "issues_total", "legacy_high", "failsafe_high", "unparsed",
+        "unparsed_ratio", "conflicts", "legacy_blocking", "shadow_blocking",
+        "would_flip",
+    }, f"shadow 事件的键集合变了：{sorted(payload_keys)}"
+    assert shadow["verdict"] == "ISSUES"
+    assert shadow["issues_total"] == 1
+    assert shadow["unparsed_ratio"] == 1.0
+    assert shadow["conflicts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_code_audit_actually_goes_through_shadow_decision(
+    audit_env,  # noqa: F811 —— fixture 参数，不是重复定义
+    monkeypatch,
+):
+    """正向对照：`run_code_audit` 必须**经由**唯一判定点 `shadow_decision`。
+
+    为什么必须有这条（第二轮复审 P2）：
+    `test_failsafe_composition_stays_wide`（在 `test_anti_wording_matrix.py`）
+    只断言 `shadow_decision()` **自己**的结论 —— 如果有人在 `run_code_audit`
+    里**重新内联**一份判据（本仓最忌讳的"同一事实两处判"），那条守卫**仍然全绿**。
+    这里把 `shadow_decision` 换成哨兵：一旦它没被调用（＝判据被内联复制），
+    或用例改走别的判定路径，本用例即转红。
+    """
+    import hiveweave.services.code_audit as _ca
+
+    calls: list[tuple[str, list[str]]] = []
+    _real = _ca.shadow_decision
+
+    def _sentinel(verdict: str, issues: list[str]):
+        calls.append((verdict, list(issues)))
+        return _real(verdict, issues)
+
+    monkeypatch.setattr(_ca, "shadow_decision", _sentinel)
+
+    async def call_llm(system: str, user: str) -> str:
+        return "VERDICT: ISSUES\nsrc/a.py:1 [medium] 命名风格\n"
+
+    p_wt, p_git, p_save = _run_audit_patches()
+    with p_wt, p_git, p_save:
+        result = await run_code_audit(PROJECT_ID, AGENT_ID, call_llm=call_llm)
+
+    assert result.get("audited") is True, f"审计本身应完成：{result}"
+    assert calls, (
+        "run_code_audit 没有走 shadow_decision ⇒ 判据被内联复制了"
+        "（同一事实两处判 ⇒ 切真拦时会有一处漏改）"
+    )
+    assert calls[0][0] == "ISSUES"

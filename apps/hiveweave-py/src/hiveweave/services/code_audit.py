@@ -672,8 +672,14 @@ def parse_issue_severity(issue: str) -> str | None:
 
     判定顺序（**只认首个**，其后文本一律忽略）：
       ① 显式前缀 ``SEVERITY:high|medium|low``（全/半角冒号皆可）；
-      ② 旧括号形态 ``[high]`` / ``【high】``（兼容期）；
-      ③ 都没有 ⇒ ``None``。
+      ② 旧括号形态 ``[high]``（**仅 ASCII 方括号**）；
+      ③ 都没有 ⇒ ``None``（"未知"，交调用方 fail-safe）。
+
+    ⚠ **全角 ``【high】`` / 中文 ``高`` / 法文 一律落 ``None``** —— 这里**不是**
+      "兼容期也认"。把全角也认下会让 ``unparsed`` **少算**，shadow 结论跟着偏
+      乐观；而且旧闸门的已识别集合本来就只有 ASCII（详见
+      `_SEVERITY_BRACKET_RE` 上方注释）。2026-09-15 实测：
+      ``【high】`` / ``[高]`` / ``高危：…`` → 均 ``None``。
 
     ⚠ ①命中即返回 —— 这正是计划要的冲突规则：``SEVERITY:low … 【high】`` 按 **low**，
       后面的 `【high】` 不再影响判定（`severity_conflict()` 会把这次"忽略后文"报出来）。
@@ -732,6 +738,51 @@ def count_issue_severities(issues: list[str]) -> dict[str, int]:
         if severity_conflict(issue):
             out["conflicts"] += 1
     return out
+
+
+# ── #12 影子期的**唯一判定点** ────────────────────────────────────
+#
+# 为什么把这两条判据抽成函数（2026-09-15，独立审计 P1）：
+# 「旧闸门判据」与「fail-safe 判据」此前被写了**四遍** —— `run_code_audit`、
+# `log.warning` 的 payload、`event_audit.log` 的 payload，以及验收脚本
+# （`scripts/measure_audit_severity_baseline.py`）里的复算。
+# 抄一份判据就是一个将来的漂移源：切「真拦」时只要漏改一处，那一处会继续
+# 算出「看起来正常」的假数字（本项目最贵的一类错觉）。故收敛为**单一定义点**，
+# 全部调用方只读它的返回值 —— 日志与事件由**同一个 dict**展开，结构上不可能再不一致。
+
+
+def legacy_high_count(issues: list[str]) -> int:
+    """旧闸门（**此刻仍在生效**的那个）数到的 high 条数。
+
+    ⚠ 判据是**大小写不敏感的子串** ``"[high]" in issue`` —— 这正是 #12 的病灶
+    （fail-open：``【high】``/``高``/法文 一律不命中 ⇒ 静默放行）。
+    保留它只为影子期对照；切「真拦」时本函数与 ``legacy_blocking`` **一起退场**。
+    """
+    return sum(1 for i in issues if "[high]" in i.lower())
+
+
+def shadow_decision(verdict: str, issues: list[str]) -> dict[str, Any]:
+    """影子期对照判定 —— 一次算齐 legacy / fail-safe 两套结论与 ``would_flip``。
+
+    返回键与 ``log.warning("code_audit_severity_shadow", …)`` 及
+    ``agent_events.code_audit_severity_shadow`` 的 payload **同名同义**：
+    验收脚本按同一批键复算，所以两边永远对得上。
+
+    ``would_flip`` = 上线 fail-safe 后**新增被拦**的审计数（误拦率的分母）。
+    """
+    counts = count_issue_severities(issues)
+    legacy_high = legacy_high_count(issues)
+    legacy_blocking = verdict == "ISSUES" and legacy_high > 0
+    failsafe_high = counts["high"] + counts["unparsed"]
+    shadow_blocking = verdict == "ISSUES" and failsafe_high > 0
+    return {
+        "counts": counts,
+        "legacy_high": legacy_high,
+        "legacy_blocking": legacy_blocking,
+        "failsafe_high": failsafe_high,
+        "shadow_blocking": shadow_blocking,
+        "would_flip": shadow_blocking and not legacy_blocking,
+    }
 
 
 def _parse_cached_issues(raw: object) -> list[str]:
@@ -1230,34 +1281,35 @@ async def run_code_audit(
         #
         # ⚠ #12（2026-09-14）：**旧判据 `"[high]" in issue` 是 fail-open 的**——
         # 它把"severity 写成了别的形态（`【high】`/`高`/法文）"静默当成"不是 high"
-        # ⇒ 改个标点或换语言即放行。下面同时算出 **fail-safe** 判定
+        # ⇒ 改个标点或换语言即放行。`shadow_decision` 同时算出 **fail-safe** 判定
         # （**解析不出 ⇒ 视为 high**），但**只记录不拦**（shadow 试运行，见模块 docstring）。
-        high_count = sum(1 for i in issues if "[high]" in i.lower())
-        blocking = verdict == "ISSUES" and high_count > 0
+        # 判定式单点收敛在 `shadow_decision`（2026-09-15 审计 P1：此前四处各写一遍
+        # ⇒ 切真拦时漏改一处就会算出假数字）。
+        _dec = shadow_decision(verdict, issues)
+        _counts = _dec["counts"]
+        blocking = _dec["legacy_blocking"]
         exit_code = 1 if blocking else 0
 
-        _counts = count_issue_severities(issues)
-        _failsafe_high = _counts["high"] + _counts["unparsed"]
-        shadow_blocking = verdict == "ISSUES" and _failsafe_high > 0
         _total_issues = len(issues) or 0
         _unparsed_ratio = (
             round(_counts["unparsed"] / _total_issues, 3) if _total_issues else 0.0
         )
         # 量的是**平台可控指标**（"分类一致率/误判率"），不是重试率那类上游指标。
-        # `would_flip` = 上线 fail-safe 后**新增被拦**的任务数（误拦率的分母）。
-        log.warning(
-            "code_audit_severity_shadow",
-            verdict=verdict,
-            issues_total=_total_issues,
-            legacy_high=high_count,
-            failsafe_high=_failsafe_high,
-            unparsed=_counts["unparsed"],
-            unparsed_ratio=_unparsed_ratio,
-            conflicts=_counts["conflicts"],
-            legacy_blocking=blocking,
-            shadow_blocking=shadow_blocking,
-            would_flip=(shadow_blocking and not blocking),
-        )
+        # ⚠ 日志与事件共用**同一个 dict** —— 结构上不可能再出现两处不一致
+        # （审计核过旧写法两处 payload 一致，但那是"当时刚好一致"）。
+        _shadow_payload = {
+            "verdict": verdict,
+            "issues_total": _total_issues,
+            "legacy_high": _dec["legacy_high"],
+            "failsafe_high": _dec["failsafe_high"],
+            "unparsed": _counts["unparsed"],
+            "unparsed_ratio": _unparsed_ratio,
+            "conflicts": _counts["conflicts"],
+            "legacy_blocking": _dec["legacy_blocking"],
+            "shadow_blocking": _dec["shadow_blocking"],
+            "would_flip": _dec["would_flip"],
+        }
+        log.warning("code_audit_severity_shadow", **_shadow_payload)
         if _counts["conflicts"]:
             # 计划 §三 #12 验收④：冲突用例要**有日志说明忽略了后文**。
             log.warning(
@@ -1272,18 +1324,7 @@ async def run_code_audit(
                 agent_id=agent_id,
                 project_id=project_id,
                 event_type="code_audit_severity_shadow",
-                payload={
-                    "verdict": verdict,
-                    "issues_total": _total_issues,
-                    "legacy_high": high_count,
-                    "failsafe_high": _failsafe_high,
-                    "unparsed": _counts["unparsed"],
-                    "unparsed_ratio": _unparsed_ratio,
-                    "conflicts": _counts["conflicts"],
-                    "legacy_blocking": blocking,
-                    "shadow_blocking": shadow_blocking,
-                    "would_flip": shadow_blocking and not blocking,
-                },
+                payload=dict(_shadow_payload),
             )
         except Exception:  # noqa: BLE001 — 观测旁支绝不挂掉审计
             pass
@@ -1305,7 +1346,7 @@ async def run_code_audit(
             commit_hash=commit_hash,
             stdout_hash=hash_stdout(text),
             command_or_url=(
-                f"[verdict={verdict}] high={high_count}"
+                f"[verdict={verdict}] high={_dec['legacy_high']}"
                 if verdict == "ISSUES"
                 else f"[verdict={verdict}]"
             ),
