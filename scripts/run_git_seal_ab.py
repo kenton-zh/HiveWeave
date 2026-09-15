@@ -1,4 +1,4 @@
-"""run_git_seal_ab.py —— #2 封条的「修前 / 修后」对照运行器。
+"""run_git_seal_ab.py —— #2（收窄写面 + 封条 + 信任锚）的「修前 / 修后」对照运行器。
 
 做两件事，产出可核验的对照日志：
   1. `git archive HEAD apps/hiveweave-py` 导出**纯净树**（= 未含本次改动的 src），
@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 PY = REPO / "apps" / "hiveweave-py" / ".venv" / "Scripts" / "python.exe"
-PROBES = ("probe_git_write_surface.py", "probe_git_gitdir_redirect.py")
+PROBES = ("probe_git_write_surface.py", "probe_git_trust_anchor.py")
 
 
 def run(probe: str, src: Path | None, out: Path) -> int:
