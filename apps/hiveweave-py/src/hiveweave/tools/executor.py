@@ -2880,7 +2880,6 @@ async def _f10_result_hooks(
             known_signature_hint,
             note_distinct_hitter,
             record_failure_signature,
-            signature_of,
         )
 
         project_id = await get_agent_project_id(agent_id) or None
@@ -2912,7 +2911,10 @@ async def _f10_result_hooks(
             and project_id
             and _has_nonempty_param_value(tool_args)
         ):
-            _sig_for_pending = signature_of(error)
+            # ⚠ 复用**写侧带回的签名**（rec["sig"]，带 root 归一），不自己
+            # 再算 signature_of(error) —— 那是不带 root 的另一份签名，回填
+            # 时对不上写侧记忆行（#5 修复的「同一事实两处判」变体）。
+            _sig_for_pending = rec.get("sig")
             if _sig_for_pending:
                 _pending_key = _pending_solutions_key(
                     agent_id, tool_name, tool_args
@@ -2949,8 +2951,10 @@ async def _f10_result_hooks(
                 _notice_parts.append(hint)
         # TEST_DSH_47 #6：run 内同签名即时去重 —— 首撞者被抑制 shared-fix
         # 提示是正确的，但复撞时至少要告诉它"自己刚撞过"。
+        # （sig 同样复用写侧带回的那份 —— 本去重是进程内自比，换签名来源
+        # 会自我不一致。）
         _self_note = _note_self_repeat_hit(
-            agent_id, tool_name, signature_of(error)
+            agent_id, tool_name, rec.get("sig") if isinstance(rec, dict) else None
         )
         if _self_note:
             _notice_parts.append(_self_note)
@@ -2971,7 +2975,9 @@ async def _f10_result_hooks(
         if project_id:
             org_text = await note_distinct_hitter(
                 project_id=project_id,
-                signature_key=signature_of(error) or "",
+                signature_key=(
+                    rec.get("sig") if isinstance(rec, dict) else None
+                ) or "",
                 tool_name=tool_name,
                 agent_id=agent_id,
             )

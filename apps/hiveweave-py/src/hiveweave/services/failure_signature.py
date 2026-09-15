@@ -36,12 +36,57 @@ _MAX_SIG_LEN = 160
 
 _WS_RE = re.compile(r"\s+")
 
+# ── #5（fixplan-16items）：签名身份 = 错误类别，不是错误原文 ─────────────
+# 「空白归一 + 截断后的原文」会把每次生成都不同的噪声（uuid / 时间戳 /
+# 绝对路径里的用户名盘符）当进身份 ⇒ 同类错误记成多条互异签名（实测
+# 31 条零重复），R7 因此算出 0 的假阴性。下面四类噪声在进身份前剥掉。
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_HEX32_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
+_ISO_TS_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+_EPOCH_MS_RE = re.compile(r"(?<![0-9])1[0-9]{12}(?![0-9])")
+# Windows 绝对路径（含盘符）；跨机不稳定的部分是「盘符 + 用户名」，
+# 剥到「路径尾两段」——既消灭用户名/盘符，又保留错误里最有信息量的文件名。
+_WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\r\n]+[\\/])*[^\\/:*?\"<>|\r\n]+")
+_UNIX_PATH_RE = re.compile(r"(?<![\w.@])/(?:[\w.@+-]+/)*[\w.@+-]+")
 
-def signature_of(error: str | None) -> str | None:
-    """规范化失败签名：空白归一 + 截断；None = 无有效信息（不广播）。"""
+
+def _keep_path_tail(match: re.Match) -> str:
+    """绝对路径 → 尾两段（文件名 + 直接父目录）。"""
+    parts = re.split(r"[\\/]", match.group(0))
+    return "/".join(parts[-2:])
+
+
+def signature_of(error: str | None, root: str | None = None) -> str | None:
+    """规范化失败签名：剥噪声（uuid/时间戳/哈希/绝对路径）+ 空白归一 + 截断。
+
+    ``root`` 给定时，项目根前缀的路径先归一为 ``./`` 相对形态（#5 采纳的
+    收窄方向：**直接项目根相对**，不要"相对→绝对→根相对"三步）；随后剩余
+    绝对路径剥到尾两段。``root`` 不给（或解析失败）时只做通用剥离 —— 两次
+    调用只要同参就同结果，写侧与查侧必须传同样的 root 才能对上签名。
+
+    返回 None = 无有效信息（不广播）。
+    """
     if not error or not error.strip():
         return None
-    sig = _WS_RE.sub(" ", error.strip())
+    sig = error.strip()
+    if root:
+        escaped = re.escape(root.rstrip("\\/"))
+        sig = re.sub(
+            # (?![\w-])：不吃兄弟目录前缀（root="D:\w\proj1" 不得匹配
+            # "D:\w\proj1-archive\..."）—— Windows 盘符大小写不敏感
+            escaped + r"(?![\w-])", ".", sig, flags=re.IGNORECASE
+        )
+    sig = _ISO_TS_RE.sub("<ts>", sig)
+    sig = _EPOCH_MS_RE.sub("<ts>", sig)
+    sig = _UUID_RE.sub("<uuid>", sig)
+    sig = _HEX32_RE.sub("<hash>", sig)
+    sig = _WIN_PATH_RE.sub(_keep_path_tail, sig)
+    sig = _UNIX_PATH_RE.sub(_keep_path_tail, sig)
+    sig = _WS_RE.sub(" ", sig)
     if len(sig) < _MIN_SIG_LEN:
         return None
     return sig[:_MAX_SIG_LEN]
@@ -182,6 +227,22 @@ async def _trim_signature_rows(project_id: str) -> None:
         log.warning("failure_signature.trim_failed", error=str(e))
 
 
+async def _project_root_of(project_id: str) -> str | None:
+    """项目根路径（给 ``signature_of`` 的路径归一用；best-effort ⇒ None）。
+
+    ⚠ **写侧（``record_failure_signature``）与查侧（``known_signature_hint``）
+    必须经由同一个解析函数** ⇒ 同一 project_id 永远得到同一 root（或同
+    None），两次 ``signature_of`` 才能对上同一签名 —— 一侧带 root 一侧不带
+    就是新的「同一事实两处判」。
+    """
+    try:
+        from hiveweave.db import meta as meta_db
+
+        return await meta_db.get_project_workspace(project_id)
+    except Exception:
+        return None
+
+
 async def record_failure_signature(
     *,
     project_id: str | None,
@@ -189,19 +250,33 @@ async def record_failure_signature(
     tool_name: str,
     error: str | None,
     attribution: str = "",
-) -> bool:
+) -> dict:
     """把新失败签名写入项目共享空间（R7 → 0 的可机检支撑）。
 
-    Returns ``{"written": bool, "preexisting": bool, "preexisting_source": str|None}``：
-    ``preexisting``=该签名在本次失败**之前**已存在（39 审计 P1-3：首撞者不该收
-    "先读它"自指提示——executor 据此门控 hint）；``preexisting_source``=首撞者。
+    Returns ``{"written": bool, "preexisting": bool, "preexisting_source":
+    str|None, "sig": str|None}``：``preexisting``=该签名在本次失败**之前**
+    已存在（39 审计 P1-3：首撞者不该收"先读它"自指提示——executor 据此
+    门控 hint）；``preexisting_source``=首撞者；``sig``=**写侧实际使用的
+    规范化签名**（带 root 归一）。executor 侧的 pending/自指去重/组织升级
+    必须**复用这个 sig**，不得自己再调 ``signature_of(error)`` —— 那会算出
+    不带 root 的另一份签名，与写侧记忆行失配（同一事实两处判）。
     best-effort。
     """
     if not project_id:
-        return False
-    sig = signature_of(error)
+        return {
+            "written": False,
+            "preexisting": False,
+            "preexisting_source": None,
+            "sig": None,
+        }
+    sig = signature_of(error, root=await _project_root_of(project_id))
     if sig is None:
-        return {"written": False, "preexisting": False, "preexisting_source": None}
+        return {
+            "written": False,
+            "preexisting": False,
+            "preexisting_source": None,
+            "sig": None,
+        }
     try:
         from hiveweave.services.memory import MemoryService
 
@@ -312,10 +387,16 @@ async def record_failure_signature(
             "written": True,
             "preexisting": preexisting,
             "preexisting_source": preexisting_source,
+            "sig": sig,
         }
     except Exception as e:
         log.warning("failure_signature.broadcast_failed", error=str(e))
-        return {"written": False, "preexisting": False, "preexisting_source": None}
+        return {
+            "written": False,
+            "preexisting": False,
+            "preexisting_source": None,
+            "sig": None,
+        }
 
 
 async def known_signature_hint(
@@ -336,7 +417,7 @@ async def known_signature_hint(
     """
     if not project_id:
         return None
-    sig = signature_of(error)
+    sig = signature_of(error, root=await _project_root_of(project_id))
     if sig is None:
         return None
     try:
