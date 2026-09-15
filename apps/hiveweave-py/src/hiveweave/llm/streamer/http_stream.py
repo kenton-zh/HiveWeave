@@ -336,8 +336,8 @@ class HttpStreamMixin:
             # 重复 flush 是安全的：缓冲区里该 agent 的样本为空时直接返回 0。
             try:
                 await flush_unknown_samples(agent_id)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — 样本 flush 是 best-effort 观测旁支（e14bd1a）：
+                pass            # 失败只丢这条留痕，绝不影响外层的错误收口主路径
             # 不可重试错误（401/400 等）→ 不报告熔断器
             # （客户端配置问题，非 provider 故障，不应触发熔断）
             # error_status 必须保留: agent 层靠它区分 402 余额耗尽
@@ -737,8 +737,8 @@ class HttpStreamMixin:
             # 正在抛出的原始错误**，让排查失去线索）。best-effort，失败不影响。
             try:
                 await flush_unknown_samples(agent_id)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — 样本 flush 是 best-effort 观测旁支（e14bd1a）：
+                pass            # 失败只丢这条留痕，绝不影响外层的错误收口主路径
             # 45 轮 P1：断流/超时 raise 路径保住已收 usage（budget_cut
             # 返回路径此前已保，raise 路径随异常丢弃）——挂异常对象，由
             # _stream_single_round 的错误收口带出、tool_loop 并入账本。

@@ -1885,7 +1885,7 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
                 "code": POLICY_LEDGER_FAIL_VERDICT,
                 "message": f"{row['c']} 个未解决的 FAIL 终验",
             })
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — FAIL 计数失败按无此 blocker（fail-open，见 docstring：判据故障不得把 CEO 卡成"永远标记不了"）
         pass
     try:
         cur = await conn.execute(
@@ -1899,7 +1899,7 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
                 "code": POLICY_LEDGER_APPROVED_OPEN,
                 "message": f"{row['c']} 个 approved 未 closed 任务",
             })
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — approved 计数失败按无此 blocker（fail-open，见 docstring）
         pass
     try:
         cur = await conn.execute(
@@ -1919,7 +1919,7 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
                 "code": POLICY_INBOX_UNREAD_HUMAN,
                 "message": f"你还有 {len(rows)}+ 条未读人工消息（{listing}）",
             })
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — 未读列举失败按无此 blocker（fail-open，与前两条计数同语义，不猜）
         pass
     return blockers
 
