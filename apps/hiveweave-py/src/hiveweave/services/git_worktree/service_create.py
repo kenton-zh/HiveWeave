@@ -27,6 +27,12 @@ from .constants import (
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
 from .git_cmd import _current_branch, _git, _resolve_base_branch
+
+
+def _anchor_gitdir(project_root: str, worktree_path: str) -> str:
+    """与 `git_anchor.resolve_anchor` 同一派生规则（保持单点一致）。"""
+    return os.path.join(str(project_root), ".git", "worktrees",
+                        os.path.basename(os.path.realpath(worktree_path)))
 from .git_identity import (
     PLATFORM_EMAIL,
     PLATFORM_NAME,
@@ -86,6 +92,10 @@ class CreateMixin:
         ok, _ = await _git(["init"], workspace_path)
         if not ok:
             return {"success": False, "message": "Failed to initialize git repository."}
+        # 身份指纹（R4）：在**创建点**记录项目 `.git` 的身份（早于任何 agent 命令）
+        from .git_anchor import record_gitdir_identity
+
+        record_gitdir_identity(os.path.join(workspace_path, ".git"))
 
         # Rename master → main (ignore failure — may already be main/trunk)
         await _git(["branch", "-m", "master", "main"], workspace_path)
@@ -601,6 +611,11 @@ yarn.lock merge=union
             await self._retire_worktree_config_carrier(
                 workspace_path, result["path"], short_id
             )
+            # 身份指纹（R4）：worktree gitdir 同样在**创建点**记录
+            from .git_anchor import record_gitdir_identity
+
+            record_gitdir_identity(_anchor_gitdir(workspace_path,
+                                                  result["path"]))
             self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
 

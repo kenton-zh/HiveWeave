@@ -28,13 +28,17 @@ worktree 的 `.git` 指针、也能写 git 自己会去读的 gitdir 内文件 �
   另一个落点（已在本批接上锚）。修法提示（实测）：`git config extensions.worktreeConfig
   false`（**repo config**）后该载体 `IGNORED`、载荷 `BLOCKED`；而命令行
   `-c extensions.worktreeConfig=false` **无效**（实测仍执行）。
-- **同路径替换挡不住**（残余 R4）：本模块把 gitdir/common 钉在**平台派生路径**上，
-  但那条路径**可预测** ⇒ agent 删掉 `<proj>/.git` 再 `git init` 造一个**同样路径**的
-  新仓，平台读到的就是它的 config。**审计 2026-09-15 实测**：① 项目根边界形态下
-  `rmdir /s /q <proj>\\.git` → 重建 → 平台 `_git` 读到 `FROM_AGENT_COMMON`（`ok=True`）；
-  ② worktree cwd 形态**删除同样成功**，只是重建被本模块拒（fail-closed = DoS）。
-  ⇒ 需「身份指纹」层（项目创建时把 `<proj>/.git` 的 `(st_dev, st_ino)` 记进
-  `project_meta`，每次 `_git` 校验）；本模块**不**声称挡住它。
+- **同路径替换（R4）由「身份指纹」这一层挡**（2026-09-15 落地）：信任锚钉的是**路径**，
+  路径可预测 ⇒ 光钉路径挡不住「删掉该路径上的 gitdir、再在同路径造一个自己的仓」。
+  故另记 `(st_dev, st_ino)`（NTFS 上 = 卷序列号 + 文件索引；**同路径重建必变**，
+  平台重写 `config` **不变** —— 都实测过）到 `get_data_root()/git-anchor/`
+  （**在项目 ACL 授权面之外** ⇒ agent 读不到也写不到），每次跑 git 前比对；不符 ⇒ 拒绝。
+  **创建点主动记录**（`service_create` 的 `git init` / `worktree add` 之后），TOFU 只兜
+  「本机制上线前就存在的项目」。
+  ⚠ **运维逃生门**：若 `.git` 是**用户**（而非 agent）删掉重建的，平台会持续拒绝 ——
+  删掉 `<data_root>/git-anchor/<hash>.id` 让平台下次重新采用即可；而「用户删掉 `.git`
+  让平台重建」这条恢复路本身是通的（`ensure_git_repo` 的 `git init` 会覆盖记录），
+  只有「`.git` 仍在（agent 造的）」才会持续拒绝。
 """
 
 from __future__ import annotations
@@ -209,17 +213,109 @@ def anchor_for_git(cwd: str, project_root: str | None = None
 
     1. 派生出锚点 ⇒ 钉住（`--git-dir` + `GIT_COMMON_DIR`）；
     2. **可证篡改**（平台 worktree 的 `.git` 变成目录、期望 gitdir 消失、调用方给了
-       project_root 而 cwd 既非项目根也不是指针 worktree）⇒ `AnchorRefusal` ⇒
-       **拒绝执行**（loud）。静默回落「让 git 自己找」正是被改写指针利用的那条路；
+       project_root 而 cwd 既非项目根也不是指针 worktree、**身份指纹不符**）⇒
+       `AnchorRefusal` ⇒ **拒绝执行**（loud）。静默回落「让 git 自己找」正是被改写
+       指针利用的那条路；
     3. 只是**派生不出**（兄弟目录布局等）⇒ 退回不钉锚（= 修复前行为）+ 一条
        warning —— 拒绝会把合法布局一起打死（实测：`test_checkpoint_dirty_contract`
        的夹具就是这种布局）。
     """
     try:
-        return resolve_anchor(cwd, project_root), None
+        anchor = resolve_anchor(cwd, project_root)
     except AnchorRefusal as exc:
         log.warning("git_anchor_refused", cwd=str(cwd), reason=str(exc))
         return None, f"git 拒绝执行（信任锚校验失败）：{exc}"
     except AnchorUnderivable as exc:
         log.warning("git_anchor_underivable", cwd=str(cwd), reason=str(exc))
         return None, None
+    if anchor is not None:
+        mismatch = verify_gitdir_identity(anchor.git_dir)
+        if mismatch is not None:
+            log.warning("git_anchor_identity_mismatch", cwd=str(cwd),
+                        git_dir=anchor.git_dir, reason=mismatch)
+            return None, f"git 拒绝执行（gitdir 身份指纹不符）：{mismatch}"
+    return anchor, None
+
+
+# ── gitdir 身份指纹（fixqueue #2 残余 R4：**同路径替换**）────────────────
+# 信任锚钉的是**路径**（`--git-dir`/`GIT_COMMON_DIR`），挡不住「把那个路径上的目录
+# 删掉、再在同路径造一个自己的仓」—— 实测（审计 2026-09-15）：项目根边界形态
+# `rmdir /s /q <proj>\.git` 后 `git init`，平台 `_git` 就读到了 agent 的 config。
+# ⇒ 再钉一层**身份**：记下 gitdir 的 (st_dev, st_ino)（NTFS 上=卷序列号+文件索引），
+# 每次跑 git 前 stat 比对；不符 ⇒ 拒绝。指纹落在**平台数据根**（`get_data_root()`，
+# 与 `empty-git-hooks` 同处，在项目 ACL 授权面之外 ⇒ agent 写不到、也伪造不了）。
+#
+# 边界（写清楚，别读成万无一失）：**首次见到某 gitdir 时是 TOFU**（记录当下身份）。
+# 平台新建项目/新建 worktree 会在**创建点**主动记录（早于任何 agent 命令），TOFU
+# 只覆盖「本机制上线前就已存在的项目」。
+_IDENTITY_CACHE: dict[str, tuple[int, int] | None] = {}
+
+
+def _identity_dir() -> str:
+    from pathlib import Path
+
+    from hiveweave.config import get_data_root
+
+    d = Path(get_data_root()) / "git-anchor"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def _identity_file(git_dir: str) -> str:
+    import hashlib
+
+    key = hashlib.sha256(os.path.realpath(git_dir).encode("utf-8")).hexdigest()
+    return os.path.join(_identity_dir(), f"{key[:32]}.id")
+
+
+def record_gitdir_identity(git_dir: str) -> tuple[int, int] | None:
+    """记录 gitdir 当前身份（创建点调用；幂等）。返回 (dev, ino) 或 None。"""
+    try:
+        st = os.stat(git_dir)
+    except OSError:
+        return None
+    ident = (int(st.st_dev), int(st.st_ino))
+    try:
+        with open(_identity_file(git_dir), "w", encoding="utf-8") as fh:
+            fh.write(f"{ident[0]}:{ident[1]}\n")
+    except OSError as exc:  # 记录不下就**不**缓存 ⇒ 下次重试（不静默当作已记）
+        log.warning("git_anchor_identity_record_failed", git_dir=git_dir,
+                    error=str(exc)[:120])
+        return None
+    _IDENTITY_CACHE[os.path.realpath(git_dir)] = ident
+    return ident
+
+
+def read_gitdir_identity(git_dir: str) -> tuple[int, int] | None:
+    """读**已记录**的 gitdir 身份（诊断/测试用；没有记录 ⇒ None）。"""
+    try:
+        with open(_identity_file(git_dir), encoding="utf-8") as fh:
+            dev_s, _, ino_s = (fh.read().strip() or ":").partition(":")
+        return (int(dev_s), int(ino_s))
+    except (OSError, ValueError):
+        return None
+
+
+def verify_gitdir_identity(git_dir: str) -> str | None:
+    """校验 gitdir 身份。`None` = 通过（或首次 TOFU 记录成功）；否则返回拒因。"""
+    key = os.path.realpath(git_dir)
+    try:
+        st = os.stat(git_dir)
+    except OSError:
+        return None  # 路径不在：交给上游的「不存在」分支处理（不在这里断言）
+    live = (int(st.st_dev), int(st.st_ino))
+    expected = _IDENTITY_CACHE.get(key)
+    if expected is None:
+        try:
+            with open(_identity_file(git_dir), encoding="utf-8") as fh:
+                dev_s, _, ino_s = (fh.read().strip() or ":").partition(":")
+            expected = (int(dev_s), int(ino_s))
+        except (OSError, ValueError):
+            record_gitdir_identity(git_dir)  # TOFU：首次见到 ⇒ 记当下身份
+            log.info("git_anchor_identity_adopted", git_dir=git_dir)
+            return None
+    if expected == live:
+        _IDENTITY_CACHE[key] = expected
+        return None
+    return (f"{git_dir} 的身份与平台记录不符（记录 {expected[0]}:{expected[1]} / "
+            f"现实 {live[0]}:{live[1]}）—— 该 gitdir 已被删除并重建（同路径替换）")
