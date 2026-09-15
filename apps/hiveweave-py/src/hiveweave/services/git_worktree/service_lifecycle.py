@@ -27,11 +27,19 @@ from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
 
 def _unlock_git_lockdown(project_root: str) -> None:
     """清理前解锁（best-effort）：`git worktree remove` 会删到被 R1 锁死的
-    `<gitdir>/config.worktree` ⇒ 不解锁就 PermissionError。"""
+    `<gitdir>/config.worktree` ⇒ 不解锁就 PermissionError。
+
+    ⚠ 这里是**有意吞异常**，但**不静默**：解锁失败不该挡住清理（清理是
+    清场路径，失败原因会由随后的 `worktree remove` 真实结果暴露出来，
+    那才是判据）。故只记 debug 留痕，不 re-raise —— 本项目把"静默失效"
+    当一等缺陷，`pass` 会让这一处无从排查（裸 except 棘轮实测抓到过一次）。
+    """
     try:
         unlock_git_lockdown(project_root)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — 见 docstring：不挡住清理，但要留痕
+        log.debug(
+            "git_lockdown_unlock_failed", root=project_root, error=str(exc)
+        )
 
 
 from .git_cmd import _current_branch, _git, _resolve_base_branch
