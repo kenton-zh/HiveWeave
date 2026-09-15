@@ -44,7 +44,13 @@ from hiveweave.services.acl_sandbox.policy import (
     SpawnDecision,
     resolve_policy,
 )
-from hiveweave.services.acl_sandbox.sid import cache_sid, extra_sid, git_sid, worktree_sid
+from hiveweave.services.acl_sandbox.sid import (
+    cache_sid,
+    extra_sid,
+    git_sid,
+    shared_sid,
+    worktree_sid,
+)
 from hiveweave.services.acl_sandbox.spawn import ConfinedRunner
 from hiveweave.services.acl_sandbox.token import RestrictedTokenFactory
 from hiveweave.util.safe_env import build_child_env
@@ -446,6 +452,233 @@ class _AsyncGrant:
     async def break_inheritance_async(self, path) -> None:
         await asyncio.to_thread(self._g.break_inheritance, path)
 
+    async def seal_agent_aces_async(self, path, sids: set[str]) -> bool:
+        return await asyncio.to_thread(self._g.seal_agent_aces, path, sids)
+
+    async def deny_delete_child_async(self, path, sids: set[str]) -> int:
+        return await asyncio.to_thread(self._g.deny_delete_child, path, sids)
+
+
+# ── #2 GitSpawn 治本：git「引导文件」封条（2026-09-15） ────────────────
+# 判据来源是 `scripts/probe_git_write_surface.py`（真令牌，修前修后各跑一次），
+# 不是读码推断。实测事实（修前）：
+#   K1/K2  `extensions.worktreeConfig=true` 时 git **真的会读** `.git/config.worktree`
+#          与 `.git/worktrees/<id>/config.worktree`（平台自己在 worktree 创建时就
+#          打开这个扩展 ⇒ 两个载体天然活着）；
+#   E1–E3  **三条** config 载体各自都能让平台的 `git add`（经唯一 spawn 漏斗）
+#          执行 agent 的载荷 —— `filter.<n>.clean` 是**动态键名**，`GIT_CONFIG_*`
+#          静态清单覆盖不到（既有边界 ①）；
+#   R1/R1b  `<worktree>/.git` 这个 **gitdir 指针文件**可被 agent 改写 ⇒ 平台的
+#          `git add` 直接去读 agent 目录里的 config ⇒ 载荷 EXECUTED（绕开全部 config 封条）；
+#   D1–D3  三条载体在「只摘 ACE」的形态下**都能被 del 掉再重建**（Windows 删子项
+#          两条准入路径：子对象 DELETE **或** 父目录 FILE_DELETE_CHILD）。
+# ⇒ 故封条 = 「摘能力 SID ACE + PROTECTED」×〔载体文件〕 ＋「父目录 deny DC」。
+#
+# 封的是**能力 SID 全族**（`S-1-4-` 前缀，见 sid.py）：判据与「当前是谁在跑」无关
+# —— 否则换个角色（bash_main vs worktree）同一文件又开一次口子。
+_AGENT_SID_PREFIX = "S-1-4-"
+# 需要「占位」的载体：不存在时由平台先建**空文件**再封 —— 否则 agent 可以自己
+# 新建这个同名文件（父目录仍有写权），封条对它无效。空 config 对 git 是合法的。
+_PLACEHOLDER_CARRIERS = ("config.worktree",)
+
+
+def _is_agent_sid(sid: str) -> bool:
+    return sid.startswith(_AGENT_SID_PREFIX)
+
+
+def _seal_subject_sids(policy) -> set[str]:
+    """封条的 subject 集合 —— **派生**，不看目标文件上现在有什么 ACE。
+
+    ⚠ 为什么不能用「文件上现有的能力 SID」当 subject（一手实测）：首轮 grant 与
+    封条在**同一次** standing-grants 里先后执行，目标文件上那一刻可能还没有能力
+    ACE ⇒ 摘了个寂寞，而下一轮又会被灌进来。实测（本批修后首跑）：只封到两个
+    `config.worktree` 占位，`.git/config` 全程可写、E1–E3 仍 EXECUTED。
+    （子对象何时拿到继承 ACE 与 NTFS 传播时机有关，本仓不再依赖该时机。）
+
+    ⇒ subject = 本项目/本边界**所有可能被授予**的能力 SID（项目级 git/cache/
+    shared/venv + 边界 + 每个已存在 worktree 自己 + temp/extras）。多给没关系：
+    不存在的 SID 摘不掉任何东西，且 `seal_agent_aces` 幂等。
+    """
+    project = policy.project_root
+    sids: set[str] = {
+        git_sid(project),
+        worktree_sid(project),
+        cache_sid(project),
+        shared_sid(project),
+        policy.venv_sid_str,
+        policy.temp_sid,
+        worktree_sid(policy.boundary_root),
+    }
+    sids.update(policy.extra_sids or ())
+    wt_root = os.path.join(project, ".git", "worktrees")
+    if os.path.isdir(wt_root):
+        for name in os.listdir(wt_root):
+            sids.add(worktree_sid(os.path.join(wt_root, name)))
+    sids.discard(None)
+    return {s for s in sids if s}
+
+
+def _agent_aces_leaking(path: str) -> list[str]:
+    """读回复核：该路径上仍带写/删/改 DACL 位的**允许**能力 SID。
+
+    只算 allow：deny（父目录禁删子项）本来就是我们要的形态。
+    """
+    from hiveweave.services.acl_sandbox.grant import ACE_ALLOWED
+
+    leaking = []
+    for ace_type, _f, mask, sid in _grant_aces(path):
+        if ace_type == ACE_ALLOWED and _is_agent_sid(sid) and (
+                mask & _SEAL_WRITE_BITS):
+            leaking.append(sid)
+    return sorted(leaking)
+
+
+# 封条要摘干净的位：写 + 删 + 删子项 + 改 DACL/属主（后两者本仓从不授予，
+# 但读回复核按「一律不许」判，免得将来某处放宽后封条静默失效）
+_SEAL_WRITE_BITS = GRANT_MASK | WRITE_DAC | WRITE_OWNER
+
+
+def _grant_aces(path: str) -> list[tuple[int, int, int, str]]:
+    """[(ace_type, flags, mask, sid)] —— 供 service 层判「封条是否已生效」。"""
+    from hiveweave.services.acl_sandbox.grant import WriteGrant
+
+    return WriteGrant.list_aces(path)
+
+
+async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
+    """封住 git 的引导文件（agent 不可写、不可删建）。返回本次实际改动的项。
+
+    fail-closed：任一环节失败抛 `SandboxUnavailableError` —— 封条是安全不变量，
+    「封不上还继续跑」正是本仓最反感的「看似有守卫」。列不出目标（`.git` 不存在）
+    是合法空态（项目未初始化 git），直接返回。
+    """
+    project = os.path.realpath(policy.project_root)
+    git_dir = os.path.join(project, ".git")
+    if not os.path.isdir(git_dir):
+        return []
+    changed: list[str] = []
+    sids = _seal_subject_sids(policy)
+
+    async def seal_file(path: str) -> None:
+        created = False
+        if not os.path.exists(path):
+            if os.path.basename(path) not in _PLACEHOLDER_CARRIERS:
+                return  # 非占位载体不存在 ⇒ 无事可做（不是缺口）
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "a", encoding="utf-8"):
+                    pass
+                created = True
+            except OSError as exc:
+                raise SandboxUnavailableError(
+                    f"cannot create git bootstrap placeholder {path}: {exc}. "
+                    f"agent 可自行新建该文件并让平台 git 读它 ⇒ 拒绝继续",
+                ) from exc
+        wrote = await agrant.seal_agent_aces_async(path, sids)
+        # 读回复核（§4.11 同族纪律）：摘完必须**读到干净**，否则 fail-closed。
+        # 没有这步，「摘了个寂寞」与「已封」在日志上长得一样。
+        leaking = _agent_aces_leaking(path)
+        if leaking:
+            raise SandboxUnavailableError(
+                f"seal read-back failed: {path} 仍有能力 SID 写位 {leaking} "
+                f"—— git 引导文件未封住，拒绝继续执行 agent 命令")
+        if wrote or created:
+            changed.append(f"{'create+' if created else ''}seal:{path}")
+
+    async def deny_dc(path: str) -> None:
+        if await agrant.deny_delete_child_async(path, sids):
+            changed.append(f"deny-dc:{path}")
+
+    # ① `.git` **根**：不授写 —— 这是本条的病因，也是唯一留得住的杠杆。
+    #    为什么不「只封住 config 文件」：`git config` 是 **lock + rename 替换**，
+    #    而「删」走 pass-1（user ACE，封条挡不住）、「建」走父目录 create 权
+    #    （pass-2 管得住 —— 实测工作区外 create 被拒）。只封文件 ⇒ agent 一条
+    #    `git config` 就把封条换成一个继承 `.git` ACE 的新文件（实测：_dbg_seal
+    #    里 config 从 protected=True 变回 protected=False 且带回能力 ACE）。
+    #    ⇒ 把写面从「`.git` 整棵」收成「git 真正需要写的子目录」。
+    await agrant.seal_agent_aces_async(git_dir, sids)
+    leaking_root = _agent_aces_leaking(git_dir)
+    if leaking_root:
+        raise SandboxUnavailableError(
+            f"seal read-back failed: {git_dir} 仍可被 agent 写 {leaking_root} "
+            f"—— 配置载体可被 lock+rename 替换，拒绝继续执行 agent 命令")
+    # git 真正需要 agent 写的子目录（agent 自己的 add/commit 落在 worktree gitdir
+    # + 共享 objects/refs/logs；**不含** `.git` 根、不含 `info/`、不含 `hooks/`）
+    for name in ("objects", "refs", "logs"):
+        d = os.path.join(git_dir, name)
+        if os.path.isdir(d):
+            await _grant_if_missing(d, git_sid(project), GRANT_MASK, agrant)
+
+    # ② 主 config + 主 worktree config（占位）+ `.git` 下的其它引导文件
+    for name in ("config", "config.worktree"):
+        await seal_file(os.path.join(git_dir, name))
+
+    # ③ 每个 worktree 的 gitdir：本身要继续可写（agent 的 index/index.lock 在
+    #    那里），故这里封的 `config.worktree` / `commondir` **只是提高门槛**：
+    #    gitdir 可写 ⇒ 仍可删+重建（残余，见 fixqueue #2「已实测残余」）。
+    wt_root = os.path.join(git_dir, "worktrees")
+    if os.path.isdir(wt_root):
+        for name in sorted(os.listdir(wt_root)):
+            gd = os.path.join(wt_root, name)
+            if not os.path.isdir(gd):
+                continue
+            await _grant_if_missing(gd, git_sid(project), GRANT_MASK, agrant)
+            await seal_file(os.path.join(gd, "config.worktree"))
+            await seal_file(os.path.join(gd, "commondir"))
+            await deny_dc(gd)
+    await deny_dc(git_dir)
+
+    # ③ worktree 边界：`<wt>/.git` 是 gitdir 指针 —— 改它 = 平台在 worktree 里的
+    #    git 去读 agent 目录的 config。
+    #    ⚠ **先校验再封**（审计 2026-09-15 A1）：`os.path.isfile` 为假时**不能静默
+    #    跳过**（早先形态：指针被删后每次都跳过，等于封条无声消失）；也不是
+    #    「写不进去」就安全 —— 删这一侧走 pass-1（user ACE），agent 删得掉指针，
+    #    再建一个**同名目录** `.git/`（内含自己的 config）⇒ 平台在该 worktree 的
+    #    `git add -A` 照样执行其载荷（审计实测三段全通）。
+    #    ⇒ 判据落成「指针**身份**」：必须是指向本 worktree 期望 gitdir 的文件；
+    #    否则 fail-closed（把静默变成 loud，且不给它继续工作的权限）。
+    boundary = os.path.realpath(policy.boundary_root)
+    if boundary != project:
+        wt_git = os.path.join(boundary, ".git")
+        if not os.path.isfile(wt_git):
+            raise SandboxUnavailableError(
+                f"worktree gitdir 指针不是文件（或已被删除/替换成目录）：{wt_git}"
+                f" —— 平台在该 worktree 的 git 会去读非平台指定的 gitdir，"
+                f"拒绝继续执行 agent 命令（fixqueue #2「A1」）")
+        expected = os.path.join(git_dir, "worktrees", os.path.basename(boundary))
+        if not _points_at(wt_git, expected):
+            raise SandboxUnavailableError(
+                f"worktree gitdir 指针未指向期望 gitdir：{wt_git} "
+                f"（期望 {expected}）—— 可能已被 agent 改写，拒绝继续执行")
+        await seal_file(wt_git)
+        await deny_dc(boundary)
+
+    if changed:
+        log.info("acl_sandbox.git_bootstrap_sealed", count=len(changed),
+                 items=changed[:8])
+    return changed
+
+
+def _points_at(pointer_path: str, expected_gitdir: str) -> bool:
+    """`<wt>/.git` 指针内容是否指向期望 gitdir（身份判据，不是意图判据）。
+
+    容忍 git 的书写差异：`gitdir:` 前缀、正/反斜杠、大小写、尾随空白/换行。
+    比较目标路径的 realpath，避免 `..`/短名造成假红。
+    """
+    try:
+        raw = open(pointer_path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+    text = raw.strip()
+    if text.lower().startswith("gitdir:"):
+        text = text[len("gitdir:"):].strip()
+    if not text:
+        return False
+    got = os.path.realpath(text.replace("\\", os.sep).replace("/", os.sep))
+    want = os.path.realpath(expected_gitdir)
+    return os.path.normcase(got) == os.path.normcase(want)
+
+
 
 async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
     """verify-then-skip 补授：主体探测 → .hiveweave 裁剪 → 边界根 + 项目级 git/缓存。"""
@@ -470,7 +703,10 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
     # 边界是 worktree 时，realpath 下的 `.git`（gitdir 指针文件）不在这里授。
     git_path = os.path.join(project, ".git")
     if os.path.exists(git_path):
-        await _grant_if_missing(git_path, git_sid(project), GRANT_MASK, agrant)
+        # #2：**不再**对 `.git` 整棵授 GRANT_MASK（那正是「agent 能改 config」的
+        # 来源，且会被 lock+rename 一路穿透封条）。改由封条函数收窄写面 + 只授
+        # git 真正需要写的子目录（objects/refs/logs + 各 worktree gitdir）。
+        await _seal_git_bootstrap_files(policy, agrant)
 
     cache_dir = policy.cache_dir
     if not os.path.isdir(cache_dir):

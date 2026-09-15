@@ -471,23 +471,34 @@ def test_positive_control_hooks_path_override_is_what_blocks(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. 已知缺口登记（strict xfail）—— P2 落地后会自动转红提醒
+# 4. 已知缺口登记（strict xfail）——**env 层**的固有残余，不是 #2 的进度信号
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "已知缺口（报告边界 ①）：filter.<name>.clean / merge.<name>.driver 的 "
-        "<name> 由**仓库内 .gitattributes 动态指定**，静态键名清单结构上列不出来。"
-        "实测排除两条替代方案：core.attributesFile 指向空文件挡不住（第一轮 4c 仍 "
-        "EXECUTED）；也试不出可注入的通配键。这一路只能靠收回 .git/config 写权限"
-        "（P2）治本。strict=True ⇒ P2 修好后此条会转红，提醒把它改回正常断言。"
+        "**env 层**的固有残余（报告边界 ①）：filter.<name>.clean / merge.<name>.driver "
+        "的 <name> 由**仓库内 .gitattributes 动态指定**，静态键名清单结构上列不出来，"
+        "所以 `GIT_CONFIG_*` 加固永远覆盖不到这一族。实测排除两条替代方案："
+        "core.attributesFile 指向空文件挡不住（第一轮 4c 仍 EXECUTED）；也试不出可注入"
+        "的通配键。"
+        ""
+        "⚠ **本条不是 #2 的进度信号**（计划原先写「P2 落地后它会转红」—— 那句错了）："
+        "本用例的攻击现场是 harness 用 `_raw_git`（**不受限**）写出来的 config，"
+        "ACL 收窄（#2）改变的是「受限 agent 能不能写 config」，不会让这条断言转红。"
+        "strict=True 在这里的语义 = 「env 层这条缺口仍在」，它会**长期红着**。"
+        ""
+        "#2 的进度信号在 tests/test_git_config_seal.py："
+        "① test_agent_cannot_replace_git_config（受控 agent 写不进 config = 载体死）；"
+        "② 两条 xfail（test_agent_cannot_delete_git_config / "
+        "test_agent_cannot_write_worktree_gitdir_carrier）转红 = 残余被修掉。"
     ),
 )
 def test_dynamic_key_paths_are_known_gap_until_p2(repo: Path, tmp_path: Path) -> None:
-    """如实记录 P0 层挡不住的动态键名路径（filter/merge driver 同族）。
+    """如实记录「env 层」挡不住的动态键名路径（filter/merge driver 同族）。
 
     ⚠ 这条**不是**「期望攻击成功」，而是「已知缺口登记」：断言写的是正常期望
-    （应当被拦住），当前拦不住 ⇒ xfail。P2 落地后它会转红。
+    （应当被拦住），当前拦不住 ⇒ xfail。它的前提（config 被写入）由 harness 直接
+    制造，与 agent 有无写权限无关 ⇒ **它长期为红**，见 xfail reason。
     """
     flag = tmp_path / "flag_gap.txt"
     payload = _sh_payload(flag)

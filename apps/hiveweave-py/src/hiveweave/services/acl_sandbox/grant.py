@@ -233,6 +233,135 @@ class WriteGrant:
             | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
             WriteGrant._owner(path), WriteGrant._group(path), dacl, None)
 
+    # ── #2 GitSpawn 治本：git 引导文件的「封条」原语（2026-09-15） ──────
+    @staticmethod
+    def list_aces(path: str) -> list[tuple[str, int, int]]:
+        """[(sid_str, ace_flags, mask)] —— 公开只读视图（不存在的路径 ⇒ []）。"""
+        _require_win32()
+        if not os.path.exists(path):
+            return []
+        try:
+            dacl = WriteGrant._read_dacl(path)
+        except (pywintypes.error, OSError):
+            return []
+        if dacl is None:
+            return []
+        return _iter_aces(dacl)
+
+    @staticmethod
+    def seal_agent_aces(path: str, sid_strs: set[str]) -> bool:
+        """封条：把给定受限 SID 的 ACE 从 *path* 摘除，其余 ACE 转显式 + PROTECTED。
+
+        返回 True = 实际写盘；**幂等**（已摘除且已 PROTECTED ⇒ False，不再写盘
+        —— 与 grant_standing 的精确跳过同一动机：SetNamedSecurityInfo 会急切
+        重新传播，大树上很贵）。
+
+        为什么必须同时做三件事（缺任何一件都是假封条）：
+        1. **摘除**而不是加 DENY：受限令牌 pass-2 落空的判据是「没有任何 ACE 授予
+           该受限 SID」—— 与 `_ensure_standing_grants` 的 verify-then-skip 同一
+           机制，不引入第二种判定语义。
+        2. **其余 ACE 转显式**（清 INHERITED_ACE 位）：PROTECTED 之后 Windows 不再
+           从父目录算继承；若「用户/AuthUsers 的写」原本是继承来的，直接置
+           PROTECTED 会把它们一起丢掉 ⇒ **平台自己的 `git config <写>` 会失败**。
+           （计划 §四 担心的「收权限会坏三处」是**只读文件属性**探针的产物，
+           不是 ACL 方案的 —— 见 `scripts/probe_git_write_surface.py` F1。）
+        3. **PROTECTED**：否则下一轮 standing grant 的父目录 OI/CI 传播会把封条
+           重新灌开 —— 与 `.hiveweave` 的 `break_inheritance` 同族不变量。
+
+        ⚠ 只接受可由 `AddAccessAllowedAceEx`/`AddAccessDeniedAceEx` 重建的 ACE
+        （allow/deny）；出现其它类型（object ACE 等）**拒改**并抛错 —— 重建时
+        丢掉一个不认识的 ACE 等于静默削平台权限，宁可 fail-closed。
+        """
+        _require_win32()
+        if not os.path.exists(path):
+            return False
+        sd = win32security.GetNamedSecurityInfo(
+            path, win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+        if dacl is None:
+            raise SandboxUnavailableError(
+                f"seal target has NULL DACL (refuse to treat as sealed): {path}",
+                api_name="GetSecurityDescriptorDacl")
+        control, _rev = sd.GetSecurityDescriptorControl()
+        protected = bool(control & win32security.SE_DACL_PROTECTED)
+        # ⚠ 只算 **ALLOW** ACE：本模块自己会往这些对象上加 DENY（deny_delete_child），
+        # 若把 deny 也算成「还有 agent ACE」，则每次都判定为未达标 ⇒ **每轮 spawn
+        # 全量重建 DACL**（审计 B1 实测），封条承诺的稳态零写盘就没了。
+        has_agent_ace = any(
+            ace_type == ACE_ALLOWED and s in sid_strs
+            for ace_type, _f, _m, s in _iter_aces(dacl))
+        if protected and not has_agent_ace:
+            return False
+        new_acl = win32security.ACL()
+        for ace_type, ace_flags, mask, sid in _iter_aces(dacl):
+            if ace_type == ACE_ALLOWED and sid in sid_strs:
+                continue
+            flags = ace_flags & ~_INHERITED_ACE
+            # 掩码符号：GetAce 给的是无符号值，AddAccess* 收 C long ⇒ 高位掩码
+            # 会 OverflowError（审计 B2）。归一到有符号 32 位。
+            signed = mask - 0x100000000 if mask > 0x7FFFFFFF else mask
+            if ace_type == ACE_ALLOWED:
+                new_acl.AddAccessAllowedAceEx(
+                    win32security.ACL_REVISION, flags, signed,
+                    win32security.ConvertStringSidToSid(sid))
+            elif ace_type == ACE_DENIED:
+                new_acl.AddAccessDeniedAceEx(
+                    win32security.ACL_REVISION, flags, signed,
+                    win32security.ConvertStringSidToSid(sid))
+            else:
+                raise SandboxUnavailableError(
+                    f"seal target has ACE type {ace_type} that cannot be "
+                    f"rebuilt (would silently drop platform rights): {path}")
+        win32security.SetNamedSecurityInfo(
+            path, win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            WriteGrant._owner(path), WriteGrant._group(path), new_acl, None)
+        return True
+
+    @staticmethod
+    def deny_delete_child(path: str, sid_strs: set[str]) -> int:
+        """对 *path* 加 DENY ACE（`DELETE|FILE_DELETE_CHILD`，本对象、不继承）。
+
+        ⚠ **这不是「防删」的保证，只是部分防线**（审计 2026-09-15 B1 实测）：
+        Windows 删子项有两条准入路径 —— 子对象自己的 DELETE **或** 父目录的
+        FILE_DELETE_CHILD；而本仓的能力 ACE 语义是 **pass-2**，可**删**这一侧
+        走的是 **pass-1**（普通令牌的 user ACE，它对平台自有文件有 FILE_ALL_ACCESS）
+        ⇒ 受限 agent 照样删得掉封条文件（实测 D1–D3 修前修后同为 DELETED）。
+        本函数堵的是 DC 那条路（挡住「子对象自己没有 DELETE」时的删除），成本为零，
+        故保留 —— 但**不得**在别处声称「文件已经不能被删」。
+        真正的防删要么收 user 侧的 DELETE（= 平台自己也不能 lock+rename 改它，
+        见 fixqueue #2「双阶段」），要么在平台侧改用显式 `--git-dir` 之类的
+        **信任锚**，不依赖「文件还在不在」。
+
+        返回实际新增的 ACE 数（幂等：已有同 SID 的等价 deny ⇒ 跳过）。
+        """
+        _require_win32()
+        if not os.path.isdir(path):
+            return 0
+        dacl = WriteGrant._read_dacl(path)
+        if dacl is None:
+            raise SandboxUnavailableError(
+                f"deny_delete_child target has NULL DACL: {path}",
+                api_name="GetSecurityDescriptorDacl")
+        covered = {
+            sid for ace_type, _f, mask, sid in _iter_aces(dacl)
+            if ace_type == ACE_DENIED and mask & SEAL_DENY_MASK == SEAL_DENY_MASK
+        }
+        todo = sorted(sid_strs - covered)
+        if not todo:
+            return 0
+        dacl.SetEntriesInAcl([
+            _explicit_access(
+                win32security.ConvertStringSidToSid(sid),
+                SEAL_DENY_MASK, win32security.DENY_ACCESS, 0)
+            for sid in todo
+        ])
+        WriteGrant._write_dacl(path, dacl)
+        return len(todo)
+
     @staticmethod
     def has_subject_write_ace(path: str) -> bool:
         """§4.12 部署前提探测：DACL 是否授予「当前令牌身份」写权。
@@ -337,3 +466,9 @@ class WriteGrant:
 OI_CI = (win32con.CONTAINER_INHERIT_ACE | win32con.OBJECT_INHERIT_ACE
          if win32con is not None else 0)
 ACE_ALLOWED = (win32con.ACCESS_ALLOWED_ACE_TYPE if win32con is not None else 0)
+ACE_DENIED = (win32con.ACCESS_DENIED_ACE_TYPE if win32con is not None else 0)
+# INHERITED_ACE：ACE 上的「我是继承来的」标记（win32security.INHERITED_ACE=0x10）。
+# 封条重建时把它清掉 —— 见 seal_agent_aces 第 2 条理由。
+_INHERITED_ACE = getattr(win32security, "INHERITED_ACE", 0x10)
+# 父目录禁「删子项」用的掩码：DELETCHILD 的两条准入路径都要堵
+SEAL_DENY_MASK = DELETE | FILE_DELETE_CHILD  # 0x10040
