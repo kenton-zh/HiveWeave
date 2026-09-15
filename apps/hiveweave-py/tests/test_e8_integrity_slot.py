@@ -27,6 +27,7 @@ from hiveweave.services.git_worktree.service_merge import (
 from hiveweave.services.task import TaskService
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 # ── 静态扫描器 ───────────────────────────────────────────────
@@ -92,7 +93,7 @@ async def _mk_running_verify(ts: TaskService, pid: str) -> tuple[str, str]:
         assignee_id=EXEC,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, vid, EXEC, bypass_verify_serialize=True)
     await ts.start_task(pid, vid)
     branch = f"hw/EXEC/t-{vid[:8].lower()}"

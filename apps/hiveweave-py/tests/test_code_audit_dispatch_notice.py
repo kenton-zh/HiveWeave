@@ -141,7 +141,7 @@ async def test_dispatch_writer_gets_notice_once():
 
 @pytest.mark.asyncio
 async def test_dispatch_verify_task_gets_no_notice():
-    verify_row = {"title": "VERIFY: 登录模块", "is_archived": False}
+    verify_row = {"title": "VERIFY: 登录模块", "kind": "verify", "is_archived": False}
     with _enter(_dispatch_patches(_WRITER, [verify_row, verify_row])):
         svc = DispatchService()
         result = await svc.dispatch_task(

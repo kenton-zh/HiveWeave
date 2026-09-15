@@ -12,6 +12,7 @@ from hiveweave.agents.agent import Agent, AgentState
 from hiveweave.db import project as project_db
 from hiveweave.services import task as task_module
 from hiveweave.services.task import TaskService
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 PROJECT_ID = "test-open-task-project"
 AGENT_A = "agent-assignee"
@@ -244,7 +245,7 @@ async def test_verify_approve_auto_closes(env):
         assignee_id=AGENT_A,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, tid, AGENT_A)
     await ts.start_task(pid, tid)
     await ts.submit_task(

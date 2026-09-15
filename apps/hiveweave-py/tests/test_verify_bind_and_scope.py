@@ -15,6 +15,7 @@ from hiveweave.tools.tasks.verify_merge import (
 from hiveweave.tools.tasks.verify_spawn import _spawn_post_approve_verify_task
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 async def _mint_verify(ts: TaskService, pid: str, title: str) -> str:
@@ -30,7 +31,7 @@ async def _mint_verify(ts: TaskService, pid: str, title: str) -> str:
         parent_task_id=parent,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from hiveweave.services.task import TaskService
 from hiveweave.services.tasks.verify import ORPHAN_APPROVED_GRACE_MS
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 async def _make_approved(ts, pid, title="Feature", creator=COORD, assignee=EXEC):
@@ -224,7 +225,7 @@ async def test_verify_parent_close_failure_notifies_creator(task_env):
         pid, "VERIFY: Feature", "verify",
         creator_id=COORD, assignee_id=EXEC,
         parent_task_id=parent_id, source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(

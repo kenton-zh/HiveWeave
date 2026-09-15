@@ -114,11 +114,12 @@ async def test_assignee_needs_write_worktree_excludes_verify(tmp_path: Path):
         );
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY, assignee_id TEXT, status TEXT,
-            title TEXT, tags TEXT, is_archived INTEGER DEFAULT 0
+            title TEXT, tags TEXT, kind TEXT, is_archived INTEGER DEFAULT 0
         );
         INSERT INTO agents VALUES ('a1', 'A003', 'active');
+        -- #11：VERIFY 判定读 kind，标题只是展示（这里列结构与生产一致）
         INSERT INTO tasks VALUES (
-            'v1', 'a1', 'running', 'VERIFY: parent', '["verify"]', 0
+            'v1', 'a1', 'running', 'VERIFY: parent', '["verify"]', 'verify', 0
         );
         """
     )
@@ -325,6 +326,7 @@ async def test_ensure_verify_task_id_does_not_bypass_gate():
         "workspace_path": None,
     }
     verify_task = {
+        "kind": "verify",
         "id": "verify-uuid",
         "title": "VERIFY: game",
         "tags": ["verify"],
@@ -457,6 +459,7 @@ async def test_check_verify_baseline_rejects_stale_commit():
     from hiveweave.services.attestation import check_verify_baseline
 
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: game",
         "tags": ["verify"],
@@ -517,6 +520,7 @@ async def test_check_verify_baseline_accepts_target_commit():
 
     tip = "4937306abcdef0123456789"
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: game",
         "tags": ["verify"],

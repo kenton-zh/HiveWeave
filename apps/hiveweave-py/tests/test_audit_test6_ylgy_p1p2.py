@@ -419,6 +419,8 @@ async def test_submit_creates_review_obligation():
                         "reviewer_id": None,
                         "tags": "[]",
                         "title": "feat",
+                        # #11：stub 必须镜像生产的 SELECT 列（submit_task 读 kind）
+                        "kind": None,
                     }],
                 ]
             ),

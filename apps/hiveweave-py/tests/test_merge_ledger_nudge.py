@@ -309,6 +309,7 @@ async def test_get_actionable_obligations_includes_approved():
             "is_archived": 0,
         },
         {
+            "kind": "verify",
             "id": "t-verify",
             "creator_id": "c1",
             "assignee_id": "a1",

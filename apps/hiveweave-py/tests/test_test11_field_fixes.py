@@ -22,6 +22,7 @@ from hiveweave.services.turn_session import (
     set_pending_turn_result,
 )
 from hiveweave.services.wait_contract import default_ttl_ms
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 PROJECT_ID = "test11-field-fixes"
@@ -258,7 +259,7 @@ async def test_verify_submit_forces_creator_as_reviewer(task_env):
         assignee_id=QA,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, tid, QA)
     await ts.start_task(pid, tid)
     await ts.submit_task(

@@ -29,6 +29,7 @@ from hiveweave.tools.orchestration_tools import (
 from hiveweave.tools.task_tools import ReviewTaskParams, review_task_tool
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 CEO = "ceo-1"
 MERGER = "merger-1"
@@ -139,7 +140,7 @@ async def _make_verify_task(pid: str) -> str:
         tags=["verify", "mandatory", "post-merge"],
         evidence={"merged_by": MERGER},
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, verify_id, QA)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(
@@ -250,7 +251,7 @@ async def test_submit_task_preserves_merged_by(task_env):
         tags=["verify"],
         evidence={"merged_by": MERGER},
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, tid, QA)
     await ts.start_task(pid, tid)
     await ts.submit_task(

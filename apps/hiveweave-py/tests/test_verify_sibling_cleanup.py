@@ -14,6 +14,7 @@ from hiveweave.services.task import TaskService
 from hiveweave.services.tasks.verify import VerifyMixin
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 def test_verify_title_key_normalizes():
@@ -41,6 +42,9 @@ async def _setup(parent_title: str, verify_ok_title: str, pid: str, ts) -> str:
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
+        # #11：判定来源是 kind；`VERIFY: ` 前缀只是展示。不传 kind ⇒ 普通
+        # 任务 ⇒ 起点 claimed，close_task 直连会 Illegal transition。
+        kind=VERIFY_KIND,
     )
     await ts.close_task(pid, verify_ok)
     return parent_id
@@ -74,7 +78,7 @@ async def test_cleanup_spares_plain_verify_tagged_impl_tasks(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
 
@@ -94,13 +98,13 @@ async def test_cleanup_spares_different_verify_target(task_env):
         pid, "VERIFY: Other Module", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, other, EXEC)
     verify_ok = await ts.create_task(
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, other)
@@ -118,14 +122,14 @@ async def test_cleanup_spares_in_flight_duplicate(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, dup_running, EXEC)
     await ts.start_task(pid, dup_running)
     verify_ok = await ts.create_task(
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup_running)
@@ -143,12 +147,12 @@ async def test_cleanup_archives_inactive_true_duplicate(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     verify_ok = await ts.create_task(
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup)
@@ -166,12 +170,12 @@ async def test_cleanup_archives_numbered_duplicate(task_env):
         pid, "VERIFY: Root（1）", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     verify_ok = await ts.create_task(
         pid, "VERIFY: Root（2）", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup)
@@ -188,7 +192,7 @@ async def test_cleanup_spares_rework_duplicate(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, dup, EXEC)
     await ts.start_task(pid, dup)
     await ts.submit_task(
@@ -206,7 +210,7 @@ async def test_cleanup_spares_rework_duplicate(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     # review rework 是瞬态（reviewing → rework → running）

@@ -11,6 +11,7 @@ import pytest
 from hiveweave.db import project as project_db
 from hiveweave.services import task as task_module
 from hiveweave.services.task import TaskService
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 PROJECT_ID = "test-assign-claim"
 COORD = "coord-1"
@@ -67,7 +68,7 @@ async def test_verify_with_assignee_stays_created(env):
         assignee_id=EXEC,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     t = await ts.get_task(pid, tid)
     assert t["status"] == "created"
     assert t["assignee_id"] == EXEC

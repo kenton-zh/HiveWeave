@@ -39,6 +39,7 @@ from hiveweave.services.tasks.verdict_claim_check import (
     run_verdict_claim_check,
 )
 from hiveweave.services.attestation import create_waiver
+from hiveweave.services.tasks.verify import VERIFY_KIND
 from hiveweave.services.worktree_review import (
     _all_doc_paths,
     _has_parent_segment,
@@ -147,20 +148,30 @@ async def env():
         project_db._agent_cache.pop(EXEC_ID, None)
 
 
-async def _mk_running_task(env, svc, *, title="Feature", tags=None, **kw):
+async def _mk_running_task(
+    env, svc, *, title="Feature", tags=None, kind=None, source=None, **kw
+):
+    """新建并跑到 running。
+
+    #11：VERIFY 判定来源是 ``kind``，**不是**标题前缀 —— 这里不再从
+    ``title.startswith("VERIFY")`` 反推 source / 串行化旁路（那正是被删掉的
+    文本判据；写在测试里会掩盖生产里"标题伪造 VERIFY"的真实路径）。
+    需要 VERIFY 语义的调用方显式传 ``kind=VERIFY_KIND``。
+    """
+    is_verify = kind == VERIFY_KIND
     tid = await svc.create_task(
         env["project_id"], title, "d",
         creator_id=env["coordinator_id"],
         assignee_id=env["executor_id"],
         tags=tags or ["generic_tests"],
-        # VERIFY: 前缀是系统保留（_reject_forged_verify_title）
-        source="system" if title.upper().startswith("VERIFY") else "agent",
+        source=source or ("system" if is_verify else "agent"),
+        kind=kind,
         **kw,
     )
     # 单测同库并行多条 VERIFY —— 绕过单飞串行化锁（同 test_verdict_gate）
     await svc.claim_task(
         env["project_id"], tid, env["executor_id"],
-        bypass_verify_serialize=title.upper().startswith("VERIFY"),
+        bypass_verify_serialize=is_verify,
     )
     await svc.start_task(env["project_id"], tid)
     return tid
@@ -256,6 +267,7 @@ async def test_submit_preflight_aggregates_verdict_and_checklist(env):
         title="VERIFY: 里程碑",
         tags=["verify"],
         acceptance_criteria=["导出 CSV 功能可用", "边界情况有测试覆盖"],
+        kind=VERIFY_KIND,
     )
     submit_mock = AsyncMock()
 
@@ -298,7 +310,7 @@ async def test_submit_preflight_aggregates_verdict_and_checklist(env):
 async def test_verify_task_not_blocked_by_files_changed_empty(env):
     """VERIFY 任务无 files_changed 不算问题（交付物是凭证/verdict）。"""
     svc = TaskService()
-    tid = await _mk_running_task(env, svc, title="VERIFY: x", tags=["verify"])
+    tid = await _mk_running_task(env, svc, title="VERIFY: x", tags=["verify"], kind=VERIFY_KIND)
 
     async def _fake_verify_ids(project_id, ids, **kwargs):
         return True, ""
@@ -437,7 +449,7 @@ async def test_submit_fail_receipt_includes_claim_check_fact_bits(env):
     ws = Path(env["workspace_path"])
     (ws / "src").mkdir(parents=True, exist_ok=True)
     (ws / "src" / "auth.py").write_text("def login():\n", encoding="utf-8")
-    tid = await _mk_running_task(env, svc, title="VERIFY: 交互", tags=["verify"])
+    tid = await _mk_running_task(env, svc, title="VERIFY: 交互", tags=["verify"], kind=VERIFY_KIND)
 
     async def _fake_verify_ids(project_id, ids, **kwargs):
         return True, ""
@@ -646,6 +658,7 @@ async def test_service_submit_rejects_uncovered_checklist(env):
     vid = await _mk_running_task(
         env, svc, title="VERIFY: 导出", tags=["verify"],
         acceptance_criteria=criteria,
+        kind=VERIFY_KIND,
     )
     with pytest.raises(ValueError) as ei:
         await svc.submit_task(pid, vid, evidence={"verdict": "PASS"})
@@ -674,6 +687,7 @@ async def test_service_submit_na_and_index_text_rejected(env):
     vid = await _mk_running_task(
         env, svc, title="VERIFY: 导出2", tags=["verify"],
         acceptance_criteria=criteria,
+        kind=VERIFY_KIND,
     )
     with pytest.raises(ValueError) as ei:
         await svc.submit_task(
@@ -688,7 +702,7 @@ async def test_service_submit_na_and_index_text_rejected(env):
     assert (await svc.get_task(pid, vid))["status"] == "running"
 
     # 无 acceptance_criteria 的 VERIFY 不受门影响
-    vid2 = await _mk_running_task(env, svc, title="VERIFY: 无清单", tags=["verify"])
+    vid2 = await _mk_running_task(env, svc, title="VERIFY: 无清单", tags=["verify"], kind=VERIFY_KIND)
     await svc.submit_task(pid, vid2, evidence={"verdict": "PASS"})
     assert (await svc.get_task(pid, vid2))["status"] == "submitted"
 
@@ -705,6 +719,7 @@ async def test_service_submit_covered_by_task_credentials(env):
     vid = await _mk_running_task(
         env, svc, title="VERIFY: 导出3", tags=["verify"],
         acceptance_criteria=criteria,
+        kind=VERIFY_KIND,
     )
     a1 = await att_module.attestation_service.create(
         pid, agent_id=EXEC_ID, kind="test_run", task_id=vid,
@@ -740,6 +755,7 @@ async def test_service_submit_ui_item_covered_by_browse_e2e(env):
         env, svc, title="VERIFY: 登录页", tags=["verify"],
         policy_id="ui_browser_e2e",
         acceptance_criteria=["登录页可点通并截图"],
+        kind=VERIFY_KIND,
     )
     aid = await att_module.attestation_service.create(
         pid, agent_id=EXEC_ID, kind="browse_e2e", task_id=vid,
@@ -763,6 +779,7 @@ async def test_service_submit_soft_policy_accepts_execution_kinds(env):
     vid = await _mk_running_task(
         env, svc, title="VERIFY: 冒烟", tags=["verify"],
         acceptance_criteria=["冒烟脚本可跑通"],
+        kind=VERIFY_KIND,
     )
     aid = await att_module.attestation_service.create(
         pid, agent_id=EXEC_ID, kind="browse_e2e", task_id=vid,

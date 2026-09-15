@@ -315,11 +315,12 @@ async def test_assignee_is_verify_only_true_for_verify_running(tmp_path: Path):
         );
         CREATE TABLE tasks (
             id TEXT PRIMARY KEY, assignee_id TEXT, status TEXT,
-            title TEXT, tags TEXT, is_archived INTEGER DEFAULT 0
+            title TEXT, tags TEXT, kind TEXT, is_archived INTEGER DEFAULT 0
         );
         INSERT INTO agents VALUES ('a1', 'A003', 'active');
+        -- #11：判定读 kind
         INSERT INTO tasks VALUES (
-            'v1', 'a1', 'running', 'VERIFY: parent', '[]', 0
+            'v1', 'a1', 'running', 'VERIFY: parent', '[]', 'verify', 0
         );
         """
     )

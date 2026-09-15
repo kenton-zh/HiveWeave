@@ -26,6 +26,7 @@ from hiveweave.services.attestation import (
 from hiveweave.services.task import TaskService
 from hiveweave.tools.tasks.create import CreateTaskParams, create_task_tool
 from hiveweave.tools.tasks.dispatch import DispatchTaskParams, dispatch_task_tool
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 PROJECT_ID = "test-duty-gates"
 COORD = "coord-1"
@@ -176,7 +177,7 @@ async def test_verify_title_not_auto_blocked_on_depends_on(env):
         depends_on=[parent],
         source="system",
         policy_id="ui_browser_e2e",
-    )
+        kind=VERIFY_KIND)
     t = await ts.get_task(pid, vid)
     assert t["status"] == "created"
     assert t["assignee_id"] == QA
@@ -184,15 +185,30 @@ async def test_verify_title_not_auto_blocked_on_depends_on(env):
 
 @pytest.mark.asyncio
 async def test_agent_cannot_forge_verify_title(env):
+    """#11：标题**不再是**判定来源 —— agent 造一个叫 `VERIFY: …` 的任务是合法的，
+    但它必须是普通任务、拿不到任何 VERIFY 权限。
+
+    旧断言（"标题像 VERIFY 就 ValueError"）守的是文本判据；换成下面的
+    状态断言后，绕过难度反而更高：改措辞/换语言都不影响 kind 仍为 NULL。
+    """
+    from hiveweave.services.tasks.verify import is_verify_task
+
     ts = TaskService()
-    with pytest.raises(ValueError, match="milestoneVerify"):
-        await ts.create_task(
-            env["project_id"],
-            "VERIFY: sneaky",
-            "d",
-            COORD,
-            source="agent",
-        )
+    tid = await ts.create_task(
+        env["project_id"],
+        "VERIFY: sneaky",
+        "d",
+        COORD,
+        source="agent",
+    )
+    t = await ts.get_task(env["project_id"], tid)
+    # 标题照抄了展示前缀，但 kind 没跟上 ⇒ 平台不认它是 VERIFY
+    assert (t.get("title") or "").startswith("VERIFY:")
+    assert t.get("kind") in (None, ""), f"agent 不该能写到 kind: {t.get('kind')!r}"
+    assert not is_verify_task(t), (
+        "标题形似 VERIFY 的任务被 `is_verify_task` 认成了 VERIFY —— "
+        "说明判定又回到了文本判据"
+    )
 
 
 @pytest.mark.asyncio

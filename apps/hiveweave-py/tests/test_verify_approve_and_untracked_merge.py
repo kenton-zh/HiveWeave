@@ -97,6 +97,7 @@ def test_compare_still_blocks_empty_by_default():
 @pytest.mark.asyncio
 async def test_gate_skips_verify_task():
     task = {
+        "kind": "verify",
         "id": "t1",
         "title": "VERIFY: Phase 1",
         "tags": ["verify"],

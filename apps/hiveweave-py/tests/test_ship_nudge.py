@@ -89,6 +89,9 @@ async def test_verify_close_sends_and_triggers():
                 "id": "v1",
                 "parent_task_id": "p1",
                 "title": "VERIFY: MAIN QA",
+                # #11：VERIFY 判定读 kind。漏了它这条会走"无 VERIFY ⇒ 扫账本"
+                # 那条路（本用例 fake_query 恰好返回空 ⇒ 照样绿）= 假绿。
+                "kind": "verify",
             },
         )
 

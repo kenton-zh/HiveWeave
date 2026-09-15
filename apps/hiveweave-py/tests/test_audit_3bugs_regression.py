@@ -262,6 +262,7 @@ async def test_check_verify_baseline_canonical_query_key(tmp_path):
                 exit_code=0,
             )
             task = {
+                "kind": "verify",
                 "id": task_id,
                 "title": "VERIFY: game",
                 "evidence": {"target_merge_commit": "99999999999999999999"},

@@ -109,10 +109,14 @@ async def env():
 
 
 async def _create_verify(env, svc, title: str) -> str:
+    # #11：VERIFY 判定来源是 kind；标题前缀只是展示。
+    from hiveweave.services.tasks.verify import VERIFY_KIND
+
     return await svc.create_task(
         project_id=env["project_id"], title=title, description="d",
         creator_id=env["coordinator_id"], assignee_id=env["executor_id"],
         source="system",
+        kind=VERIFY_KIND,
     )
 
 

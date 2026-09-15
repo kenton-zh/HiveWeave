@@ -51,6 +51,7 @@ async def test_verify_baseline_accepts_behind_but_unrelated_scope():
     tip = "8992c22abcdef0123456789"
     att = "797ff6dbeef0123456789ab"  # ancestor of tip, ran the verified backend
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: backend",
         "parent_task_id": "parent-1",
@@ -127,6 +128,7 @@ async def test_verify_baseline_rejects_behind_touching_scope():
     tip = "8992c22abcdef0123456789"
     att = "797ff6dbeef0123456789ab"
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: backend",
         "parent_task_id": "parent-1",
@@ -200,6 +202,7 @@ async def test_verify_baseline_rejects_directory_scope_touched():
     tip = "8992c22abcdef0123456789"
     att = "797ff6dbeef0123456789ab"
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: backend",
         "parent_task_id": "parent-1",
@@ -270,6 +273,7 @@ async def test_verify_baseline_rejects_hiveweave_scope_undecidable():
     tip = "8992c22abcdef0123456789"
     att = "797ff6dbeef0123456789ab"
     task = {
+        "kind": "verify",
         "id": "verify-1",
         "title": "VERIFY: backend",
         "parent_task_id": "parent-1",

@@ -283,6 +283,7 @@ async def test_task_stall_nudges_idle_verify_lock_waiter():
     }
     tasks = [
         {
+            "kind": "verify",
             "id": "verify-queued-1",
             "creator_id": COORD,
             "assignee_id": EXEC,
@@ -404,6 +405,7 @@ async def test_maybe_reassign_skips_submitted_verify():
     handled = await maybe_reassign_stalled_verify(
         "p",
         {
+            "kind": "verify",
             "id": "v1",
             "title": "VERIFY: x",
             "status": "submitted",
@@ -432,6 +434,7 @@ async def test_nudge_stale_ledger_verify_escalation_calls_reassign():
     }
     tasks = [
         {
+            "kind": "verify",
             "id": tid,
             "creator_id": COORD,
             "assignee_id": EXEC,

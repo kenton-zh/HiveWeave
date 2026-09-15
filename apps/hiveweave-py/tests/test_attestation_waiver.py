@@ -167,6 +167,7 @@ async def test_waive_fail_verdict_rejected(env):
     task = {
         "id": "t-verify-fail",
         "title": "VERIFY: feature",
+        "kind": "verify",
         "tags": ["verify", "mandatory"],
         "assignee_id": "qa1",
         "evidence": {
@@ -223,6 +224,7 @@ async def test_waive_non_fail_verdict_unaffected(env):
     task = {
         "id": "t-verify-pass",
         "title": "VERIFY: feature",
+        "kind": "verify",
         "tags": ["verify", "mandatory"],
         "assignee_id": "qa1",
         "evidence": {"verdict": "PASS", "tests_passed": True},
@@ -278,6 +280,7 @@ async def test_waive_degraded_with_open_verify_rejected(env):
     task = {
         "id": "t-verify-e5",
         "title": "VERIFY: feature",
+        "kind": "verify",
         "tags": ["verify", "mandatory"],
         "assignee_id": "qa1",
         "evidence": {"verdict": "PASS", "tests_passed": True},
@@ -285,6 +288,7 @@ async def test_waive_degraded_with_open_verify_rejected(env):
     open_verify = {
         "id": "t-verify-open",
         "title": "VERIFY: other",
+        "kind": "verify",
         "tags": ["verify"],
         "assignee_id": "qa1",
     }
@@ -345,6 +349,7 @@ async def test_waive_normal_not_blocked_by_e5(env):
     task = {
         "id": "t-verify-e5b",
         "title": "VERIFY: feature",
+        "kind": "verify",
         "tags": ["verify", "mandatory"],
         "assignee_id": "qa1",
         "evidence": {"verdict": "PASS", "tests_passed": True},

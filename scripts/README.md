@@ -62,3 +62,42 @@ STATS DRIFT DETECTED — run scripts/gen-stats.py to refresh docs/stats.json
 
 - 行数为「文件物理行数」，包含空行与注释；用于趋势对照而非精确度量。
 - `@tool` / 路由装饰器靠正则匹配，遇到非常规写法（如装饰器跨多行且首行不闭合）可能漏计，按当前代码风格可覆盖。
+
+## scan_judgement_field.py
+
+扫描**「判定字段被消费时静默丢失」**的耦合点 —— 换判据字段（文本判据 → 状态列，如
+`kind`）时的固定探针。
+
+### 为什么需要它
+
+把某个判定从**文本判据**（标题子串）改成**状态判据**（DB 列）之后，真正的缺陷不是一处
+而是一类：凡是把「行的某个子集」交给判定的环节，只要那一步没带上该列，判定就**恒为
+「不匹配」**，依赖它的门**静默失效**（不报错、不打日志）。
+
+2026-09-14 实测（#11 把 VERIFY 判定从标题换成 `kind`）：同一形态一次撞见 **4 处**真缺陷，
+最严重的一处让「VERIFY 的 reviewer 必须钉在 creator」规则**永不生效**（等于开了自审后门）。
+
+### 三类载体
+
+| 类 | 形态 | 说明 |
+|---|---|---|
+| **A** | 窄 SELECT 缺列 × 同函数喂判定 | 函数里有 `FROM tasks` 的 SQL 常量、字段表不含目标列，且同函数出现判定调用 |
+| **B** | 中间视图缺键 | 本函数用 dict 字面量赋的局部变量直接传给判定，且该字面量无目标键。**最隐蔽**——`draft = {...}` 看着只是搬运字段 |
+| **C** | 测试面 fixture 缺键 | dict 字面量 `title` 以标记开头却无目标键 ⇒ 断言走「非匹配」分支（**假绿**） |
+
+### 用法
+
+```bash
+python scripts/scan_judgement_field.py                    # 默认 --field kind --marker VERIFY
+python scripts/scan_judgement_field.py --field kind --marker VERIFY
+python scripts/scan_judgement_field.py --kinds A B        # 只跑指定类别
+```
+
+### 判据性质与边界
+
+- 判的是**数据流缺列**（状态），**不是文案匹配** —— 与项目全局纪律一致。
+- **退出码恒为 0：这是盘点工具，不是 gate。** A/C 类含已知假阳性（窄行只用于读
+  `status`/`assignee_id`；测试**显式 stub 了判定**，或故意造「无该列」的负向对照）
+  ⇒ **逐条人核**。做成 gate 的唯一后果是训练人「红了就 append」。
+- 同类纪律见 `ratchet_positive_controls.py`。
+

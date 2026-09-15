@@ -4,10 +4,13 @@ TEST19 实测：磐石给普通模块验证任务打 tags=["verify", ...]，平�
 _is_verify_task 双通道判定把普通任务当 VERIFY 系统任务 → 自动归档
 (P0-1) / 隔离门拒绝 (P0-2) / 强制 main 跑测试 (P1-3) 全部误伤。
 
-修复后两条规则：
-1. _is_verify_task（及所有独立判定点）只认系统 VERIFY: 前缀。
+修复后两条规则（**#11 更新：判据从"标题前缀"改成 `kind` 字段**）：
+1. `_is_verify_task`（及所有独立判定点）**只读 `tasks.kind`**（状态判据）。
+   标题前缀只作**展示**，去掉它不改变任何门的行为。
 2. create_task 入口剥离 agent/user 提交的保留 tag
    （verify/mandatory/post-merge），source="system" 豁免。
+   `kind` 更进一步：**根本不是工具参数**（agent 拿不到这个字段），
+   守卫见 `tests/test_verify_serialization_lock.py::test_agent_facing_create_tool_has_no_kind_param`。
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from hiveweave.services.task import TaskService
 from hiveweave.services.tasks.verify import VerifyMixin
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 def _stored_tags(t: dict) -> list:
@@ -30,11 +34,11 @@ def _stored_tags(t: dict) -> list:
     return json.loads(raw) if isinstance(raw, str) else raw
 
 
-# ── 规则 1：判定只认前缀 ──────────────────────────────────────────
+# ── 规则 1：判定只读 kind（标题不参与）───────────────────────────
 
 
 async def test_is_verify_task_prefix_only(task_env):
-    """tags=verify 无前缀 → 普通任务；VERIFY: 前缀 → 系统 VERIFY。"""
+    """`tags=verify`/像 VERIFY 的标题 → 普通任务；`kind=verify` → 系统 VERIFY。"""
     ts = TaskService()
     pid = task_env["project_id"]
     plain = await ts.create_task(
@@ -48,7 +52,7 @@ async def test_is_verify_task_prefix_only(task_env):
         pid, "VERIFY: 模块A", "v",
         creator_id=COORD, assignee_id=EXEC, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     t2 = await ts.get_task(pid, sys_verify)
     assert VerifyMixin._is_verify_task(t2) is True
 
@@ -64,7 +68,7 @@ async def test_is_verify_task_prefix_only_preserves_system(task_env):
         pid, "VERIFY: Root", "verify", creator_id=COORD,
         assignee_id=EXEC, tags=["verify", "mandatory", "post-merge"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     t = await ts.get_task(pid, tid)
     assert VerifyMixin._is_verify_task(t) is True
 
@@ -81,10 +85,12 @@ async def test_row_is_verify_task_prefix_only(task_env):
         pid, "VERIFY: 模块B", "v",
         creator_id=COORD, assignee_id=EXEC, tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     for tid, expected in ((plain, False), (sys_v, True)):
         t = await ts.get_task(pid, tid)
-        assert _row_is_verify_task(t["title"], t["tags"]) is expected
+        # `_row_is_verify_task(kind)` 收的是**列值**（该文件的查询是窄 SELECT，
+        # 只取 t.kind —— 见其 docstring）
+        assert _row_is_verify_task(t.get("kind")) is expected
 
 
 # ── 规则 2：create_task 剥离保留 tag ─────────────────────────────
@@ -133,7 +139,7 @@ async def test_create_task_keeps_reserved_tags_for_system(task_env):
         creator_id=COORD, assignee_id=EXEC,
         tags=["verify", "mandatory", "post-merge"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     t = await ts.get_task(pid, tid)
     stored = _stored_tags(t)
     assert "verify" in stored
@@ -156,18 +162,31 @@ async def test_create_task_keeps_plain_tags(task_env):
 
 
 async def test_create_task_rejects_forged_verify_title(task_env):
-    """agent 不得伪造 VERIFY: 标题（系统 spawn 专属通道）。"""
+    """agent 起个像 VERIFY 的标题：**照建，但不被认成 VERIFY**（#11 新契约）。
+
+    改造前这里断言 `pytest.raises(ValueError, match="VERIFY:")` —— 那时靠
+    **标题正则**挡伪造。问题是同一套正则也是判据：改措辞/换语言/换个括号形态
+    就能两头穿透（H1 的历史就是"把宽松正则换成更严正则"），而且它会**误伤**
+    起名像 VERIFY 的普通任务（P0 的另一半）。
+
+    现在：标题**不参与任何判定**；伪造面改由「`kind` 不是工具参数」堵住
+    （agent 根本无法表达"我是 VERIFY"这个意图）。所以本用例的判据是
+    **状态**：建得成，且 `kind` 仍是 NULL ⇒ 它拿不到 VERIFY 的任何门。
+    """
     ts = TaskService()
     pid = task_env["project_id"]
-    with pytest.raises(ValueError, match="VERIFY:"):
-        await ts.create_task(
-            pid, "VERIFY: forged", "d",
-            creator_id=COORD, assignee_id=EXEC,
-        )
+    tid = await ts.create_task(
+        pid, "VERIFY: forged", "d",
+        creator_id=COORD, assignee_id=EXEC,
+    )
+    t = await ts.get_task(pid, tid)
+    assert t is not None
+    assert not t.get("kind"), "agent 起的 VERIFY 标题不得让 kind 变成 verify"
+    assert VerifyMixin._is_verify_task(t) is False
 
 
-async def test_update_task_strips_reserved_tags_and_rejects_verify_title(task_env):
-    """PATCH 同样剥保留 tag；不可把 title 改成 VERIFY:。"""
+async def test_update_task_strips_reserved_tags_and_ignores_verify_title(task_env):
+    """PATCH 同样剥保留 tag；**改标题成 VERIFY: 不改变任何门的行为**。"""
     ts = TaskService()
     pid = task_env["project_id"]
     tid = await ts.create_task(
@@ -181,5 +200,10 @@ async def test_update_task_strips_reserved_tags_and_rejects_verify_title(task_en
     assert "mandatory" not in stored
     assert "ui" in stored
 
-    with pytest.raises(ValueError, match="VERIFY:"):
-        await ts.update_task(pid, tid, title="VERIFY: sneaky")
+    # 改标题成 VERIFY: —— 允许（标题是**展示**），但门的行为**不变**
+    #（`kind` 未被工具暴露 ⇒ 改文案翻转不了任何验收门，这正是 #11 的验收点）。
+    await ts.update_task(pid, tid, title="VERIFY: sneaky")
+    after = await ts.get_task(pid, tid)
+    assert after["title"] == "VERIFY: sneaky", "标题本身照改（它不再是判据）"
+    assert not after.get("kind"), "改标题**不得**把 kind 变成 verify"
+    assert VerifyMixin._is_verify_task(after) is False

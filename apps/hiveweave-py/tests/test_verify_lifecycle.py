@@ -19,6 +19,7 @@ from hiveweave.tools.task_tools import (
 )
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 @pytest.mark.asyncio
@@ -47,7 +48,7 @@ async def test_verify_created_not_actionable_pre_merge(task_env):
         parent_task_id=parent_id,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     obs = await ts.get_actionable_obligations(pid, EXEC)
     ids = [t["id"] for t in obs]
     assert verify_id not in ids
@@ -119,7 +120,8 @@ async def test_spawn_verify_stays_created(task_env):
 @pytest.mark.asyncio
 async def test_spawn_skips_when_parent_assignee_is_qa(task_env):
     """QA's own delivery must not mint VERIFY-of-the-test-suite for a non-QA."""
-    from hiveweave.services.tasks.verify import is_verify_title
+    # #11：判定来源是 kind，标题判据（is_verify_title）已从运行时删除。
+    from hiveweave.services.tasks.verify import is_verify_task
 
     ts = TaskService()
     pid = task_env["project_id"]
@@ -166,7 +168,7 @@ async def test_spawn_skips_when_parent_assignee_is_qa(task_env):
         for t in await ts.list_tasks(pid, include_archived=True)
         if t.get("parent_task_id") == parent_id
     ]
-    assert not any(is_verify_title(t.get("title")) for t in kids)
+    assert not any(is_verify_task(t) for t in kids)
 
 
 async def _approve_task(ts, pid, assignee, title):
@@ -277,7 +279,7 @@ async def test_spawn_keeps_existing_verify_child_for_qa_parent(task_env):
         parent_task_id=parent_id,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     parent = await ts.get_task(pid, parent_id)
     with patch(
         "hiveweave.services.org.OrgService.get_agent",
@@ -315,7 +317,7 @@ async def test_nudge_claims_then_obligation(task_env):
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     verify = await ts.get_task(pid, verify_id)
 
     with (
@@ -372,7 +374,7 @@ async def test_stale_verify_nudge_claims_and_triggers(task_env):
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     from hiveweave.services import task as task_module
     from hiveweave.tools import task_tools as tt
 
@@ -439,7 +441,7 @@ async def test_stale_verify_respects_cooldown(task_env):
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     old_ms = int(time.time() * 1000) - VERIFY_STALE_MS - 60_000
     await task_module._execute(
         pid, "UPDATE tasks SET updated_at = ? WHERE id = ?", [old_ms, verify_id]
@@ -495,7 +497,7 @@ async def test_stale_verify_not_nudged_when_fresh(task_env):
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
 
     with patch(
         "hiveweave.tools.tasks.verify_merge._nudge_one_verify_task",
@@ -528,7 +530,7 @@ async def _make_verify(pid, ts, title="UI"):
         parent_task_id=parent_id,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     return verify_id
 
 

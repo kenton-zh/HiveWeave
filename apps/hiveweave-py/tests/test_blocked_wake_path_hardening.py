@@ -32,6 +32,7 @@ from hiveweave.tools.tasks.lifecycle import (
 )
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 PROJECT_ID = "test-blocked-wake-path"
 CEO_ID = "test-ceo"
@@ -251,12 +252,12 @@ async def test_claim_gate_names_blocked_blocker_with_wake_path(task_env):
         pid, "VERIFY: UI A", "verify",
         creator_id=COORD, assignee_id=EXEC,
         source="system",
-    )
+        kind=VERIFY_KIND)
     queued_b = await ts.create_task(
         pid, "VERIFY: UI B", "verify",
         creator_id=COORD, assignee_id=EXEC,
         source="system",
-    )
+        kind=VERIFY_KIND)
     dep = await ts.create_task(pid, "Blocker", "d",
                                creator_id=COORD, assignee_id=EXEC)
     await ts.claim_task(pid, blocker_a, EXEC)
@@ -284,11 +285,11 @@ async def test_unblock_verify_rejected_while_another_in_flight(task_env):
     running_a = await ts.create_task(
         pid, "VERIFY: UI A", "verify",
         creator_id=COORD, assignee_id=EXEC, source="system",
-    )
+        kind=VERIFY_KIND)
     parked_b = await ts.create_task(
         pid, "VERIFY: UI B", "verify",
         creator_id=COORD, assignee_id=EXEC, source="system",
-    )
+        kind=VERIFY_KIND)
     # 先 park B（blocked 无解封路径，不占锁），再 claim A 使其在飞
     await ts.claim_task(pid, parked_b, EXEC)
     await ts.start_task(pid, parked_b)
@@ -312,7 +313,7 @@ async def test_unblock_verify_allowed_when_no_in_flight(task_env):
     parked = await ts.create_task(
         pid, "VERIFY: UI C", "verify",
         creator_id=COORD, assignee_id=EXEC, source="system",
-    )
+        kind=VERIFY_KIND)
     plain = await ts.create_task(
         pid, "Plain", "d", creator_id=COORD, assignee_id=EXEC
     )
@@ -455,7 +456,7 @@ async def test_watchdog_parked_blocked_notified_to_creator_despite_live_wait(
     pid = gt_env["project_id"]
     tid = await ts.create_task(pid, "VERIFY: UI A", "verify",
                                creator_id=CEO_ID, assignee_id=QA_ID,
-                               source="system")
+                               source="system", kind=VERIFY_KIND)
     await ts.claim_task(pid, tid, QA_ID)
     await ts.start_task(pid, tid)
     await ts.block_task(pid, tid, "归零策略：等全部合并后批量验收")
@@ -484,7 +485,7 @@ async def test_watchdog_has_wake_path_with_live_wait_is_skipped(gt_env):
                                    creator_id=CEO_ID, assignee_id=QA_ID)
     tid = await ts.create_task(pid, "VERIFY: UI B", "verify",
                                creator_id=CEO_ID, assignee_id=QA_ID,
-                               source="system")
+                               source="system", kind=VERIFY_KIND)
     await ts.claim_task(pid, tid, QA_ID)
     await ts.start_task(pid, tid)
     await ts.block_task(pid, tid, "等 blocker",

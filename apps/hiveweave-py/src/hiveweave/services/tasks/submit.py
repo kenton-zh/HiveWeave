@@ -222,7 +222,7 @@ class SubmitMixin:
         # only fills when column is empty (non-VERIFY). VERIFY always → creator.
         meta_rows = await _query(
             project_id,
-            "SELECT assignee_id, creator_id, reviewer_id, tags, title "
+            "SELECT assignee_id, creator_id, reviewer_id, tags, title, kind "
             "FROM tasks WHERE id = ?",
             [task_id],
         )
@@ -231,9 +231,13 @@ class SubmitMixin:
         if meta_rows:
             creator_id = meta_rows[0]["creator_id"]
             existing_reviewer = meta_rows[0]["reviewer_id"]
+            # ⚠ 这里的 draft 是「中间视图」：字段缺一个，下游判定就静默走错分支。
+            # `kind` 必须带上 —— #11 后 `_is_verify_task` 只读 kind；漏掉它会让
+            # VERIFY 的「reviewer 钉 creator」规则**永不生效**（reviewer 可自审）。
             draft = {
                 "tags": meta_rows[0]["tags"],
                 "title": meta_rows[0]["title"],
+                "kind": meta_rows[0]["kind"],
             }
             if self._is_verify_task(draft):
                 reviewer_id = creator_id

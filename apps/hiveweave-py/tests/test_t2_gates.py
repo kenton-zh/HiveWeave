@@ -101,6 +101,7 @@ async def test_review_self_forbidden_even_with_waiver():
     task = {
         "id": "t-v",
         "title": "VERIFY: x",
+        "kind": "verify",  # #11：VERIFY 判定读 kind（review_task_tool 用它分流）
         "tags": ["verify"],
         "assignee_id": "qa1",
         "status": "submitted",

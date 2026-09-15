@@ -120,6 +120,20 @@ class CrudMixin:
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
 
+        # `kind` 是闭合枚举：非成员**拒绝**（不写进库、更不许静默当普通任务）。
+        # 「未知」在读取侧一律 None（不猜，见 task_kind），但**写入侧**必须
+        # fail loud —— 否则一个拼错的 kind 会静默退化成普通任务，而"它本该是
+        # VERIFY"这件事永远不会有人知道。
+        if kind is not None:
+            from hiveweave.services.tasks.verify import task_kind as _norm_kind
+
+            if _norm_kind({"kind": kind}) is None:
+                raise ValueError(
+                    f"unknown task kind {kind!r}: 必须是闭合枚举成员或 None"
+                    "（见 services/tasks/verify.py::VERIFY_KIND）"
+                )
+            kind = _norm_kind({"kind": kind})
+
         # VERIFY: 前缀 + 保留 tag 均为系统专属。agent/user 不得伪造。
         tags = _strip_platform_reserved_tags(tags, source=source, title=title)
 
@@ -158,7 +172,16 @@ class CrudMixin:
 
         wait_kind: str | None = None
         blocked_reason: str | None = None
-        draft_for_verify = {"title": title, "tags": tags or []}
+        # ⚠ `kind` **必须**在这个"函数内视图"里（#11 遗留缺口，2026-09-14 实测）：
+        # 判定函数 `_is_verify_task` 读的是 dict 的 `kind`，而下面两处 draft 一度
+        # 只带 title/tags ⇒ 即便 INSERT 把 kind 写进了库，**本函数内部的每个决策
+        # 看到的仍是"没有 kind"** ⇒ 一律按普通任务处理：
+        #   · assign-as-claim：VERIFY 被插成 `claimed`（绕过 claim 路径 ⇒ 串行锁
+        #     在创建口就被跳过）；
+        #   · depends_on 自动阻塞：VERIFY 被错误地自动 block。
+        # 这是"字段加了、但调用链里的**中间视图**没加"的典型：单测绿（读库往返
+        # 正常）、生产里行为不对。守卫：tests/test_verify_serialization_lock.py。
+        draft_for_verify = {"title": title, "tags": tags or [], "kind": kind}
         auto_block_deps = bool(depends_on) and not self._is_verify_task(
             draft_for_verify
         )
@@ -221,6 +244,7 @@ class CrudMixin:
         draft = {
             "title": title,
             "tags": tags or [],
+            "kind": kind,   # 同上：判定读这个键，缺了就把 VERIFY 当普通任务
         }
         assign_is_claim = (
             bool(assignee_id)

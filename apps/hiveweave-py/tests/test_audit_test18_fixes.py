@@ -413,6 +413,7 @@ async def test_bind_sole_verify_created_without_task_id():
     verify = {
         "id": "v-created",
         "title": "VERIFY: parent module",
+        "kind": "verify",  # #11：判定来源
         "status": "created",
         "assignee_id": "qa-1",
         "tags": ["verify"],
@@ -427,8 +428,7 @@ async def test_bind_sole_verify_created_without_task_id():
         ),
         patch(
             "hiveweave.services.task.TaskService._is_verify_task",
-            side_effect=lambda t: "verify" in (t.get("tags") or [])
-            or str(t.get("title") or "").startswith("VERIFY:"),
+            side_effect=lambda t: t.get("kind") == "verify",
         ),
     ):
         tid, note = await _resolve_test_attestation_task_id(
@@ -446,6 +446,7 @@ async def test_bind_prefers_verify_over_other_running():
     verify = {
         "id": "v-1",
         "title": "VERIFY: parent",
+        "kind": "verify",  # #11：判定来源
         "status": "created",
         "assignee_id": "qa-1",
         "tags": ["verify"],
@@ -464,7 +465,7 @@ async def test_bind_prefers_verify_over_other_running():
         ),
         patch(
             "hiveweave.services.task.TaskService._is_verify_task",
-            side_effect=lambda t: "verify" in (t.get("tags") or []),
+            side_effect=lambda t: t.get("kind") == "verify",
         ),
     ):
         tid, note = await _resolve_test_attestation_task_id(

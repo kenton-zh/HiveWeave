@@ -18,12 +18,18 @@ def _exec(i: int) -> dict:
     }
 
 
-def _task(status: str, assignee: str = "", title: str = "Feature") -> dict:
+def _task(
+    status: str,
+    assignee: str = "",
+    title: str = "Feature",
+    kind: str | None = None,
+) -> dict:
     return {
         "id": title + status + assignee,
         "status": status,
         "assignee_id": assignee,
         "title": title,
+        "kind": kind,  # #11：VERIFY 判定读 kind，不再读标题
         "is_archived": 0,
     }
 
@@ -81,8 +87,8 @@ def test_verify_tasks_not_counted_as_executor_work():
     2 个 VERIFY 活 vs 2 在编 executor → open=0，提示为 0 < 2。"""
     agents = [_exec(i) for i in range(2)]
     tasks = [
-        _task("created", title="VERIFY: UI A"),
-        _task("created", title="VERIFY: UI B"),
+        _task("created", title="VERIFY: UI A", kind="verify"),
+        _task("created", title="VERIFY: UI B", kind="verify"),
     ]
     note = staffing_advisory(agents=agents, tasks=tasks)
     assert note is not None

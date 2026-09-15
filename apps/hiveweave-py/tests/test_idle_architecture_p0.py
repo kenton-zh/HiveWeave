@@ -20,6 +20,7 @@ from hiveweave.services.process_registry import (
 )
 from hiveweave.services.task import TaskService
 from hiveweave.services.wake_policy import classify_message, should_wake
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 def test_notify_still_wakes():
@@ -211,7 +212,7 @@ async def test_verify_approve_closes_parent(task_env):
         parent_task_id=parent_id,
         tags=["verify"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(

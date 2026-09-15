@@ -40,6 +40,7 @@ def test_get_workspace_path_source_does_not_rewrite_verify():
 
 def _verify_task():
     return {
+        "kind": "verify",
         "id": "v-1",
         "title": "VERIFY: MAIN QA",
         "status": "running",

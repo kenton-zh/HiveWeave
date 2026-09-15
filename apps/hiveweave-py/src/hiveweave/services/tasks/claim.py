@@ -121,8 +121,14 @@ class ClaimMixin:
         （锁已持有、检查已做，直接 claim）。
         """
         task_id = await self.require_task_id(project_id, task_id)
+        # ⚠ **必须带 `kind`**（#11 遗留缺口，2026-09-14 实测）：下面
+        # `self._is_verify_task(row)` 读的是行里的 `kind`；这里漏了它 ⇒ 每个
+        # 任务看起来都不是 VERIFY ⇒ **整个验收串行锁（上面的 docstring 描述的
+        # 那套锁）一行都不执行**，而且是静默的（没有报错、没有日志）。
+        # 这正是"窄 SELECT 漏字段"这一类：字段加了、读取点没跟着加。
+        # 守卫：tests/test_verify_serialization_lock.py::test_second_verify_claim_is_blocked
         rows = await _query(project_id,
-            "SELECT status, assignee_id, title FROM tasks WHERE id = ?", [task_id])
+            "SELECT status, assignee_id, title, kind FROM tasks WHERE id = ?", [task_id])
         if not rows:
             raise ValueError(f"Task not found: {task_id}")
         row = dict(rows[0])

@@ -19,6 +19,7 @@ from hiveweave.services import task as task_module
 from hiveweave.services.task import TaskService
 
 from tests.test_idle_architecture_p0 import COORD, EXEC, task_env  # noqa: F401
+from hiveweave.services.tasks.verify import VERIFY_KIND
 
 
 async def _mk_verify_running(ts: TaskService, pid: str) -> str:
@@ -31,7 +32,7 @@ async def _mk_verify_running(ts: TaskService, pid: str) -> str:
         assignee_id=EXEC,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     # 单测会在同一 project DB 里并行建多条 VERIFY 行——绕过单飞串行化锁
     # （平台运行时由 _nudge_one_verify_task 持锁 claim，测试不走该路径）。
     await ts.claim_task(pid, verify_id, EXEC, bypass_verify_serialize=True)
@@ -364,7 +365,7 @@ async def _mk_verify_running_for(ts: TaskService, pid: str, agent: str) -> str:
         assignee_id=agent,
         tags=["verify", "mandatory"],
         source="system",
-    )
+        kind=VERIFY_KIND)
     await ts.claim_task(pid, verify_id, agent, bypass_verify_serialize=True)
     await ts.start_task(pid, verify_id)
     assert (await ts.get_task(pid, verify_id))["status"] == "running"
