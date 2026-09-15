@@ -576,21 +576,27 @@ async def test_dev_server_tool_out_of_bounds_write_succeeds_when_sandbox_off(
     for p in patches:
         p.start()
     try:
-        # ⚠ 关沙箱（autouse 夹具开了它）⇒ 走原生 spawn 路径
+        # ⚠ 关沙箱（autouse 夹具开了它）⇒ 判定为原生 ⇒ 走原生 spawn 路径。
+        # #1 治本后判定点是 `policy.sandbox_disabled_reason()`（读同一 settings）。
         monkeypatch.setattr(settings, "acl_sandbox", False)
+        # 诊断留在断言里（失败时要说清"是没跑"还是"跑了没写出来"—— 二者
+        # 对应完全不同的下一步动作，而 `except: pass` 会把区别吃掉）。
+        res: object = None
+        exc: BaseException | None = None
         try:
-            await start_dev_server_tool(
+            res = await start_dev_server_tool(
                 StartDevServerParams(command=cmd, preferred_port=3198),
                 "A001",
                 str(ws),
             )
-        except Exception:  # noqa: BLE001 — 只关心文件是否出现
-            pass
+        except Exception as e:  # noqa: BLE001 — 只关心文件是否出现
+            exc = e
     finally:
         for p in reversed(patches):
             p.stop()
 
     assert target.exists(), (
         "★ 沙箱关闭时同一越界命令**也没写出文件** ⇒ 上一条的『文件不存在』是"
-        "**恒真**（没跑到 spawn），那条测试其实什么都没证明 —— 必须先修测试环境"
+        f"**恒真**（没跑到 spawn），那条测试其实什么都没证明。\n"
+        f"  工具回执：{res!r}\n  抛出的异常：{exc!r}"
     )

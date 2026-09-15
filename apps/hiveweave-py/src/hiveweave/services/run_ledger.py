@@ -404,6 +404,7 @@ class RunLedger:
         injection_applied: bool | None = None,
         timeout_kind: str | None = None,
         timeout_ms: int | None = None,
+        enforcement: str | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -416,6 +417,14 @@ class RunLedger:
         ``timeout_kind`` / ``timeout_ms`` 均 best-effort 落库；
         None = 不写（保持既有缺省），调用方只在能确定时传值 —— 未确定
         不得臆断，宁可留空也不给错误归因（对齐 DSH「致命证据优先于拒绝」）。
+
+        ``enforcement``（#1 治本，2026-09-14）：本条命令**实际**走的执行面
+        （``confined`` / ``native``，由 `acl_sandbox.entry.spawn_agent_command`
+        无条件盖戳）。它回答的是「这次调用有没有被沙箱约束」——在改造前
+        这个问题**无法从账本回答**：沙箱路由是每个工具自己的约定，漏接不产生
+        任何信号（`start_dev_server` 从未接线而照样跑）。
+        ⚠ 非 spawn 类工具（write_file 等）与遗留行一律 NULL = 「不适用/未判定」，
+        不要回填成 ``native``（那会把"没这条信息"说成"确认无沙箱"）。
         """
         now = _now_ms()
         if result_excerpt and len(result_excerpt) > 2048:
@@ -442,9 +451,11 @@ class RunLedger:
             params = [status, result_hash, result_size, result_excerpt, error,
                       now, duration, step_id]
             # F4 事实位 / F7 超时分类 —— 允许为主更新字段拼接。
+            # enforcement 同批拼接：它是**观测字段**（不是归因），值为闭合枚举
+            # 或 NULL；不参与 COALESCE 组合语义（一条步骤只可能走一条路）。
             if any(v is not None for v in (
                 runner_failed, command_failed, injection_applied,
-                timeout_kind, timeout_ms,
+                timeout_kind, timeout_ms, enforcement,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -454,7 +465,8 @@ class RunLedger:
                     "command_failed = COALESCE(?, command_failed), "
                     "injection_applied = COALESCE(?, injection_applied), "
                     "timeout_kind = COALESCE(?, timeout_kind), "
-                    "timeout_ms = COALESCE(?, timeout_ms) "
+                    "timeout_ms = COALESCE(?, timeout_ms), "
+                    "enforcement = COALESCE(?, enforcement) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -467,6 +479,7 @@ class RunLedger:
                     None if injection_applied is None else (1 if injection_applied else 0),
                     timeout_kind,
                     timeout_ms,
+                    enforcement,
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层

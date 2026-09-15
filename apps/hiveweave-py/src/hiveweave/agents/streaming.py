@@ -330,6 +330,10 @@ async def on_tool_call(
                 injection_applied=result.get("injection_applied"),
                 timeout_kind=result.get("timeout_kind"),
                 timeout_ms=result.get("timeout_ms"),
+                # #1 治本：执行面（confined/native）落库。spawn 类工具由
+                # `acl_sandbox.entry.spawn_agent_command` 无条件盖戳（含原生
+                # 分支）；非 spawn 工具没有该键 ⇒ None ⇒ 列留 NULL（不适用）。
+                enforcement=result.get("enforcement"),
             )
         except Exception as e:
             log.debug("run_ledger.step_end_failed", error=str(e))

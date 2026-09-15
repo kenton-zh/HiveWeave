@@ -29,6 +29,12 @@ from hiveweave.tools.dev_server_tools import (
     start_dev_server_tool,
 )
 
+# #1 治本（2026-09-14）：本文件的用例与**沙箱路由无关**（测 cwd 校验 /
+# 端口 / 注册表 / alarm 脚本安全校验），而 spawn 现在必经唯一判定点 ——
+# pytest 的 tmp workspace 不满足受限令牌前置条件 ⇒ 显式声明走原生执行面，
+# 保持这些用例的被测语义（改造前它们隐式就在原生路径上）。
+pytestmark = pytest.mark.usefixtures("native_sandbox_plane")
+
 TEST_AGENT = "agent-m6"
 TEST_PROJECT = "test-m6-project"
 
@@ -235,6 +241,9 @@ async def test_agent_active_verify_task_detects_inflight(monkeypatch):
     verify_row = {
         "id": "t-verify-1",
         "title": "VERIFY: milestone QA",
+        # #11（2026-09-14）：判定读 `kind`，**标题只是展示** —— 造行必须带上它，
+        # 否则测试造的是一个"标题像 VERIFY 的普通任务"（那样的行**不该**被认）。
+        "kind": "verify",
         "status": "claimed",
         "assignee_id": TEST_AGENT,
         "policy_id": "verify",

@@ -1650,64 +1650,89 @@ class GameTimeService:
                         # P1 (spec §5.7)：alarm 收编进 ACL 沙箱（项目根边界）。
                         # 顺带修复现状缺陷：native 路径继承后端 cwd（HiveWeave
                         # 源码树）且不受限 —— 受限路径以项目根为 workdir。
+                        # #1 治本：判定/路由/盖戳走**唯一入口**（与 bash /
+                        # run_command / dev_server / python_script 同源）。
                         project_id_here = _alarm_project.get(alarm["id"], "")
                         agent_here = (
                             alarm.get("to_agent_id") or alarm.get("from_agent_id")
                             or "alarm"
                         )
-                        confined = None
                         project_root = None
+                        from hiveweave.services.acl_sandbox.entry import (
+                            spawn_agent_command,
+                        )
                         from hiveweave.services.acl_sandbox.integration import (
-                            acl_sandbox_active,
                             resolve_project_root,
                         )
+                        from hiveweave.services.acl_sandbox.policy import (
+                            resolve_spawn_decision,
+                        )
 
-                        if acl_sandbox_active():
-                            from hiveweave.services.acl_sandbox.service import (
-                                spawn_confined,
-                            )
-                            from hiveweave.util.win_subprocess import list2cmdline
-
+                        # ⚠ 项目根在受限分支是 alarm 的**工作目录**，因此受限判定
+                        # 下必须解析成功；解析不到 ⇒ **整个脚本跳过**（含原生回退，
+                        # 原生会继承后端 cwd 且不受限）。
+                        # 【行为变更·2026-09-14】此前这里**自称** fail-closed，
+                        # 实际只是打了一条 `..._skipped` 警告就**落进原生路径把
+                        # 脚本跑了**（注释与代码不一致，"看似有守卫"）。现在按
+                        # 注释执行：受限判定 + 项目根解析失败 ⇒ 不跑。
+                        decision = await resolve_spawn_decision(project_id_here)
+                        if decision.confined:
                             project_root = await resolve_project_root(project_id_here)
                             if not project_root:
-                                # fail-closed：沙箱 on 但项目根解析失败 → 跳过脚本，
-                                # 绝不回退原生（原生会继承后端 cwd 且不受限）。
                                 log.warning(
                                     "alarm_script_sandbox_unresolved_skipped",
                                     alarm_id=alarm["id"],
                                     project_id=project_id_here,
                                 )
-                            else:
-                                sres = await spawn_confined(
+
+                        if not decision.confined or project_root:
+                            from hiveweave.services.acl_sandbox.service import (
+                                spawn_confined,
+                            )
+                            from hiveweave.util.win_subprocess import list2cmdline
+
+                            async def _confined(ctx):
+                                return await spawn_confined(
                                     command=list2cmdline(cmd_parts),
-                                    workdir=project_root,
-                                    workspace_path=project_root,
-                                    agent_id=agent_here,
-                                    project_id=project_id_here,
-                                    project_workspace_path=project_root,
-                                    entry="alarm",
                                     timeout_s=120,
+                                    **ctx.confined_kwargs(),
                                 )
-                                if sres is not None:
-                                    confined = sres
-                                    stdout = (sres.get("stdout") or "").encode()
-                                    stderr = (sres.get("stderr") or "").encode()
-                                    rc = sres.get("exit_code")
 
-                        if confined is None:
-                            safe_env = filtered_environ()
-                            from hiveweave.util.win_subprocess import hidden_exec
+                            async def _native():
+                                from hiveweave.util.win_subprocess import (
+                                    hidden_exec,
+                                )
 
-                            proc = await hidden_exec(
-                                *cmd_parts,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                                env=safe_env,
+                                safe_env = filtered_environ()
+                                proc = await hidden_exec(
+                                    *cmd_parts,
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE,
+                                    env=safe_env,
+                                )
+                                out_b, err_b = await asyncio.wait_for(
+                                    proc.communicate(), timeout=120
+                                )
+                                return out_b, err_b, proc.returncode
+
+                            routed = await spawn_agent_command(
+                                entry="alarm",
+                                agent_id=agent_here,
+                                workspace_path=project_root or "",
+                                workdir=project_root or "",
+                                project_id=project_id_here,
+                                project_root=project_root,
+                                decision=decision,
+                                confined=_confined,
+                                native=_native,
                             )
-                            stdout, stderr = await asyncio.wait_for(
-                                proc.communicate(), timeout=120
-                            )
-                            rc = proc.returncode
+                            sres = routed.result
+                            if routed.native:
+                                stdout, stderr, rc = sres
+                            else:
+                                stdout = (sres.get("stdout") or "").encode()
+                                stderr = (sres.get("stderr") or "").encode()
+                                rc = sres.get("exit_code")
                         if rc not in (0, None):
                             log.warning(
                                 "alarm_script_failed",

@@ -80,6 +80,21 @@ def test_build_confined_argv_shape():
     assert "hello" in argv[-1].lower()
 
 
+def _native_decision():
+    """原生判定（沙箱配置关）—— #1 治本后的**唯一判定接缝**。
+
+    改造前这些用例 patch `integration.acl_sandbox_active`；判定搬进
+    `policy.resolve_spawn_decision` 后那个 patch 不再被任何代码读取
+    （静默失效）。测试必须跟着接缝走，否则"绿"是假绿。
+    """
+    from hiveweave.services.acl_sandbox.policy import (
+        R_NATIVE_CONFIG_OFF,
+        make_decision,
+    )
+
+    return make_decision(R_NATIVE_CONFIG_OFF)
+
+
 def test_spawn_confined_requires_command_or_argv():
     from hiveweave.services.acl_sandbox.service import spawn_confined
 
@@ -115,8 +130,8 @@ async def test_python_script_runs_code_native(tmpdir):
     ws = str(tmpdir)
     with (
         patch(
-            "hiveweave.services.acl_sandbox.integration.acl_sandbox_active",
-            return_value=False,
+            "hiveweave.services.acl_sandbox.policy.resolve_spawn_decision",
+            new=AsyncMock(return_value=_native_decision()),
         ),
         patch("hiveweave.tools.helpers.get_project_id", new=AsyncMock(return_value="p1")),
     ):
@@ -137,8 +152,8 @@ async def test_python_script_error_surface(tmpdir):
     ws = str(tmpdir)
     with (
         patch(
-            "hiveweave.services.acl_sandbox.integration.acl_sandbox_active",
-            return_value=False,
+            "hiveweave.services.acl_sandbox.policy.resolve_spawn_decision",
+            new=AsyncMock(return_value=_native_decision()),
         ),
         patch("hiveweave.tools.helpers.get_project_id", new=AsyncMock(return_value="p1")),
     ):

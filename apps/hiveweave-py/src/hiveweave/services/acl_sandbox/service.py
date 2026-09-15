@@ -6,6 +6,11 @@
   c) 项目 sandbox_mode=danger-full-access（P3 §9 逃生门，显式配置性信任）
 其余一切异常（含意外 bug）→ SandboxUnavailableError，绝不降级 native。
 
+⚠ #1 治本（2026-09-14）：上面三条**不再由本模块判定**，而是
+`policy.resolve_spawn_decision()` 的三条具名理由；None 的**语义**归判定层所有
+（并只由 `entry.spawn_agent_command` 消费）。本模块是**受限执行器**：
+传了 `decision` 就用它（不重判），原生判定传进来直接 ValueError。
+
 verify-then-skip（§5.6 v2）：**不做正向 grant 缓存**。每命令读根 DACL 确认
 ACE 在场才放行 —— worktree 删除后同路径重建/项目删除重建/workspace 迁移
 全都天然正确，正确性不依赖缓存失效钩子。
@@ -35,7 +40,10 @@ from hiveweave.services.acl_sandbox.grant import (
     WRITE_OWNER,
     WriteGrant,
 )
-from hiveweave.services.acl_sandbox.policy import resolve_policy
+from hiveweave.services.acl_sandbox.policy import (
+    SpawnDecision,
+    resolve_policy,
+)
 from hiveweave.services.acl_sandbox.sid import cache_sid, extra_sid, git_sid, worktree_sid
 from hiveweave.services.acl_sandbox.spawn import ConfinedRunner
 from hiveweave.services.acl_sandbox.token import RestrictedTokenFactory
@@ -638,26 +646,41 @@ async def spawn_confined(
     entry: str = "bash",
     long_running: bool = False,
     env_extra: dict[str, str] | None = None,
+    decision: SpawnDecision | None = None,
 ) -> dict | None:
-    """受限执行入口。返回 None 的仅两种情形：非 Windows / 配置关。
+    """受限执行入口。返回 None 的仅两种情形：非 Windows / 配置关 / 项目级逃生门。
 
     ``project_workspace_path`` = 项目根（git/cache SID 派生源 §4.8/§8）；
     缺省回退到 workspace_path（P0 单目录形态）。
     ``env_extra`` = 调用方增量 env（dev server 端口注入等）。
     E10：优先 ``argv``（逐元素引用修剥引号根因）；不传回退整串 ``command``。
+
+    ``decision``（#1 治本）：**判定由 `policy.resolve_spawn_decision` 做，
+    本函数的职责只是执行**。不传 ⇒ 本函数自己调判定（兼容既有调用方，
+    行为与改造前逐字节一致）；传了 ⇒ **不重判**（避免判定与执行之间的
+    TOCTOU），且判定为原生时**抛 ValueError** —— 路由必须由
+    `entry.spawn_agent_command` 做，把原生判定传进来再期待"自动降级"
+    正是本条要消灭的形态（同一个 None 被五处各自解释）。
+
+    结果字典随 `enforcement*` 戳一并返回（见 `SpawnDecision.stamp`）：
+    强度是 **partial**（受限令牌只约束写），不是"已隔离"。
     """
     if argv is None and command is None:
         raise ValueError("spawn_confined requires command or argv")
-    if not _is_windows():
-        return None
-    if not settings.acl_sandbox:
-        return None
 
-    # P3 (§9)：项目级 sandbox_mode=danger-full-access 逃生门 —— 信任项目，
-    # 跳过受限令牌（降级 native，属显式配置性开关，与 fail-closed 正交）。
-    from hiveweave.services.acl_sandbox.integration import project_sandbox_mode
+    decision_explicit = decision is not None
+    if decision is None:
+        # 经模块属性调用（不是 import 名）：判定点是全平台唯一的接缝。
+        from hiveweave.services.acl_sandbox import policy
 
-    if await project_sandbox_mode(project_id) == "danger-full-access":
+        decision = await policy.resolve_spawn_decision(project_id)
+    if not decision.confined:
+        if decision_explicit:
+            raise ValueError(
+                f"spawn_confined 收到原生判定（reason={decision.reason!r}）——"
+                "spawn 路由必须由 entry.spawn_agent_command 做；"
+                "不要把判定结果传进来再期待它自动降级（#1：None 的五种解释）"
+            )
         return None
 
     agrant = _AsyncGrant(WriteGrant())
@@ -706,11 +729,16 @@ async def spawn_confined(
                     "private_cache_dir": os.path.join(
                         policy.temp_dir, "cache"
                     ),
+                    **decision.stamp(boundary_root=policy.boundary_root),
                 }
             result = await runner.run_foreground(
                 token, command, workdir, env, timeout_s,
                 **({"argv": argv} if argv is not None else {}),
             )
+            result = {
+                **(result or {}),
+                **decision.stamp(boundary_root=policy.boundary_root),
+            }
         finally:
             token.Close()
     except SandboxUnavailableError:

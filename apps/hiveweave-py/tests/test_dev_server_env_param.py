@@ -23,6 +23,12 @@ from tests.test_dev_server_cwd_precheck import (
     _FakeProc,
 )
 
+# #1 治本（2026-09-14）：本文件的用例与**沙箱路由无关**（测 cwd 校验 /
+# 端口 / 注册表 / alarm 脚本安全校验），而 spawn 现在必经唯一判定点 ——
+# pytest 的 tmp workspace 不满足受限令牌前置条件 ⇒ 显式声明走原生执行面，
+# 保持这些用例的被测语义（改造前它们隐式就在原生路径上）。
+pytestmark = pytest.mark.usefixtures("native_sandbox_plane")
+
 
 async def _run_start(monkeypatch, tmp_path, params: StartDevServerParams):
     """复用 cwd_precheck 测试的桩件（项目 id / spawn / 健康检查秒过）。"""

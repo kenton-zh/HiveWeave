@@ -619,7 +619,8 @@ PROJECT_DB_TABLES = [
         timeout_ms INTEGER,
         outcome_unknown INTEGER DEFAULT 0,
         not_started INTEGER DEFAULT 0,
-        started INTEGER DEFAULT 0
+        started INTEGER DEFAULT 0,
+        enforcement TEXT
     )
     """,
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
@@ -684,6 +685,15 @@ PROJECT_DB_TABLES = [
     # 正是本修复要避免的那次**副作用双发邀请**。不写 DEFAULT ⇒ 存量行为 NULL。
     # 新行由 `record_step_start` 的 INSERT **显式**写 started=0（不依赖列默认值）。
     """ALTER TABLE run_steps ADD COLUMN started INTEGER""",
+    # #1 治本（2026-09-14）：**执行面观测字段** —— 这条命令实际走的哪条路
+    # （`confined` / `native`），由 `acl_sandbox.entry.spawn_agent_command`
+    # 无条件盖戳（含原生分支），工具结果透传。
+    # 为什么需要它：改造前沙箱路由是**每个工具自己的约定**，漏接不产生任何
+    # 信号（实证：`start_dev_server` 从未 import 过 sandbox 而照样以平台身份
+    # 执行任意 command）。有了这一列，「某次调用到底有没有沙箱」才可查。
+    # ⚠ **不写 DEFAULT**：非 spawn 类工具与升级前遗留行必须是 NULL
+    # （= 不适用/未判定）；回填成 'native' 会把"没这条信息"说成"确认无沙箱"。
+    """ALTER TABLE run_steps ADD COLUMN enforcement TEXT""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -865,7 +875,7 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     "run_steps": {
         "runner_failed", "command_failed", "injection_applied",
         "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
-        "started",
+        "started", "enforcement",
     },
 }
 

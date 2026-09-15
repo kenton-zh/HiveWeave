@@ -13,10 +13,15 @@
    且 **`spawn_project_process` 一次都不被调用**（后者＝平台身份无沙箱）；
 2. **沙箱不可用 ⇒ fail-closed**：干净拒绝，**绝不静默降级为原生 spawn**
    （「以为在沙箱里、其实在沙箱外」是本条最坏的形态）；
-3. **反面对照**：沙箱配置关 ⇒ 回落原生路径（确认没有把正常路径改死）。
+3. **反面对照**：判定为原生 ⇒ 回落原生路径（确认没有把正常路径改死）。
 
 ⚠ 不断言"越界命令真的被拒" —— 那要真沙箱（Windows ACL/CreateProcessAsUser），
 属真机实调；本文件钉的是**路由**（"命令走哪条 spawn"），路由错了后面全错。
+
+⚠ #1 治本后**控制面换了**：路由由 `entry.spawn_agent_command` 经
+`policy.resolve_spawn_decision` 决定 —— 所以本文件 patch 的是那个判定函数，
+而**不是** `integration.acl_sandbox_active`（后者已退化为布尔视图，工具侧
+不再读它；继续 patch 它会让本文件静默失去控制力 = 假绿）。
 """
 
 from __future__ import annotations
@@ -24,10 +29,22 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from hiveweave.services.acl_sandbox.policy import (
+    R_CONFINED,
+    R_NATIVE_CONFIG_OFF,
+    make_decision,
+)
 from hiveweave.tools.dev_server_tools import (
     StartDevServerParams,
     start_dev_server_tool,
 )
+
+_DECISION_SEAM = "hiveweave.services.acl_sandbox.policy.resolve_spawn_decision"
+
+
+def _decide(reason: str):
+    """判定接缝的替身（#1 治本后的唯一控制面）。"""
+    return patch(_DECISION_SEAM, new=AsyncMock(return_value=make_decision(reason)))
 
 
 class _Job:
@@ -74,8 +91,7 @@ async def test_sandbox_on_routes_to_spawn_confined(tmp_path):
     for p in patchers:
         p.start()
     try:
-        with patch("hiveweave.services.acl_sandbox.integration.acl_sandbox_active",
-                   return_value=True), \
+        with _decide(R_CONFINED), \
              patch("hiveweave.services.acl_sandbox.integration.build_confined_argv",
                    side_effect=lambda c: ["cmd.exe", "/c", c]):
             await start_dev_server_tool(
@@ -112,8 +128,7 @@ async def test_sandbox_unavailable_is_fail_closed(tmp_path):
     for p in patchers:
         p.start()
     try:
-        with patch("hiveweave.services.acl_sandbox.integration.acl_sandbox_active",
-                   return_value=True), \
+        with _decide(R_CONFINED), \
              patch("hiveweave.services.acl_sandbox.integration.build_confined_argv",
                    side_effect=lambda c: ["cmd.exe", "/c", c]):
             result = await start_dev_server_tool(
@@ -133,15 +148,14 @@ async def test_sandbox_unavailable_is_fail_closed(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sandbox_off_falls_back_to_native(tmp_path):
-    """反面对照：沙箱配置**关** ⇒ 回落原生路径（确认没把正常路径改死）。"""
+    """反面对照：判定为**原生** ⇒ 回落原生路径（确认没把正常路径改死）。"""
     confined = AsyncMock()
     native = MagicMock(return_value=(None, "boom", {}))
     patchers = _patch_common(confined, native)
     for p in patchers:
         p.start()
     try:
-        with patch("hiveweave.services.acl_sandbox.integration.acl_sandbox_active",
-                   return_value=False):
+        with _decide(R_NATIVE_CONFIG_OFF):
             await start_dev_server_tool(
                 StartDevServerParams(command="npm run dev -- --port 3100 --strictPort", preferred_port=3100), "agent-1", str(tmp_path)
             )
@@ -149,5 +163,62 @@ async def test_sandbox_off_falls_back_to_native(tmp_path):
         for p in reversed(patchers):
             p.stop()
 
-    assert confined.await_count == 0, "沙箱关时不该走受限入口"
-    assert native.call_count == 1, "沙箱关 ⇒ 回落原生路径（既有行为不变）"
+    assert confined.await_count == 0, "原生判定时不该走受限入口"
+    assert native.call_count == 1, "原生判定 ⇒ 回落原生路径（既有行为不变）"
+
+
+@pytest.mark.asyncio
+async def test_native_decision_stamps_the_result(tmp_path):
+    """★ #1 治本：**原生分支也要盖戳** —— 「这次没有沙箱」必须被看见。
+
+    只在受限侧盖戳时，原生就是那个静默的默认值：一个**漏接**的工具与一个
+    正确接线但沙箱关的平台，在数据里长得一模一样（#1 的真实形态是
+    `start_dev_server` 从未 import 过 sandbox 而照样跑）。
+
+    回滚探针：删掉 `entry._with_stamp` 的原生分支即转红。
+    """
+    from hiveweave.services.acl_sandbox.entry import spawn_agent_command
+
+    async def _native_impl():
+        return {"stdout": "x", "exit_code": 0}
+
+    with _decide(R_NATIVE_CONFIG_OFF):
+        routed = await spawn_agent_command(
+            entry="dev_server", agent_id="a", workspace_path=str(tmp_path),
+            workdir=str(tmp_path), project_id="proj-1",
+            confined=AsyncMock(),
+            native=_native_impl,
+        )
+    assert routed.native is True
+    assert routed.result["enforcement"] == "native"
+    assert routed.result["enforcement_reason"] == R_NATIVE_CONFIG_OFF
+    assert routed.result["enforcement_level"] == "none"
+    assert "enforcement_boundary" not in routed.result, (
+        "原生侧不该有边界标记 —— 「没有边界」本身就是要被看见的事实"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confined_decision_never_silently_downgrades(tmp_path):
+    """★ 入口的最后一道不变式：判定说受限、受限实现却"没结果" ⇒ **fail-closed**。
+
+    #1 最坏的形态是「以为在沙箱里、其实在沙箱外」；静默按原生再跑一遍正是
+    它的实现方式。判定与执行不一致时只能抛错。
+
+    回滚探针：把 `spawn_agent_command` 里的 raise 改成 `return await native()` 即转红。
+    """
+    from hiveweave.services.acl_sandbox.entry import spawn_agent_command
+    from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
+
+    native = AsyncMock(return_value={"stdout": "unconfined!", "exit_code": 0})
+    with _decide(R_CONFINED):
+        with pytest.raises(SandboxUnavailableError):
+            await spawn_agent_command(
+                entry="dev_server", agent_id="a", workspace_path=str(tmp_path),
+                workdir=str(tmp_path), project_id="proj-1",
+                confined=AsyncMock(return_value=None),
+                native=native,
+            )
+    assert native.await_count == 0, (
+        "★ 判定为受限时**绝不能**回落原生 —— 那正是「以为在沙箱里」"
+    )

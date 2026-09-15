@@ -256,3 +256,36 @@ def browse_fake_proc():
 
     ctx = Ctx()
     return ctx
+
+
+# ── #1 治本（2026-09-14）：把 spawn 执行面固定为「原生」的夹具 ──────────
+@pytest.fixture
+def native_sandbox_plane():
+    """本次测试内所有 agent 命令 spawn 判为**原生**执行面。
+
+    为什么需要它：#1 治本后**每一次命令行 spawn 都经唯一判定点**
+    （`acl_sandbox.policy.resolve_spawn_decision`）。而 pytest 的 tmp workspace
+    往往不满足受限令牌的前置条件（OWNER_RIGHTS-only / 缺 ACL）⇒ 真实受限路径会
+    raise `SandboxUnavailableError`，把**与沙箱路由无关**的用例（测 cwd 校验 /
+    端口分配 / 注册表语义 / alarm 脚本安全校验）整片带红。
+
+    那些用例对"走哪条执行面"**没有主张**，改造前它们隐式就处在原生路径上
+    （那时 dev_server / alarm 根本没接沙箱）⇒ 显式声明原生 = 保持它们的被测语义。
+
+    ⚠ 与沙箱路由**有关**的用例（`test_sandbox_single_entry.py` /
+    `test_dev_server_sandbox_wiring.py` / `test_acl_sandbox_*`）**不得**使用本夹具
+    —— 那会把被测的东西打桩掉。
+
+    用法：`pytestmark = pytest.mark.usefixtures("native_sandbox_plane")`
+    """
+    from unittest.mock import AsyncMock
+
+    from hiveweave.services.acl_sandbox import policy
+
+    with patch(
+        "hiveweave.services.acl_sandbox.policy.resolve_spawn_decision",
+        new=AsyncMock(
+            return_value=policy.make_decision(policy.R_NATIVE_CONFIG_OFF)
+        ),
+    ):
+        yield

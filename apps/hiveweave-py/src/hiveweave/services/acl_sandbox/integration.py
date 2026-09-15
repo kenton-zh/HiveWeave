@@ -1,15 +1,18 @@
 """ACL 沙箱 ↔ 工具/平台接线共享助手（spec §5.7 六入口，P1）。
 
-把「是否启用」「受限 shell 命令行」「项目根解析」集中在此，bash.py /
-game_time.py 只做薄接线。shell 方言适配 = P1 最大工作量（S1：Git Bash
-受限下不可用，受限 shell = pwsh 优先 + cmd 兜底）。
+把「受限 shell 命令行」「项目根解析」集中在此，bash.py / game_time.py 只做
+薄接线。shell 方言适配 = P1 最大工作量（S1：Git Bash 受限下不可用，
+受限 shell = pwsh 优先 + cmd 兜底）。
+
+⚠ 「是否启用」**已不在此处判定**（#1 治本，2026-09-14）：判定 = `policy.py`
+的 `resolve_spawn_decision()`（唯一判定点），路由 = `entry.py` 的
+`spawn_agent_command()`；本模块的 `acl_sandbox_active()` 退化为布尔视图。
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import sys
 
 import structlog
 
@@ -21,24 +24,21 @@ class PwshUnavailableError(RuntimeError):
 
 
 def acl_sandbox_active() -> bool:
-    """沙箱启用判定（批次 E 三值化：on / off / auto）。
+    """沙箱是否整体生效（**布尔视图**，兼容入口）。
 
-    - ``acl_sandbox=False`` → off（旧 bool 直关，向后兼容）
-    - ``acl_sandbox_mode="off"`` → off（新三值覆盖）
-    - ``acl_sandbox_mode="on"`` → 强制开（不问探测）
-    - ``acl_sandbox_mode="auto"``（默认）→ Windows 即开（与旧 bool=True 一致）
-    - 非 Windows → 一律 False。
+    ⚠ #1 治本后本函数**不是判定点**，只是 `policy.sandbox_disabled_reason()`
+    的布尔视图。工具侧不应再调用它 —— 判定走 `policy.resolve_spawn_decision()`
+    （唯一判定点），路由走 `entry.spawn_agent_command()`。二者存在的意义见
+    `policy.py` 模块头「执行面判定」注释：把判定留给调用方，就会重新长出
+    「同一信号被五处各自解释」的病（`python_script` 拒 / 其余四条跑）。
+
+    三值语义（批次 E）：``acl_sandbox=False`` 或 ``mode="off"`` → off；
+    ``mode="on"`` → 强制开；``mode="auto"``（默认）→ Windows 即开；
+    非 Windows → 一律 False。
     """
-    from hiveweave.config import settings
+    from hiveweave.services.acl_sandbox.policy import sandbox_disabled_reason
 
-    if not sys.platform.startswith("win"):
-        return False
-    if not settings.acl_sandbox:
-        return False
-    mode = getattr(settings, "acl_sandbox_mode", "auto") or "auto"
-    if mode == "off":
-        return False
-    return True
+    return sandbox_disabled_reason() is None
 
 
 def _quote_windows_arg(arg: str) -> str:

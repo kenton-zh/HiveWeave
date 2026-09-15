@@ -17,11 +17,15 @@ def _force_windows_and_on(monkeypatch):
 
 
 async def test_non_windows_returns_none(monkeypatch) -> None:
-    """非 Windows → None（两种合法 None 之一）。"""
-    monkeypatch.setattr(svc, "_is_windows", lambda: False)
-    from hiveweave.config import settings
+    """非 Windows → None（合法 None 之一：判定理由 platform_not_windows）。
 
-    monkeypatch.setattr(settings, "acl_sandbox", True)
+    ⚠ #1 治本后 patch 目标必须换：判定已从 `service._is_windows` 搬进
+    `policy.sandbox_disabled_reason()`（唯一判定点）。继续 patch
+    `svc._is_windows` 会**静默失去控制力**（测试看似还在守，其实什么也没守）。
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
     r = await svc.spawn_confined(
         command="echo hi", workdir=r"D:\ws", workspace_path=r"D:\ws",
         agent_id="A001", timeout_s=30)

@@ -314,14 +314,12 @@ async def start_dev_server_tool(
     # 此前本工具直接 `spawn_project_process` ⇒ 以**平台身份、无沙箱**执行任意
     # `params.command`。实证（TEST_DSH_56）：叶子用 start_dev_server 成功写出
     # 项目之外，而同一越界动作经 pwsh 被 ACL 拒绝 —— 干净对照。
-    # 形态照 `tools/bash.py` 的 dev-server 路：**同一个功能此前只有那条在沙箱内**；
-    # 两条路各写一份正是本条的根因（"沙箱路由是每个工具自己的约定"）。
+    # 根因：沙箱路由是**每个工具自己的约定** ⇒ 修法是**唯一入口**：判定、路由、
+    # 盖戳都由 `entry.spawn_agent_command` 做（同一个 dev-server 功能的两条路
+    # 从此共用同一份判定，不再各自 `if acl_sandbox_active()`）。
+    from hiveweave.services.acl_sandbox.entry import spawn_agent_command
     from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
-    from hiveweave.services.acl_sandbox.integration import (
-        acl_sandbox_active,
-        build_confined_argv,
-        resolve_project_root,
-    )
+    from hiveweave.services.acl_sandbox.integration import build_confined_argv
     from hiveweave.services.acl_sandbox.service import spawn_confined
 
     def _native_spawn():
@@ -336,34 +334,37 @@ async def start_dev_server_tool(
             **({"env": params.env} if params.env else {}),
         )
 
-    try:
-        if acl_sandbox_active():
-            project_root = await resolve_project_root(project_id)
-            sres = await spawn_confined(
-                argv=build_confined_argv(cmd),
-                workdir=work_cwd,
-                workspace_path=work_cwd,
-                agent_id=agent_id or "unknown",
-                project_id=project_id,
-                project_workspace_path=project_root,
-                entry="dev_server",
-                long_running=True,
-            )
-            if sres is not None:
-                # ⚠ **复用** bash.py 的 Popen-like shim，不复制第二份：同一个 shim
-                # 出现两次就会各自演化（本条的根因正是"同一功能两条路各写一份"）。
-                from hiveweave.tools.bash import _ConfinedDevProc
+    async def _confined(ctx):
+        return await spawn_confined(
+            argv=build_confined_argv(cmd),
+            long_running=True,
+            **ctx.confined_kwargs(),
+        )
 
-                proc = _ConfinedDevProc(sres["job"])
-                spawn_err = None
-                meta = {"command": cmd, "cwd": work_cwd, "pid": proc.pid}
-            else:
-                # `spawn_confined` 返回 None 仅两种情形：**非 Windows / 沙箱配置关**
-                # ⇒ 回落原生路径（与 bash 同语义）。⚠ 这与"沙箱**不可用**"不同，
-                # 后者走下面的 SandboxUnavailableError = fail-closed。
-                proc, spawn_err, meta = _native_spawn()
+    try:
+        routed = await spawn_agent_command(
+            entry="dev_server",
+            agent_id=agent_id or "unknown",
+            workspace_path=work_cwd,
+            workdir=work_cwd,
+            project_id=project_id,
+            confined=_confined,
+            native=_native_spawn,
+        )
+        if routed.native:
+            # 判定为原生（非 Windows / 配置关 / 项目级逃生门）⇒ 回落既有的
+            # 平台身份 spawn。⚠ 这与"沙箱**不可用**"是两回事，后者走下面的
+            # SandboxUnavailableError = fail-closed。
+            proc, spawn_err, meta = routed.result
         else:
-            proc, spawn_err, meta = _native_spawn()
+            sres = routed.result
+            # ⚠ **复用** bash.py 的 Popen-like shim，不复制第二份：同一个 shim
+            # 出现两次就会各自演化（本条的根因正是"同一功能两条路各写一份"）。
+            from hiveweave.tools.bash import _ConfinedDevProc
+
+            proc = _ConfinedDevProc(sres["job"])
+            spawn_err = None
+            meta = {"command": cmd, "cwd": work_cwd, "pid": proc.pid}
         if spawn_err or proc is None:
             log_file.close()
             tail = _read_log_tail(log_path)
@@ -384,7 +385,10 @@ async def start_dev_server_tool(
             command=cmd[:120],
             cwd=work_cwd[:120],
         )
-        return e.to_tool_dict()
+        # 本工具的函数契约是 `ToolResult` ⇒ 用**类型化**出口。
+        # （用 `to_tool_dict()` 会返回裸 dict，调用方按 ToolResult 用即
+        #  `AttributeError: 'dict' object has no attribute 'success'`。）
+        return e.to_tool_result()
     except Exception as e:
         log_file.close()
         tail = _read_log_tail(log_path)

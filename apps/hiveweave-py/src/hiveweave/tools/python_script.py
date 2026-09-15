@@ -181,46 +181,67 @@ async def python_script_execute(
     interp = await _resolve_interpreter(workspace)
     argv = [interp, str(script_file)]
     try:
-        # ACL 沙箱 on → 受限执行（经 spawn_confined，argv 逐元素引用）
+        # #1 治本：spawn 经**唯一入口** —— 判定/路由/盖戳都在那里，本工具不再
+        # 自己判沙箱。此前这里是 `if acl_sandbox_active():` + 「入口返回 None
+        # ⇒ 沙箱坏，拒绝执行」，而其余四条路（bash / run_command / dev_server /
+        # alarm）把同一个 None 读成「沙箱关 ⇒ 回落原生」。于是项目级
+        # `danger-full-access`（显式逃生门）下四跑一拒 —— 同一信号五种解释。
+        # 现在这个 None 根本不会到达工具层（判定与回落都在入口内部完成）。
+        from hiveweave.services.acl_sandbox.entry import spawn_agent_command
+        from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
         from hiveweave.services.acl_sandbox.integration import (
-            acl_sandbox_active,
+            PwshUnavailableError,
             build_confined_argv,
-            resolve_project_root,
         )
         from hiveweave.services.acl_sandbox.service import spawn_confined
 
-        if acl_sandbox_active():
-            project_id = await get_project_id(agent_id)
-            project_root = await resolve_project_root(project_id)
+        project_id = await get_project_id(agent_id)
+
+        async def _native_exec() -> dict[str, Any]:
+            return await _run_native_argv(argv, workspace, timeout_s)
+
+        async def _confined(ctx) -> dict[str, Any] | None:
             # DSH_33 P0：受限路径经 pwsh 承载，`"interp" "script"` 在 pwsh 里是
             # ParserError（第二个引号串没有调用运算符）——实测 7/7 全失败。
             # 用 dialect="pwsh" 直传并显式加 `&` 调用运算符，且**不**再经
             # _normalize_for_pwsh（那会把路径里的 $ 之类当 bash 变量改写）。
-            result = await spawn_confined(
-                argv=build_confined_argv(
+            try:
+                cargv = build_confined_argv(
                     f'& "{interp}" "{script_file}"', dialect="pwsh"
-                ),
-                workdir=workspace,
-                workspace_path=workspace,
-                agent_id=agent_id,
-                project_id=project_id,
-                project_workspace_path=project_root,
-                timeout_s=timeout_s,
-                entry="python_script",
+                )
+            except PwshUnavailableError as exc:
+                return {"output": "", "stdout": "", "stderr": "",
+                        "exit_code": None, "timed_out": False, "error": str(exc)}
+            return await spawn_confined(
+                argv=cargv, timeout_s=timeout_s, **ctx.confined_kwargs()
             )
-            if result is None:
-                return ToolResult.err("python_script: sandbox unavailable")
-            if result.get("long_running"):
-                return ToolResult.err("python_script: background unsupported")
-            result = {
-                "output": "",
-                "stdout": result.get("stdout", "") or "",
-                "stderr": result.get("stderr", "") or "",
-                "exit_code": result.get("exit_code"),
-                "timed_out": bool(result.get("timed_out", False)),
-            }
-        else:
-            result = await _run_native_argv(argv, workspace, timeout_s)
+
+        routed = await spawn_agent_command(
+            entry="python_script",
+            agent_id=agent_id,
+            workspace_path=workspace,
+            workdir=workspace,
+            project_id=project_id,
+            confined=_confined,
+            native=_native_exec,
+        )
+        result = routed.result
+        if result.get("long_running"):
+            return ToolResult.err("python_script: background unsupported")
+        result = {
+            "output": "",
+            "stdout": result.get("stdout", "") or "",
+            "stderr": result.get("stderr", "") or "",
+            "exit_code": result.get("exit_code"),
+            "timed_out": bool(result.get("timed_out", False)),
+            "error": result.get("error"),
+            # 执行面戳随结果上报（落 run_steps.enforcement / 日志）
+            **{k: v for k, v in result.items() if k.startswith("enforcement")},
+        }
+    except SandboxUnavailableError as e:
+        # fail-closed：判定为受限但受限路径起不来 ⇒ 干净拒绝，绝不落原生
+        #（「以为在沙箱里、其实在沙箱外」比明确拒绝糟得多）。
+        return ToolResult.err(f"python_script: sandbox unavailable: {e}")
     except Exception as e:
         return ToolResult.err(f"python_script: execution failed: {e}")
 

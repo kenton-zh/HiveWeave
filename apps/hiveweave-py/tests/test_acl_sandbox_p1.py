@@ -57,16 +57,30 @@ def test_confined_bash_is_verbatim_pwsh_plus_encoding_pin() -> None:
 
 
 # ── bash 接线 ───────────────────────────────────────────────
-async def test_run_sandboxed_returns_none_when_off(monkeypatch) -> None:
-    """沙箱 off → _run_sandboxed 返回 None（调用方回退 native）。"""
+async def test_run_sandboxed_never_returns_none(monkeypatch) -> None:
+    """沙箱 off ⇒ 入口内部**回落 native**，并把 `enforcement=native` 戳带回。
+
+    #1 治本（2026-09-14）：改造前本函数返回 None，让**每个调用方各自**回落
+    native —— 同一判定被五处各自解释（python_script 把 None 读成"沙箱坏"直接
+    拒绝，bash/run_command/dev_server/alarm 读成"沙箱关"照跑原生）。
+    现在 None **不会**出现在工具层：判定与回落都在 `entry.spawn_agent_command`。
+
+    回滚探针：把 `_run_sandboxed` 改回「off ⇒ return None」即转红。
+    """
+    import os
+
     from hiveweave.config import settings
 
     monkeypatch.setattr(settings, "acl_sandbox", False)
     r = await _run_sandboxed(
-        "echo hi", "/tmp", 30,
-        workspace_path="/tmp", agent_id="A001", project_id=None, entry="bash",
+        "echo hi", os.getcwd(), 30,
+        workspace_path=os.getcwd(), agent_id="A001", project_id=None, entry="bash",
     )
-    assert r is None
+    assert r is not None, "返回 None 会让调用方各自解释 —— 那正是 #1 的根因"
+    assert r["enforcement"] == "native"
+    assert r["enforcement_level"] == "none"
+    assert r["enforcement_reason"] == "config_off"
+    assert r["exit_code"] == 0, f"off 时必须真的执行了原生命令：{r}"
 
 
 def test_native_shaped_normalizes() -> None:

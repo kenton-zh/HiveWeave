@@ -283,7 +283,6 @@ async def _run_registered_dev_server(
         terminate_spawned,
         listening_ports_for_pid,
     )
-    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
     from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
 
     command = _strip_trailing_ampersand(command)
@@ -341,15 +340,26 @@ async def _run_registered_dev_server(
     # `prepare_spawn_command` 就被拦下，见上方注释）。
 
     try:
-        if acl_sandbox_active():
-            # P1 §5.7：dev server 收编 —— 受限长驻 spawn，注册 process_registry。
-            # E10：传 argv（逐元素引用，修剥引号根因）。
-            from hiveweave.services.acl_sandbox.integration import (
-                build_confined_argv,
-                resolve_project_root,
-            )
-            from hiveweave.services.acl_sandbox.service import spawn_confined
+        # #1 治本：dev server 的 spawn 走**唯一入口** —— 判定/路由/盖戳都由
+        # `entry.spawn_agent_command` 做，本函数只提供两条实现。改造前这里是
+        # `if acl_sandbox_active():` 自己判，且与 `dev_server_tools.py` 的同类
+        # 功能各写一份（"同一功能两条路"正是本条根因）。
+        from hiveweave.services.acl_sandbox.entry import spawn_agent_command
+        from hiveweave.services.acl_sandbox.integration import build_confined_argv
+        from hiveweave.services.acl_sandbox.service import spawn_confined
 
+        # 受限侧要在 spawn 前准备命令（注入端口 / 检保留端口）。准备结果用局部
+        # holder 带回来 —— 不塞进 spawn 结果里是为了不污染它的形状（同一份
+        # 结果还要被 `_ConfinedDevProc` 与 process_registry 注册消费）。
+        prepared: dict[str, Any] = {}
+
+        async def _native_spawn():
+            return spawn_project_process(
+                command, cwd=cwd, project_id=project_id, preferred_port=port
+            )
+
+        async def _confined(ctx) -> dict[str, Any] | None:
+            # E10：传 argv（逐元素引用，修剥引号根因）。
             cmd2, extra_env, prep_err, _inj_meta = prepare_spawn_command(
                 command, project_id=project_id, preferred_port=port
             )
@@ -365,43 +375,47 @@ async def _run_registered_dev_server(
                 # 只有两侧都不命中时才落回「spawn 准备失败 = 命令从未执行」
                 # 的默认格，且此时是**真·runner 故障**。
                 _prep_fact = classify_error_text(prep_err) or "runner_failed"
+                # 仍经唯一漏斗收口（`finalize_fact_dict` 幂等；调用方拿到后
+                # 也会再收一次 —— 不能因为"外面会收"就在出口裸奔字典）。
                 return finalize_fact_dict({
                     "success": False, "output": "",
                     "error": prep_err, "blocked": True,
                     "fact": _prep_fact,
                 })
-            project_root = await resolve_project_root(project_id)
-            sres = await spawn_confined(
+            prepared["command"] = cmd2
+            prepared["env_port"] = extra_env.get("PORT") or extra_env.get("VITE_PORT")
+            return await spawn_confined(
                 argv=build_confined_argv(cmd2),
-                workdir=cwd,
-                workspace_path=cwd,
-                agent_id=agent_id or "unknown",
-                project_id=project_id,
-                project_workspace_path=project_root,
-                entry="dev_server",
                 long_running=True,
                 env_extra=extra_env,
+                **ctx.confined_kwargs(),
             )
-            if sres is not None:
-                proc = _ConfinedDevProc(sres["job"])
-                spawn_err = None
-                meta = {
-                    "command": cmd2,
-                    "cwd": cwd,
-                    "pid": proc.pid,
-                    "env_port": extra_env.get("PORT") or extra_env.get("VITE_PORT"),
-                }
-            else:
-                proc, spawn_err, meta = spawn_project_process(
-                    command, cwd=cwd, project_id=project_id, preferred_port=port
-                )
+
+        routed = await spawn_agent_command(
+            entry="dev_server",
+            agent_id=agent_id or "unknown",
+            workspace_path=cwd,
+            workdir=cwd,
+            project_id=project_id,
+            confined=_confined,
+            native=_native_spawn,
+        )
+        sres = routed.result
+        if routed.native:
+            proc, spawn_err, meta = sres
+        elif sres.get("long_running"):
+            proc = _ConfinedDevProc(sres["job"])
+            spawn_err = None
+            meta = {
+                "command": prepared["command"],
+                "cwd": cwd,
+                "pid": proc.pid,
+                "env_port": prepared["env_port"],
+            }
         else:
-            proc, spawn_err, meta = spawn_project_process(
-                command,
-                cwd=cwd,
-                project_id=project_id,
-                preferred_port=port,
-            )
+            # 受限侧在 spawn 之前就失败（prep_err）—— 事实位已按证据归类，
+            # 原样回执，不重新组装。
+            return finalize_fact_dict(sres)
     except SandboxUnavailableError as e:
         # fail-closed：沙箱不可用 → 直接干净拒绝，不重复 spawn / 不落原生。
         log.warning(
@@ -619,19 +633,35 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
     )
 
 
+def _enforcement_stamp(result: dict) -> dict[str, Any]:
+    """把唯一入口盖的执行面戳原样搬到最终结果（键名以 policy 为准，不另起名）。"""
+    from hiveweave.services.acl_sandbox.policy import ENFORCEMENT_STAMP_KEYS
+
+    return {k: result[k] for k in ENFORCEMENT_STAMP_KEYS if k in result}
+
+
 def _native_shaped(result: dict) -> dict[str, Any]:
-    """把 spawn_confined 的 {exit_code,stdout,stderr,timed_out} 归一为 native 形态。"""
+    """把 spawn_confined 的 {exit_code,stdout,stderr,timed_out} 归一为 native 形态。
+
+    ⚠ 两件事必须**保留**，归一化不该把它们抹掉：
+      · `enforcement*` 戳 —— 「这次到底有没有沙箱」是 #1 要让人看得见的事实，
+        在归一化处丢掉等于又回到"静默默认值"；
+      · `error` —— 受限 shell 不可用（pwsh 缺失）等**在受限侧就失败**的情形，
+        归一化把它抹成 None 会让失败变成"空输出成功"。
+    """
     stdout = result.get("stdout", "") or ""
     stderr = result.get("stderr", "") or ""
     combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
-    return {
+    out: dict[str, Any] = {
         "output": combined,
         "stdout": stdout,
         "stderr": stderr,
         "exit_code": result.get("exit_code"),
         "timed_out": bool(result.get("timed_out", False)),
-        "error": None,
+        "error": result.get("error"),
     }
+    out.update(_enforcement_stamp(result))
+    return out
 
 
 async def _run_sandboxed(
@@ -646,37 +676,53 @@ async def _run_sandboxed(
     long_running: bool = False,
     env_extra: dict[str, str] | None = None,
     dialect: str = "bash",
-) -> dict[str, Any] | None:
-    """沙箱 on 时受限执行；返回 None = 沙箱未启用（调用方回退 native）。"""
+    decision=None,
+) -> dict[str, Any]:
+    """经**唯一入口**（`entry.spawn_agent_command`）执行并回传执行面戳。
+
+    与改造前的区别（#1 治本）：本函数**不再自己判沙箱、也不再返回 None**。
+    此前它读 `acl_sandbox_active()` 自判，返回 None 让**每个调用方各自**回落
+    native —— 同一判定被五处各自解释，其中 `python_script` 把"判定为原生"
+    读成了"沙箱坏"并拒绝执行。现在判定与回落都在入口内部，调用方拿到的
+    永远是结果本体（含 `enforcement*`）。
+    """
+    from hiveweave.services.acl_sandbox.entry import spawn_agent_command
     from hiveweave.services.acl_sandbox.integration import (
         PwshUnavailableError,
-        acl_sandbox_active,
         build_confined_argv,
-        resolve_project_root,
     )
     from hiveweave.services.acl_sandbox.service import spawn_confined
 
-    if not acl_sandbox_active():
-        return None
-    try:
-        argv = build_confined_argv(command, dialect=dialect)
-    except PwshUnavailableError as exc:
-        return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": False, "error": str(exc)}
-    project_root = await resolve_project_root(project_id)
-    result = await spawn_confined(
-        argv=argv,
-        workdir=cwd,
-        workspace_path=workspace_path,
-        agent_id=agent_id or "unknown",
-        project_id=project_id,
-        project_workspace_path=project_root,
-        timeout_s=timeout_s or 0,
+    async def _native() -> dict[str, Any]:
+        return await _run_native(command, cwd, int(timeout_s or 0), dialect=dialect)
+
+    async def _confined(ctx) -> dict[str, Any] | None:
+        try:
+            argv = build_confined_argv(command, dialect=dialect)
+        except PwshUnavailableError as exc:
+            # 受限 shell 不可用 ⇒ 可操作错误（≠「沙箱没开」，后者会走 native）
+            return {"output": "", "stdout": "", "stderr": "",
+                    "exit_code": None, "timed_out": False, "error": str(exc)}
+        return await spawn_confined(
+            argv=argv,
+            timeout_s=timeout_s or 0,
+            long_running=long_running,
+            env_extra=env_extra,
+            **ctx.confined_kwargs(),
+        )
+
+    routed = await spawn_agent_command(
         entry=entry,
-        long_running=long_running,
-        env_extra=env_extra,
+        agent_id=agent_id or "unknown",
+        workspace_path=workspace_path,
+        workdir=cwd,
+        project_id=project_id,
+        confined=_confined,
+        native=_native,
+        decision=decision,
     )
-    if result is None or result.get("long_running"):
+    result = routed.result
+    if result.get("long_running"):
         return result
     return _native_shaped(result)
 
@@ -1883,11 +1929,13 @@ def precheck_command_string(command: str, workspace_path: str = "") -> str | Non
     return None
 
 
-def _pwsh_is_effective_shell() -> bool:
-    """True when a bash-dialect command will actually be run by pwsh.
+def _pwsh_effective_shell(*, confined: bool) -> bool:
+    """受限/原生 + 平台 + pwsh 存在 ⇒ 该命令**实际**由 pwsh 解释。
 
-    受限沙箱（Windows + acl_sandbox on）走 ``build_confined_argv`` → pwsh 优先；
-    native 路径有 Git Bash 时是真 bash，方言门必须闭嘴（否则误伤合法 unix 命令）。
+    `confined` 必须来自**唯一判定点**（`policy.resolve_spawn_decision`）。
+    改造前这里有第二处判定（读 `acl_sandbox_active()`）：同一个事实被两处判，
+    于是项目级逃生门（`danger-full-access`）下 —— 路由走 native（Git Bash），
+    方言门却仍按 pwsh 拒掉 unix-only 命令，**把合法命令误拒**。
     """
     if not sys.platform.startswith("win"):
         return False
@@ -1895,23 +1943,37 @@ def _pwsh_is_effective_shell() -> bool:
 
     if not _shutil.which("pwsh"):
         return False  # cmd 兜底路径走 _map_unix_to_cmd，不是 pwsh 方言
+    return confined
+
+
+def _pwsh_is_effective_shell() -> bool:
+    """⚠ **legacy 零参版**（保留给 `subagent.py` 的方言提示与既有测试）。
+
+    它是「平台模式近似」—— 只看 `acl_sandbox` 配置，**不含**项目级逃生门，
+    因此与真实路由可能不一致（见 `_pwsh_effective_shell` 的说明）。
+    `execute_bash` / `execute_run_command` 已改为传入真实判定，不再走本函数。
+    """
     from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
 
-    if acl_sandbox_active():
-        return True
-    # 沙箱 off：native 优先 Git Bash；无 Git Bash 时才落 cmd（同样非 pwsh）
-    return False
+    return _pwsh_effective_shell(confined=acl_sandbox_active())
 
 
-def _pwsh_dialect_gate(command: str) -> str | None:
+def _pwsh_dialect_gate(command: str, *, confined: bool | None = None) -> str | None:
     """受限模式（pwsh 生效）下 unix-only 命令 → 可操作错误；否则 None（放行）。
 
     P1-3（B 结构解）：词典翻译层退役后，受限 bash 命令以 PowerShell 语义
     **verbatim** 交给 pwsh；此处对原生命令做 unix-only 前置拒绝并给 pwsh
     等价（兑现 bash 工具 description 的承诺 —— rejected up front with the
     pwsh equivalent，而非静默透传造成 head/--ignore 混血参数）。
+
+    ``confined`` = 本次 spawn 的真实判定；缺省 None ⇒ 回退平台模式近似
+    （既有测试与调用方）。**新调用方一律显式传**，否则会重现
+    「同一事实两处判」的偏差。
     """
-    if not _pwsh_is_effective_shell():
+    if confined is None:
+        if not _pwsh_is_effective_shell():
+            return None
+    elif not _pwsh_effective_shell(confined=confined):
         return None
     return detect_untranslated_unix(command)
 
@@ -1991,12 +2053,18 @@ async def execute_bash(
     # 1.5. Auto-source .hiveweave/env.sh if the project has one.
     # The project declares its own environment setup.
     hw_dir = str(Path(workspace_path) / ".hiveweave")
-    # P1：沙箱 on 时受限 shell 是 pwsh/cmd，无法 source bash 语法的 env.sh ——
+    # #1 治本：本次命令的执行面**在这里判定一次**，本函数后续每个分支（env.sh
+    # 前缀、封闭集翻译、方言门）与 spawn 路由**共用这一份**。改造前这些点各自
+    # 读 `acl_sandbox_active()` —— 与真实路由可以不一致（项目级
+    # `danger-full-access` 下路由已判 native，方言门却仍按 pwsh 拒），
+    # 结果是**合法命令被误拒**：同一事实两处判的典型代价。
+    from hiveweave.services.acl_sandbox.policy import resolve_spawn_decision
+
+    spawn_decision = await resolve_spawn_decision(project_id)
+    # P1：受限 shell 是 pwsh/cmd，无法 source bash 语法的 env.sh ——
     # 跳过前缀（否则所有命令被 `source` 掐死），项目环境由 .hiveweave 之外
     # 的机制声明（见 spec §18.3 受限 shell 方言适配）。
-    from hiveweave.services.acl_sandbox.integration import acl_sandbox_active
-
-    if not acl_sandbox_active():
+    if not spawn_decision.confined:
         command = _source_env_sh(command, hw_dir)
 
     # 1.6. 方言 fast-fail（DSH_33 P0 / R3 P0-2）：受限 shell = pwsh 时，
@@ -2008,7 +2076,7 @@ async def execute_bash(
     # 仅 pwsh 宿主生效（审计 H2）：Linux/Git Bash 下原生命令合法，
     # 无条件改写会弄坏可直接执行的 bash。
     translated_pair = None
-    if _pwsh_is_effective_shell():
+    if _pwsh_effective_shell(confined=spawn_decision.confined):
         translated_pair = try_closed_pipe_translation(command)
         if translated_pair is not None:
             command, _orig_cmd = translated_pair
@@ -2017,7 +2085,7 @@ async def execute_bash(
                 translated_preview=command[:180],
             )
 
-    dialect_err = _pwsh_dialect_gate(command)
+    dialect_err = _pwsh_dialect_gate(command, confined=spawn_decision.confined)
     if dialect_err:
         log.info("bash.dialect_gate", command_preview=command[:120])
         # s3-clone_06 P0-3/P0-4：命令从未执行（方言不认）→ runner_failed=1。
@@ -2090,16 +2158,14 @@ async def execute_bash(
         timeout_s = timeout_ms / 1000
 
     # 4. Choose execution backend
-    # P1 (spec §5.7): ACL 沙箱 on 时受限执行；None = 未启用 → native。
+    # P1 (spec §5.7) + #1 治本：spawn 经**唯一入口**取判定并路由（受限/原生），
+    # 工具不再判断沙箱 —— 改造前这里是 `_run_sandboxed()` 返回 None 再由本函数
+    # 回落 native，判定含义因此散在五个调用点上（python_script 读成"沙箱坏"）。
     result = await _run_sandboxed(
         command, cwd, timeout_s,
         workspace_path=ws, agent_id=agent_id, project_id=project_id,
-        entry="bash", dialect=dialect,
+        entry="bash", dialect=dialect, decision=spawn_decision,
     )
-    if result is None:
-        result = await _run_native(
-            command, cwd, int(timeout_s or 0), dialect=dialect
-        )
 
     if result.get("error"):
         # F4：runner 失败（命令没跑起来）—— spawn 失败 / 方言 / 沙箱拒绝。
@@ -2109,6 +2175,7 @@ async def execute_bash(
             "success": False, "output": "",
             "error": f"Error: {result['error']}\n{cwd_hint}",
             "fact": "runner_failed",
+            **_enforcement_stamp(result),
         })
 
     if result["timed_out"]:
@@ -2119,6 +2186,7 @@ async def execute_bash(
                      f"{int(timeout_s or 0)} seconds\n{cwd_hint}",
             "timeout_kind": "command",
             "timeout_ms": int((timeout_s or 0) * 1000),
+            **_enforcement_stamp(result),
         }
 
     output = _truncate_output(result["output"])
@@ -2129,7 +2197,8 @@ async def execute_bash(
         return {"success": True,
                 "output": f"{body}\n\n{cwd_hint}\nExit code: 0",
                 "error": None,
-                "exit_code": 0}
+                "exit_code": 0,
+                **_enforcement_stamp(result)}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 失败时把 stdout/stderr 各自的尾部 4KB 放进 error 字段。
@@ -2158,6 +2227,7 @@ async def execute_bash(
         "exit_code": exit_code,
         # F4：命令执行了但失败（非零退出 = command_failed，不是 runner 失败）
         "fact": "command_failed",
+        **_enforcement_stamp(result),
     })
 
 
@@ -2218,8 +2288,12 @@ async def execute_run_command(
     # R3 P0-2：run_command 同样是被方言混血走的后门（attestation 测试步）。
     # 与 bash/pwsh 工具同一 unix-only gate；native 环境（无 pwsh）gate 闭口。
     # 仅 pwsh 宿主生效（审计 H2，同 execute_bash）。
+    # #1 治本：判定在此**取一次**，翻译/方言门/路由共用（同 execute_bash）。
+    from hiveweave.services.acl_sandbox.policy import resolve_spawn_decision
+
+    spawn_decision = await resolve_spawn_decision(project_id)
     translated_pair_rc = None
-    if _pwsh_is_effective_shell():
+    if _pwsh_effective_shell(confined=spawn_decision.confined):
         translated_pair_rc = try_closed_pipe_translation(command)
         if translated_pair_rc is not None:
             command, _orig_cmd_rc = translated_pair_rc
@@ -2228,7 +2302,7 @@ async def execute_run_command(
                 translated_preview=command[:180],
             )
 
-    run_dialect_err = _pwsh_dialect_gate(command)
+    run_dialect_err = _pwsh_dialect_gate(command, confined=spawn_decision.confined)
     if run_dialect_err:
         log.info("run_command.dialect_gate", command_preview=command[:120])
         return finalize_fact_dict({"success": False, "output": "",
@@ -2264,27 +2338,27 @@ async def execute_run_command(
     log.info("run_command.execute", cwd=full_cwd, timeout_s=timeout_s,
              command_preview=command[:120])
 
-    # P1 (spec §5.7): run_command 收编进沙箱；None = 未启用 → native。
+    # P1 (spec §5.7) + #1 治本：run_command 同 bash —— 判定与回落都在唯一入口内。
     result = await _run_sandboxed(
         command, full_cwd, timeout_s,
         workspace_path=ws, agent_id=agent_id, project_id=project_id,
-        entry="run_command",
+        entry="run_command", decision=spawn_decision,
     )
-    if result is None:
-        result = await _run_native(command, full_cwd, timeout_s)
 
     if result.get("error"):
         # F4：runner 失败（命令没跑起来）—— spawn 失败 / 沙箱拒绝。
         return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {result['error']}",
-                "fact": "runner_failed"})
+                "fact": "runner_failed",
+                **_enforcement_stamp(result)})
 
     if result["timed_out"]:
         # F7：command 超时（命令跑起来但未按时完成）。
         return {"success": False, "output": "",
                 "error": f"Error: Command timed out after {timeout_s} seconds",
                 "timeout_kind": "command",
-                "timeout_ms": int((timeout_s or 0) * 1000)}
+                "timeout_ms": int((timeout_s or 0) * 1000),
+                **_enforcement_stamp(result)}
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
@@ -2292,7 +2366,8 @@ async def execute_run_command(
     if exit_code == 0:
         body = output if output.strip() else "(no output)"
         return {"success": True, "output": f"{body}\n\nExit code: 0",
-                "error": None, "exit_code": 0}
+                "error": None, "exit_code": 0,
+                **_enforcement_stamp(result)}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 同 execute_bash — 失败时返回 stdout/stderr 各自尾部 4KB。
@@ -2317,6 +2392,7 @@ async def execute_run_command(
         "exit_code": exit_code,
         # F4：命令执行了但失败（非零退出 = command_failed）
         "fact": "command_failed",
+        **_enforcement_stamp(result),
     })
 
 
