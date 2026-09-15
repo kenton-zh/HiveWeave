@@ -125,7 +125,9 @@ async def test_real_commit_failure_carries_git_output(tmp_path: Path, monkeypatc
     real_git = sc_module._git
 
     async def failing_commit(args, cwd, timeout=30.0, project_root=None):
-        if args[:1] == ["commit"]:
+        # ⚠ 不能用 args[0] 判子命令：提交现在前置了 `-c user.name=…` 身份参数
+        #   （见 git_identity：per-agent 身份改命令行注入）⇒ 判「是不是 commit」要扫全 argv
+        if "commit" in args:
             return False, "error: pre-commit hook declined (simulated stderr)"
         return await real_git(args, cwd, timeout)
 
@@ -149,7 +151,9 @@ async def test_commit_failure_appends_stripped_list(tmp_path: Path, monkeypatch)
     real_git = sc_module._git
 
     async def failing_commit(args, cwd, timeout=30.0, project_root=None):
-        if args[:1] == ["commit"]:
+        # ⚠ 不能用 args[0] 判子命令：提交现在前置了 `-c user.name=…` 身份参数
+        #   （见 git_identity：per-agent 身份改命令行注入）⇒ 判「是不是 commit」要扫全 argv
+        if "commit" in args:
             return False, "error: cannot commit"
         return await real_git(args, cwd, timeout)
 

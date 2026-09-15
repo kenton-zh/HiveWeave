@@ -143,8 +143,8 @@ def proj(tmp_path: Path) -> Path:
 def wt(proj: Path) -> Path:
     wt = proj / ".hiveweave" / "worktrees" / "A001"
     _raw_git(proj, "worktree", "add", "-q", str(wt), "-b", "wt/A001")
-    # 平台在 worktree 创建时开启 worktreeConfig（service_create.py:620）
-    _raw_git(wt, "config", "extensions.worktreeConfig", "true")
+    # ⚠ 平台**不再**开启 `extensions.worktreeConfig`（R3 收口：git_identity 把它置
+    #   false ⇒ `<gitdir>/config.worktree` 不再是活载体）。夹具也不再模拟"开启"态。
     return wt
 
 
@@ -238,24 +238,33 @@ async def test_agent_cannot_create_worktree_config_carriers(
     assert main_carrier.read_bytes() == before_main, "主载体被写入"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="已实测残余：worktree gitdir 必须对 agent 可写（index/index.lock），"
-           "故 `<gitdir>/config.worktree` 可被 lock+rename 替换掉封条。"
-           "根因是平台自己打开 extensions.worktreeConfig ⇒ 该载体被 git 读。"
-           "修法（下一批，已定位）：把 per-agent git 身份从 `--worktree` 配置改为 "
-           "GIT_AUTHOR_* / GIT_COMMITTER_* 环境变量，然后不再启用该扩展 ⇒ "
-           "该载体整体失效，无需依赖 ACL。本条转红 = 修法落地，改回正常断言。",
-)
 async def test_agent_cannot_write_worktree_gitdir_carrier(
         proj: Path, wt: Path) -> None:
-    """`<gitdir>/config.worktree`：**已知残余**（见 xfail reason）。"""
+    """`<gitdir>/config.worktree` 写不进（R3 收口后的新事实）。
+
+    修法前这里是 `xfail(strict=True)`（agent 用 `git config --worktree` 能写进去）。
+    **退休 `extensions.worktreeConfig` 之后**，`git config --worktree` 本身失效
+    （扩展没启用 ⇒ 写 worktree-local config 的动作被 git 拒）⇒ 载体内容不变。
+    判据仍是**状态**（文件字节），不看退出码/文案。
+    """
     await _bootstrap(wt, proj)
     carrier = proj / ".git" / "worktrees" / "A001" / "config.worktree"
     assert carrier.exists(), "占位载体未预建"
     before = carrier.read_bytes()
     await _agent(wt, proj, "git config --worktree filter.p.test x")
     assert carrier.read_bytes() == before, "worktree 载体被写入"
+
+
+async def test_worktree_config_carrier_is_not_live(proj: Path, wt: Path) -> None:
+    """R3 收口判据：平台跑过一次受限命令后，repo 级扩展必须已是 false。
+
+    这一条与 `test_git_config_seal.py` 其余用例同源（都在受限 spawn 之后看盘），
+    不依赖 merge 现场，故比 `test_merge_tree_anchor.py` 那条更快、更稳。
+    """
+    await _bootstrap(wt, proj)
+    got = _raw_git(proj, "config", "--get",
+                   "extensions.worktreeConfig").stdout.strip()
+    assert got == "false", f"扩展仍开着（{got!r}）⇒ 载体仍活"
 
 
 async def test_agent_cannot_mutate_main_git_metadata(proj: Path, wt: Path) -> None:

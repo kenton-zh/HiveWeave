@@ -22,6 +22,7 @@ from .constants import (
     _create_locks_guard,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
+from .git_identity import agent_identity_args
 from .git_cmd import _current_branch, _git, _resolve_base_branch, _target_tip_short
 from .merge_support import (
     _auto_checkpoint_dirty_target,
@@ -848,7 +849,8 @@ class MergeMixin:
             has_staged = not ok_diff
             if has_staged:
                 await _git(
-                    ["commit", "-m", "pre-merge-checkpoint"],
+                    [*await agent_identity_args(short_id),
+                     "commit", "-m", "pre-merge-checkpoint"],
                     wt_path,
                     project_root=workspace_path,
                 )

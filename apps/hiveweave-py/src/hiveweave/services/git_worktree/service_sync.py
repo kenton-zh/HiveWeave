@@ -43,6 +43,7 @@ from .conflict_predict import (
     predict_merge_conflicts,
 )
 from .ensure import worktree_commits_behind_main
+from .git_identity import agent_identity_args
 from .git_cmd import _current_branch, _git, _resolve_base_branch
 from .merge_support import parse_untracked_overwrite
 
@@ -404,7 +405,9 @@ async def sync_main_into_worktree(
         ok_diff, _ = await _git(["diff", "--cached", "--quiet"], wt_path)
         if not ok_diff:  # exit 1 = 有暂存改动
             ok_ci, ci_out = await _git(
-                ["commit", "-m", "pre-merge-checkpoint"], wt_path
+                [*await agent_identity_args(short_id),
+                 "commit", "-m", "pre-merge-checkpoint"],
+                wt_path,
             )
             if not ok_ci:
                 return _reject(

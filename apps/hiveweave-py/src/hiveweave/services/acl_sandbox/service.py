@@ -480,6 +480,10 @@ _AGENT_SID_PREFIX = "S-1-4-"
 # 需要「占位」的载体：不存在时由平台先建**空文件**再封 —— 否则 agent 可以自己
 # 新建这个同名文件（父目录仍有写权），封条对它无效。空 config 对 git 是合法的。
 _PLACEHOLDER_CARRIERS = ("config.worktree",)
+# 「退休 worktree-config 扩展」的进程内去重：每项目每进程只跑一次（会 spawn 一个
+# git 进程，不能每命令都跑）。⚠ 只做缓存不做失效：该标志一旦置 false 就永久有效
+# （把 agent 写面关掉是单向动作），且失败**不**入缓存（下次重试）。
+_WORKTREE_CONFIG_RETIRED: set[str] = set()
 
 
 def _is_agent_sid(sid: str) -> bool:
@@ -656,6 +660,27 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     if changed:
         log.info("acl_sandbox.git_bootstrap_sealed", count=len(changed),
                  items=changed[:8])
+
+    # ④ 退休 `extensions.worktreeConfig`（fixqueue #2 残余 R3）：
+    #    只要它开着，git 就会读 `<proj>/.git/config.worktree` 与
+    #    `<gitdir>/config.worktree` —— 后者在 agent 可写面内（worktree gitdir 必须
+    #    可写），且 `filter.<n>.clean`/`merge.<n>.driver` 是动态键名
+    #    （`GIT_CONFIG_*` 覆盖不到）⇒ 实测平台进程会执行 agent 写的驱动。
+    #    ⚠ 存量项目也要治（老版本在 worktree 创建时开过它）⇒ 放在**每次受限命令的
+    #    grant 阶段**（去重成每项目每进程一次），不依赖「新建 worktree」。
+    #    fail-quiet：关不上只记 warning（封条仍在，且 identity 已改 `-c` 注入）。
+    if project not in _WORKTREE_CONFIG_RETIRED:
+        try:
+            from hiveweave.services.git_worktree.git_identity import (
+                retire_worktree_config,
+            )
+
+            if await retire_worktree_config(project):
+                _WORKTREE_CONFIG_RETIRED.add(project)
+        except Exception:
+            log.warning("acl_sandbox.worktree_config_retire_error",
+                        project=project)
+
     return changed
 
 

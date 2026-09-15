@@ -27,6 +27,11 @@ from .constants import (
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
 from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_identity import (
+    PLATFORM_EMAIL,
+    PLATFORM_NAME,
+    agent_identity_args,
+)
 from .merge_support import (
     _auto_checkpoint_dirty_target,
     _merge_failure_result,
@@ -593,91 +598,56 @@ yarn.lock merge=union
         # 首命令不再背传播成本。删→同路径重建走 verify-then-skip 兜底。
         if result.get("success") and result.get("path"):
             # Per-agent git 身份（同步写，先于 agent 首个 checkpoint）。
-            await self._apply_agent_git_identity(result["path"], short_id)
+            await self._retire_worktree_config_carrier(
+                workspace_path, result["path"], short_id
+            )
             self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
 
-    async def _apply_agent_git_identity(
-        self, worktree_path: str, short_id: str
+    async def _retire_worktree_config_carrier(
+        self, workspace_path: str, worktree_path: str, short_id: str
     ) -> None:
-        """Per-agent git 身份（用户需求：每个 agent 在 git 内有自己的名字）。
+        """退休 worktree-local config 载体（fixqueue #2 残余 R3）。
 
-        worktree-local config 覆盖该 agent 的 checkpoint commit 与自发
-        bash commit——fast-forward merge 后 main 的 git log 直接显示
-        作者花名（「判断带出处」不变式的 git 侧落地）。
+        **原来**这里做的是 `config extensions.worktreeConfig true` +
+        `config --worktree user.name/email` —— 代价是 git 从此会读
+        `<proj>/.git/config.worktree` 与 `<gitdir>/config.worktree`，而后者在
+        agent 可写面内（worktree gitdir 必须可写：index/index.lock），且
+        `filter.<n>.clean` / `merge.<n>.driver` 是动态键名、`GIT_CONFIG_*` 覆盖不到
+        ⇒ 实测平台进程会执行 agent 写的驱动。
 
-        - user.name  = agent 花名（resolve_agent 查不到时 fallback
-          ``HiveWeave Agent <short_id>``，仍可与其它 agent 区分）
-        - user.email = ``<short_id>@agents.hiveweave.local``（合成、
-          ASCII、可从 email 反查 agent）
-        - 前置：repo 级 ``extensions.worktreeConfig=true``（幂等开启）
-          必须先于 ``--worktree`` 写入，顺序不可颠倒。
-        - fail-quiet：身份写失败不阻塞 worktree 创建，回退 repo 级
-          统一身份（HiveWeave Agent）。
+        **现在**：把 repo 级 `extensions.worktreeConfig` 置 **false**（自愈存量项目；
+        ⚠ 必须写 repo config —— 命令行 `-c extensions.worktreeConfig=false` 实测无效），
+        于是那两个载体整体失效、不再依赖 ACL；per-agent 身份改由
+        `git_identity.agent_identity_args()` 在**提交命令行**注入（见 checkpoint /
+        pre-merge checkpoint），可见性与「作者=花名」不变。
+
+        fail-quiet：这步失败不阻塞 worktree 创建（旧实现同哲学）；但会记 warning，
+        且**不再**有任何东西把扩展打开。
         """
         try:
-            ok, _ = await _git(
-                ["config", "extensions.worktreeConfig", "true"],
-                worktree_path,
-            )
-            if not ok:
+            from .git_identity import retire_worktree_config
+
+            if not await retire_worktree_config(workspace_path):
                 log.warning(
-                    "git_worktree.agent_identity_worktree_config_off",
-                    short_id=short_id,
+                    "git_worktree.worktree_config_carrier_retire_failed",
+                    short_id=short_id, root=workspace_path,
                 )
                 return
-            name: str | None = None
-            try:
-                from hiveweave.services.org import OrgService
-
-                agent = await OrgService().resolve_agent(short_id)
-                raw = (agent or {}).get("name")
-                # 脏数据防御：非 str 或空白一律走 fallback（审计 P1-2）
-                name = raw if isinstance(raw, str) and raw.strip() else None
-            except Exception:
-                name = None
-            git_name = name or f"HiveWeave Agent {short_id}"
-            email = f"{short_id}@agents.hiveweave.local"
-            ok_n, _ = await _git(
-                ["config", "--worktree", "user.name", git_name],
-                worktree_path,
-            )
-            ok_e, _ = await _git(
-                ["config", "--worktree", "user.email", email],
-                worktree_path,
-            )
-            if not (ok_n and ok_e):
-                # 审计 P1-1：--worktree 写失败时确保 repo 级至少有 fallback
-                # 身份（存量/收养仓库可能完全没有 user.name）——否则
-                # checkpoint 会以 "Please tell me who you are" 硬失败。
-                # 只在缺失时补写，不覆盖既有身份。
-                ok_chk, cur = await _git(
-                    ["config", "user.name"], worktree_path
-                )
-                if not ok_chk or not (cur or "").strip():
-                    await _git(
-                        ["config", "user.name", git_name], worktree_path
-                    )
-                    await _git(
-                        ["config", "user.email", email], worktree_path
-                    )
-                log.warning(
-                    "git_worktree.agent_identity_worktree_write_failed",
-                    short_id=short_id,
-                    repo_level_fallback=True,
-                )
-            else:
-                log.info(
-                    "git_worktree.agent_identity_applied",
-                    short_id=short_id,
-                    git_name=git_name,
-                )
-        except Exception as e:
-            log.warning(
-                "git_worktree.agent_identity_failed",
-                short_id=short_id,
-                error=str(e),
-            )
+            # 兜底身份：存量/收养仓库可能完全没有 user.name —— 否则 agent 自己
+            # 在 worktree 里 `git commit` 会以 "Please tell me who you are" 硬失败。
+            # 只在缺失时补写，不覆盖既有身份。
+            ok_chk, cur = await _git(["config", "user.name"], worktree_path)
+            if not ok_chk or not (cur or "").strip():
+                await _git(["config", "user.name", PLATFORM_NAME],
+                           worktree_path)
+                await _git(["config", "user.email", PLATFORM_EMAIL],
+                           worktree_path)
+                log.info("git_worktree.platform_identity_seeded",
+                         short_id=short_id)
+        except Exception:
+            log.warning("git_worktree.worktree_config_carrier_retire_error",
+                        short_id=short_id)
 
     def _schedule_sandbox_grant(
         self, project_root: str, worktree_path: str, short_id: str
@@ -1196,7 +1166,10 @@ yarn.lock merge=union
             }
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
-        ok, commit_out = await _git(["commit", "-m", commit_msg], path, project_root=workspace_path)
+        ok, commit_out = await _git(
+            [*await agent_identity_args(short_id), "commit", "-m", commit_msg],
+            path, project_root=workspace_path,
+        )
         if not ok:
             # T1.2: 失败带 git commit 的 stderr/stdout（此前无原因失败），
             # 剥离清单非空时附上，便于区分「没东西可提交」与「真失败」。

@@ -9,7 +9,7 @@
 |---|---|---|
 | `<gitdir>/commondir` → 有效 evil common（内含 `merge.*.driver`） | **不执行** | ⇒ 对 merge-tree 而言 commondir 不是可用载体（与 `git config` 读取不同） |
 | 指针 → 自建仓（`rm .git && git init`） | 执行该仓 config 的 driver，但**没有共享历史** ⇒ `merge-tree` 无东西可合 | ⇒ 平台侧仍必须**拒绝**（锚），否则任何依赖「读 agent 自己那棵树」的子命令都会被带跑 |
-| `<gitdir>/config.worktree` 写 `merge.*.driver`（**需 `extensions.worktreeConfig=true`**） | **执行**（实测 `EXECUTED`） | ⇒ 这是 merge-tree 这条落点**当前真正的载体** = 残余 R3，见文件末 xfail |
+| `<gitdir>/config.worktree` 写 `merge.*.driver`（**需 `extensions.worktreeConfig=true`**） | **执行**（实测 `EXECUTED`） | ⇒ 这条落点的真实载体 = R3；**2026-09-15 已收口**：平台退休该扩展（写 repo config）后载体失效，见 `test_retire_disables_gitdir_config_carrier` |
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from hiveweave.services.git_worktree.conflict_predict import predict_merge_conflicts
+from hiveweave.services.git_worktree.git_identity import retire_worktree_config
 
 pytestmark = [pytest.mark.win32]
 
@@ -88,20 +89,13 @@ def test_merge_tree_refuses_on_tampered_pointer(repo: Path, wt: Path) -> None:
     assert pred.status == "unknown", pred
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="已实测残余 R3：agent 在 `<gitdir>/config.worktree` 写 "
-           "`[merge \"evildrv\"] driver = <载荷>`（配仓库内 .gitattributes 的 "
-           "`* merge=evildrv`）⇒ 平台的 `git merge-tree` **执行其载荷**（2026-09-15 审计"
-           "实跑 EXECUTED；信任锚钉的是**路径**，不改变这个载体被读）。"
-           "修法（下一批，已定位并实测）：`git config extensions.worktreeConfig false`"
-           "（**repo config**）后该载体 IGNORED、载荷 BLOCKED；⚠ 命令行 "
-           "`-c extensions.worktreeConfig=false` **无效**（实测仍执行）；身份改由 "
-           "`-c user.name/-c user.email` 显式注入。本条转红 = 该修法落地。",
-)
-def test_merge_tree_driver_from_gitdir_config_worktree_is_blocked(
-        repo: Path, wt: Path, tmp_path: Path) -> None:
-    """R3 载体（`<gitdir>/config.worktree`）承载 merge driver ⇒ 平台不得执行。"""
+def test_retire_disables_gitdir_config_carrier(repo: Path, wt: Path,
+                                              tmp_path: Path) -> None:
+    """R3 收口：`extensions.worktreeConfig` 退休 ⇒ `<gitdir>/config.worktree` 里的
+    merge driver **不再被执行**（平台 `merge-tree` 这条落点的真实载体）。
+
+    先做**阳性对照**：扩展开着时该现场确实会执行（否则断言无意义）。
+    """
     flag = tmp_path / "flag_r3.txt"
     _raw_git(wt, "config", "extensions.worktreeConfig", "true")
     _raw_git(wt, "config", "--worktree", "merge.evildrv.driver",
@@ -114,6 +108,20 @@ def test_merge_tree_driver_from_gitdir_config_worktree_is_blocked(
     assert flag.exists(), (
         "阳性对照失败：R3 现场没生效（driver 未被调用）⇒ 本用例证明不了什么")
 
+    # 平台动作：退休扩展（写 **repo config**；命令行 -c 关不掉 —— 实测）
+    retired = asyncio.run(retire_worktree_config(str(repo)))
+    assert retired is True
+    assert _raw_git(repo, "config", "extensions.worktreeConfig").stdout.strip() \
+        == "false"
+
+    # 载体失效：平台 merge-tree 不再执行它
     flag.unlink(missing_ok=True)
     asyncio.run(predict_merge_conflicts(str(wt), project_root=str(repo)))
-    assert not flag.exists(), "平台 merge-tree 执行了 agent 的 merge driver"
+    assert not flag.exists(), "退休后平台 merge-tree 仍执行了 agent 的 merge driver"
+
+
+def test_retire_is_idempotent_and_tolerates_non_repo(tmp_path: Path) -> None:
+    """退休函数幂等；非仓库目录不抛异常（fail-quiet 契约）。"""
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    assert asyncio.run(retire_worktree_config(str(plain))) is False
