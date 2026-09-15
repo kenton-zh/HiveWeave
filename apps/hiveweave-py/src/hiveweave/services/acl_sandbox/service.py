@@ -452,11 +452,19 @@ class _AsyncGrant:
     async def break_inheritance_async(self, path) -> None:
         await asyncio.to_thread(self._g.break_inheritance, path)
 
-    async def seal_agent_aces_async(self, path, sids: set[str]) -> bool:
-        return await asyncio.to_thread(self._g.seal_agent_aces, path, sids)
+    async def seal_agent_aces_async(self, path, sids: set[str],
+                                    *, lock_against_delete: bool = False
+                                    ) -> bool:
+        return await asyncio.to_thread(
+            self._g.seal_agent_aces, path, sids,
+            strip_platform_delete=lock_against_delete)
 
     async def deny_delete_child_async(self, path, sids: set[str]) -> int:
         return await asyncio.to_thread(self._g.deny_delete_child, path, sids)
+
+    async def deny_child_delete_for_all_async(self, path) -> int:
+        return await asyncio.to_thread(
+            self._g.deny_child_delete_for_all, path)
 
 
 # ── #2 GitSpawn 治本：git「引导文件」封条（2026-09-15） ────────────────
@@ -549,6 +557,47 @@ def _grant_aces(path: str) -> list[tuple[int, int, int, str]]:
     return WriteGrant.list_aces(path)
 
 
+def unlock_git_lockdown(project_root: str) -> int:
+    """**清理前解锁**：把 R1 锁死的 git 路径恢复成可删（best-effort，同步）。
+
+    给两个清理路径用：项目删除的 `rmtree`、worktree 移除（`git worktree remove`）——
+    否则它们会在 `.git/config` / `<gitdir>/config.worktree` 上 PermissionError
+    （锁死档 + 全主体 FC deny 把删位摘掉了）。
+
+    解锁项 = 三个载体文件 + 承载它们的目录（`.git`、各 `<gitdir>`、项目根）的
+    Everyone-FC deny。返回改动数；**失败只记 warning**（清理路径不该因解锁失败而中止）。
+    """
+    from hiveweave.services.acl_sandbox.grant import WriteGrant
+
+    project = os.path.realpath(project_root)
+    git_dir = os.path.join(project, ".git")
+    if not os.path.isdir(git_dir):
+        return 0
+    targets: list[str] = []
+    for name in ("config", "config.worktree"):
+        targets.append(os.path.join(git_dir, name))
+    wt_root = os.path.join(git_dir, "worktrees")
+    if os.path.isdir(wt_root):
+        for name in sorted(os.listdir(wt_root)):
+            gd = os.path.join(wt_root, name)
+            if os.path.isdir(gd):
+                targets.append(os.path.join(gd, "config.worktree"))
+                targets.append(gd)
+    targets.append(git_dir)
+    targets.append(project)
+    changed = 0
+    for path in targets:
+        try:
+            if WriteGrant.unlock_for_delete(path):
+                changed += 1
+        except Exception:
+            log.warning("acl_sandbox.unlock_for_delete_failed", path=path)
+    if changed:
+        log.info("acl_sandbox.git_lockdown_unlocked", count=changed,
+                 project=project)
+    return changed
+
+
 async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     """封住 git 的引导文件（agent 不可写、不可删建）。返回本次实际改动的项。
 
@@ -563,7 +612,8 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     changed: list[str] = []
     sids = _seal_subject_sids(policy)
 
-    async def seal_file(path: str) -> None:
+    async def seal_file(path: str, *, lock_against_delete: bool = False
+                        ) -> None:
         created = False
         if not os.path.exists(path):
             if os.path.basename(path) not in _PLACEHOLDER_CARRIERS:
@@ -578,7 +628,8 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
                     f"cannot create git bootstrap placeholder {path}: {exc}. "
                     f"agent 可自行新建该文件并让平台 git 读它 ⇒ 拒绝继续",
                 ) from exc
-        wrote = await agrant.seal_agent_aces_async(path, sids)
+        wrote = await agrant.seal_agent_aces_async(
+            path, sids, lock_against_delete=lock_against_delete)
         # 读回复核（§4.11 同族纪律）：摘完必须**读到干净**，否则 fail-closed。
         # 没有这步，「摘了个寂寞」与「已封」在日志上长得一样。
         leaking = _agent_aces_leaking(path)
@@ -590,10 +641,50 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
             changed.append(f"{'create+' if created else ''}seal:{path}")
 
     async def deny_dc(path: str) -> None:
-        if await agrant.deny_delete_child_async(path, sids):
-            changed.append(f"deny-dc:{path}")
+        """禁删子项 —— **对所有人**（不只能力 SID）。
 
-    # ① `.git` **根**：不授写 —— 这是本条的病因，也是唯一留得住的杠杆。
+        见 `WriteGrant.deny_child_delete_for_all` 的 docstring：删子项两条路径都走
+        pass-1，只 deny 能力 SID 挡不住（D1–D3 / rmdir .git 实测）。
+        """
+        if await agrant.deny_child_delete_for_all_async(path):
+            changed.append(f"deny-dc-all:{path}")
+
+    # ① 退休 `extensions.worktreeConfig`（fixqueue #2 残余 R3）。
+    #    ⚠ **必须早于下面任何一个 seal**：锁死档会连平台主体的 DELETE 一起摘，
+    #    之后再 `git config <写>` 就会失败（本行顺序是硬约束，改动前先读这段）。
+    #    只要它开着，git 就会读 `<proj>/.git/config.worktree` 与
+    #    `<gitdir>/config.worktree` —— 后者在 agent 可写面内（worktree gitdir 必须
+    #    可写），且 `filter.<n>.clean`/`merge.<n>.driver` 是动态键名
+    #    （`GIT_CONFIG_*` 覆盖不到）⇒ 实测平台进程会执行 agent 写的驱动。
+    #    ⚠ 存量项目也要治（老版本在 worktree 创建时开过它）⇒ 放在**每次受限命令的
+    #    grant 阶段**（去重成每项目每进程一次），不依赖「新建 worktree」。
+    #    fail-quiet：关不上只记 warning（封条仍在，且 identity 已改 `-c` 注入）。
+    if project not in _WORKTREE_CONFIG_RETIRED:
+        try:
+            from hiveweave.services.git_worktree.git_identity import (
+                retire_worktree_config,
+            )
+
+            if await retire_worktree_config(project):
+                _WORKTREE_CONFIG_RETIRED.add(project)
+            else:
+                # 审计 2026-09-15 ②-8：关不上就等于 R3 载体仍然活着（git 会读
+                # `<gitdir>/config.worktree` 里的动态键名驱动）⇒ **fail-closed**，
+                # 不许静默降级成 warning。
+                raise SandboxUnavailableError(
+                    f"无法退休 extensions.worktreeConfig（{project}）—— "
+                    f"worktree config 载体仍会被 git 读，拒绝执行 agent 命令。"
+                    f"修复：确认 `.git/config` 可写（必要时删掉 "
+                    f"<data_root>/git-anchor 下的记录或用 unlock 解锁）后重试")
+        except SandboxUnavailableError:
+            raise
+        except Exception as exc:
+            log.warning("acl_sandbox.worktree_config_retire_error",
+                        project=project, error=str(exc)[:200])
+            raise SandboxUnavailableError(
+                f"退休 extensions.worktreeConfig 时出错（{project}）：{exc}") from exc
+
+    # ② `.git` **根**：不授写 —— 这是本条的病因，也是唯一留得住的杠杆。
     #    为什么不「只封住 config 文件」：`git config` 是 **lock + rename 替换**，
     #    而「删」走 pass-1（user ACE，封条挡不住）、「建」走父目录 create 权
     #    （pass-2 管得住 —— 实测工作区外 create 被拒）。只封文件 ⇒ agent 一条
@@ -613,9 +704,16 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
         if os.path.isdir(d):
             await _grant_if_missing(d, git_sid(project), GRANT_MASK, agrant)
 
-    # ② 主 config + 主 worktree config（占位）+ `.git` 下的其它引导文件
+    # ② 主 config + 主 worktree config（占位）——**锁死档**：连平台主体的
+    #    DELETE/DC 一起摘（R1 双阶段）。理由：`git config` 是 lock+rename，
+    #    只摘能力 SID 时 agent 仍能凭**普通令牌的 user ACE** 把文件删掉（实测
+    #    D1/V2 = DELETED）⇒ 删掉后平台下次 `git config` 会以**继承 ACE** 重建它，
+    #    窗口期等于把封条让给了 agent。锁死后谁都替换不掉。
+    #    代价：平台自己也不再用 `git config <写>` 改它 —— 已核对平台写点只有
+    #    ① `ensure_git_repo` 的两处 init 写入（本函数之前）② `retire_worktree_config`
+    #    （已前置到本函数之上且改成「先读、非 false 才写」）。
     for name in ("config", "config.worktree"):
-        await seal_file(os.path.join(git_dir, name))
+        await seal_file(os.path.join(git_dir, name), lock_against_delete=True)
 
     # ③ 每个 worktree 的 gitdir：本身要继续可写（agent 的 index/index.lock 在
     #    那里），故这里封的 `config.worktree` / `commondir` **只是提高门槛**：
@@ -627,10 +725,21 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
             if not os.path.isdir(gd):
                 continue
             await _grant_if_missing(gd, git_sid(project), GRANT_MASK, agrant)
+            # ⚠ 这里**只做普通封条、不锁死**：该载体已随 `extensions.worktreeConfig`
+            #   退休而死（git 根本不读它），而 `git worktree prune/remove` 要删掉**整个
+            #   `<gitdir>`** —— 锁死档会让 prune 删不掉（审计 2026-09-15 实测：
+            #   `prune` rc=0 但报 `failed to delete ...: Invalid argument`，注册项残留
+            #   ⇒ 同名 worktree 再建永久失败）。锁死不带来安全收益，只带来这个副作用。
             await seal_file(os.path.join(gd, "config.worktree"))
             await seal_file(os.path.join(gd, "commondir"))
             await deny_dc(gd)
     await deny_dc(git_dir)
+    # `.git` 本体的删除走**父目录**的 DC 那一条路（`.git` 自己已无 agent DELETE）
+    # ⇒ 项目根也要禁删子项，否则 agent 一条 `rmdir /s /q .git` 就把整个仓端掉
+    # （实测：项目根边界形态 rc=0 删成功）。只影响「直接子项里自己没有 agent DELETE」
+    # 的那些（`.git`/`.hiveweave`）——普通文件仍可删。
+    if os.path.realpath(policy.boundary_root) == project:
+        await deny_dc(project)
 
     # ③ worktree 边界：`<wt>/.git` 是 gitdir 指针 —— 改它 = 平台在 worktree 里的
     #    git 去读 agent 目录的 config。
@@ -660,26 +769,6 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     if changed:
         log.info("acl_sandbox.git_bootstrap_sealed", count=len(changed),
                  items=changed[:8])
-
-    # ④ 退休 `extensions.worktreeConfig`（fixqueue #2 残余 R3）：
-    #    只要它开着，git 就会读 `<proj>/.git/config.worktree` 与
-    #    `<gitdir>/config.worktree` —— 后者在 agent 可写面内（worktree gitdir 必须
-    #    可写），且 `filter.<n>.clean`/`merge.<n>.driver` 是动态键名
-    #    （`GIT_CONFIG_*` 覆盖不到）⇒ 实测平台进程会执行 agent 写的驱动。
-    #    ⚠ 存量项目也要治（老版本在 worktree 创建时开过它）⇒ 放在**每次受限命令的
-    #    grant 阶段**（去重成每项目每进程一次），不依赖「新建 worktree」。
-    #    fail-quiet：关不上只记 warning（封条仍在，且 identity 已改 `-c` 注入）。
-    if project not in _WORKTREE_CONFIG_RETIRED:
-        try:
-            from hiveweave.services.git_worktree.git_identity import (
-                retire_worktree_config,
-            )
-
-            if await retire_worktree_config(project):
-                _WORKTREE_CONFIG_RETIRED.add(project)
-        except Exception:
-            log.warning("acl_sandbox.worktree_config_retire_error",
-                        project=project)
 
     return changed
 

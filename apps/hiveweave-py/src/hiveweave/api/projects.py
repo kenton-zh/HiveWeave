@@ -812,6 +812,24 @@ async def create_project(body: ProjectCreate) -> dict:
                 os.chmod(path, _stat.S_IWRITE)
             except Exception as exc:
                 log.debug("rmtree_chmod_failed", path=path, error=str(exc))
+            # R1 锁死档（ACL 摘了 DELETE）⇒ chmod 救不了，得做 ACL 解锁再重试；
+            # 否则 `.git/config` 这类锁定文件会让 rmtree 直接 PermissionError。
+            try:
+                from hiveweave.services.acl_sandbox.service import (
+                    unlock_git_lockdown,
+                )
+
+                root = path
+                for _ in range(3):
+                    nxt = os.path.dirname(root)
+                    if not nxt or nxt == root:
+                        break
+                    root = nxt
+                    if os.path.isdir(os.path.join(root, ".git")):
+                        break
+                unlock_git_lockdown(root)
+            except Exception as exc:
+                log.debug("rmtree_acl_unlock_failed", path=path, error=str(exc))
             try:
                 func(path)
             except Exception as exc:

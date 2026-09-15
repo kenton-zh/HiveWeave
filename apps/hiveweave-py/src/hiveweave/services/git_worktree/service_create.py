@@ -83,6 +83,10 @@ class CreateMixin:
             # and migrate legacy ignore rules (workspace tracking) if found.
             await self._migrate_legacy_hiveweave_ignore(workspace_path)
             await self._ensure_gitignore_entries(workspace_path)
+            # 收养仓库也要补兜底身份（审计 2026-09-15 ③）：本分支不写 config，
+            # 而 `.git/config` 之后会被「锁死档」锁住 ⇒ 这里是**收养路径上最后的
+            # 可写窗口**。只在 `user.name` 完全解析不到时才写（幂等，不动既有身份）。
+            await self._seed_platform_identity(workspace_path)
             return {"success": True, "initialized": False}
 
         ok, _ = await _git(["--version"], workspace_path)
@@ -96,6 +100,7 @@ class CreateMixin:
         from .git_anchor import record_gitdir_identity
 
         record_gitdir_identity(os.path.join(workspace_path, ".git"))
+        await self._seed_platform_identity(workspace_path)
 
         # Rename master → main (ignore failure — may already be main/trunk)
         await _git(["branch", "-m", "master", "main"], workspace_path)
@@ -619,6 +624,22 @@ yarn.lock merge=union
             self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
 
+    async def _seed_platform_identity(self, workspace_path: str) -> None:
+        """兜底身份：仓库**完全没有** user.name 时补平台身份（收养仓库）。
+
+        ⚠ **必须在这里做**（`git init` 之后、`.git/config` 被「锁死档」封住之前）：
+        锁死后连平台主体都没有 DELETE/DC ⇒ `git config <写>` 会失败。
+        没有它，agent 自己在 worktree 里 `git commit` 会以
+        "Please tell me who you are" 硬失败。
+        """
+        ok_chk, cur = await _git(["config", "user.name"], workspace_path)
+        if ok_chk and (cur or "").strip():
+            return
+        await _git(["config", "user.name", PLATFORM_NAME], workspace_path)
+        await _git(["config", "user.email", PLATFORM_EMAIL], workspace_path)
+        log.info("git_worktree.platform_identity_seeded",
+                 workspace=workspace_path)
+
     async def _retire_worktree_config_carrier(
         self, workspace_path: str, worktree_path: str, short_id: str
     ) -> None:
@@ -649,17 +670,6 @@ yarn.lock merge=union
                     short_id=short_id, root=workspace_path,
                 )
                 return
-            # 兜底身份：存量/收养仓库可能完全没有 user.name —— 否则 agent 自己
-            # 在 worktree 里 `git commit` 会以 "Please tell me who you are" 硬失败。
-            # 只在缺失时补写，不覆盖既有身份。
-            ok_chk, cur = await _git(["config", "user.name"], worktree_path)
-            if not ok_chk or not (cur or "").strip():
-                await _git(["config", "user.name", PLATFORM_NAME],
-                           worktree_path)
-                await _git(["config", "user.email", PLATFORM_EMAIL],
-                           worktree_path)
-                log.info("git_worktree.platform_identity_seeded",
-                         short_id=short_id)
         except Exception:
             log.warning("git_worktree.worktree_config_carrier_retire_error",
                         short_id=short_id)

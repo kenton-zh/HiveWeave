@@ -52,6 +52,8 @@ _ADMINISTRATORS_SID = "S-1-5-32-544"
 # 给工作区内缓存类目录补授 AU 写即让**同一工作区的所有受限代理**可共享写入，
 # 供测试运行器（.pytest_cache/__pycache__/node_modules/.cache）多 agent 并发复用。
 _AUTHENTICATED_USERS_SID = "S-1-5-11"
+# Everyone：用于「任何主体都不许删该目录的直接子项」的锁死 ACE
+_EVERYONE_SID = "S-1-1-0"
 
 
 def _require_win32() -> None:
@@ -249,7 +251,8 @@ class WriteGrant:
         return _iter_aces(dacl)
 
     @staticmethod
-    def seal_agent_aces(path: str, sid_strs: set[str]) -> bool:
+    def seal_agent_aces(path: str, sid_strs: set[str], *,
+                        strip_platform_delete: bool = False) -> bool:
         """封条：把给定受限 SID 的 ACE 从 *path* 摘除，其余 ACE 转显式 + PROTECTED。
 
         返回 True = 实际写盘；**幂等**（已摘除且已 PROTECTED ⇒ False，不再写盘
@@ -292,12 +295,28 @@ class WriteGrant:
         has_agent_ace = any(
             ace_type == ACE_ALLOWED and s in sid_strs
             for ace_type, _f, _m, s in _iter_aces(dacl))
-        if protected and not has_agent_ace:
+        # ⚠ strip 档下**不能**只看能力 SID 就短路：`unlock_for_delete` 解锁时补的是
+        #   **平台主体**的 DELETE/DC（判定看不见）⇒ 只判 has_agent_ace 会把「已解锁」
+        #   误判成「已封」，**一次解锁永久生效**（实测：解锁后再跑封条，
+        #   平台 DELETE 仍在 ⇒ 删得掉）。故 strip 档必须确认「没有任何 ALLOW ACE
+        #   还带 DELETE/FC」，否则照常重建。
+        strip_leftover = any(
+            ace_type == ACE_ALLOWED and mask & (DELETE | FILE_DELETE_CHILD)
+            for ace_type, _f, mask, _s in _iter_aces(dacl))
+        if protected and not has_agent_ace and not (
+                strip_platform_delete and strip_leftover):
             return False
         new_acl = win32security.ACL()
         for ace_type, ace_flags, mask, sid in _iter_aces(dacl):
             if ace_type == ACE_ALLOWED and sid in sid_strs:
                 continue
+            if strip_platform_delete and ace_type == ACE_ALLOWED:
+                # 「双阶段」的锁死期：连**平台主体**的 DELETE/DC 一起去掉 ⇒ 谁都替换
+                # 不掉这个文件（Windows 删子项两条准入路径都被堵）。
+                # ⚠ 代价：平台自己也**不再能** lock+rename 重写它（`git config <写>`
+                # 会失败）⇒ 只对「平台在锁死之后确实不需要再写」的载体启用
+                # （`.git/config` / `config.worktree`；见 acl_sandbox/service.py 的调用点）。
+                mask = mask & ~(DELETE | FILE_DELETE_CHILD)
             flags = ace_flags & ~_INHERITED_ACE
             # 掩码符号：GetAce 给的是无符号值，AddAccess* 收 C long ⇒ 高位掩码
             # 会 OverflowError（审计 B2）。归一到有符号 32 位。
@@ -361,6 +380,112 @@ class WriteGrant:
         ])
         WriteGrant._write_dacl(path, dacl)
         return len(todo)
+
+    @staticmethod
+    def unlock_for_delete(path: str) -> bool:
+        """把 *path* 恢复成「可删」：给当前主体补 DELETE + 摘掉父目录的 Everyone-FC 锁死 ACE。
+
+        为什么需要：**锁死档**（`seal_agent_aces(strip_platform_delete=True)`）+
+        **全主体禁删子项**（`deny_child_delete_for_all`）是给 agent 看的锁，但平台
+        **自己的清理路径也要动这些路径**（`git worktree remove` 要删整个 `<gitdir>`；
+        删项目/清残留的 `rmtree` 会走到 `.git` 附近）⇒ 清理前解锁，否则会
+        PermissionError（或被 `rmtree` 的 onerror 吞成 debug 日志）。
+        实现上用**属主改 DACL**（owner 天生有 WRITE_DAC）—— 所以这不需要额外特权，
+        也说明「锁」防的是 agent 而不是管理员。
+
+        返回 True = 做过改动。
+        """
+        _require_win32()
+        changed = False
+        parent = os.path.dirname(os.path.abspath(path))
+        # ① 父目录：摘掉 Everyone 的 FC deny（只摘这一条，别的 deny 不动）
+        if os.path.isdir(parent):
+            dacl = WriteGrant._read_dacl(parent)
+            if dacl is not None:
+                new_acl = win32security.ACL()
+                removed = False
+                for ace_type, ace_flags, mask, sid in _iter_aces(dacl):
+                    if (ace_type == ACE_DENIED and sid == _EVERYONE_SID
+                            and mask & FILE_DELETE_CHILD):
+                        removed = True
+                        continue
+                    flags = ace_flags & ~_INHERITED_ACE
+                    signed = mask - 0x100000000 if mask > 0x7FFFFFFF else mask
+                    if ace_type == ACE_ALLOWED:
+                        new_acl.AddAccessAllowedAceEx(
+                            win32security.ACL_REVISION, flags, signed,
+                            win32security.ConvertStringSidToSid(sid))
+                    elif ace_type == ACE_DENIED:
+                        new_acl.AddAccessDeniedAceEx(
+                            win32security.ACL_REVISION, flags, signed,
+                            win32security.ConvertStringSidToSid(sid))
+                if removed:
+                    win32security.SetNamedSecurityInfo(
+                        parent, win32security.SE_FILE_OBJECT,
+                        win32security.DACL_SECURITY_INFORMATION
+                        | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                        WriteGrant._owner(parent), WriteGrant._group(parent),
+                        new_acl, None)
+                    changed = True
+        # ② 目标本身：给当前主体（用户）补 DELETE
+        if os.path.exists(path):
+            dacl = WriteGrant._read_dacl(path)
+            if dacl is not None:
+                user_sid = WriteGrant._current_subject_sids()
+                has_delete = any(
+                    ace_type == ACE_ALLOWED and s in user_sid
+                    and mask & DELETE
+                    for ace_type, _f, mask, s in _iter_aces(dacl))
+                if not has_delete:
+                    sid = win32security.OpenProcessToken(
+                        win32api.GetCurrentProcess(), win32security.TOKEN_QUERY)
+                    try:
+                        user = win32security.GetTokenInformation(
+                            sid, win32security.TokenUser)[0]
+                    finally:
+                        sid.Close()
+                    dacl.SetEntriesInAcl([_explicit_access(
+                        user, DELETE | FILE_DELETE_CHILD,
+                        win32security.GRANT_ACCESS, 0)])
+                    WriteGrant._write_dacl(path, dacl)
+                    changed = True
+        return changed
+
+    @staticmethod
+    def deny_child_delete_for_all(path: str) -> int:
+        """对 *path* 加「**任何主体**都不许删它的**直接子项**」的 DENY（mask=FILE_DELETE_CHILD）。
+
+        为什么必要（09-15 实测的「两条准入路径」再现）：Windows 删子项可走
+        ① 子对象自己的 DELETE，**或** ② 父目录的 FILE_DELETE_CHILD —— 而 ① 走 pass-1
+        （普通令牌的 user ACE，对平台自有文件有 FILE_ALL_DELETE），② 也走 pass-1。
+        所以只摘「能力 SID 的 ACE」根本挡不住删（D1–D3 实测 DELETED）；「锁死档」把
+        子对象的 DELETE 摘掉之后，只剩 ② 这条路 ⇒ 必须 deny **父目录**的 DC，
+        而且要 deny 给**所有主体**（deny 给某几个 SID 挡不住 user 那条）。
+
+        ⚠ 为什么 deny 的是 FC 而不是 DELETE：DELETE 在**目录自己**身上，deny 它会把
+        「删这个目录」也堵掉（而平台要保留删该目录的能力，例如 `git worktree prune`）。
+        FC 只管「删它的子项」这一条路；子项**自己**有 DELETE 的（正常继承来的）
+        照旧可删 —— 只有被锁死的那些（已摘 DELETE）才真的删不掉。
+
+        返回实际新增的 ACE 数（幂等）。
+        """
+        _require_win32()
+        if not os.path.isdir(path):
+            return 0
+        dacl = WriteGrant._read_dacl(path)
+        if dacl is None:
+            raise SandboxUnavailableError(
+                f"deny_child_delete target has NULL DACL: {path}",
+                api_name="GetSecurityDescriptorDacl")
+        for ace_type, _f, mask, sid in _iter_aces(dacl):
+            if (ace_type == ACE_DENIED and sid == _EVERYONE_SID
+                    and mask & FILE_DELETE_CHILD):
+                return 0
+        dacl.SetEntriesInAcl([_explicit_access(
+            win32security.ConvertStringSidToSid(_EVERYONE_SID),
+            FILE_DELETE_CHILD, win32security.DENY_ACCESS, 0)])
+        WriteGrant._write_dacl(path, dacl)
+        return 1
 
     @staticmethod
     def has_subject_write_ace(path: str) -> bool:

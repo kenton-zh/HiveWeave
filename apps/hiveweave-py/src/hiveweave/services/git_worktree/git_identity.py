@@ -76,6 +76,16 @@ async def retire_worktree_config(project_root: str) -> bool:
     try:
         from hiveweave.util.win_subprocess import hidden_run
 
+        # ⚠ **先读后写**：`.git/config` 在「锁死档」下连平台主体都没有 DELETE ⇒
+        # 一旦已经是 false 就**不要**再写（否则每次重启都会因 lock+rename 失败刷 warning）。
+        probe = await asyncio.to_thread(
+            hidden_run,
+            ["git", "config", "--get", "extensions.worktreeConfig"],
+            cwd=project_root, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        if (probe.stdout or "").strip().lower() == "false":
+            return True
         proc = await asyncio.to_thread(
             hidden_run,
             ["git", "config", "extensions.worktreeConfig", "false"],

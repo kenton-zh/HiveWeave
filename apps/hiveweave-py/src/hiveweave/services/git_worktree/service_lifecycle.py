@@ -22,6 +22,18 @@ from .constants import (
     _create_locks_guard,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
+from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
+
+
+def _unlock_git_lockdown(project_root: str) -> None:
+    """清理前解锁（best-effort）：`git worktree remove` 会删到被 R1 锁死的
+    `<gitdir>/config.worktree` ⇒ 不解锁就 PermissionError。"""
+    try:
+        unlock_git_lockdown(project_root)
+    except Exception:
+        pass
+
+
 from .git_cmd import _current_branch, _git, _resolve_base_branch
 from .merge_support import (
     _auto_checkpoint_dirty_target,
@@ -167,6 +179,7 @@ class LifecycleMixin:
             branch = compute_branch_name(short_id)
 
         # Detach from git's worktree list without deleting the branch
+        _unlock_git_lockdown(workspace_path)
         ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
         if not ok:
             ok, _ = await _git(
@@ -290,6 +303,7 @@ class LifecycleMixin:
 
         # ① worktree 移除链: remove → remove --force → rmtree + prune
         removed = True
+        _unlock_git_lockdown(workspace_path)
         ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
         if not ok:
             ok, _ = await _git(

@@ -197,18 +197,14 @@ async def test_agent_cannot_write_git_config(proj: Path, wt: Path) -> None:
     assert cfg.read_bytes() == before, "受限 agent 改写了 .git/config"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="已实测残余（pass-1 层）：Windows 的删除权「对象自己的 DELETE」由**普通令牌**"
-           "判定 —— `del <文件>` 走得通，而 create 才归 pass-2 管。所以收窄能挡住"
-           "「替换」（= 本条的代码执行跳板），挡不住「删掉」（DoS：config 丢失 ⇒ "
-           "身份/ extensions.worktreeConfig 回到默认）。修法（已定位，属计划里的"
-           "「双阶段」）：锁死期连**平台主体**的 DELETE 一起摘掉（`git config` 的 "
-           "lock+rename 也需 DELETE ⇒ 平台同样写不进去），并把平台侧的 config 写入"
-           "全部挪到锁之前 / 改走带外通道。本条转红 = 双阶段落地。",
-)
 async def test_agent_cannot_delete_git_config(proj: Path, wt: Path) -> None:
-    """`del .git/config` 的 DoS —— **已知残余**（见 xfail reason）。"""
+    """`del .git/config` 的 DoS —— **已收口（R1 双阶段）**。
+
+    修法：该文件走「锁死档」封条（`strip_platform_delete`）—— 连**平台主体**的
+    DELETE/DC 一起摘 ⇒ Windows 删子项的两条准入路径（对象自己的 DELETE / 父目录的 DC）
+    同时落空，谁都替换不掉它。代价是平台自己也不能再 `git config <写>`（见
+    `test_platform_git_write_paths_still_work` 的新契约）。
+    """
     await _bootstrap(wt, proj)
     cfg = proj / ".git" / "config"
     await _agent(wt, proj, r"del ..\..\..\.git\config")
@@ -267,6 +263,39 @@ async def test_worktree_config_carrier_is_not_live(proj: Path, wt: Path) -> None
     assert got == "false", f"扩展仍开着（{got!r}）⇒ 载体仍活"
 
 
+async def test_agent_cannot_delete_whole_git_dir(proj: Path, wt: Path) -> None:
+    """`rmdir /s /q .git` —— **已收口（R1）**：项目根也禁删子项。
+
+    ⚠ 必须用 **`bash_main`（项目根边界）**跑：worktree 边界下 agent 本来就没有
+    项目 `.git` 的写 ACE（pass-2 落空），删不掉是**别的原因** ⇒ 那样写会恒绿
+    （审计 2026-09-15 ②-6 指出）。项目根边界才是"最强形态"：它对项目根有写权，
+    唯一挡住它的就是本批加的那条 **Everyone-FC deny**。
+    """
+    await _bootstrap(wt, proj)
+    # 先证「deny 在场」（状态判据）：Everyone 的 FC deny 落在项目根上
+    import win32security as _ws
+
+    def _has_everyone_fc_deny(path: Path) -> bool:
+        sd = _ws.GetNamedSecurityInfo(
+            str(path), _ws.SE_FILE_OBJECT, _ws.DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+        for i in range(dacl.GetAceCount()):
+            ((t, _f), m, s) = dacl.GetAce(i)
+            if (t == _ws.ACCESS_DENIED_ACE_TYPE
+                    and _ws.ConvertSidToStringSid(s) == "S-1-1-0"
+                    and m & 0x40):
+                return True
+        return False
+
+    # 项目根的 deny 由**项目根边界**那一次 grant 铺（worktree 边界不铺项目根）
+    await _agent(proj, proj, "echo boot", agent_id="CEO", entry="bash_main")
+    assert _has_everyone_fc_deny(proj), "项目根上没有 Everyone-FC deny（R1a 未生效）"
+    git_dir = proj / ".git"
+    await _agent(proj, proj, f'rmdir /s /q "{git_dir}"',
+                 agent_id="CEO", entry="bash_main")
+    assert git_dir.is_dir(), "受限 agent 删掉了整个 .git"
+
+
 async def test_agent_cannot_mutate_main_git_metadata(proj: Path, wt: Path) -> None:
     """行为变更（有意）：agent 不再能改**主树**的 git 元数据。
 
@@ -296,16 +325,21 @@ async def test_agent_cannot_rewrite_worktree_gitdir_pointer(
 # 2. 平台侧：封条不得伤到平台自己的 git 用法
 # ══════════════════════════════════════════════════════════════════
 async def test_platform_git_write_paths_still_work(proj: Path, wt: Path) -> None:
-    """计划 §四 担心的「收权限会坏三处」：ACL 方案下平台写入必须仍然成功。
+    """**锁死档之后**（R1 双阶段）平台 git 的编排照常，但 config **写入**按设计被拒。
 
-    （那是**只读文件属性**探针的产物：属性对一切主体生效；ACL 只摘受限 SID。）
+    边界说清楚：`.git/config` 在锁死档下连**平台主体**都没有 DELETE/DC ⇒
+    `git config <写>`（lock+rename）不再可行 —— 这是有意的取舍：平台对 config 的写入
+    只有「`ensure_git_repo` 的两处 init 写入」与「退休标志」，两者都排在锁死之前
+    （见 `acl_sandbox/service.py` 的顺序硬约束 + `git_identity` 的先读后写）。
+    其余编排（worktree add / add / commit / status / merge）**不写 config** ⇒ 必须照常。
     """
     await _bootstrap(wt, proj)
-    assert _raw_git(proj, "config", "user.email", "p@t.t").returncode == 0
-    assert "p@t.t" in _raw_git(proj, "config", "--get",
-                               "user.email").stdout
-    assert _raw_git(wt, "config", "extensions.worktreeConfig",
-                    "true").returncode == 0
+    # 平台**读** config：OK
+    assert _raw_git(proj, "config", "--get",
+                    "core.repositoryformatversion").returncode == 0
+    # 平台**写** config：锁死档下被拒（新的契约）
+    assert _raw_git(proj, "config", "user.email", "p@t.t").returncode != 0, (
+        "锁死档下平台仍能重写 .git/config ⇒ 双阶段没生效")
     wt2 = proj / ".hiveweave" / "worktrees" / "B002"
     assert _raw_git(proj, "worktree", "add", "-q", str(wt2),
                     "-b", "wt/B002").returncode == 0
@@ -355,7 +389,7 @@ async def test_positive_control_with_old_wide_grant_agent_can_write(
 async def test_fail_closed_when_seal_raises(proj: Path, wt: Path,
                                             monkeypatch) -> None:
     """封条写不下去 ⇒ 命令**不得执行**（不许静默降级）。"""
-    def _boom(self, path, sids):
+    def _boom(self, path, sids, *, strip_platform_delete: bool = False):
         raise SandboxUnavailableError(f"boom: {path}")
 
     monkeypatch.setattr(WriteGrant, "seal_agent_aces", _boom)
@@ -371,11 +405,17 @@ async def test_seal_covers_all_known_carriers(proj: Path, wt: Path) -> None:
     recorded: list[tuple[str, str]] = []
 
     class _Recording:
-        async def seal_agent_aces_async(self, path, sids):
+        async def seal_agent_aces_async(self, path, sids,
+                                        *, lock_against_delete: bool = False):
             recorded.append(("seal", os.path.normcase(path)))
             return False
 
         async def deny_delete_child_async(self, path, sids):
+            recorded.append(("deny-dc", os.path.normcase(path)))
+            return 0
+
+        async def deny_child_delete_for_all_async(self, path):
+            # R1 起改用「全主体禁删子项」（旧的能力 SID 版挡不住 pass-1 的 user 那条路）
             recorded.append(("deny-dc", os.path.normcase(path)))
             return 0
 
@@ -469,3 +509,65 @@ def test_deny_delete_child_is_idempotent(tmp_path: Path) -> None:
     cap = "S-1-4-123456789-987654321"
     assert WriteGrant.deny_delete_child(str(tmp_path), {cap}) == 1
     assert WriteGrant.deny_delete_child(str(tmp_path), {cap}) == 0
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. 原语级：锁死 + 解锁（R1 的清理侧配套）
+# ══════════════════════════════════════════════════════════════════
+def test_lock_then_unlock_roundtrip(tmp_path: Path) -> None:
+    """锁死档下谁都删不掉 ⇒ `unlock_for_delete` 之后又能删（平台清理路径依赖它）。
+
+    锁死档 = ① 摘掉文件自己 ACE 里的 DELETE/DC；② 对父目录加 Everyone 的 FC deny。
+    清理路径（项目删除 rmtree / `git worktree remove`）若不解锁 ⇒ PermissionError。
+    """
+    from hiveweave.services.acl_sandbox.grant import WriteGrant
+    from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
+
+    _subject_ace_helpers()(tmp_path)
+    proj = tmp_path / "proj"
+    (proj / ".git").mkdir(parents=True)
+    cfg = proj / ".git" / "config"
+    cfg.write_text("[core]\n\trepositoryformatversion = 0\n", encoding="utf-8")
+
+    cap = "S-1-4-123456789-987654321"
+    WriteGrant.grant_standing(str(proj / ".git"), cap, GRANT_MASK)
+    WriteGrant.seal_agent_aces(str(cfg), {cap}, strip_platform_delete=True)
+    WriteGrant.deny_child_delete_for_all(str(proj / ".git"))
+
+    # 锁死态：删不掉（属主也没有 DELETE，父目录 FC 被 deny）
+    try:
+        cfg.unlink()
+        locked_ok = False
+    except PermissionError:
+        locked_ok = True
+    assert locked_ok, "锁死档没生效（文件仍可被删除）"
+
+    # 解锁（平台清理路径的动作）⇒ 可删
+    assert unlock_git_lockdown(str(proj)) >= 1
+    cfg.unlink()
+    assert not cfg.exists()
+
+
+async def test_worktree_prune_still_works_after_seal(proj: Path, wt: Path) -> None:
+    """密封之后 `git worktree prune` 必须**真的删掉** gitdir（审计 2026-09-15 ①）。
+
+    这条守的是「锁死档别把平台自己的清理路径堵死」：`<gitdir>/config.worktree`
+    一度被纳入锁死档 ⇒ `prune` **rc=0 但报 `failed to delete ...: Invalid argument`**、
+    注册项残留 ⇒ 同名 worktree 再建永久失败（`already registered`）。判据用**状态**
+    （gitdir 是否消失 + 同名能否重建），不看 rc（rc 会说谎）。
+    """
+    await _bootstrap(wt, proj)
+    gitdir = proj / ".git" / "worktrees" / "A001"
+    assert gitdir.is_dir()
+    # 让该 worktree 变成 prunable：删掉 worktree 目录本身（平台侧动作）
+    import subprocess as _sp
+
+    _sp.run(["cmd", "/c", "rmdir", "/s", "/q", str(wt)], capture_output=True)
+    assert not wt.exists()
+    r = _raw_git(proj, "worktree", "prune")
+    assert r.returncode == 0, r.stderr
+    assert not gitdir.exists(), (
+        f"prune 没删掉 gitdir（rc=0 的假成功）：{r.stderr.strip()[:120]}")
+    # 同名 worktree 必须能重建（否则 prune 的残留会把项目卡死）
+    r2 = _raw_git(proj, "worktree", "add", "-q", str(wt), "-b", "wt/A001b")
+    assert r2.returncode == 0, r2.stderr
