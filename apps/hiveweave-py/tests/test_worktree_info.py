@@ -61,7 +61,7 @@ async def _info_with_git(tmp_path: Path, git_side_effect):
 async def test_info_lists_porcelain_files(tmp_path: Path):
     raw = " M src/app.py\n?? scratch.txt\nR  old.py -> new.py"
 
-    async def fake_git(args, cwd, timeout=30.0):
+    async def fake_git(args, cwd, timeout=30.0, project_root=None):
         if args[:2] == ["rev-parse", "--short"]:
             return True, "abc1234"
         if args[:2] == ["rev-parse", "--abbrev-ref"]:
@@ -84,7 +84,7 @@ async def test_info_lists_porcelain_files(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_info_git_status_failure_sets_git_status_error(tmp_path: Path):
-    async def fake_git(args, cwd, timeout=30.0):
+    async def fake_git(args, cwd, timeout=30.0, project_root=None):
         if args[:2] == ["rev-parse", "--short"]:
             return True, "abc1234"
         if args[:2] == ["rev-parse", "--abbrev-ref"]:

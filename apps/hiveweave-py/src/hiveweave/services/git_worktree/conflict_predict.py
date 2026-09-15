@@ -11,12 +11,14 @@ fail-open / fail-closed 边界:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass, field
 
 import structlog
 
 from .constants import GIT_TIMEOUT
+from .git_anchor import anchor_for_git
 from .git_cmd import _current_branch, _git, _resolve_base_branch
 
 log = structlog.get_logger(__name__)
@@ -70,20 +72,35 @@ def _parse_conflict_files(output: str) -> list[str]:
     return files
 
 
-async def _merge_tree(base: str, branch: str, cwd: str) -> tuple[int, str]:
+async def _merge_tree(base: str, branch: str, cwd: str,
+                      project_root: str | None = None) -> tuple[int, str]:
     """git merge-tree --write-tree 带退出码 (exit 1 = 冲突)。
 
     ``_git`` 只返回 bool, 无法区分 exit 1(冲突)与 exit 128(fatal) —
     fail-closed 判定必须看退出码, 这里单独跑子进程。
+
+    ⚠ **这条不走 `_git`，故必须自己接信任锚**（审计 2026-09-15 ①-1 实测：不接锚时
+    `merge-tree` 会执行 agent 写的 merge driver ⇒ 平台进程执行其载荷，与 #2 同族）。
+    锚点派生失败（可证篡改）⇒ **不跑 git**，返回哨兵 -4（调用方按「判定不可用」处理，
+    不猜冲突）。
     """
+    anchor, refusal = anchor_for_git(cwd, project_root)
+    if refusal is not None:
+        return -4, refusal
+    argv: list[str] = ["merge-tree", "--write-tree", base, branch]
+    kwargs: dict = {}
+    if anchor is not None:
+        argv = [*anchor.args, *argv]
+        kwargs["env"] = {**os.environ, **anchor.env}
     try:
         from hiveweave.util.win_subprocess import hidden_exec
 
         proc = await hidden_exec(
-            "git", "merge-tree", "--write-tree", base, branch,
+            "git", *argv,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
         )
     except FileNotFoundError:
         return -1, "git not found on PATH"
@@ -97,11 +114,16 @@ async def _merge_tree(base: str, branch: str, cwd: str) -> tuple[int, str]:
     return (proc.returncode if proc.returncode is not None else -3), output
 
 
-async def predict_merge_conflicts(worktree_path: str) -> ConflictPrediction:
+async def predict_merge_conflicts(worktree_path: str,
+                                 project_root: str | None = None
+                                 ) -> ConflictPrediction:
     """只读预演 worktree 检出分支与 base(main/master) 的合并冲突。
 
     预演分支 = worktree 实际检出分支(与 ``_resolve_agent_branch``
     "事实优先"一致), 预测的就是 merge 将要合的东西。
+
+    ``project_root``：cwd 是 worktree 时请传（信任锚的可靠派生源；本函数内的
+    `merge-tree` 走独立子进程、不经过 `_git`，故锚要在这里显式传下去）。
     """
     global _merge_tree_supported
 
@@ -135,7 +157,7 @@ async def predict_merge_conflicts(worktree_path: str) -> ConflictPrediction:
             status="unknown", behind=behind, ahead=ahead, degraded=True,
         )
 
-    rc, out = await _merge_tree(base, branch, worktree_path)
+    rc, out = await _merge_tree(base, branch, worktree_path, project_root)
     if rc == 0:
         return ConflictPrediction(status="clean", behind=behind, ahead=ahead)
     if rc == 1:

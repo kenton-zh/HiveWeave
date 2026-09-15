@@ -839,9 +839,10 @@ class MergeMixin:
         if wt_path and _Path(wt_path).is_dir():
             # Checkpoint worktree state before rebase — skip vacuum empty commits
             # (TEST6 evening P3-7: empty pre-merge-checkpoint polluted main tip).
-            await _git(["add", "-A"], wt_path)
+            await _git(["add", "-A"], wt_path, project_root=workspace_path)
             ok_diff, diff_out = await _git(
-                ["diff", "--cached", "--quiet"], wt_path
+                ["diff", "--cached", "--quiet"], wt_path,
+                project_root=workspace_path
             )
             # diff --quiet: exit 0 = no staged changes; exit 1 = dirty
             has_staged = not ok_diff
@@ -849,6 +850,7 @@ class MergeMixin:
                 await _git(
                     ["commit", "-m", "pre-merge-checkpoint"],
                     wt_path,
+                    project_root=workspace_path,
                 )
             else:
                 log.info(
@@ -857,10 +859,10 @@ class MergeMixin:
                 )
             # Rebase onto target_branch
             ok_reb, reb_out = await _git(
-                ["rebase", target_branch], wt_path)
+                ["rebase", target_branch], wt_path, project_root=workspace_path)
             if not ok_reb:
                 # Rebase conflict — abort rebase, continue with 3-way merge
-                await _git(["rebase", "--abort"], wt_path)
+                await _git(["rebase", "--abort"], wt_path, project_root=workspace_path)
                 log.warning("git_worktree.rebase_failed",
                             branch=branch, output=reb_out[:200])
 

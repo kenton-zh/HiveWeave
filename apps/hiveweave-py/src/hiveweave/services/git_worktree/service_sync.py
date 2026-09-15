@@ -191,7 +191,8 @@ async def _restore_quarantined_files(
 
 
 async def _predict_sync_conflicts(
-    worktree_path: str, branch: str, base: str
+    worktree_path: str, branch: str, base: str,
+    project_root: str | None = None,
 ) -> tuple[bool, list[str]]:
     """merge-tree 预演 MAIN→worktree 内容冲突。返回 ``(conflicted, files)``。
 
@@ -201,11 +202,13 @@ async def _predict_sync_conflicts(
     """
     default_base = await _resolve_base_branch(worktree_path)
     if (default_base or "main") == base:
-        pred = await predict_merge_conflicts(worktree_path)
+        pred = await predict_merge_conflicts(
+            worktree_path, project_root=project_root
+        )
         if pred.status == "conflict":
             return True, list(pred.conflicts)
         return False, []
-    rc, out = await _merge_tree(base, branch, worktree_path)
+    rc, out = await _merge_tree(base, branch, worktree_path, project_root)
     if rc == 1:
         return True, _parse_conflict_files(out)
     return False, []
@@ -326,7 +329,7 @@ async def sync_main_into_worktree(
         # ── 3. merge-tree 预演第一道（checkpoint/隔离之前）：拒绝路径
         #    零副作用（只看已提交态；未提交改动 vs MAIN 的冲突由第二道接）──
         conflicted, conflict_files = await _predict_sync_conflicts(
-            wt_path, branch, base
+            wt_path, branch, base, project_root=workspace_path
         )
         if conflicted:
             listing = (
@@ -426,7 +429,7 @@ async def sync_main_into_worktree(
         #    的冲突在此（checkpoint 落成提交后）才可预判。拒绝路径可能
         #    留下 checkpoint 提交 —— 回执明示 hash 与处方，不算静默副作用。
         conflicted, conflict_files = await _predict_sync_conflicts(
-            wt_path, branch, base
+            wt_path, branch, base, project_root=workspace_path
         )
         if conflicted:
             listing = (

@@ -819,11 +819,16 @@ async def _submit_preflight(
         )
         from hiveweave.services.worktree_review import (
             agent_worktree_path as _cwt,
+            project_main_workspace as _pmw2,
         )
 
         _wt = await _cwt(agent_id)
         if _wt:
-            _pred = await _predict(_wt)
+            # 冲突预演要信任锚的项目根（本块作用域里 _sub_ws 不存在 —— 那是上面
+            # 另一个 try 块里的局部名；加关键字参数务必连调用链一起 grep）
+            _pred = await _predict(
+                _wt, project_root=await _pmw2(project_id)
+            )
             if _pred.status == "conflict":
                 issues.append({
                     "code": "merge_conflict_with_main",

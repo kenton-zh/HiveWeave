@@ -176,7 +176,8 @@ async def test_predict_unknown_on_fatal_merge_tree(
     _git(git_repo, "add", "other.txt")
     _git(git_repo, "commit", "-m", "main side")
 
-    async def _fatal(base: str, branch: str, cwd: str) -> tuple[int, str]:
+    async def _fatal(base: str, branch: str, cwd: str,
+                     project_root: str | None = None) -> tuple[int, str]:
         return 128, "fatal: repository corruption"
 
     monkeypatch.setattr(

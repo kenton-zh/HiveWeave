@@ -128,13 +128,16 @@ class LifecycleMixin:
             return {"success": False,
                     "message": f"No checkpoints found for {short_id}."}
 
-        ok, _ = await _git(["reset", "--hard", target], path)
+        ok, _ = await _git(["reset", "--hard", target], path,
+                            project_root=workspace_path)
         if not ok:
             return {"success": False,
                     "message": f"Rollback failed for {short_id}"}
 
-        ok, head = await _git(["rev-parse", "--short", "HEAD"], path)
-        ok2, msg = await _git(["log", "-1", "--format=%s"], path)
+        ok, head = await _git(["rev-parse", "--short", "HEAD"], path,
+                               project_root=workspace_path)
+        ok2, msg = await _git(["log", "-1", "--format=%s"], path,
+                           project_root=workspace_path)
         log.info("git_worktree.rollback", short_id=short_id,
                  hash=head if ok else "", target=target)
         return {"success": True,
@@ -441,12 +444,15 @@ class LifecycleMixin:
         if not Path(path).is_dir():
             return {"success": True, "status": None}
 
-        ok, head = await _git(["rev-parse", "--short", "HEAD"], path)
+        ok, head = await _git(["rev-parse", "--short", "HEAD"], path,
+                               project_root=workspace_path)
         if not ok:
             return {"success": True, "status": None}
 
-        ok2, branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], path)
-        ok3, st = await _git(["status", "--porcelain"], path)
+        ok2, branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], path,
+                                 project_root=workspace_path)
+        ok3, st = await _git(["status", "--porcelain"], path,
+                             project_root=workspace_path)
         git_status_error = not ok3
         if ok3:
             uncommitted_files = _porcelain_uncommitted_paths(st)

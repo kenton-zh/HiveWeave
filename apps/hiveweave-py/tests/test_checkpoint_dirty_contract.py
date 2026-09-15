@@ -124,7 +124,7 @@ async def test_real_commit_failure_carries_git_output(tmp_path: Path, monkeypatc
 
     real_git = sc_module._git
 
-    async def failing_commit(args, cwd, timeout=30.0):
+    async def failing_commit(args, cwd, timeout=30.0, project_root=None):
         if args[:1] == ["commit"]:
             return False, "error: pre-commit hook declined (simulated stderr)"
         return await real_git(args, cwd, timeout)
@@ -148,7 +148,7 @@ async def test_commit_failure_appends_stripped_list(tmp_path: Path, monkeypatch)
 
     real_git = sc_module._git
 
-    async def failing_commit(args, cwd, timeout=30.0):
+    async def failing_commit(args, cwd, timeout=30.0, project_root=None):
         if args[:1] == ["commit"]:
             return False, "error: cannot commit"
         return await real_git(args, cwd, timeout)
@@ -323,7 +323,7 @@ async def test_checkpoint_add_failure_carries_git_output(tmp_path: Path, monkeyp
 
     real_git = sc_module._git
 
-    async def failing_add(args, cwd, timeout=30.0):
+    async def failing_add(args, cwd, timeout=30.0, project_root=None):
         if args[:2] == ["add", "-A"]:
             return False, "fatal: index.lock already held (simulated)"
         return await real_git(args, cwd, timeout)

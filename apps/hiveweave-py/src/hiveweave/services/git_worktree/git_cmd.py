@@ -2,14 +2,35 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 from .constants import GIT_TIMEOUT
+from .git_anchor import anchor_for_git
 
-async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple[bool, str]:
+
+async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
+              project_root: str | None = None) -> tuple[bool, str]:
     """Run a git command, return (success, output).
 
     stderr merged into stdout (mirrors Elixir stderr_to_stdout: true).
+
+    **信任锚（2026-09-15）**：gitdir / common dir 由平台**派生并钉住**，不让 git 去读
+    agent 可写的 `<wt>/.git` 指针与 `commondir` —— 否则 agent 可让平台的 git 读它写好的
+    config，从而执行动态键名驱动（`filter.<n>.clean` 等，`GIT_CONFIG_*` 覆盖不到）。
+    实测见 `git_anchor.py` 模块 docstring；派生失败 ⇒ 拒绝执行（不静默回落）。
+
+    `project_root`：**cwd 是 worktree 时请务必传**（调用方手里通常就有
+    `workspace_path`）—— 那是与布局无关的可靠派生源；不传则退化为结构上溯，
+    上溯不到（如 worktree 与主仓是兄弟目录）会**拒绝执行**（fail-closed）。
     """
+    anchor, refusal = anchor_for_git(cwd, project_root)
+    if refusal is not None:
+        return False, refusal
+    kwargs: dict = {}
+    if anchor is not None:
+        args = [*anchor.args, *args]
+        # env 走漏斗：`hidden_exec` 会把 GIT_CONFIG_* 加固**追加**进同一个 env。
+        kwargs["env"] = {**os.environ, **anchor.env}
     try:
         from hiveweave.util.win_subprocess import hidden_exec
 
@@ -19,6 +40,7 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT) -> tuple
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **kwargs,
         )
     except FileNotFoundError:
         return False, "git not found on PATH"

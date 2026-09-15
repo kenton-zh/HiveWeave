@@ -145,7 +145,9 @@ async def _log_worktree_rebuild_event(
     if not agent_id:
         return
     head = ""
-    ok_h, head_out = await _git(["rev-parse", "HEAD"], path if _has_git(path) else workspace_path)
+    ok_h, head_out = await _git(
+        ["rev-parse", "HEAD"], path if _has_git(path) else workspace_path,
+        project_root=workspace_path)
     if ok_h and head_out:
         head = head_out.strip()
     project_id = ""

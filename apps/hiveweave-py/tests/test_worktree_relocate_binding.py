@@ -284,7 +284,7 @@ async def test_checkpoint_uses_effective_relocated_path(tmp_path: Path) -> None:
     agent = {"short_id": "A015", "workspace_path": str(relocated)}
     git_calls: list[tuple[list[str], str]] = []
 
-    async def fake_git(args: list[str], cwd: str):
+    async def fake_git(args: list[str], cwd: str, project_root=None):
         git_calls.append((list(args), cwd))
         # Empty porcelain → "no changes" early return still proves cwd
         if args[:1] == ["status"]:

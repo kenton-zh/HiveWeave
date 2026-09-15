@@ -1000,7 +1000,7 @@ yarn.lock merge=union
             return {"success": False,
                     "message": f"Worktree for {short_id} does not exist."}
 
-        ok, add_out = await _git(["add", "-A"], path)
+        ok, add_out = await _git(["add", "-A"], path, project_root=workspace_path)
         if not ok:
             # P1-2: 失败必须透传 git 原始输出（此前丢 stderr 只回"Failed to
             # stage files"，agent 只能盲试 —— platform-issue-report P1-2 的
@@ -1165,10 +1165,10 @@ yarn.lock merge=union
             pass  # best-effort: don't fail checkpoint on ignore check
 
         # No changes → return current HEAD, count=0
-        ok, status = await _git(["status", "--porcelain"], path)
+        ok, status = await _git(["status", "--porcelain"], path, project_root=workspace_path)
         if ok and status == "":
-            ok2, head = await _git(["rev-parse", "--short", "HEAD"], path)
-            conflict_warning = await self._conflict_warning(path)
+            ok2, head = await _git(["rev-parse", "--short", "HEAD"], path, project_root=workspace_path)
+            conflict_warning = await self._conflict_warning(path, workspace_path)
             return {"success": True, "hash": head if ok2 else "",
                     "count": 0,
                     "message": "no changes to commit" + ignored_warning
@@ -1182,8 +1182,8 @@ yarn.lock merge=union
             ["diff", "--cached", "--name-only"], path
         )
         if ok_cached and not (cached_out or "").strip():
-            ok2, head = await _git(["rev-parse", "--short", "HEAD"], path)
-            conflict_warning = await self._conflict_warning(path)
+            ok2, head = await _git(["rev-parse", "--short", "HEAD"], path, project_root=workspace_path)
+            conflict_warning = await self._conflict_warning(path, workspace_path)
             return {
                 "success": True,
                 "hash": head if ok2 else "",
@@ -1196,7 +1196,7 @@ yarn.lock merge=union
             }
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
-        ok, commit_out = await _git(["commit", "-m", commit_msg], path)
+        ok, commit_out = await _git(["commit", "-m", commit_msg], path, project_root=workspace_path)
         if not ok:
             # T1.2: 失败带 git commit 的 stderr/stdout（此前无原因失败），
             # 剥离清单非空时附上，便于区分「没东西可提交」与「真失败」。
@@ -1220,8 +1220,8 @@ yarn.lock merge=union
 
         # 冲突预警在 commit 之后算: 本次存档新引入的变更参与预演(审计 P2-1),
         # 否则新写出的冲突要滞后一轮才暴露。
-        conflict_warning = await self._conflict_warning(path)
-        ok, head = await _git(["rev-parse", "--short", "HEAD"], path)
+        conflict_warning = await self._conflict_warning(path, workspace_path)
+        ok, head = await _git(["rev-parse", "--short", "HEAD"], path, project_root=workspace_path)
         count = await self._count_checkpoints(path)
         log.info("git_worktree.checkpoint", short_id=short_id,
                  hash=head if ok else "", count=count)
@@ -1229,13 +1229,16 @@ yarn.lock merge=union
                 "message": (ignored_warning + generated_note + regen_note
                             + runtime_note + conflict_warning) or None}
 
-    async def _conflict_warning(self, path: str) -> str:
+    async def _conflict_warning(self, path: str,
+                               workspace_path: str) -> str:
         """checkpoint 回执的冲突预警文案(只提示, 绝不拦截——checkpoint 语义
         = 过程存档/回滚保险, 预警 fail-quiet)。"""
         try:
             from .conflict_predict import predict_merge_conflicts
 
-            pred = await predict_merge_conflicts(path)
+            pred = await predict_merge_conflicts(
+                path, project_root=workspace_path
+            )
             if pred.status == "conflict":
                 return (
                     f" WARNING: main 已领先 {pred.behind} 个提交, 且合并时将"
