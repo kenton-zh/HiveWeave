@@ -33,8 +33,31 @@ def test_first_rejection_not_annotated_second_is():
     assert rm.annotate_repeat_rejection("submit_task", text) == ""
     second = rm.annotate_repeat_rejection("submit_task", text)
     assert "[REPEAT REJECTION #2 via submit_task]" in second
+
+
+def test_same_gate_different_task_id_counts_as_one_cause():
+    """0-4（09-16）：同一门禁里的 8 位 task id 不再把"同一个因"拆成多个。
+
+    本模块存在的理由正是抓「同一堵墙被反复撞」；task id 每次调用都不同，
+    把它算进身份会让计数永远停在 1 —— 那正是 45 轮实测到的病。
+    """
+    a = "COMMIT REJECTED (gate): 未回复详情: 归零 (422b17c5) contract=e62cfb3a 未答复"
+    b = "COMMIT REJECTED (gate): 未回复详情: 归零 (5dc7d7cb) contract=e62cfb3a 未答复"
+    assert rm.annotate_repeat_rejection("commit_turn", a) == ""
+    second = rm.annotate_repeat_rejection("commit_turn", b)
+    assert "[REPEAT REJECTION #2" in second, second
+
+
+def test_different_gates_still_count_separately():
+    """反向对照：不同门禁**必须**分开计（归一化不得把不同因洗成一条）。"""
+    a = "COMMIT REJECTED (gate A): unreplied asks list too long to review now"
+    b = "COMMIT REJECTED (gate B): unreplied asks list too long to review now"
+    assert rm.annotate_repeat_rejection("commit_turn", a) == ""
+    assert rm.annotate_repeat_rejection("commit_turn", b) == ""
+    second = rm.annotate_repeat_rejection("commit_turn", a)
+    assert "[REPEAT REJECTION #2" in second, second
     assert "勿原样重试" in second
-    assert rm.rejection_count(text) == 2
+    assert rm.rejection_count(a) == 2
 
 
 def test_different_signatures_count_independently():

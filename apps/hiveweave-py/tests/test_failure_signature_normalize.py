@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import re
+
 from hiveweave.services.failure_signature import signature_of
 
 _UUID_A = "3f2b8c1a-9d4e-4f6a-b2c3-1e5d7f9a0b2c"
@@ -132,3 +134,194 @@ def test_git_sha40_not_eaten_by_hex32_rule():
     )
     assert s2 is not None and sha2 in s2
     assert s1 != s2
+
+
+# ══════════════════════════════════════════════════════════════════
+# 0-4（2026-09-16）：再剥两类「平台自产标识形状」
+# ══════════════════════════════════════════════════════════════════
+#
+# **为什么还要改**：`468bf79` 之后同一根因跨 agent **仍被判成不同身份**。
+# 用真实库全量重放（`scripts/replay_failure_signatures.py`，只读）实测：
+# 58 项目 144 条失败 → 85 个签名，其中 **3 组同根因被拆开**，现场是 —
+#   · `命令指向 worktree A075/A076/A077（不是你所在的树）`
+#   · `merging main into hw/A074|A076|A077/work would conflict`
+#   · `.hiveweave/reports/<8 位 id>`
+# 这三处里的 agent 短号与 8 位十六进制**都是平台自己生成的标识**，与根因正交。
+#
+# ⚠ **库里「50 行 → 50 签名 ⇒ 0% 去重」这个结论是测量方法错**：
+# `_SIGNATURE_MAX_ROWS = 50` 是**裁剪上限**，upsert 去重之后行数恒 ≤50
+# ⇒ 拿行数当去重率必然读出 0%。本文件下面的用例是**逐条构造**的判据，
+# 不依赖库内行数。
+
+from hiveweave.services.failure_signature import (  # noqa: E402
+    make_module_id,
+    signature_of as _sig,
+)
+
+
+def test_agent_short_id_normalized_across_agents():
+    """★ DoD 验收现场之一：`worktree A075/A076/A077` ⇒ 同一签名。
+
+    这是"同一根因跨 agent"的最直观形态 —— 三个人各自撞到「路径指向别人的
+    worktree」，差别只有自己的短号。
+    """
+    base = (
+        "Error: Command blocked: 命令指向 worktree {sid}（不是你所在的树）。"
+        "该路径指向**别的 worktree**（``.hiveweave/worktrees/<非本树 id>/…``），"
+        "已越出你的授权树根"
+    )
+    sigs = {_sig(base.format(sid=s)) for s in ("A074", "A075", "A076", "A077")}
+    assert len(sigs) == 1, sigs
+    assert "<agent>" in (sigs.pop() or "")
+
+
+def test_branch_short_id_normalized_across_agents():
+    """★ DoD 验收现场之二：`hw/A074|A076|A077/work` ⇒ 同一签名。"""
+    base = (
+        "Sync refused: merging main into hw/{sid}/work would conflict: "
+        "index.html. Nothing was merged and nothing was changed"
+    )
+    sigs = {_sig(base.format(sid=s)) for s in ("A074", "A076", "A077")}
+    assert len(sigs) == 1, sigs
+
+
+def test_task_id8_normalized():
+    """★ DoD 验收现场之三：`.hiveweave/reports/<8 位 id>` ⇒ 同一签名。"""
+    base = "Error: Directory not found: .hiveweave/reports/{tid}. Not in this tree."
+    sigs = {
+        _sig(base.format(tid=t))
+        for t in ("b8027383", "1027f091", "1dd78a1f", "91765492")
+    }
+    assert len(sigs) == 1, sigs
+
+    # module_id 是签名的纯函数 ⇒ 它自然也必须一致（DoD 的措辞就是 module_id）
+    one = _sig(base.format(tid="b8027383"))
+    other = _sig(base.format(tid="1027f091"))
+    assert make_module_id("p1", one or "") == make_module_id("p1", other or "")
+
+
+def test_agent_short_id_shape_not_over_eaten():
+    """反向对照：只有**恰好** `A`+3 位数字、且左右不是字母数字才替。
+
+    放宽成子串匹配会把 `XA023`、`A0234`（更长的号）一起吃掉 ——
+    那是把不同根因洗成同一条，方向与上面几条相反。
+    """
+    e_long = "tool XA023A and A0234 are both real identifiers in this message body"
+    sig = _sig(e_long)
+    assert sig is not None and "A0234" in sig, sig
+
+
+def test_task_id8_does_not_eat_longer_or_numeric_quantities():
+    """反向对照：**恰好 8 位**十六进制才替。
+
+    - 6 位 / 9 位的十进制量（字节数、计数）不得被替 —— 那是内容；
+    - 40 位 git sha 由 `test_git_sha40_not_eaten_by_hex32_rule` 钉住；
+    - 32 位哈希先被 `<hash>` 吃掉，不会退化成 `<id8>`。
+    """
+    sig = _sig(
+        "archive failed: wrote 327746 bytes into 123456789 slots, "
+        "expected 327746 bytes in total"
+    )
+    assert sig is not None
+    assert "327746" in sig and "123456789" in sig, sig
+
+    sig32 = _sig("blob mismatch for " + "a1b2c3d4" * 4 + " during verification step")
+    assert sig32 is not None and "<hash>" in sig32 and "<id8>" not in sig32
+
+
+def test_distinct_root_causes_still_split():
+    """★ 反向对照（防过度合并）：措辞不同 = 根因不同 ⇒ 必须不同签名。
+
+    本批只剥**平台自产标识形状**，措辞一行不剥。若有人为了"提高去重率"
+    改成按 tool 或按错误类别归并，这条会转红 —— 那是把共享条目变成大杂烩，
+    本仓明写「错解比无解更贵」。
+    """
+    a = _sig("Error: File not found: docs/a.md. Not in this tree.")
+    b = _sig("Error: File not found: docs/b.md. Not in this tree.")
+    c = _sig("Error: Permission denied: docs/a.md. Not in this tree.")
+    assert a and b and c
+    assert a != b, "不同文件名被合并 —— 过度归一化"
+    assert a != c, "不同错误类别被合并 —— 过度归一化"
+
+
+def test_signature_stable_for_same_input_and_root():
+    """写侧/查侧同参必须同结果；且 **root 参与身份**（带 root 与不带可不同）。
+    ⚠ 后半句只对**含项目根前缀的绝对路径**成立 —— 相对路径（`.hiveweave/...`）
+    不受 root 影响，两种调用本就同签名。别把它写成"带 root 必不同"。
+    """
+    e = "Error: Directory not found: .hiveweave/reports/b8027383. Not in this tree."
+    root = "D:\\work\\proj"
+    assert _sig(e, root=root) == _sig(e, root=root)
+
+    abs_err = "failed to read D:\\work\\proj\\src\\a.py while scanning"
+    assert _sig(abs_err, root=root) == _sig(abs_err, root=root)
+    assert _sig(abs_err, root=root) != _sig(abs_err)
+
+
+# ── 0-4 审计处置：四条「别让注释宣称一个实测不成立的不变式」 ─────────
+
+
+def test_absolute_path_with_placeholder_loses_drive_and_user():
+    """★ 审计 D1：**含占位符的绝对路径也必须剥到「尾两段」**。
+
+    占位符形态是 `<id8>`/`<agent>`，**内含尖括号**；而 `_WIN_PATH_RE` 的段
+    字符类原先排除 `<>` ⇒ 路径在占位符处截断、匹配回退 ⇒ 盘符与用户名段
+    **回流**（`D:/Temp/<id8>/out.txt`），把 docstring 宣称的"绝对路径里的
+    用户名盘符已剥"变成假陈述。修法是把 `<>` 放进段字符类。
+    """
+    cases = [
+        "failed reading D:\\Temp\\b8027383\\out.txt while scanning",
+        "failed reading D:\\Temp\\A075\\out.txt while scanning",
+        "failed reading C:\\Users\\99744\\AppData\\Local\\Temp\\b8027383\\cache.json",
+        "failed reading D:\\alice\\A075\\index.html during merge",
+    ]
+    for err in cases:
+        sig = _sig(err)
+        assert sig is not None, err
+        assert not re.search(r"[A-Za-z]:", sig), (err, sig)
+        assert "99744" not in sig and "alice" not in sig, (err, sig)
+        assert "<id8>" in sig or "<agent>" in sig, (err, sig)
+
+
+def test_eight_digit_decimal_is_intentionally_eaten():
+    """★ 审计 D3：把「代价」写成**判据**而不是注释。
+
+    `_TASK_ID8_RE` 含纯十进制（task id 是 uuid 前 8 位，纯数字合法）⇒
+    恰好 8 位的十进制量会被当成 id。这是**有意接受**的代价：
+    代价不对称（漏替 task id = 同一根因永久拆开；误替一个 8 位量 = 少一点精度）。
+    若有人把规则收窄成"必须含 a-f"，本用例会转红 —— 那正是实测漏掉
+    `t-91765492` 的形态。
+    """
+    sig = _sig("archive wrote expected 32774618 bytes but size check failed")
+    assert sig is not None
+    assert "<id8>" in sig, sig  # 有意吃掉的代价，写在这里而不是注释里
+
+
+def test_hex_length_policy_is_explicit():
+    """★ 审计 D2：十六进制串的**长度即语义**，这条策略要被钉住而不是被默认。
+
+    - 恰好 8 位 ⇒ 平台 task id（uuid 前 8 位）⇒ 归并（**含 git 的 8 位短 sha**）；
+    - 7 位 / 40 位 ⇒ 视为内容稳定标识 ⇒ **不**归并（40 位由既有用例声明）。
+    两条策略不同源是有意的：8 位是平台 id 的长度，7/40 位是 git 的形态。
+    """
+    eight_a = _sig("patch failed to apply at blob abc12345 during rebase step")
+    eight_b = _sig("patch failed to apply at blob def67890 during rebase step")
+    assert eight_a is not None and eight_b is not None
+    assert eight_a == eight_b, "8 位十六进制必须归并（平台 task id 形态）"
+
+    seven_a = _sig("patch failed to apply at rev eabaa7b during rebase step")
+    seven_b = _sig("patch failed to apply at rev bd98c74 during rebase step")
+    assert seven_a != seven_b, "7 位短 sha 不得归并"
+
+
+def test_zero_information_signature_is_not_broadcast():
+    """★ 审计 D4：**占位符不计信息量**。
+
+    `"A075 A076 A077 A078"` 在归一化后是 31 字符的 `<agent>`×4 ——
+    旧口径只看总长会**开始广播**一条零信息条目（原实现对它返回 None）。
+    """
+    assert _sig("A075 A076 A077 A078") is None
+    assert _sig("A075 A076 A077 A078 A079") is None
+    # 反向：真内容仍照常广播
+    assert _sig("A075 A076 A077 A078 patch apply rejected by merge gate") is not None
+

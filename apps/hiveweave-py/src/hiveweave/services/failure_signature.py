@@ -50,8 +50,55 @@ _ISO_TS_RE = re.compile(
 _EPOCH_MS_RE = re.compile(r"(?<![0-9])1[0-9]{12}(?![0-9])")
 # Windows 绝对路径（含盘符）；跨机不稳定的部分是「盘符 + 用户名」，
 # 剥到「路径尾两段」——既消灭用户名/盘符，又保留错误里最有信息量的文件名。
-_WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\r\n]+[\\/])*[^\\/:*?\"<>|\r\n]+")
-_UNIX_PATH_RE = re.compile(r"(?<![\w.@])/(?:[\w.@+-]+/)*[\w.@+-]+")
+#
+# ⚠ 字符类**必须容忍 `<` `>`**（0-4 审计 D1 实测）：本模块的占位符形态是
+# `<uuid>`/`<hash>`/`<agent>`/`<id8>`，它们**内含尖括号**；而原来的类把
+# `<>` 排除了 ⇒ 路径在占位符处被截断、匹配回退 ⇒ **"剥到尾两段"这个不变式
+# 在含占位符的绝对路径上不成立**，表现为盘符/用户名段回流：
+#   `D:\Temp\<id8>\out.txt` 旧行为 → `D:/Temp/<id8>/out.txt`（盘符回流）。
+# 这是 `468bf79` 起就存在的洞（`<uuid>`/`<hash>` 同样踩），0-4 把触发面扩大到
+# agent 短号与 8 位 id 后一并收口。
+_WIN_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/](?:[^\\/:*?\"|\r\n]+[\\/])*[^\\/:*?\"|\r\n]+"
+)
+# UNIX 路径同样：段字符类里补 `<>`，否则绝对 unix 路径上的占位符会截断匹配。
+_UNIX_PATH_RE = re.compile(r"(?<![\w.@])/(?:[\w.@+-<>]+/)*[\w.@+-<>]+")
+
+# ── 0-4（2026-09-16，实测驱动）：再剥两类「平台自产的标识形状」 ──────────
+#
+# 为什么必须补：`468bf79` 剥了 uuid/时间戳/hash/路径之后，**同一根因跨 agent
+# 仍被判成不同身份** —— 全量重放 `scripts/replay_failure_signatures.py` 实测
+# 58 项目：144 条失败 → 85 个签名，其中 **3 组同根因被拆成多个签名**，现场就是：
+#   · `命令指向 worktree A075/A076/A077（不是你所在的树）` → 3 个签名
+#   · `merging main into hw/A074|A076|A077/work would conflict` → 3 个签名
+#   · `.hiveweave/reports/<8位id>` → 每个 task 一个签名
+# 这三类里的 `A0xx` 与 8 位十六进制**都是平台自己生成的标识**，
+# 与"根因"正交 ⇒ 必须从身份里拿掉。
+#
+# ⚠ 这是**剥标识形状**，不是"补词表"：判据是「平台会不会生成这个形状」
+# （agent 短号 = `A` + 3 位数字，见 `_SHORT_ID_RE`；8 位十六进制 = task id
+# 前 8 位，见 `_TASK_BRANCH_RE` 的 `t-([0-9a-fA-F]{8})`），与措辞/语言无关。
+# 措辞本身**不剥** —— 两条 stdout 不同的 pwsh 失败是不同的根因，
+# 合并它们等于把共享条目变成大杂烩（本仓明写「错解比无解更贵」）。
+_AGENT_SHORT_ID_RE = re.compile(r"(?<![A-Za-z0-9])A\d{3}(?![0-9A-Za-z])")
+# 8 位十六进制：**恰好 8 个**十六进制字符（前后不得再有十六进制字符）。
+# ⚠ 为什么**不**要求"至少含一个 a-f"：task id 是 uuid 前 8 位，**纯数字是合法
+# 取值**（概率约 2%）。曾按"含字母"收窄，实测立刻漏掉一条
+# `hw/<agent>/t-91765492`（纯数字 task id）⇒ 同根因又被拆开。
+# 实测（审计逐 token 查上下文）：58/59 被咬的 23+27 个 token **全部**是
+# uuid 前缀（`attestation_id=` / `taskId=` / `.hiveweave/reports/<id>`…），
+# 零误咬；两类纯数字的（`91765492`/`51861384`）也确是真 task id。
+#
+# ⚠ **取舍已显式接受**：`[0-9a-fA-F]{8}` 含纯十进制 ⇒ 恰好 8 位的十进制量
+# （`expected 32774618 bytes`）与紧凑日期（`20260916`）会被替成 `<id8>`。
+# 判定理由是代价不对称：一个 8 位量被测成"同一条"只损失一点精度，
+# 而 task id 漏替会让同一根因**永久**拆成多条。此取舍由
+# `test_eight_digit_decimal_is_intentionally_eaten` 钉住（不是口头承诺）。
+# 注：7 位与 40 位十六进制**不**替 —— 前者是 git 短 sha 的常见形态、
+# 后者由既有用例声明为「内容稳定标识，不归并」；长度差异是有意的。
+_TASK_ID8_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}(?![0-9a-fA-F])")
+# 占位符（用于"信息量"判定：占位符不计入有效长度）。
+_PLACEHOLDER_RE = re.compile(r"<[a-z0-9]+>")
 
 
 def _keep_path_tail(match: re.Match) -> str:
@@ -61,7 +108,7 @@ def _keep_path_tail(match: re.Match) -> str:
 
 
 def signature_of(error: str | None, root: str | None = None) -> str | None:
-    """规范化失败签名：剥噪声（uuid/时间戳/哈希/绝对路径）+ 空白归一 + 截断。
+    """规范化失败签名：剥噪声（uuid/时间戳/哈希/路径/**平台标识**）+ 空白归一 + 截断。
 
     ``root`` 给定时，项目根前缀的路径先归一为 ``./`` 相对形态（#5 采纳的
     收窄方向：**直接项目根相对**，不要"相对→绝对→根相对"三步）；随后剩余
@@ -69,6 +116,29 @@ def signature_of(error: str | None, root: str | None = None) -> str | None:
     调用只要同参就同结果，写侧与查侧必须传同样的 root 才能对上签名。
 
     返回 None = 无有效信息（不广播）。
+
+    ⚠ **仍是"文本判据"的一份**（如实登记，别读成已清干净）：身份由错误原文
+    归一而成，只是把**平台自产、与根因正交的标识形状**拿掉了
+    （uuid / 时间戳 / 32 位与 8 位十六进制 / agent 短号 / 绝对路径里的
+    用户名盘符）。**措辞本身不剥** —— 两条 stdout 不同的 pwsh 失败是不同的
+    根因，合并它们会让共享条目变大杂烩（本仓明写「错解比无解更贵」）。
+    因此「同一根因」的判定精度受限于措辞差异：换了说法/换了语言的同一根因
+    仍会算成两个身份。彻底的做法是改用**结构化身份**（tool + 事实位），
+    但那要求事实位先可用 —— 当前 144 条失败里绝大多数位是 `unclassified`
+    （= #15 残余 E19 那条），现在就切会把身份塌成"只剩 tool"，属于过度合并。
+
+    ⚠ **算法一旦改动，库里既有条目的签名即失配** —— 但**不是"全部不再命中"**
+    （0-4 审计实测订正了这条：初稿写的是"老条目不再被新查询命中"，与实现相反）：
+    定位判据是 ``f"| {sig}" in first_line or sig[:48] in first_line`` ——
+    **前缀支``sig[:48]``仍会命中相当一部分老条目**（实测 58 = 21 例 / 59 = 31 例
+    是"整串不等但前缀命中"），这也正是 59 里 6/7 条「已验证解法」得以存活的原因。
+    真正搁浅的是**两个判据都命中不了**的那批：它们的解法行再也读不到、
+    `known_signature_hint` 对它恒返回 None —— 实测 59 = **1/7**。
+    ⇒ 失配集中在两处**静默**出口（`known_signature_hint` 与
+    `note_distinct_hitter` 未命中即 return，无日志）；本函数无法在单点解决，
+    处置落在：① 本节如实写明口径；② `scripts/replay_failure_signatures.py`
+    报出"库里签名已被算法变更搁浅的条目数"；③ 不改用"兼容旧签名"的方式绕
+    （那会变成两份判据）。
     """
     if not error or not error.strip():
         return None
@@ -84,10 +154,22 @@ def signature_of(error: str | None, root: str | None = None) -> str | None:
     sig = _EPOCH_MS_RE.sub("<ts>", sig)
     sig = _UUID_RE.sub("<uuid>", sig)
     sig = _HEX32_RE.sub("<hash>", sig)
+    # 0-4：平台自产标识形状（agent 短号 / 8 位十六进制 id）——
+    # 顺序在 uuid/hex32 **之后**：32 位十六进制已被上面吃掉，这里不会再咬它。
+    sig = _AGENT_SHORT_ID_RE.sub("<agent>", sig)
+    sig = _TASK_ID8_RE.sub("<id8>", sig)
     sig = _WIN_PATH_RE.sub(_keep_path_tail, sig)
     sig = _UNIX_PATH_RE.sub(_keep_path_tail, sig)
     sig = _WS_RE.sub(" ", sig)
     if len(sig) < _MIN_SIG_LEN:
+        return None
+    # 0-4（审计 D4）：**占位符不计信息量**。
+    # 门槛原本只看总长，而归一化会把标识**换成长度不同的占位符**
+    # （`A075`(4) → `<agent>`(7)）⇒ `"A075 A076 A077 A078"` 这种**信息量为零**
+    # 的输入会被膨胀到 31 字符而**开始广播**（旧实现正确地返回 None）。
+    # 反向也可能：`<id8>`(6) 比 8 位原文短 ⇒ 真实签名跌破门槛而**不再广播**。
+    # 故门槛落在"剥掉占位符后仍有多少内容"上。实测 58/59 真实语料影响 **0 条**。
+    if len(_PLACEHOLDER_RE.sub("", sig)) < _MIN_SIG_LEN:
         return None
     return sig[:_MAX_SIG_LEN]
 
@@ -445,6 +527,22 @@ async def known_signature_hint(
                     "[shared fix] 团队共享空间已有该失败签名条目 —— 先读它，"
                     "别重复撞同一个坑。"
                 )
+        # 0-4（审计 M2）：未命中此前**完全静默** —— 而"算法变更导致老条目不可达"
+        # 与"这个失败确实是新的"在日志上长得一样，无从分辨。
+        # 这里只在**项目里确实存在签名条目**时留痕，并降到 debug：
+        # hint 是每次工具调用前都会跑的路径，"未命中"是常态 ⇒ 用 info 会刷屏，
+        # 反而让真正要看的东西被淹掉（口径与 `git_hardening_degraded` 一致）。
+        n_entries = sum(
+            1 for _m in (mems or []) if _m.get("type") == "failure_signature"
+        )
+        if n_entries:
+            log.debug(
+                "failure_signature.hint_no_match",
+                n_entries=n_entries,
+                sig_prefix=sig[:48],
+                note="no entry matched — if the signature algorithm changed, "
+                "older entries may have become unreachable",
+            )
         return None
     except Exception:
         return None
@@ -908,8 +1006,9 @@ async def note_distinct_hitter(
         from hiveweave.services.memory import MemoryService
 
         memory_service = MemoryService()
+        mems = await memory_service.get_project_memories(project_id)
         target = None
-        for m in (await memory_service.get_project_memories(project_id)) or []:
+        for m in mems or []:
             if m.get("type") != "failure_signature":
                 continue
             fl = (m.get("content") or "").split("\n", 1)[0]
@@ -921,6 +1020,20 @@ async def note_distinct_hitter(
                 target = m
                 break
         if target is None or not target.get("module_id"):
+            # 0-4（审计 M2）：这条也是静默出口 —— 与 `known_signature_hint` 同理，
+            # 未命中 = 「新签名」与「算法变更后老条目不可达」在日志上同形。
+            # 只在项目里存在签名条目时留痕，且用 debug（调用频次高）。
+            if target is None:
+                n_entries = sum(
+                    1 for _m in (mems or [])
+                    if _m.get("type") == "failure_signature"
+                )
+                if n_entries:
+                    log.debug(
+                        "failure_signature.hitter_no_match",
+                        n_entries=n_entries,
+                        sig_prefix=sig[:48],
+                    )
             return ""
 
         prev_meta = dict(target.get("metadata") or {})
