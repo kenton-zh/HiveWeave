@@ -159,7 +159,10 @@ docs/*
 .opencode/skills/
 
 # Local project skills (user 2026-08-31 钦定: 不进远程, 本地唯一权威位置)
-skills/
+# 必须带前导斜杠锚定仓库根：裸 `skills/` 会按任意深度匹配，连带吞掉 .agents/skills/ 等平台技能目录
+/skills/
+# 各平台技能目录（Copilot / Gemini CLI 约定），同样本地专用；显式钉住以免锚定后浮出为 untracked
+.agents/skills/
 
 # Generated assets
 image/
