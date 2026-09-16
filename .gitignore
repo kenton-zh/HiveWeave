@@ -163,6 +163,8 @@ docs/*
 /skills/
 # 各平台技能目录（Copilot / Gemini CLI 约定），同样本地专用；显式钉住以免锚定后浮出为 untracked
 .agents/skills/
+# 技能注册表：登记的正是上面这些本地专用技能，且仓内无任何消费者（纯本机记账）⇒ 与 AGENTS.md 同族，不进库
+skills-lock.json
 
 # Generated assets
 image/
