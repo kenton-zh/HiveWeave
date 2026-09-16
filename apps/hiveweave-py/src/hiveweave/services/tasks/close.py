@@ -220,6 +220,20 @@ class CloseMixin:
             short_id=short_id,
             branch=res.get("branch"),
             preserved_branch=res.get("preserved_branch"),
+            removed=res.get("removed"),
+        )
+        # 0-2：这条是 merge 侧「assignee 还有 open 任务 ⇒ 跳过清理」之后**唯一
+        # 的补删路径** ⇒ #21 的现场形态（合并成功 + worktree 回收 + husk 残留）
+        # 完全可以由它产生，而此前它与 merge 侧一样只读 preserved_branch。
+        from hiveweave.services.git_worktree.service_lifecycle import (
+            _surface_husk_left,
+        )
+
+        _surface_husk_left(
+            res,
+            short_id=short_id,
+            branch=str(res.get("branch") or ""),
+            event="worktree_gc_on_close_husk_left",
         )
 
     def _task_skips_merge_gate(self, task: dict) -> bool:

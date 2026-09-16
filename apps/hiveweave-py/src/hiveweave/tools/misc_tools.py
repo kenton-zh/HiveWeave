@@ -1163,9 +1163,33 @@ async def git_worktree_remove_tool(
     task_name = params.branch_name or "task"
 
     result = await gwt.delete(workspace_path, short_id, task_name)
-    if result.get("success"):
-        return ToolResult.ok("Worktree removed")
-    return ToolResult.err(result.get("message", "Failed to remove worktree"))
+    # 0-2：独立可 grep 的 husk 事件（与 merge / close-gc / dismiss 同一实现）
+    from hiveweave.services.git_worktree.service_lifecycle import (
+        _surface_husk_left,
+    )
+
+    _surface_husk_left(
+        result,
+        short_id=short_id,
+        branch=str(result.get("branch") or ""),
+        event="git_worktree_remove_husk_left",
+    )
+    if not result.get("success"):
+        return ToolResult.err(result.get("message", "Failed to remove worktree"))
+    # 0-2：``success=True`` 不等于目录已消失 —— delete() 的 removed=False 表示
+    # remove/prune 之后目录仍在（Windows 文件锁下的 husk）。此前这里无条件回
+    # "Worktree removed"，是「假装删除成功」的工具层残余（Python 层早就诚实了）。
+    # ⚠ **保持 ok（不升硬失败）**：第 0 步口径是"先能看见"，「removed=False 是否
+    # 该变成失败」由 1-4 单独立项、按全项目频次×后果评估 —— 这里改成 err 会提前
+    # 把 24 次"本来没事"的删除失败变成停摆，并污染 1-4 的数据口径（审计 Q3）。
+    if result.get("removed") is not True:
+        return ToolResult.ok(
+            f"Worktree registration/branch handled, but the directory is still "
+            f"on disk at {result.get('path') or 'path unknown'} — something "
+            "holds it open (Device busy). Registered worktree + branch were "
+            "still cleaned up; reconcile retries the directory."
+        )
+    return ToolResult.ok("Worktree removed")
 
 
 # ── git_worktree_status ──────────────────────────────────

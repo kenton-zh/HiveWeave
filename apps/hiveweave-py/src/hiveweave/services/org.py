@@ -1215,11 +1215,25 @@ class OrgService:
                                     error=str(nerr),
                                 )
                     else:
-                        await gwt.delete(project_ws, short_id)
+                        dismissed = await gwt.delete(project_ws, short_id)
                         log.info(
                             "org.dismiss_agent.worktree_cleaned",
                             agent_id=agent_id,
                             short_id=short_id,
+                            removed=(dismissed or {}).get("removed"),
+                        )
+                        # 0-2：dismiss 是 husk 的**第三条来源**（reconcile.py
+                        # 的注释点名 "dismiss/reset residue"）—— 此前返回值整个
+                        # 丢弃，husk 在日志里连触发点都没有。
+                        from hiveweave.services.git_worktree.service_lifecycle import (
+                            _surface_husk_left,
+                        )
+
+                        _surface_husk_left(
+                            dismissed,
+                            short_id=short_id,
+                            branch=str((dismissed or {}).get("branch") or ""),
+                            event="org.dismiss_agent.worktree_husk_left",
                         )
         except Exception as e:
             log.warning("dismiss_clean_worktree_failed",

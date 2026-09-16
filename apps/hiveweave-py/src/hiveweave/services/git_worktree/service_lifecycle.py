@@ -65,6 +65,57 @@ from .porcelain import (
 
 log = structlog.get_logger(__name__)
 
+
+def _surface_husk_left(
+    cleanup: Any, *, short_id: str, branch: str, event: str
+) -> None:
+    """0-2：把 ``delete()`` 的 ``removed=False`` 透出成**独立可 grep 的事件**。
+
+    判据是**状态**不是文案：``removed`` 由本模块 ``delete()`` 在 remove/prune
+    之后用 ``Path(path).exists()`` **无条件**实测得出（见该处的 ①' 后置条件）。
+    ⇒ 事件名带**触发场景**（merge / close-gc / dismiss）+ 短号 + 路径 —— 这正是
+    #21 现场缺的那一环：husk 的线索在深处，却与触发它的那次操作无从关联。
+
+    **只透出，不改判定**（第 0 步口径）：不抛错、不改 ``success``、不改正常路径的
+    agent 可见回执。⇒ 本函数**不返回任何值**：返回值没人消费就是本仓最忌的
+    「写了事实位却没消费者」（#15 残余 E23 的同族）。
+
+    ⚠ **保守方向选在"可疑"侧**（独立审计 Q5）：只有 ``removed is True`` 才静默。
+    代价极不对称 —— 误报 = 一行日志，漏报 = 下一次主干被清空（已实测 3 次）。
+    payload 带原始 ``removed`` 值（``False`` / ``None``），让「确认残留」与
+    「判据缺失」在 grep 时仍可区分。
+    """
+    try:
+        raw_removed = cleanup.get("removed") if isinstance(cleanup, dict) else None
+        if raw_removed is True:
+            return
+        husk_path = (
+            str(cleanup.get("path") or "") if isinstance(cleanup, dict) else ""
+        )
+        log.error(
+            event,
+            short_id=short_id,
+            branch=branch,
+            path=husk_path or "<unknown>",
+            removed=raw_removed,
+            hint="Worktree directory survived removal (locked husk). A later "
+            "checkpoint run inside it would record the whole tree as deleted — "
+            "reconcile retries, or move the holder aside.",
+        )
+    except Exception as exc:  # noqa: BLE001 — 纯观测件不得影响调用方判定
+        # 审计 Q1：调用点大多包在 try 里，一旦本函数自己抛错，外层 `except`
+        # 会把回执改写成 cleanup_failed（丢掉 preserved_branch 警告）⇒ 违反
+        # "不改判定"。故自带兜底，绝不让异常穿出去。
+        # ⚠ 键名**不能**叫 `event`：那是 structlog 的保留参数（第一个位置参数），
+        # 写 `log.warning("x", event=...)` 会 `TypeError: got multiple values for
+        # argument 'event'` —— 兜底自己抛错比不兜底更糟，本仓实测过一次。
+        log.warning(
+            "git_worktree.husk_surface_failed",
+            surface_event=event,
+            error=str(exc),
+        )
+
+
 # info() porcelain hint: first N paths, never dump the full status blob.
 _INFO_UNCOMMITTED_FILES_LIMIT = 12
 
@@ -250,8 +301,10 @@ class LifecycleMixin:
         task_name: DEPRECATED — 仅为旧调用方保留, 只作 legacy slug 分支
         的兜底解析, 不参与新命名。
 
-        Always returns ``{success: True, removed: True, branch,
-        preserved_branch}`` (best-effort).
+        Always returns ``{success: True, removed: bool, path, branch,
+        preserved_branch}`` (best-effort). ⚠ ``success=True`` ≠ 目录已消失:
+        ``removed=False`` 表示 rmtree 之后目录仍在（锁定 husk），调用方**必须**
+        读它并透出 —— 否则「工作树已回收」就是假陈述（见 #21 成因链）。
         """
         path = await self._resolve_effective_worktree_path(
             workspace_path, short_id
@@ -310,7 +363,6 @@ class LifecycleMixin:
             )
 
         # ① worktree 移除链: remove → remove --force → rmtree + prune
-        removed = True
         _unlock_git_lockdown(workspace_path)
         ok, _ = await _git(["worktree", "remove", fwd_path], workspace_path)
         if not ok:
@@ -321,18 +373,26 @@ class LifecycleMixin:
             # Worktree may not be registered — delete directory manually
             shutil.rmtree(path, ignore_errors=True)
             await _git(["worktree", "prune"], workspace_path)
-            # 2026-08-11 A023 事故：Windows 文件锁下 rmtree 静默失败 →
-            # husk 永久残留。失败必须透出（removed=False），由调用方/reconcile
-            # 重试，而不是假装删除成功。
-            if Path(path).exists():
-                log.error(
-                    "git_worktree.delete_dir_remove_failed",
-                    short_id=short_id,
-                    path=str(path),
-                    hint="Directory locked (Device busy). Reconcile will retry; "
-                    "kill the holding process or move it aside if persistent.",
-                )
-                removed = False
+
+        # ①' **后置条件：目录到底还在不在**（0-2，独立审计 Q7③ 修正）。
+        # 原实现只在「两级 remove 都失败」的分支里量一次 ⇒ 若 `git worktree
+        # remove` 报成功（rc=0）却把目录留下（本仓已实证过 git 的删除失败只在
+        # stderr、rc 仍为 0 的形态），`removed` 会是 True，**所有新老消费者
+        # 都不会报** —— 观测面本身就是残缺的。改成无条件测量：`removed` 从此是
+        # 「目录是否真的消失」这一事实位，而不是「走到了哪条分支」的副产品。
+        # 本处**不改任何控制流**（原来失败的路径仍然走同一条链），只让事实位变真。
+        removed = True
+        if Path(path).exists():
+            # 2026-08-11 A023 事故：Windows 文件锁下删除静默失败 → husk 永久残留。
+            # 必须透出（removed=False），由调用方/reconcile 重试，而不是假装删除成功。
+            log.error(
+                "git_worktree.delete_dir_remove_failed",
+                short_id=short_id,
+                path=str(path),
+                hint="Directory locked (Device busy). Reconcile will retry; "
+                "kill the holding process or move it aside if persistent.",
+            )
+            removed = False
 
         # ②/③ 分支处置 (分支不存在时 _dispose_branch 直接返回 None)
         preserved = await self._dispose_branch(workspace_path, target, discard)
@@ -341,7 +401,10 @@ class LifecycleMixin:
                  preserved=preserved is not None, discard=discard)
         return {
             "success": True,
+            # 0-2：removed=True 只代表「worktree 注册/分支已处置」，目录可能仍在
+            # （Windows 文件锁下 rmtree 静默失败 ⇒ husk）。调用方要读它。
             "removed": removed,
+            "path": str(path),
             "branch": target,
             "preserved_branch": preserved,
         }

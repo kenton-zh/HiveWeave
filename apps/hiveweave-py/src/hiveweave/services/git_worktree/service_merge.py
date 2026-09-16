@@ -22,6 +22,7 @@ from .constants import (
     _create_locks_guard,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
+from .service_lifecycle import _surface_husk_left
 from .git_identity import agent_identity_args
 from .git_cmd import _current_branch, _git, _resolve_base_branch, _target_tip_short
 from .merge_support import (
@@ -665,6 +666,13 @@ class MergeMixin:
                 )
             else:
                 cleanup = await self.delete(workspace_path, short_id, branch=branch)
+                # 0-2：husk 留痕（独立事件，与下面的 preserved_branch 正交）
+                _surface_husk_left(
+                    cleanup,
+                    short_id=short_id,
+                    branch=branch,
+                    event="git_worktree.merge_cleanup_husk_left",
+                )
                 preserved = (cleanup or {}).get("preserved_branch")
                 if preserved:
                     log.warning(
@@ -1068,6 +1076,13 @@ class MergeMixin:
                 else:
                     cleanup = await self.delete(
                         workspace_path, short_id, branch=branch
+                    )
+                    # 0-2：husk 留痕（merge_by_branch 同样的独立事件）
+                    _surface_husk_left(
+                        cleanup,
+                        short_id=short_id,
+                        branch=branch,
+                        event="git_worktree.merge_by_branch_cleanup_husk_left",
                     )
                     preserved = (cleanup or {}).get("preserved_branch")
                     if preserved:
