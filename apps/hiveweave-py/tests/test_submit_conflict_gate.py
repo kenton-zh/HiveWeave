@@ -177,7 +177,9 @@ async def test_submit_rejected_on_conflict(git_repo: Path) -> None:
     assert result.success is False
     assert "合并冲突" in (result.error or "")
     assert "file.txt" in (result.error or "")
-    assert "rebase" in (result.error or "").lower()
+    # ③（2026-09-16）：同上 —— 处方指向 `git_worktree_sync`。
+    assert "git_worktree_sync" in (result.error or ""), result.error
+    assert "git rebase" not in (result.error or ""), result.error
     assert submitted.get("evidence") is None  # 服务层 submit 未被调用
 
 

@@ -161,7 +161,8 @@ def note_judgement(family: str) -> None:
         key = str(family or "unknown")
         _JUDGED_BY_FAMILY[key] = _JUDGED_BY_FAMILY.get(key, 0) + 1
     except Exception:  # noqa: BLE001 — 计数绝不打断主路径
-        pass
+        # 空 handler 是 L17 事故的温床（静默失效只在**下游**炸开）⇒ 留痕。
+        log.debug("unknown_samples.note_judgement_failed", family=key)
 
 
 def unknown_sample_stats() -> dict[str, Any]:

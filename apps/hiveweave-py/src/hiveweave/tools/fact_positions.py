@@ -470,7 +470,8 @@ def finalize_tool_result(
 
         note_judgement("fact_position")
     except Exception:  # noqa: BLE001 — 计数绝不打断收口
-        pass
+        # 空 handler 是 L17 事故的温床（静默失效只在**下游**炸开）⇒ 留痕。
+        log.debug("fact_positions.note_judgement_failed")
 
     unclassified: dict = {}
     if isinstance(raw, ToolResult):

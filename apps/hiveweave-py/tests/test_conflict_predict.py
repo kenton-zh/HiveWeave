@@ -213,7 +213,10 @@ async def test_checkpoint_warns_on_conflict(git_repo: Path) -> None:
     msg = result.get("message") or ""
     assert "WARNING" in msg
     assert "file.txt" in msg
-    assert "rebase" in msg.lower() or "rebase" in msg
+    # ③（2026-09-16）：处方从"教裸 rebase"改成**指向平台操作** ⇒
+    # 断言按同一意图改写（且反向钉住：不得退回教裸 git）。
+    assert "git_worktree_sync" in msg, msg
+    assert "git rebase" not in msg, msg
 
 
 @pytest.mark.asyncio
@@ -303,4 +306,5 @@ async def test_checkpoint_note_when_degraded_and_behind(
     assert result["success"] is True, result
     msg = result.get("message") or ""
     assert "NOTE" in msg
-    assert "rebase" in msg
+    assert "git_worktree_sync" in msg, msg
+    assert "git rebase" not in msg, msg

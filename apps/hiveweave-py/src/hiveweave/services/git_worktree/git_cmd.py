@@ -162,11 +162,16 @@ async def merge_in_progress(
     它会把冲突标记当正常改动**提交成一次正常提交**（`git add` 一条未解决路径
     即视为已解决），于是半成品被当成已完成的代码。
     """
-    ok, _ = await _git(
+    ok, out = await _git(
         ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
         worktree_path, project_root=project_root,
     )
-    return bool(ok)
+    # ⚠ 判据要求**正面证据**（解析出 sha），不是只看退出码：`--verify` 成功时
+    # 一定吐 sha；而"退出码 0 + 空输出"只可能来自**打桩的假 git**（全量回归实测：
+    # `test_worktree_relocate_binding` 的 `fake_git` 对任何命令都 `return True, ""`
+    # ⇒ 只看退出码会把正常树误判成半合并态、checkpoint 被误拒）。
+    # 真实 git 不存在 MERGE_HEAD 时是 rc≠0 ⇒ 两种形态都判对。
+    return bool(ok and (out or "").strip())
 
 
 async def unmerged_paths(

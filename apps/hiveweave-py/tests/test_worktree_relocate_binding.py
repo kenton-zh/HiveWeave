@@ -292,6 +292,12 @@ async def test_checkpoint_uses_effective_relocated_path(tmp_path: Path) -> None:
         # fail-closed 拒绝 —— 那是**桩不忠实**，不是被测行为。
         if args[:2] == ["worktree", "list"]:
             return True, f"worktree {ws}\nworktree {relocated}\n"
+        # ③（2026-09-16）：checkpoint 入口还要问「这棵树是不是在 merge 中」⇒
+        # 本桩同样要像真 git：`rev-parse --verify --quiet MERGE_HEAD` 在**没有**
+        # 半合并态时是 **rc≠0**。只回 ""（退出码 0）会让入口误判成半合并态并
+        # 按 fail-closed 拒绝 —— 又是**桩不忠实**，不是被测行为。
+        if "MERGE_HEAD" in args:
+            return False, ""
         # Empty porcelain → "no changes" early return still proves cwd
         if args[:1] == ["status"]:
             return True, ""
