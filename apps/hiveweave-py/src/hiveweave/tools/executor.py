@@ -81,10 +81,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "on. Long output is truncated to head+tail; the full text is "
             "saved and the path is reported. Windows: without the sandbox "
             "Git Bash (`bash -c`) runs it; under the ACL sandbox (the "
-            "default) the command is actually executed by **pwsh** "
-            "**verbatim — no unix→pwsh translation is applied**. unix-only "
-            "commands (`head`, `tail`, `grep`, `wc`, `sed`, `awk`, `xargs`, "
-            "`cut`, `find`, `touch`, `which`, `sort -u`, `echo -e`, …) are "
+            "default) the command is actually executed by **pwsh**, with a "
+            "**narrow auto-translation** applied first for two closed sets — "
+            "a trailing `| head/-n N` or `| tail/-n N` or `| wc -l` pipe tail, "
+            "and a whole-command `head -N f` / `tail -N f` / `wc -l f`. "
+            "Other unix-only commands (`grep`, `sed`, `awk`, `xargs`, `cut`, "
+            "`find`, `touch`, `which`, `sort -u`, `echo -e`, …) are "
             "rejected up front with the pwsh equivalent — rewrite it as "
             "suggested, or call the `pwsh` tool and write PowerShell directly "
             "(same permissions as bash). Plain non-unix commands (git, "
@@ -2217,8 +2219,11 @@ TOOL_PARAM_SCHEMAS["pwsh"] = {
             "type": "string",
             "aliases": ["cmd", "run"],
             "description": (
-                "The PowerShell command to execute, passed to pwsh verbatim "
-                "(no unix→pwsh translation). Use $env:NAME for environment "
+                "The PowerShell command to execute. A narrow auto-translation "
+                "handles two closed sets first (`| head/-n N` / `| tail/-n N` / "
+                "`| wc -l` pipe tail, and whole-command `head -N f` / "
+                "`tail -N f` / `wc -l f`); everything else reaches pwsh "
+                "verbatim. Use $env:NAME for environment "
                 "variables and the & call operator for quoted programs: "
                 "& \"python\" \"script.py\"."
             ),

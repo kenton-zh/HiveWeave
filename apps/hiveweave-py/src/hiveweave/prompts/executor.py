@@ -58,12 +58,13 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 # 是否仍然成立、词表本身该不该增删某个命令，机器判不了**——那要人/LLM 复核。
 # 不要把这条改动当成「提示词一致性有保障了」。
 _SHELL_DIALECT_SECTION = f"""## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
-命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
+命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语**多数**会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
+⚠ **例外（会被自动转译，直接用即可）**：`| head -N` / `| tail -N` / `| wc -l` 这类**管道尾**，以及**整条**就是 `head -N 文件` / `tail -N 文件` / `wc -l 文件` 的写法 —— 平台会先改写成 pwsh 等价物再执行。**其余 unix 写法不在例外内。**
 
-**以下命令会被平台前置拒绝（`unix-only command(s) not available`）——全部别用**：
+**以下命令会被平台前置拒绝（`unix-only command(s) not available`）——别用（上一条的例外形态除外）**：
 {_rejected_commands_inline()}
 
-- 另有这些**结构性**写法也不行：`cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `| head -n` / `VAR=value cmd`（bash 环境变量前缀）
+- 另有这些**结构性**写法也不行：`cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `VAR=value cmd`（bash 环境变量前缀）
 - ⚠ **同名不同义最危险**：`sort` 会落到 `system32\\sort.exe`（不认 `-u`，**静默排错**）；`find` 会落到 `system32\\find.exe`（**查字符串，不是查文件**）。这两个不报错但结果错，务必换用 pwsh 写法。
 - ⚠ **`cp` / `mv` / `rm` / `mkdir` 不在上表也不算安全**：pwsh 里它们是 `Copy-Item` 等的别名，本身能用，但**带 unix 短 flag 就会失败**（`cp -r` / `rm -rf` / `mkdir -p`）——用 `Copy-Item -Recurse` / `Remove-Item -Recurse` / `New-Item -ItemType Directory -Force`。
 - 改用：列目录 `Get-ChildItem -Force`；读文件 `Get-Content x -Tail 100`；写文件用 **write_file / apply_patch 工具**（不要用 shell 写）；输出 `Write-Host`；串接用 `;`（PowerShell 语义确认过再用）或分多次调用；筛选 `Select-Object -First 20` / `Select-String`；计数 `Measure-Object -Line`

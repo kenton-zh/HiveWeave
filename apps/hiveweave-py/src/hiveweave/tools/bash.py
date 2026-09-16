@@ -972,6 +972,9 @@ def _extract_file_paths_from_command(command: str) -> list[str]:
         # no-op**（fixplan §6 #15 的「实现坑」）。一并补 PowerShell 别名族。
         file_cmds = {'cat', 'cp', 'mv', 'rm', 'touch', 'mkdir', 'chmod',
                      'chown', 'source', 'head', 'tail', 'less', 'more',
+                     # D-5（审计）：`wc` 与 head/tail 同族（都从文件读），漏了它
+                     # ⇒ `wc -l .env` 的路径不进敏感路径检查（`head -5 .env` 会进）
+                     'wc',
                      'tee', 'dd', 'ln',
                      'remove-item', 'remove_item', 'del', 'erase', 'rd',
                      'rmdir', 'move-item', 'move_item', 'copy-item',
@@ -1675,6 +1678,118 @@ def try_closed_pipe_translation(command: str) -> tuple[str, str] | None:
     return (head_part + " " + ps_tail, command)
 
 
+#: 「只读限流词**直接形态**」的封闭集：`head -N f` / `tail -N f`（含 `-n N` 变体）。
+#: 与 `_CLOSED_PIPE_TAIL_RE` **互补**：后者只管**管道尾**，不管直接写的那一半 ——
+#: 而直接形态恰好是 agent 最常用的写法。实测（2026-09-16）：`head -5 f` /
+#: `head -n 5 f` / `tail -20 f` 三条**全部整条被拒**（管道尾那两条却能自动转译）。
+_READONLY_LIMIT_RE = re.compile(
+    r"^(?P<cmd>head|tail)\s+(?:-n\s*|-)?(?P<n>\d+)\s+(?P<file>[^-\s]\S*)$"
+)
+#: `wc -l f`（**只认 `-l`**：`wc -c/-w` 的等价物不同，宁可留给 gate 教学）。
+_READONLY_WC_RE = re.compile(r"^wc\s+-l\s+(?P<file>[^-\s]\S*)$")
+#: 出现任一即**不译**：复合命令 / 重定向 / 命令替换 / 通配。翻译器只在能**完整
+#: 确认**整条命令形状时才动手 —— 猜错 = 把 agent 的命令改坏（比拒绝更糟）。
+_SHELL_META_RE = re.compile(r"[|&;<>`$()\[\]{}*?!]")
+
+
+def _hw_read_target_allowed(path: str) -> bool:
+    """`.hiveweave` 下的目标是否属**允许只读**的那几类（M-1 守卫）。
+
+    **复用**既有的三个谓词（`_ALLOWED_HW_SUBDIRS` / `_HW_LOGS_REF` /
+    `_HW_MERGE_QUARANTINE_REF`）—— `.hiveweave` 的读放行规则**只此一份**，
+    不新增词表也不新增模式（本仓在"清单双写"上栽过两次）。
+
+    不落在读放行面时返回 False ⇒ 调用方**不译**、退回"拒 + 教学"。
+    ⚠ 这里只判"路径面"，不判动词 —— 因为本翻译器产出的形态**本身就是只读**的
+    （`Get-Content` / `.Count`）。
+    """
+    if not _HIVEWEAVE_REF.search(path):
+        return True                       # 与 `.hiveweave` 无关
+    if _ALLOWED_HW_SUBDIRS.search(path):
+        return True                       # shared/reports/drafts/worktrees/handoffs/sandbox-temp
+    if _HW_LOGS_REF.search(path) or _HW_MERGE_QUARANTINE_REF.search(path):
+        return True                       # 两个"只读例外"（诊断出口 / 隔离区）
+    return False
+
+
+def try_readonly_limit_translation(command: str) -> tuple[str, str] | None:
+    """**直接形态**的只读限流词 → PowerShell 等价（并行池 · 三条「路不通」①）。
+
+    修的是「**路在、走不通**」：`head`/`tail`/`wc` 的**管道尾**形态早就自动转译了
+    （:func:`try_closed_pipe_translation`），而**直接形态**（`head -5 f`）仍然整条
+    被拒 —— 偏偏那是 agent 最常用的写法。判据从"拦了几个"改成"**译了几个**"。
+
+    映射（与 `shell_dialect.UNIX_ONLY_HINTS` 给 agent 的**教学文案逐字同源**，
+    只是这里真的**执行**它，而不是让 agent 自己抄一遍）::
+
+        head -N f   → Get-Content f -TotalCount N
+        tail -N f   → Get-Content f -Tail N
+        wc -l f     → (Get-Content f).Count
+
+    ⚠ **只译"本来就会被拒的"**：入口先跑 :func:`detect_untranslated_unix`，
+    返回 None（本来就放行）⇒ 直接 ``return None``。⇒ 本函数**不可能**改变任何
+    "本来就合法"命令的行为，只把「拒 + 教学」换成「译 + 执行」。
+    ⚠ 复合/重定向/替换（管道 `&&` 重定向 反引号 `$()` 通配）一律**不译**，
+    交给 gate 教学；`wc -c/-w` 也不译（等价物不同）。
+    """
+    stripped = (command or "").strip()
+    if not stripped or _SHELL_META_RE.search(stripped):
+        return None
+    # 只处理"不译就会被拒"的形态（本函数的改动面因此严格是"+译"）
+    if detect_untranslated_unix(stripped) is None:
+        return None
+    m = _READONLY_LIMIT_RE.match(stripped)
+    if m:
+        cmd, n, f = m.group("cmd"), m.group("n"), m.group("file")
+        if not _hw_read_target_allowed(f):
+            # ⚠ **M-1（审计必修）**：不加这条守卫，本翻译器会**新开一条读
+            # `.hiveweave` 受保护文件的路径** —— `.hiveweave` 护栏
+            # （`_check_hiveweave_command`）是按**动词**匹配的（`cat`/`rm`…），
+            # `head`/`tail`/`wc` **不在**动词表里，而 `Get-Content` 是被**刻意
+            # 排除**的只读 cmdlet（否则 `.hiveweave/logs` 的只读放行会被关掉）。
+            # 于是 `head -5 .hiveweave/data.db` 在**改动前**被方言门拦下（顺带
+            # 保住了这条策略）、在**改动后**会译成 `Get-Content … -TotalCount 5`
+            # 并**执行**。⇒ 目标落在 `.hiveweave` 且不属既有读放行面时**不译**，
+            # 退回"拒 + 教学"（= 改动前行为）。
+            log.info(
+                "bash.dialect_translate_refused_hiveweave",
+                file=f,
+                note="目标在 .hiveweave 且不属读放行面 ⇒ 维持拒绝（不译）",
+            )
+            return None
+        ps = (
+            f"Get-Content {f} -TotalCount {n}"
+            if cmd == "head"
+            else f"Get-Content {f} -Tail {n}"
+        )
+        return (ps, command)
+    m = _READONLY_WC_RE.match(stripped)
+    if m:
+        # 同一个守卫（`wc -l .hiveweave/data.db` 同样是"新开一条读路径"）
+        if not _hw_read_target_allowed(m.group("file")):
+            log.info(
+                "bash.dialect_translate_refused_hiveweave",
+                file=m.group("file"),
+                note="目标在 .hiveweave 且不属读放行面 ⇒ 维持拒绝（不译）",
+            )
+            return None
+        return (f"(Get-Content {m.group('file')}).Count", command)
+    return None
+
+
+def try_dialect_translation(command: str) -> tuple[str, str] | None:
+    """方言自动转译的**唯一链入口**（顺序：管道尾 → 直接形态）。
+
+    ⚠ 为什么要有这个函数：链本身只能有**一份**。原先两个调用点各自只调
+    `try_closed_pipe_translation`；加第二个翻译器时若各自再加一行，就又长成
+    "每处各列一份清单"（本仓在事实位白名单上栽过两次）。
+    """
+    got = try_closed_pipe_translation(command)
+    if got is not None:
+        return got
+    return try_readonly_limit_translation(command)
+
+
 def _normalize_for_pwsh(command: str) -> str:
     """[退役 P1-3 B 结构解] bash 惯用法 → pwsh 的词典翻译层。
 
@@ -2128,7 +2243,8 @@ async def execute_bash(
     # 无条件改写会弄坏可直接执行的 bash。
     translated_pair = None
     if _pwsh_effective_shell(confined=spawn_decision.confined):
-        translated_pair = try_closed_pipe_translation(command)
+        # 唯一链：管道尾 → 直接形态（`try_dialect_translation` 是单点）
+        translated_pair = try_dialect_translation(command)
         if translated_pair is not None:
             command, _orig_cmd = translated_pair
             log.info(
@@ -2345,7 +2461,7 @@ async def execute_run_command(
     spawn_decision = await resolve_spawn_decision(project_id)
     translated_pair_rc = None
     if _pwsh_effective_shell(confined=spawn_decision.confined):
-        translated_pair_rc = try_closed_pipe_translation(command)
+        translated_pair_rc = try_dialect_translation(command)
         if translated_pair_rc is not None:
             command, _orig_cmd_rc = translated_pair_rc
             log.info(
@@ -3362,7 +3478,10 @@ async def _bash_background(
     "green). Long scripts: background=true returns waiting_on — then "
     "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
     "Stop with job_kill. Windows: under the sandbox your command is actually "
-    "run by pwsh **verbatim — no unix→pwsh translation is applied**. "
+    "run by pwsh, with a **narrow auto-translation** applied first for two "
+    "closed sets (a trailing `| head/-n N` or `| tail/-n N` or `| wc -l` pipe "
+    "tail, and a whole-command `head -N f` / `tail -N f` / `wc -l f`). "
+    "Everything else unix-only is **not** translated. "
     "unix-only commands (head/tail/grep/wc/sed/awk/xargs/cut/find/touch/which/"
     "sort -u/echo -e…) fast-fail with the pwsh equivalent; rewrite as "
     "suggested or call the `pwsh` tool for PowerShell semantics. Plain "
@@ -3640,9 +3759,11 @@ PWSH_TOOL_DESCRIPTION = (
     "backslashes (D:PC_AI... is invalid).\n"
     "- Read environment variables with $env:NAME (not $NAME). Set them with "
     "$env:NAME='value' — export is bash syntax and does not exist here.\n"
-    "- Your command is passed to pwsh VERBATIM: no unix→pwsh translation is "
-    "applied. head/sed/awk/grep/wc do not exist in pwsh — use Get-Content "
-    "-TotalCount/-Tail, -replace, Select-String, (Get-Content f).Count.\n"
+    "- Your command reaches pwsh with a **narrow auto-translation** applied "
+    "first for two closed sets: a trailing `| head/-n N` or `| tail/-n N` or "
+    "`| wc -l` pipe tail, and a whole-command `head -N f` / `tail -N f` / "
+    "`wc -l f`. Everything else is **verbatim** — sed/awk/grep/xargs do not "
+    "exist in pwsh: use -replace, Select-String, ForEach-Object.\n"
     "- Call an external program with the & call operator when the name or "
     "path is quoted: & \"python\" \"script.py\" (bare \"python\" \"x.py\" is "
     "a pwsh ParserError).\n"

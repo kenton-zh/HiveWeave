@@ -22,6 +22,9 @@ from hiveweave.tools.bash import (
     _segment_head_token,
     _split_command_segments,
     detect_untranslated_unix,
+    try_closed_pipe_translation,
+    try_dialect_translation,
+    try_readonly_limit_translation,
 )
 
 
@@ -320,3 +323,247 @@ def test_kill_hints_do_not_suggest_guard_denied_forms(verb):
 def test_new_verbs_present_in_tables():
     for v in ("od", "export", "base64", "uname", "lsof", "time"):
         assert v in _UNIX_ONLY_HINTS, v
+
+
+# ── ① 直接形态的只读限流词：**前置转译**而非整条拒绝（2026-09-16）────
+#
+# 计划 §并行池「三条路径在、但走不通」① 的原文：只读限流词（head/tail/wc -l）
+# **前置转译**而非整条拒绝；验收「判据从"拦了几个"改成"**译了几个**"」。
+#
+# 修前的实测边界（探针，2026-09-16）：
+#   `cat f | head -5`   → **已译**（管道尾，`try_closed_pipe_translation`）
+#   `head -5 f`         → **整条被拒**   ← agent 最常用的写法，正是缺口
+#   `head -n 5 f`       → 整条被拒
+#   `tail -20 f`        → 整条被拒
+#   `wc -l f`           → 整条被拒
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("head -5 f.txt", "Get-Content f.txt -TotalCount 5"),
+        ("head -n 5 f.txt", "Get-Content f.txt -TotalCount 5"),
+        ("head -n5 f.txt", "Get-Content f.txt -TotalCount 5"),
+        ("tail -20 f.log", "Get-Content f.log -Tail 20"),
+        ("tail -n 3 a.txt", "Get-Content a.txt -Tail 3"),
+        ("wc -l f.txt", "(Get-Content f.txt).Count"),
+    ],
+)
+def test_direct_readonly_limit_is_translated_and_passes_gate(gate_on, command, expected):
+    """★ ① 验收：直接形态必须被**译**，且译出来的命令能过 gate。
+
+    ⚠ 两头都断：只断"译了"不够 —— 译出一个**仍然被拒**的命令等于没修
+    （第二段断言就是防这个）。
+    """
+    got = try_readonly_limit_translation(command)
+    assert got is not None, f"{command!r} 没被译（修前：整条被拒）"
+    translated, original = got
+    assert translated == expected, translated
+    assert original == command, "必须把原命令一并带回（日志/回执要用）"
+    # ⚠ **必须同时断"链真的接了它"**（阳性对照 A 暴露的缺口）：只断函数能译，
+    # 那么"函数写好了但没接进 `try_dialect_translation`"照样全绿 —— 而生产走的是链。
+    chain = try_dialect_translation(command)
+    assert chain is not None and chain[0] == expected, (
+        f"翻译器没接进链（生产路径不过这个函数）：chain={chain!r}"
+    )
+    # 译完必须真的能过门（否则"译了等于没译"）
+    assert detect_untranslated_unix(translated) is None, (
+        f"译出来的 {translated!r} 仍被 gate 拒 ⇒ agent 还是走不通"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "wc -c f.txt",              # 字节：等价物不同（不是 .Count）⇒ 不译
+        "head -5 f.txt > out.txt",  # 重定向
+        "head -5 f.txt && echo ok",  # 复合命令
+        "head -5 'my file.txt'",    # 带空格的引号路径（本翻译器不解析引号）
+        "head -5 -v f.txt",         # 额外 flag
+        "grep x f.txt",             # 不是只读限流词族
+        "ls -la",                   # 类 2：同名不同语义
+        "head -5 f.txt | sort",     # 管道尾不是 head/tail/wc ⇒ 链也不接
+    ],
+)
+def test_direct_translation_is_conservative(gate_on, command):
+    """★ 反向对照：**猜不准就不译** —— 宁可维持"拒绝 + 教学"。
+
+    翻译器只在能**完整确认**整条命令形状时才动手；猜错 = 把 agent 的命令改坏，
+    比拒绝更糟（拒绝至少给了正确的写法）。每条都必须**仍然被拒**（不能悄悄放行）。
+    """
+    assert try_readonly_limit_translation(command) is None, command
+    assert detect_untranslated_unix(command) is not None, (
+        f"{command!r} 既没被译也没被拒 —— 有东西被悄悄放行了"
+    )
+
+
+def test_direct_translation_never_touches_already_legal_commands():
+    """★ 硬不变式：**只译"本来就会被拒的"**。
+
+    入口先跑 `detect_untranslated_unix`；本来就放行的命令一律 `None`。
+    ⇒ 这个翻译器**不可能**改变任何合法命令的行为（改动面严格是"+译"）。
+    """
+    for legal in (
+        "Get-Content x -TotalCount 80", "python script.py", "echo hello world",
+        "git status", "cd src; Get-ChildItem", "ls", "cat f.txt",
+        "uv run pytest -q", "npm test",
+    ):
+        assert detect_untranslated_unix(legal) is None, legal
+        assert try_readonly_limit_translation(legal) is None, (
+            f"{legal!r} 本来是合法命令，却被改了 —— 违反「只译会被拒的」不变式"
+        )
+
+
+def test_translation_chain_has_exactly_one_entry_point():
+    """★ **链只能有一份**：两处调用点都走 `try_dialect_translation`。
+
+    为什么单独钉：原先两个调用点各自直接调 `try_closed_pipe_translation`；加第二个
+    翻译器时若在两边各加一行，就又长成"每处各列一份清单"（本仓在事实位白名单上
+    栽过两次）。⇒ 断计数：链被调 **2** 次（execute_bash + run_command），
+    而管道尾翻译器**只在链内部**被调 **1** 次。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "src" / "hiveweave" / "tools" / "bash.py"
+    ).read_text(encoding="utf-8")
+    assert src.count("= try_dialect_translation(command)") == 2, (
+        "方言转译的调用点不是 2 处 —— 有人绕过链直接调子翻译器了"
+    )
+    assert src.count("= try_closed_pipe_translation(command)") == 1, (
+        "管道尾翻译器被直接调用（应只在 `try_dialect_translation` 链内部）"
+    )
+
+
+def test_chain_order_is_pipe_tail_first(gate_on):
+    """链的顺序：管道尾 → 直接形态（先试更具体的那个）。"""
+    command = "cat f.txt | head -5"
+    got = try_dialect_translation(command)
+    assert got is not None and got[0] == "cat f.txt | Select-Object -First 5", got
+    assert try_closed_pipe_translation(command) is not None, "管道尾那半没变"
+
+
+# ── ① 的审计处置（2026-09-16）：M-1 / M-2 / D-1 / D-4 / D-5 ──────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "head -5 .hiveweave/data.db",
+        "tail -20 .hiveweave/env.sh",
+        "wc -l .hiveweave/data.db",
+        "head -3 .hiveweave/config",
+    ],
+)
+def test_translation_refuses_protected_hiveweave_targets(gate_on, command):
+    """★ **M-1（审计必修）**：目标落在 `.hiveweave` 非读放行面 ⇒ **不译**。
+
+    为什么这条是必修：`.hiveweave` 护栏（`_check_hiveweave_command`）按**动词**匹配
+    （`cat`/`rm`…），`head`/`tail`/`wc` **不在**动词表里；而 `Get-Content` 是被
+    **刻意排除**的只读 cmdlet（否则 `.hiveweave/logs` 的只读放行会被关掉）。
+    ⇒ 不加守卫时，`head -5 .hiveweave/data.db` 在**改动前**被方言门拦下（顺带保住
+    了这条策略）、在**改动后**会译成 `Get-Content … -TotalCount 5` 并**执行** ——
+    那是本改动**新开的一条读受保护文件的路径**。
+    ⇒ 必须退回"拒 + 教学"（= 改动前行为）。
+    """
+    assert try_readonly_limit_translation(command) is None, (
+        f"{command!r} 被译了 —— 这会新开一条读 .hiveweave 受保护文件的路径"
+    )
+    assert try_dialect_translation(command) is None, command
+    assert detect_untranslated_unix(command) is not None, (
+        f"{command!r} 既不译也不拒 —— 有东西被悄悄放行了"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "head -5 .hiveweave/logs/dev-server-a.log",   # 只读例外（诊断出口）
+        "head -5 .hiveweave/shared/plan.md",          # 允许子树
+    ],
+)
+def test_translation_allows_read_cleared_hiveweave_targets(gate_on, command):
+    """反向对照：**读放行面内**的 `.hiveweave` 目标照常译。
+
+    没有这条，"一律不译含 .hiveweave 的命令"也能让上一条绿 —— 那是把
+    诊断出口（logs）与共享目录（shared）一起关掉。
+    """
+    got = try_readonly_limit_translation(command)
+    assert got is not None, f"{command!r} 属读放行面，应该照译"
+    assert got[0].startswith("Get-Content "), got
+
+
+@pytest.mark.parametrize("command", ["head -n -5 f.txt", "tail -n -3 f.txt"])
+def test_negative_line_count_is_not_translated(gate_on, command):
+    """★ **D-1**：`head -n -5 f` 在 bash 里是「除最后 5 行以外」，不是「前 5 行」。
+
+    初版正则的 `(?:-n\\s*)?-?` 会把负号吞掉、译成 `-TotalCount 5` —— 静默给错结果，
+    比拒绝更糟（本文件自己的判据：猜错 = 把命令改坏）。⇒ 不译、退回教学。
+    """
+    assert try_readonly_limit_translation(command) is None, command
+    assert detect_untranslated_unix(command) is not None, command
+
+
+@pytest.mark.parametrize(
+    "command,needles",
+    [
+        ("head -5 f.txt", ("Get-Content", "-TotalCount")),
+        ("tail -20 f.txt", ("Get-Content", "-Tail")),
+        ("wc -l f.txt", (".Count",)),
+    ],
+)
+def test_translation_tokens_match_the_taught_hint(command, needles):
+    """**D-4**：译出的形态必须与 `UNIX_ONLY_HINTS` **教给 agent 的写法同源**。
+
+    注释里声称"逐字同源"，而实现是两处手抄 ⇒ 加这条断言钉住，否则改了 hint 表
+    会静默漂移（本仓在"清单双写"上栽过两次；`shell_dialect.py` 的修改纪律明写
+    "两边不允许再出现手抄副本"）。
+    """
+    from hiveweave.tools.shell_dialect import UNIX_ONLY_HINTS
+
+    got = try_readonly_limit_translation(command)
+    assert got is not None, command
+    translated = got[0]
+    for needle in needles:
+        assert needle in translated, translated
+    # hint 里必须出现同一批 token（两边指同一件事）
+    hint_key = "head" if command.startswith("head") else (
+        "tail" if command.startswith("tail") else "wc"
+    )
+    hint = UNIX_ONLY_HINTS[hint_key]
+    for needle in needles:
+        assert needle in hint, (
+            f"hint 表里 {hint_key!r} 的写法变了（{hint!r}），而翻译器仍产出 "
+            f"{translated!r} —— 两处已漂移，请同步（它们指的是同一件事）"
+        )
+
+
+def test_wc_paths_are_extracted_like_head(gate_on):
+    """**D-5**：`wc` 与 `head`/`tail` 同族，路径提取不能漏它。
+
+    漏了 `wc` ⇒ `wc -l .env` 的路径**不进敏感路径检查**（而 `head -5 .env` 会进）
+    ⇒ 同一族命令两套判据。这是**路径提取**（不是词表），补进去是收口而不是加词表。
+    """
+    from hiveweave.tools.bash import _extract_file_paths_from_command
+
+    for cmd in ("head -5 .env", "wc -l .env", "tail -3 .env"):
+        assert _extract_file_paths_from_command(cmd) == [".env"], cmd
+
+
+def test_llm_facing_descriptions_do_not_claim_no_translation():
+    """★ **M-2（审计必修）**：**模型实际读到的那一份**文案不得再声称"no translation"。
+
+    为什么必修：`@tool` 注册表里的 description 是**被遮蔽的**那份 ——
+    `get_tool_description` / `get_tool_schema_for_llm` 优先取 `TOOL_PARAM_SCHEMAS`。
+    ⇒ 只改 `@tool` 那份 = 模型仍然读到与实现相反的承诺（审计实测两份内容不一致）。
+    """
+    from hiveweave.tools.executor import get_tool_description
+
+    desc = get_tool_description("bash")
+    assert desc, "拿不到模型面的 bash 描述"
+    assert "no unix" not in desc.lower(), (
+        "模型面仍在声称「no unix→pwsh translation is applied」—— 与实现相反"
+    )
+    assert "verbatim — no unix→pwsh translation" not in desc, desc
+    # 且必须**如实**说明有窄集合转译（否则模型不知道可以直写 head -N）
+    assert "auto-translation" in desc or "translated" in desc.lower(), desc
