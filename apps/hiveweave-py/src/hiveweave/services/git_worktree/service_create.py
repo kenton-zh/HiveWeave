@@ -33,6 +33,54 @@ def _anchor_gitdir(project_root: str, worktree_path: str) -> str:
     """与 `git_anchor.resolve_anchor` 同一派生规则（保持单点一致）。"""
     return os.path.join(str(project_root), ".git", "worktrees",
                         os.path.basename(os.path.realpath(worktree_path)))
+
+
+async def _worktree_registration(
+    workspace_path: str, path: str
+) -> tuple[str, str] | None:
+    """`path` 的还是不是在册工作树。``None`` = 在册（可以提交）。
+
+    返回 ``(verdict, reason)``，verdict ∈ ``{"husk", "unverifiable"}`` ——
+    **两档该做的动作不同**（审计 1-2 第 4 条）：`husk` = 残留目录，交给
+    reconcile 清；`unverifiable` = 多半是信任锚在拒绝（可证篡改），要上报。
+    合成一句会丢掉这个区别。
+
+    判据两条，先便宜后权威：
+      ① `_has_git(path)` —— husk 常连 `.git` 指针一起没了（rmtree 先删文件）；
+      ② `git worktree list --porcelain` 里有没有这个 realpath —— **权威判据**
+         （目录与 `.git` 指针都在、只是**注册**被删的情况，只有它认得出）。
+
+    `cwd` 用 **`path` 自己**（不是 workspace_path）：判据问的是"这个目录在不在册"，
+    从它自己问最自然，也保住调用方"checkpoint 的 git 操作都发生在被检那棵树里"
+    这条既有不变量（`test_worktree_relocate_binding` 有断言看着它）。
+    ⚠ 代价（有意识接受）：`path` 是 husk 时 ① 已先行拒掉；而「`.git` 指针在、
+    注册没了」那种 husk 会先撞上信任锚的 `AnchorRefusal` ⇒ 归到 `unverifiable`
+    而不是 `husk`（结论一样是拒绝，只是原因档不同）。
+
+    ⚠ **查不了 ⇒ fail-closed**：放行等于把"拒绝"降级成"照做"。代价不对称 ——
+    误拒 = agent 存不下工作（loud、可恢复）；误放行 = 主干被清空（不可逆，
+    TEST_DSH_58/59 已实测 3 次）。
+    """
+    if not _has_git(path):
+        return ("husk", "目录里没有 .git（husk：内容与注册都已消失）")
+    ok, out = await _git(["worktree", "list", "--porcelain"], path,
+                         project_root=workspace_path)
+    if not ok:
+        return ("unverifiable",
+                "无法核对 worktree 注册（`git worktree list` 失败）："
+                f"{(out or '').strip()[:200]}")
+    want = os.path.normcase(os.path.realpath(path))
+    for line in (out or "").splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = line[len("worktree "):].strip()
+        try:
+            if os.path.normcase(os.path.realpath(listed)) == want:
+                return None
+        except OSError:  # pragma: no cover — realpath 只对非法路径抛
+            continue
+    return ("husk", "不在 `git worktree list` 里（注册已被删除）")
+
 from .git_identity import (
     PLATFORM_EMAIL,
     PLATFORM_NAME,
@@ -987,6 +1035,14 @@ yarn.lock merge=union
         """Snapshot current state (git add -A + commit). No empty commits.
 
         Returns ``{success, hash, count}`` or ``{success: False, message}``.
+
+        ⚠ **入口必须校验「这棵树还在不在册」**（1-2，2026-09-16）。原来只查
+        `Path(path).is_dir()`，而 #21 的现场正是**目录还在、内容与注册都没了**
+        的 husk（合并后回收 worktree 被 Windows 文件锁挡住留下的残留）：
+        门禁照常要求 checkpoint ⇒ 平台在 husk 里 `git add -A`。
+        （`git add -A` 那一侧已由信任锚补 `--work-tree` 挡住"cwd 被当工作树根"，
+        见 `git_anchor`；本处补的是"目录**看似**存在但不是工作树"这一层 ——
+        它必须 **fail loud**，因为静默 no-op 会让 agent 以为工作存下来了。）
         """
         path = await self._resolve_effective_worktree_path(
             workspace_path, short_id
@@ -995,6 +1051,39 @@ yarn.lock merge=union
             return {"success": False,
                     **self._empty_volume_fields(),
                     "message": f"Worktree for {short_id} does not exist."}
+        registration = await _worktree_registration(workspace_path, path)
+        if registration is not None:
+            verdict, reason = registration
+            log.error(
+                "git_worktree.checkpoint_refused_unregistered_worktree",
+                short_id=short_id,
+                path=path,
+                verdict=verdict,
+                reason=reason,
+            )
+            if verdict == "husk":
+                tail = (
+                    "Likely a leftover husk (worktree removed but the "
+                    "directory was locked). Nothing was committed — reconcile "
+                    "cleans husks automatically (every agent start + a 6-min "
+                    "tick), or you can wait/block this turn instead of "
+                    "retrying the checkpoint."
+                )
+            else:
+                tail = (
+                    "The registration could not be verified — most often the "
+                    "git trust anchor refusing a tampered worktree. Nothing "
+                    "was committed. Report it rather than retrying."
+                )
+            return {
+                "success": False,
+                **self._empty_volume_fields(),
+                "message": (
+                    f"Checkpoint refused: {path} is not a registered git "
+                    f"worktree ({reason}). A checkpoint there would have "
+                    f"recorded every tracked file as deleted. {tail}"
+                ),
+            }
 
         ok, add_out = await _git(["add", "-A"], path, project_root=workspace_path)
         if not ok:

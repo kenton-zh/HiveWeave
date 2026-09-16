@@ -286,6 +286,12 @@ async def test_checkpoint_uses_effective_relocated_path(tmp_path: Path) -> None:
 
     async def fake_git(args: list[str], cwd: str, project_root=None):
         git_calls.append((list(args), cwd))
+        # 1-2（2026-09-16）：checkpoint 入口要核对「这棵树还在不在册」⇒ 本桩
+        # 必须像真 git 一样回答 `worktree list --porcelain`（真 git 的输出里
+        # 主工作树永远在列表里，空输出不可能出现）。只回 "" 会让入口按
+        # fail-closed 拒绝 —— 那是**桩不忠实**，不是被测行为。
+        if args[:2] == ["worktree", "list"]:
+            return True, f"worktree {ws}\nworktree {relocated}\n"
         # Empty porcelain → "no changes" early return still proves cwd
         if args[:1] == ["status"]:
             return True, ""

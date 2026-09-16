@@ -185,7 +185,23 @@ class LifecycleMixin:
                     "message": f"Worktree for {short_id} does not exist."}
 
         # Safety: snapshot current state before discarding (契约 09 安全加固)
-        await self.checkpoint(workspace_path, short_id, "pre-rollback-snapshot")
+        #
+        # ⚠ **必须看回执**（1-2 审计 2026-09-16，实测）：原来这里丢弃返回值，
+        # 于是在 **husk**（目录还在、注册没了）上会继续往下走 ——
+        # `git log --grep=checkpoint:` 取到的是**主干上的** checkpoint 提交、
+        # 再 `git reset --hard` 到它（cwd=husk，锚把工作树钉成项目根）
+        # ⇒ **主干 tip 与主干工作区被改写**（审计实测：main tip 969f80ac→65384be7、
+        # 工作区文件被删）。这是与 checkpoint 同形、同族的落点，只差一行短路。
+        cp = await self.checkpoint(workspace_path, short_id, "pre-rollback-snapshot")
+        if not cp.get("success"):
+            return {
+                "success": False,
+                "message": (
+                    "Rollback refused: the pre-rollback snapshot failed, and "
+                    "continuing would reset the wrong tree "
+                    f"({cp.get('message') or 'checkpoint failed'})"
+                ),
+            }
 
         target = commit_hash
         if not target:

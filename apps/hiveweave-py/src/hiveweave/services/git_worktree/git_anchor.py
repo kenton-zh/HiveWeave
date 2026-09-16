@@ -19,6 +19,17 @@ worktree 的 `.git` 指针、也能写 git 自己会去读的 gitdir 内文件 �
 ⇒ 本模块把「git 去哪找 gitdir / common dir」从**读 agent 可写文件**改成
 **平台派生**：不读 `<wt>/.git` 的内容、不读 `commondir`，**无 TOCTOU**。
 
+## ⚠ 2026-09-16 补全：锚必须**同时钉住工作树**（#21 成因链第 3 环）
+
+上面三档只钉了 gitdir 与 common dir ⇒ **git 把 cwd 当成工作树根**。实测复现
+（58 现场形态）：在 `<proj>/.vite`（任意普通目录）里 `--git-dir=<proj>/.git
+rev-parse --show-toplevel` 输出 `.vite`、`ls-files -d` 报出**全部** tracked 文件；
+于是 `git add -A` 把整棵树记成"删除"，而 `commit` 因 gitdir 锚定到 `<proj>/.git`
+**直接写进 `main`** ⇒ 主干清空（TEST_DSH_58/59 实测 3 次）。
+
+⇒ 锚改为同时钉 `--work-tree=` / `GIT_WORK_TREE`（见 `GitAnchor.args/env`）。
+这是**补全**（仓库 + 公共目录 + 工作树），**不是**回退本模块的任何一档。
+
 ## 边界（不要读成「git 侧全封了」）
 
 - `<gitdir>/config.worktree` 仍会被 git 读（平台自己开了
@@ -61,15 +72,33 @@ class GitAnchor:
     project_root: str
     git_dir: str
     common_dir: str
+    work_tree: str
 
     @property
     def args(self) -> list[str]:
-        return [f"--git-dir={self.git_dir}"]
+        """⚠ **必须连工作树一起钉**（#21 成因链第 3 环，2026-09-16 补全）。
+
+        只给 `--git-dir` 时，git 会把 **cwd** 当成工作树根 —— 实测复现（58 现场形态）：
+        在 `TEST_DSH_58/.vite`（任意普通目录）里
+        `--git-dir=<root>/.git rev-parse --show-toplevel` → 输出 `.vite`，
+        同目录 `ls-files -d` → **10 个**（正好＝主干 tracked 文件数）。
+        于是任何一次 `git add -A` 都会把整棵树记成"删除"，而 `commit` 因为
+        gitdir 锚定到 `<main>/.git` 而**直接写进 `main`** ⇒ 主干被清空
+        （TEST_DSH_58/59 实测 3 次）。
+
+        这不是新增约束、更不是回退锚：锚本就该同时钉住
+        「**仓库 + 公共目录 + 工作树**」三者 —— 这是**补全**。
+        """
+        return [f"--git-dir={self.git_dir}", f"--work-tree={self.work_tree}"]
 
     @property
     def env(self) -> dict[str, str]:
-        """钉住 gitdir 与 common dir —— 后者是「删 commondir 自建独立仓」的解。"""
-        return {"GIT_DIR": self.git_dir, "GIT_COMMON_DIR": self.common_dir}
+        """钉住 gitdir / 公共目录 / 工作树（三者缺一，另两处就被 cwd 或文件说了算）。"""
+        return {
+            "GIT_DIR": self.git_dir,
+            "GIT_COMMON_DIR": self.common_dir,
+            "GIT_WORK_TREE": self.work_tree,
+        }
 
 
 class AnchorRefusal(Exception):
@@ -187,7 +216,10 @@ def resolve_anchor(cwd: str, project_root: str | None = None) -> GitAnchor | Non
                 f" ⇒ 无法安全派生信任锚，拒绝跑 git")
         if not os.path.isdir(git_dir):    # pragma: no cover - 结构上不可能
             return None
-        return GitAnchor("main", holder, git_dir, git_dir)
+        # 主树：工作树 = holder（含 `.git` 目录的那层 = 项目根）。注意 holder 是
+        # `_nearest_dot_git` **上溯**到的，所以 cwd 在主树子目录时这里仍然正确
+        # —— 而"不给 --work-tree"时 git 会拿 cwd 当工作树根（那是错的）。
+        return GitAnchor("main", holder, git_dir, git_dir, holder)
 
     # `.git` 是文件 ⇒ worktree gitdir 指针形态
     if project is None:
@@ -202,7 +234,9 @@ def resolve_anchor(cwd: str, project_root: str | None = None) -> GitAnchor | Non
         raise AnchorRefusal(
             f"worktree {holder} 期望的 gitdir 不存在：{git_dir}"
             f"（可能已被删除/替换）⇒ 拒绝跑 git")
-    return GitAnchor("worktree", project, git_dir, os.path.join(project, ".git"))
+    # worktree：工作树 = holder（含 `.git` **指针文件**的那层 = worktree 根）。
+    return GitAnchor("worktree", project, git_dir,
+                     os.path.join(project, ".git"), holder)
 
 
 def anchor_for_git(cwd: str, project_root: str | None = None
