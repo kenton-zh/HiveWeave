@@ -1,0 +1,87 @@
+{
+  "1": {
+    "class_type": "UnetLoaderGGUF",
+    "inputs": { "unet_name": "qwen-image-edit-2511-Q4_K_M.gguf" }
+  },
+  "2": {
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": { "model": ["1", 0], "shift": 3.1 }
+  },
+  "3": {
+    "class_type": "CFGNorm",
+    "inputs": { "model": ["2", 0], "strength": 1.0, "pre_cfg": false }
+  },
+  "4": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "model": ["3", 0],
+      "lora_name": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+      "strength_model": 1.0
+    }
+  },
+  "5": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    }
+  },
+  "6": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "qwen_image_vae.safetensors" }
+  },
+  "7": {
+    "class_type": "LoadImage",
+    "inputs": { "image": "frame50.png", "upload": "image" }
+  },
+  "8": {
+    "class_type": "FluxKontextImageScale",
+    "inputs": { "image": ["7", 0] }
+  },
+  "9": {
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "inputs": {
+      "clip": ["5", 0],
+      "prompt": "__PROMPT__",
+      "vae": ["6", 0],
+      "image1": ["8", 0]
+    }
+  },
+  "10": {
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "inputs": {
+      "clip": ["5", 0],
+      "prompt": "",
+      "vae": ["6", 0],
+      "image1": ["8", 0]
+    }
+  },
+  "11": {
+    "class_type": "VAEEncode",
+    "inputs": { "pixels": ["8", 0], "vae": ["6", 0] }
+  },
+  "12": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["4", 0],
+      "positive": ["9", 0],
+      "negative": ["10", 0],
+      "latent_image": ["11", 0],
+      "seed": 42,
+      "steps": 4,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "13": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["12", 0], "vae": ["6", 0] }
+  },
+  "14": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["13", 0], "filename_prefix": "qwen_edit/out" }
+  }
+}
