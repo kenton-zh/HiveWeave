@@ -987,7 +987,7 @@ def _looks_like_real_path(token: str) -> bool:
 
 
 # ── Rework prescription（DSH 参照，2026-09-11）─────────────────────
-# DSH `GoalBlockReason`（packages/goal/goal/src/index.ts:222-237）把「为什么不
+# DSH `GoalBlockReason`（packages/goal/goal/src/**types.ts:52**；2026-09-16 复核：原 index.ts:222-237 已不再是定义处）把「为什么不
 # 能继续」建模为 **受限 kebab-case code + 非空 message 双字段强制**，而不是
 # 让消费方去猜自由文本里有没有某种 token。照该形态补上结构化那条正路：
 # 调用方可以显式声明处方的**类别**（闭合词表），具体说明仍写在 feedback。

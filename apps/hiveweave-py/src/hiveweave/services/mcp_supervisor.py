@@ -33,7 +33,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# ── 公开名规则（DSH tools.ts:49-55）────────────────────────────
+# ── 公开名规则（DSH packages/mcp/mcp-client/src/tools.ts:48；2026-09-16 复核）────
 MAX_PUBLIC_NAME_LENGTH = 64
 _HASH_LENGTH = 12
 # server 名与 raw 名共用的合法字符集；其余换 _

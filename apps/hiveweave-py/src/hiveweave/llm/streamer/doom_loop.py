@@ -286,7 +286,7 @@ def classify_stall_round(
     """本轮 stall 归因，``None`` = 本轮有进展。
 
     归因顺序对齐 DSH 戒律「先查 runner/tool failure 再判 denial/无进展」
-    （bash-sandbox/src/index.ts:107 "Runner failure outranks denial because
+    （bash-sandbox/src/index.ts:117 "Runner failure outranks denial because
     the command did not run"）：工具没跑成的轮次，既不是模型空转也不是护栏
     拒绝，必须先摘出去 —— 否则文案会让模型去反省它并没犯的错。
 
