@@ -112,14 +112,18 @@ SANDBOX_TEMP_GUIDE = (
 
 # B-1 P1-1 ②：测试类命令 + 权限类失败 → 追加"可写锚点"hint（bash.py 失败输出增强）。
 _TEST_CMD_RE = re.compile(
-    r"\b(?:pytest|py\.test|vitest|jest|mocha|node\s+test|"
+    r"\b(?:pytest|py\.test|vitest|jest|mocha|node\s+test|node\s+--test|"
     r"(?:npm|pnpm|yarn)\s+test|go\s+test|cargo\s+test|"
     r"mvn\s+test|gradle\s+test|dotnet\s+test)\b",
     re.IGNORECASE,
 )
 _ACCESS_DENIED_RE = re.compile(
     r"(?:access\s+is\s+denied|access\s+to\s+the\s+path|permission\s+denied|"
-    r"eacces|denied|not\s+writable|could\s+not\s+(?:create|write))",
+    r"eacces|denied|not\s+writable|could\s+not\s+(?:create|write)|"
+    # F1（#18 审计后半，2026-09-16）：**受限沙箱里 EPERM 的主频是文件锁/共享缓存
+    # unlink**（仓内 46 分钟税先例）—— 而那类失败的正确处方正是本提示（换 cache
+    # 目录 / 换 fresh temp）。此前不认 EPERM ⇒ 那批连锚点提示都拿不到。
+    r"EPERM|operation\s+not\s+permitted)",
     re.IGNORECASE,
 )
 
@@ -630,6 +634,88 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
         "caches in the workspace (.pytest_cache/__pycache__/.cache), disable "
         "them instead: -p no:cacheprovider, or vitest "
         "--cache-dir=$env:TEMP/vitest-cache."
+    )
+
+
+# ── #18（2026-09-16）：node 测试运行器撞**沙箱的管道边界** ⇒ 给可用姿势 ──
+#
+# 实测（本机 node v22.22.2，受限令牌；复现装置见
+# `tests/test_acl_sandbox_grandchild_spawn.py`，与 DSH 的同名测试逐点同形）：
+#   三态孙进程 spawn：`inherit` OK / `ignore` OK / **`pipe` DENIED (EPERM)**；
+#   `node --test` → exit 1 + `error: 'spawn EPERM'`（堆栈落在 `ChildProcess.spawn`）；
+#   `node --test --experimental-test-isolation=none` → **TAP 全绿**（同进程 ⇒ 无子进程、无管道）。
+#
+# 机制（与 DSH 的结论一致，属 WRITE_RESTRICTED 令牌的**固有边界**）：
+#   libuv 的 pipe-stdio 用**命名**管道，其默认安全描述符来自 Win32 用户态默认 SD
+#   模板（Everyone/ANONYMOUS 只读），**不是**令牌默认 DACL ⇒ 客户端开写时没有任何
+#   restricting SID 被授权 ⇒ `ERROR_ACCESS_DENIED`，**以 spawn EPERM 呈现**。
+#   ⇒ **给管道 DACL 授受限 SID 治不了它** —— 我们 #18 原定的那个修法方向据此作废。
+#
+# ⚠ 这是**失败提示（advisory）**，不是门禁：判据只用两个**观测**事实
+#   （命令里有 node 测试运行器 + 输出里有 EPERM），不推断意图、不 gate 任何东西。
+_NODE_TEST_CMD_RE = re.compile(
+    # `node --test` / `node -test`，**加词尾边界**（否则 `node x --test-mode` 误命中）；
+    # 以及**转发到 node --test 的常见入口**（`npm test` / `pnpm test` / `yarn test`）
+    # —— 它们撞的是同一条边界，之前**一条提示都没有**。
+    r"\bnode\b[^\n|;&]*\s--?test(?![\w-])"
+    r"|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b",
+    re.IGNORECASE,
+)
+#: ⚠ **必须同时看到 spawn 证据**（F1，审计实测的误诊）：受限沙箱里 `EPERM` 的**主频**
+#: 是"文件锁 / 共享缓存 unlink"那类（仓内有 **46 分钟税**的先例：
+#: `acl_sandbox/service.py` 的 npm 互锁、`tests/test_acl_sandbox_env.py` 的 TEST_DSH_35），
+#: 而那类 EPERM 的出路是**换 cache 目录 / 换 fresh temp**（锚点提示），
+#: **不是**关测试隔离。只认裸 `\bEPERM\b` 会把药方给错、还把锚点提示挤掉。
+_SPAWN_EPERM_RE = re.compile(
+    r"spawn\w*[\s\S]{0,80}?EPERM"
+    r"|EPERM[\s\S]{0,80}?(?:spawn|child_process)"
+    r"|operation\s+not\s+permitted[\s\S]{0,80}?spawn",
+    re.IGNORECASE,
+)
+NODE_TEST_ISOLATION_NOTE = (
+    "\n\n[Sandbox pipe boundary] A child-process spawn with **piped** stdio "
+    "cannot work under this Windows restricted token — that is a platform "
+    "boundary, not a defect in your code. `node --test` hits it because the "
+    "runner spawns one child per test file and reads TAP over a pipe. "
+    "Fix: run the test files **in-process** — `node --test "
+    "--experimental-test-isolation=none <files>`. That flag name is "
+    "**version-dependent**: if you get `bad option`, retry with "
+    "`--test-isolation=none` (check with `node --help` which one exists) — "
+    "`bad option` is NOT a new failure. "
+    "Two caveats: (1) isolation-off means all files share one process, so a "
+    "green run is **weaker evidence** (cross-file global state, one crash "
+    "takes the run down) — use it only because the default form cannot run "
+    "here; (2) this removes the **runner's own** pipes; if your tests "
+    "themselves spawn children with `stdio: 'pipe'`, those still fail — "
+    "switch them to `stdio: 'inherit'` or write results to files."
+)
+
+
+def _maybe_append_node_isolation_hint(command: str, error_msg: str) -> str:
+    """node 测试运行器 + EPERM ⇒ 追加"改用同进程隔离"的可操作提示。
+
+    为什么值得单独一条：撞墙的 agent 第一反应是**换 flag 重试**（本仓实测过
+    "19 分钟自救马拉松"那类），而这条边界的 flag 空间里**只有隔离开关**能绕开
+    ⇒ 不指路就是让它白烧轮次。
+    """
+    if not command or not error_msg:
+        return error_msg
+    if not _NODE_TEST_CMD_RE.search(command):
+        return error_msg
+    if not _SPAWN_EPERM_RE.search(error_msg):
+        return error_msg
+    return error_msg + NODE_TEST_ISOLATION_NOTE
+
+
+def _maybe_append_test_hints(command: str, error_msg: str) -> str:
+    """测试类失败的提示**唯一链**（顺序：可写锚点 → node 管道边界）。
+
+    ⚠ 链只能有一份：两个调用点（`execute_bash` / `run_command` 的错误出口）都走
+    这里 —— 否则加第三条提示时又会长成"每处各列一份清单"（本仓在事实位白名单上
+    栽过两次）。
+    """
+    return _maybe_append_node_isolation_hint(
+        command, _maybe_append_test_anchor_hint(command, error_msg)
     )
 
 
@@ -2383,7 +2469,7 @@ async def execute_bash(
     if detail:
         error_msg = f"{error_msg}\n{detail}"
     error_msg = _maybe_append_venv_hint(ws, error_msg)
-    error_msg = _maybe_append_test_anchor_hint(command, error_msg)
+    error_msg = _maybe_append_test_hints(command, error_msg)
     # ⚠️ 必须经漏斗：`command_failed` 已是**派生键**，裸写它会被
     # `finalize_fact_dict` 当作陈旧值 pop 掉（权威是 `fact`）。这是全平台
     # **流量最大**的失败出口 —— 漏了它等于「普通非零退出」永远拿不到事实位。
@@ -2550,7 +2636,7 @@ async def execute_run_command(
     if detail:
         error_msg = f"{error_msg}\n{detail}"
     error_msg = _maybe_append_venv_hint(ws, error_msg)
-    error_msg = _maybe_append_test_anchor_hint(command, error_msg)
+    error_msg = _maybe_append_test_hints(command, error_msg)
     # 同上：`run_command` 的普通非零退出，同样必须经漏斗。
     return finalize_fact_dict({
         "success": False,

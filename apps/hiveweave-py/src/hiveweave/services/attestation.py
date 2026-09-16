@@ -306,15 +306,20 @@ _TEST_COMMAND_RE = re.compile(
     r"\bmvn\s+test\b|"
     r"\bgradle\s+test\b|"
     r"\bdotnet\s+test\b|"
+    # F2（#18 审计，2026-09-16）：**node 官方测试入口**。此前漏了它 ⇒
+    # `node --test` 跑绿也**不算 test_run**（除非显式 `testEvidence=true`）⇒
+    # agent 从"spawn EPERM"撞到"缺凭证"，白烧轮次。`--test-only` 也认。
+    r"\bnode\s+--test(?:-only)?\b|"
+    r"\bnode\s+--run\s+test\b|"
     r"\bjest\b|"
     r"\bmocha\b|"
     r"\buv\s+run\s+pytest\b|"
     # python/node/bash 直接跑验证/测试脚本（test_*.py, *_test.py,
     # verify_*.py, check_*.py 及对应 .js/.mjs/.ts/.sh 变体）
     r"\b(?:python3?|uv\s+run\s+python3?|node|bash|sh)\s+"
-    r"(?:[^\s;&|]*/)?(?:test_|verify_|check_)[^\s;&|]*\.(?:py|[jm]js|ts|sh)\b|"
+    r"(?:[^\s;&|]*/)?(?:test_|verify_|check_)[^\s;&|]*\.(?:py|(?:[mc]?js)|ts|sh)\b|"
     r"\b(?:python3?|uv\s+run\s+python3?|node|bash|sh)\s+"
-    r"[^\s;&|]*_test\.(?:py|[jm]js|ts|sh)\b"
+    r"[^\s;&|]*_test\.(?:py|(?:[mc]?js)|ts|sh)\b"
     r")",
     re.IGNORECASE,
 )
