@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 136,
+ "_total": 139,
  "_by_tier": {
   "table": 24,
-  "regex": 112
+  "regex": 115
  },
  "_suffixes": [
   "_NEEDLES",
@@ -90,7 +90,7 @@
   },
   "api/debug.py::_TABLE_NAME_RE": {
    "tier": "regex",
-   "line": 419
+   "line": 428
   },
   "conversation/token_utils.py::_CJK_RE": {
    "tier": "regex",
@@ -192,6 +192,10 @@
    "tier": "regex",
    "line": 51
   },
+  "services/failure_signature.py::_AGENT_SHORT_ID_RE": {
+   "tier": "regex",
+   "line": 83
+  },
   "services/failure_signature.py::_EPOCH_MS_RE": {
    "tier": "regex",
    "line": 50
@@ -204,9 +208,17 @@
    "tier": "regex",
    "line": 47
   },
+  "services/failure_signature.py::_PLACEHOLDER_RE": {
+   "tier": "regex",
+   "line": 101
+  },
+  "services/failure_signature.py::_TASK_ID8_RE": {
+   "tier": "regex",
+   "line": 99
+  },
   "services/failure_signature.py::_UNIX_PATH_RE": {
    "tier": "regex",
-   "line": 54
+   "line": 65
   },
   "services/failure_signature.py::_UUID_RE": {
    "tier": "regex",
@@ -214,7 +226,7 @@
   },
   "services/failure_signature.py::_WIN_PATH_RE": {
    "tier": "regex",
-   "line": 53
+   "line": 61
   },
   "services/failure_signature.py::_WS_RE": {
    "tier": "regex",
@@ -298,7 +310,7 @@
   },
   "services/git_worktree/service_merge.py::_TASK_BRANCH_RE": {
    "tier": "regex",
-   "line": 1134
+   "line": 1149
   },
   "services/mcp_supervisor.py::_SAFE_RE": {
    "tier": "regex",
@@ -446,7 +458,7 @@
   },
   "tools/bash.py::SELF_DESTRUCTIVE_PATTERNS": {
    "tier": "table",
-   "line": 765
+   "line": 792
   },
   "tools/bash.py::_ACCESS_DENIED_RE": {
    "tier": "regex",
@@ -454,11 +466,11 @@
   },
   "tools/bash.py::_ALLOWED_HW_SUBDIRS": {
    "tier": "regex",
-   "line": 834
+   "line": 861
   },
   "tools/bash.py::_AMPERSAND_RE": {
    "tier": "regex",
-   "line": 1374
+   "line": 1401
   },
   "tools/bash.py::_ANSI_ESCAPE_RE": {
    "tier": "regex",
@@ -470,7 +482,7 @@
   },
   "tools/bash.py::_ATTEST_FOOTER_RE": {
    "tier": "regex",
-   "line": 2896
+   "line": 2947
   },
   "tools/bash.py::_BLOCKING_VERB_RE": {
    "tier": "regex",
@@ -478,11 +490,11 @@
   },
   "tools/bash.py::_CLOSED_PIPE_TAIL_RE": {
    "tier": "regex",
-   "line": 1618
+   "line": 1645
   },
   "tools/bash.py::_COMMAND_TASK_ID_RE": {
    "tier": "regex",
-   "line": 2572
+   "line": 2623
   },
   "tools/bash.py::_DEV_SERVER_TRIGGER_RE": {
    "tier": "regex",
@@ -498,31 +510,31 @@
   },
   "tools/bash.py::_HIVEWEAVE_FILE_OPS": {
    "tier": "regex",
-   "line": 792
+   "line": 819
   },
   "tools/bash.py::_HIVEWEAVE_REF": {
    "tier": "regex",
-   "line": 804
+   "line": 831
   },
   "tools/bash.py::_HIVEWEAVE_TEST_EXCLUDE_RE": {
    "tier": "regex",
-   "line": 810
+   "line": 837
   },
   "tools/bash.py::_HW_LOGS_REF": {
    "tier": "regex",
-   "line": 843
+   "line": 870
   },
   "tools/bash.py::_HW_MERGE_QUARANTINE_REF": {
    "tier": "regex",
-   "line": 872
+   "line": 899
   },
   "tools/bash.py::_HW_WRITE_MARKERS": {
    "tier": "table",
-   "line": 854
+   "line": 881
   },
   "tools/bash.py::_SHELL_KEYWORDS": {
    "tier": "table",
-   "line": 1380
+   "line": 1407
   },
   "tools/bash.py::_STATIC_SERVER_TOKEN_RE": {
    "tier": "regex",
@@ -538,7 +550,7 @@
   },
   "tools/bash.py::_UNIX_SHORT_FLAG_RE": {
    "tier": "regex",
-   "line": 1353
+   "line": 1380
   },
   "tools/bash.py::_UVICORN_HELP_RE": {
    "tier": "regex",
@@ -558,15 +570,15 @@
   },
   "tools/fact_positions.py::BAD_ARGS_SIGNATURES": {
    "tier": "table",
-   "line": 111
+   "line": 158
   },
   "tools/fact_positions.py::RUNNER_FAILURE_SIGNATURES": {
    "tier": "table",
-   "line": 76
+   "line": 95
   },
   "tools/fact_positions.py::_NORM_RE": {
    "tier": "regex",
-   "line": 149
+   "line": 196
   },
   "tools/file.py::SENSITIVE_PATTERNS": {
    "tier": "table",
