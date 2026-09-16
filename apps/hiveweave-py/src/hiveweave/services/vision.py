@@ -17,6 +17,11 @@ from typing import Any
 import structlog
 
 from hiveweave.util.tree_label import tree_tag
+from hiveweave.util.tree_scope import (
+    hit_note_for,
+    ordered_tree_roots,
+    shared_subdir_of,
+)
 
 log = structlog.get_logger()
 
@@ -129,10 +134,11 @@ def resolve_screenshot_path_multi_tree(
         if full.is_file():
             if _key_within(_norm_key(str(full)), ws_key):
                 return full, ""      # 本树命中：无跨树归因需求
-            return full, (
-                f" [read from {tag} — shared artifacts are written to MAIN"
-                " by design (4-dir shared contract)]"
-            )
+            # 归因句子按**子目录**分派（`util/tree_scope.hit_note_for`）：本函数
+            # 接受任意相对路径，原先无论命中哪个子目录都印 reports 的
+            # "written to MAIN by design"（09-16 二轮审计指出：shared 命中时这句
+            # 是反向认知，与本批的"shared 无权威落点"冲突）。
+            return full, f" [read from {tag}{hit_note_for(shared_subdir_of(rel) or '')}]"
     if not tried:
         return None, ""
     return None, (
@@ -178,39 +184,15 @@ def _multi_tree_bases(
     落点是 MAIN（``service_create.py:99-105``），所以 MAIN 排第一；
     兄弟树是 `§10.2`「MAIN → 请求者 → assignee」在同一项目命名空间
     （``dispatch_pin.py:7,34``）下的上界。
+
+    09-16（②）：顺序改由 ``util/tree_scope.ordered_tree_roots`` **唯一权威**
+    给出（按子目录合并策略参数化，reports 与 shared 不同），本函数只做
+    `(workspace, project_root)` → `(root, workspace)` 的形参转接。
+    ⚠ 旧实现与 ``tools/file.py::_reports_read_scope`` **在"请求者树不是排序
+    第一个兄弟"时给出不同顺序**（旧实现把兄弟树全排在请求者树之前）——
+    本函数签名与返回类型不变，故调用方无需改动。
     """
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def _add(base: str | None) -> None:
-        if not base or not str(base).strip():
-            return
-        try:
-            rp = str(Path(base).resolve())
-        except (OSError, ValueError):
-            return
-        key = os.path.normcase(rp)
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(rp)
-
-    _add(project_root)          # MAIN 优先（共享产物的权威落点）
-    proj = project_root or workspace
-    if proj:
-        wt_root = Path(proj) / ".hiveweave" / "worktrees"
-        try:
-            for name in sorted(p.name for p in wt_root.iterdir() if p.is_dir()):
-                if name.startswith("_"):   # _quarantine（constants.py:9）
-                    continue
-                _add(str(wt_root / name))
-        except OSError as exc:
-            # 没有 worktrees 目录 = 单树布局（非必然异常）：兄弟树本就不存在，
-            # 候选集只剩 MAIN + 本树，属预期降级。
-            log.debug("vision.sibling_trees_unavailable",
-                      root=str(wt_root), err=str(exc))
-    _add(workspace)             # 本树兜底（非 worktree 布局时即项目根）
-    return out
+    return ordered_tree_roots(project_root, workspace, local_first=False)
 
 
 def _resolve_screenshot(

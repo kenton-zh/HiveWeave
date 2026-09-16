@@ -29,6 +29,17 @@ from hiveweave.util.tree_label import (
     tree_tag,
     write_tree_suffix,
 )
+from hiveweave.util.tree_scope import (
+    cross_tree_read_enabled,
+    hit_note_for,
+    local_first_for,
+    miss_hint_for,
+    normalize_shared_rel,
+    ordered_tree_roots,
+    policy_for,
+    shared_subdir_of,
+    shared_subdir_of_parts,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -406,12 +417,26 @@ def strip_dot_slash_prefix(p: str) -> str:
     return s
 
 
+def _platform_shared_read_subdir(file_path: str) -> str | None:
+    """平台共享子目录名（``shared`` / ``reports`` / …）或 None。
+
+    **判据来源**：``services/git_worktree/service_create.py:99-105`` ——
+    ``.hiveweave/{shared,reports,drafts,handoffs}`` 四目录反选入库、
+    **跨 worktree 可见可合并**；各子目录的合并策略与由此推出的读侧候选序
+    见 ``util/tree_scope.py``（**唯一权威**，本函数只做路径识别）。
+
+    ⚠ 是否启用跨树读由 ``tree_scope.cross_tree_read_enabled()`` 决定，
+    不是"命中就一定跨树"（drafts/handoffs 刻意不开）。
+    """
+    return shared_subdir_of(strip_dot_slash_prefix(file_path))
+
+
 def _is_platform_reports_read(file_path: str) -> bool:
     """`.hiveweave/reports/**` 是平台自管共享产物（契约/取证/截图）。
 
     **判据来源**：``services/git_worktree/service_create.py:99-105`` ——
     ``.hiveweave/{shared,reports,drafts,handoffs}`` 四目录反选入库、
-    **跨 worktree 可见可合并**；``:171-175`` 给 reports 定的是「默认文本合并、
+    **跨 worktree 可见可合并**；``:239-245`` 给它定的是「默认文本合并、
     预期多方写」。写侧因此有**单一权威落点**（MAIN 的 ``.hiveweave/reports/``）
     —— 只有落在同一棵树上，其 merge 策略才成立。
 
@@ -420,9 +445,11 @@ def _is_platform_reports_read(file_path: str) -> bool:
 
     40 轮实测背景：旧解析只拼 worktree 前缀 → 永远 File not found（4 人 3
     通道 76 次读取 0 成功，225min 契约税）。
+
+    09-16（②）：判定体下移到 ``_platform_shared_read_subdir``（reports 与
+    shared 共用同一套路径识别），本函数只剩"是不是 reports"这一问。
     """
-    p = strip_dot_slash_prefix(file_path)
-    return p == ".hiveweave/reports" or p.startswith(".hiveweave/reports/")
+    return _platform_shared_read_subdir(file_path) == "reports"
 
 
 def _resolve_for_read_detail(
@@ -613,97 +640,130 @@ def _is_binary(abs_path: str) -> bool:
 
 # ── #5 读侧多树查找（判据来源：我们自己的四目录共享模型）────────────
 # 出处：services/git_worktree/service_create.py:99-105（四目录反选入库、
-# 跨 worktree 可见可合并）+ :171-175（reports = 默认文本合并、预期多方写）；
-# services/acl_sandbox/policy.py:54（boundary_root：executor=worktree）。
+# 跨 worktree 可见可合并）+ :239-245（reports = 默认文本合并、预期多方写；
+# shared = merge=binary）+ services/acl_sandbox/policy.py:54（boundary_root：
+# executor=worktree）。
 # ⇒ 我们的**共享是有意的，隔离也是有的**：写侧单一权威落点（MAIN），
 #   读侧必须能跨越 per-agent worktree 找到它，且**回执要说明在哪棵树命中**
 #   —— 多树语境下「这条读取落在哪个树」是归因的必要条件（fixplan §10.5）。
-_REPORTS_ID_RE = re.compile(r"\.hiveweave/reports/([^/]+)")
+#
+# 09-16（②）：**候选序的唯一权威搬去 `util/tree_scope.ordered_tree_roots`**
+# （按子目录合并策略参数化：reports = MAIN 优先 / shared = 本树优先）。
+# 本模块只做"把相对路径拼到各候选树根上"，不再自持一套顺序。
+
+
+def _shared_read_scope(
+    subdir: str, rel: str, root: str, write_workspace: str
+) -> list[tuple[str, str]]:
+    """某共享子目录的相对路径 → 候选 ``(树标签, 该树内的绝对路径)``。
+
+    ``rel`` 会被**归一**（见 ``tree_scope.normalize_shared_rel``）：含 ``..``
+    的路径在归约后若已不属于该子目录（如 ``.hiveweave/shared/../data.db`` →
+    ``.hiveweave/data.db``），本函数返回**空候选**，调用方按普通路径处理
+    （那条路径的守卫在别处，跨树拼接不再参与）。**这是越权读的唯一闸口**：
+    ``rel`` 会被 ``os.path.join`` 原样带到**别的树**上去 realpath。
+
+    顺序由 ``util/tree_scope`` 按该子目录的合并策略给出（reports：
+    MAIN → 本树 → 兄弟树；shared：本树 → MAIN → 兄弟树），本函数只负责
+    拼接与去重。查不查得到都会在回执里说明，不下断言。
+    """
+    rel = normalize_shared_rel(rel)
+    if not rel or shared_subdir_of(rel) != subdir:
+        return []
+    pol = policy_for(subdir)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for base in ordered_tree_roots(
+        root, write_workspace, local_first=bool(pol and pol.local_first)
+    ):
+        try:
+            full = os.path.realpath(os.path.join(base, rel))
+        except (OSError, ValueError):
+            continue
+        key = os.path.normcase(full)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((tree_tag(full), full))
+    return out
 
 
 def _reports_read_scope(
     rel: str, root: str, write_workspace: str
 ) -> list[tuple[str, str]]:
-    """reports 相对路径的候选树：(树标签, 该树内的绝对路径)。
+    """reports 子目录的候选树 —— 见 :func:`_shared_read_scope`（同一实现）。
 
-    ``rel`` 是**已剥前导 ``./`` 的相对路径**（如
-    ``.hiveweave/reports/<id>/x.png``）。
-
-    顺序 = fixplan §10.2 / ``fixplan:351`` 的读侧顺序：**MAIN（请求者/共享
-    权威落点）→ 本树 → 兄弟树**。MAIN 排第一不是随手排的 —— 共享产物的
-    权威落点就在 MAIN（``service_create.py:99-105``，写侧单一权威落点），
-    所以"可能写了它的树"里 MAIN 的可能性最高；本树（请求者）次之；兄弟树
-    是 assignee 的近似上界（``.hiveweave/worktrees/<id>`` 是同一项目下的
-    命名空间，``dispatch_pin.py:7,34``）。与 vision 侧
-    ``_multi_tree_bases`` 的顺序**完全一致**（两处各写一套会漂移）。
-    查不查得到都会在回执里说明，不做断言。
+    保留本名：它是 #5 的既有对外面（测试与 ``_reports_evidence_hint`` 都
+    从这条入口进），内部不再另立一套顺序。
     """
-    if not rel:
-        return []
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-
-    def _add(base: str) -> None:
-        if not base:
-            return
-        try:
-            full = os.path.realpath(os.path.join(base, rel))
-        except (OSError, ValueError):
-            return
-        key = os.path.normcase(full)
-        if key in seen:
-            return
-        seen.add(key)
-        out.append((tree_tag(full), full))
-
-    ws = os.path.realpath(write_workspace) if write_workspace else ""
-    # MAIN 优先（共享产物的权威落点，fixplan:351）；project_root 未给时
-    # root 即项目根，去重会自然退化为单棵。
-    _add(os.path.realpath(root))
-    _add(ws)
-    # 兄弟 worktree（`.hiveweave/worktrees/*`，跳过 _quarantine 兜底目录）
-    try:
-        wt_root = os.path.join(
-            os.path.realpath(root), ".hiveweave", "worktrees",
-        )
-        for name in sorted(os.listdir(wt_root)):
-            if name.startswith("_"):
-                continue
-            _add(os.path.join(wt_root, name))
-    except OSError:
-        pass
-    return out
+    return _shared_read_scope("reports", rel, root, write_workspace)
 
 
-def _reports_evidence_hint(file_path: str, root: str, workspace_path: str = "") -> str:
-    """reports 路径未命中时，逐树说明「查了哪些树、哪棵树有该 id 目录」。
+def _shared_key_dir(rel: str, subdir: str) -> str | None:
+    """共享路径里紧随 ``.hiveweave/<subdir>/`` 的第一段（reports 场景 = 任务 id）。
+
+    旧实现用正则 ``\\.hiveweave/reports/([^/]+)`` 抓 id，只能服务 reports；
+    改成按段扫描后两个子目录共用。取不到 → None（调用方不发提示）。
+    """
+    parts = rel.replace("\\", "/").split("/")
+    for i in range(len(parts) - 2):
+        if parts[i] == ".hiveweave" and parts[i + 1] == subdir:
+            seg = parts[i + 2]
+            return seg or None
+    return None
+
+
+def _shared_dir_from_candidate(cand: str, subdir: str) -> Path | None:
+    """候选文件路径 → 它所在树的 ``.hiveweave/<subdir>`` 目录。
+
+    ⚠ 不能用 ``Path(cand).parent.parent`` —— 那只在"``<subdir>/<key>/<file>``
+    恰好两层"时成立；``.hiveweave/reports/T1/sub/x.png`` 会被算成
+    ``reports/T1`` 再拼 key 变成 ``reports/T1/T1``（旧实现的实际行为）。
+    改为从右往左找 ``.hiveweave`` + ``<subdir>`` 段对，深度无关。
+    """
+    parts = Path(cand).parts
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i - 1] == ".hiveweave" and parts[i] == subdir:
+            return Path(*parts[: i + 1])
+    return None
+
+
+def _shared_evidence_hint(
+    subdir: str, rel: str, root: str, workspace_path: str = ""
+) -> str:
+    """共享路径未命中时，逐树说明「查了哪些树、哪棵树有该 key 目录」。
 
     46/11 #4 原实现只查项目根一棵树就下结论（``no reports directory for id``）；
     #5（2026-09-12）改为**候选树逐查 + 回执点名命中树**：
-    - 任一候选树里有 ``reports/<id>/`` 且非空 → 列出该树里已有哪些文件
-      （「证据目录已有但你要的文件未生成」）；
-    - 候选树里都没有该 id 目录 → 只说「查过哪些树、均未见到该 id 目录」，
+    - 任一候选树里有 ``<subdir>/<key>/`` 且非空 → 列出该树里已有哪些文件
+      （「目录已有但你要的文件未生成」）；
+    - 候选树里都没有该 key 目录 → 只说「查过哪些树、均未见到该目录」，
       **不断言"确实不存在"**（L17/L20 同族病：单点查空就下全局结论）。
 
-    非 reports 路径返回空串。
+    09-16（②）：由 reports 专用改为按子目录通用（候选序来自
+    ``_shared_read_scope``，与读侧同一实现）。非共享路径返回空串。
     """
-    norm = strip_dot_slash_prefix(file_path)
-    m = _REPORTS_ID_RE.search(norm)
-    if not m:
+    rel = normalize_shared_rel(rel)
+    if shared_subdir_of(rel) != subdir:
         return ""
-    eid = m.group(1)
-    candidates = _reports_read_scope(norm, root, workspace_path or root)
+    key = _shared_key_dir(rel, subdir)
+    if not key:
+        return ""
+    pol = policy_for(subdir)
+    artifact = pol.artifact if pol else "artifact"
+    candidates = _shared_read_scope(subdir, rel, root, workspace_path or root)
     if not candidates:
-        return f" [no reports directory for id '{eid}' in the searched trees]"
+        return f" [no {subdir} directory for '{key}' in the searched trees]"
     present: list[str] = []
     for tag, base in candidates:
-        # base 是 `<树根>/.hiveweave/reports/<id>/<file>` ⇒ 上溯两级才是
-        # `<树根>/.hiveweave/reports`，再拼 `<id>` 才是该 id 的目录。
-        d = Path(base).parent.parent / eid
+        d = _shared_dir_from_candidate(base, subdir)
+        if d is None:
+            continue
         try:
-            if not d.is_dir():
+            target = d / key
+            if not target.is_dir():
                 continue
-            entries = [e.name for e in d.iterdir() if not e.name.startswith(".")]
+            entries = [e.name for e in target.iterdir() if not e.name.startswith(".")]
         except OSError:
             continue
         shown = ", ".join(entries[:5]) + ("…" if len(entries) > 5 else "")
@@ -711,55 +771,39 @@ def _reports_evidence_hint(file_path: str, root: str, workspace_path: str = "") 
     searched = ", ".join(tag for tag, _ in candidates)
     if present:
         return (
-            f" [reports/{eid} found in {len(present)} of the searched trees —"
+            f" [{subdir}/{key} found in {len(present)} of the searched trees —"
             f" {'; '.join(present)} — your file is not generated yet]"
         )
     return (
-        f" [searched {len(candidates)} tree(s) for reports/{eid}: {searched}"
-        f" — no reports directory for this id in any of them"
-        f" (this is not proof the evidence does not exist)]"
+        f" [searched {len(candidates)} tree(s) for {subdir}/{key}: {searched}"
+        f" — no {subdir} directory for this key in any of them"
+        f" (this is not proof the {artifact} does not exist)]"
     )
 
 
-def _find_shadowed_read(
-    file_path: str,
-    root: str,
-    workspace_path: str,
-    primary_full: str,
-) -> str | None:
-    """本树命中失败后，在候选树里找一个**存在**的同名文件。
+def _reports_evidence_hint(file_path: str, root: str, workspace_path: str = "") -> str:
+    """reports 子目录的取证提示 —— 见 :func:`_shared_evidence_hint`（同一实现）。
 
-    #5（2026-09-12）读侧多树查找：只对**共享产物路径**生效
-    （``.hiveweave/reports/**`` —— 四目录共享设计里唯一"平台宿主写、叶子读"
-    的通道），不改变普通项目文件的解析（那仍受 per-agent 写隔离约束）。
-    命中返回该文件绝对路径，否则 None（调用方维持原 miss 路径与文案）。
+    保留本名：``#5`` 的既有对外面（既有测试直接 import 它）。
     """
-    if not _is_platform_reports_read(file_path):
-        return None
-    rel = strip_dot_slash_prefix(file_path)
-    primary_key = os.path.normcase(os.path.realpath(primary_full))
-    for _tag, cand in _reports_read_scope(rel, root, workspace_path):
-        if os.path.normcase(cand) == primary_key:
-            continue
-        try:
-            if os.path.isfile(cand):
-                return cand
-        except OSError:
-            continue
-    return None
+    return _shared_evidence_hint(
+        "reports", strip_dot_slash_prefix(file_path), root, workspace_path
+    )
 
 
-def _resolve_reports_across_trees(
+def _resolve_shared_across_trees(
+    subdir: str,
     file_path: str,
     root: str,
     workspace_path: str,
     primary_full: str,
 ) -> tuple[str, str | None] | None:
-    """共享 reports 产物的跨树解析：返回 ``(绝对路径, 命中树标签)``。
+    """共享产物的跨树解析：返回 ``(绝对路径, 命中树标签)``。
 
-    候选序 = **MAIN（权威落点）→ 本树 → 兄弟 worktree**（fixplan:351 的
-    「MAIN → 请求者树 → assignee 树」；实际顺序由 ``_reports_read_scope``
-    单一权威给出，本函数只消费，不另立一套）。
+    候选序 = 由 ``_shared_read_scope`` 按该子目录的合并策略给出（**单一权威**
+    在 ``util/tree_scope``）：reports = MAIN（权威落点）→ 本树 → 兄弟；
+    shared = **本树 → MAIN → 兄弟**（binary 合并无权威落点，MAIN 优先会读到
+    旧版）。本函数只消费，不另立一套。
     「本树」= **写侧授权树**（``workspace_path``，即 ``boundary_root``，
     见 ``acl_sandbox/policy.py:54``），**不是** ``_resolve_for_read_detail``
     预解析出来的路径 —— 后者对 reports 走的就是项目根，拿它当基准会把
@@ -768,12 +812,15 @@ def _resolve_reports_across_trees(
     本树命中返回 ``(path, None)``（无跨树归因需求，不加回执噪音）；
     跨树命中返回 ``(path, 树标签)`` —— **必须点名在哪棵树**，多树语境下
     这是归因的必要条件（fixplan §10.5）。全部未命中返回 None。
+
+    ``primary_full`` 保留为形参（调用方语义与 ``_reports_*`` 兼容），
+    当前实现不再需要它。
     """
-    rel = strip_dot_slash_prefix(file_path)
+    rel = normalize_shared_rel(file_path)
     if not rel:
         return None
     ws_key = os.path.normcase(os.path.realpath(workspace_path)) if workspace_path else ""
-    for _tag, cand in _reports_read_scope(rel, root, workspace_path):
+    for _tag, cand in _shared_read_scope(subdir, rel, root, workspace_path):
         try:
             if not os.path.isfile(cand):
                 continue
@@ -783,6 +830,63 @@ def _resolve_reports_across_trees(
         if ws_key and _path_within(cand, ws_key):
             return cand, None
         return cand, tree_tag(cand)
+    return None
+
+
+def _resolve_reports_across_trees(
+    file_path: str,
+    root: str,
+    workspace_path: str,
+    primary_full: str,
+) -> tuple[str, str | None] | None:
+    """reports 的跨树解析 —— 见 :func:`_resolve_shared_across_trees`（同一实现）。"""
+    return _resolve_shared_across_trees(
+        "reports", file_path, root, workspace_path, primary_full
+    )
+
+
+def _resolve_shared_dir_across_trees(
+    subdir: str,
+    missing_dir: Path,
+    root: str,
+    workspace_path: str,
+) -> str | None:
+    """``list_files`` 用：本树没有该共享目录时，按同一候选序找**目录**。
+
+    返回命中的绝对目录路径（调用方用它列出内容，``listing_header`` 自带树标签
+    = 归因），全都没有则 None。
+
+    相对路径由 ``missing_dir`` 与候选树根共同推出：``missing_dir`` 是调用方
+    按"本树"解析出来的（可能是 worktree 内嵌形态），所以取它在
+    ``.hiveweave/<subdir>`` **之前**的相对部分，再拼到每棵候选树上。
+    """
+    parts = missing_dir.parts
+    idx = None
+    # ⚠ 下界必须是 `len-1` 而不是 `len-2`：目标目录自己就以 `<subdir>` 结尾
+    # （`.hiveweave/shared`），`len-2` 起扫会**整体漏掉这个目录本身**
+    # （本批实测：本树没有 shared 时永远返回 None，跨树回退静默失效）。
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i - 1] == ".hiveweave" and parts[i] == subdir:
+            idx = i
+            break
+    if idx is None:
+        return None
+    # `.hiveweave/<subdir>` 之下的相对尾部（可能为空 = 目录自己）
+    tail = parts[idx + 1:]
+    for base in ordered_tree_roots(
+        root, workspace_path, local_first=local_first_for(subdir)
+    ):
+        cand = os.path.join(base, ".hiveweave", subdir, *tail)
+        try:
+            if not os.path.isdir(cand):
+                continue
+        except OSError:
+            continue
+        # ⚠ 返回**解链接后**的路径：调用方随后要用 `_check_hiveweave_dir` 复检，
+        # 而该守卫是**按字符串路径**判的 —— 不解链接的话，"shared 里放一个指向
+        # 上级 `.hiveweave` 的 junction"会让守卫看到 `<…>/shared/linkdir`（白名单
+        # 内 ⇒ 放行），实际列出的却是 `.hiveweave` 里的东西（09-16 二轮审计实测）。
+        return os.path.realpath(cand)
     return None
 
 
@@ -856,30 +960,56 @@ async def read_file(
                          "sensitive file pattern."}
 
     p = Path(full)
-    # #5：共享产物（reports/**）的解析**先走跨树候选序**（MAIN → 本树 →
-    # 兄弟树，见 _reports_read_scope；fixplan:351），因为写侧权威落点是
-    # MAIN；单一解析点无法表达"哪棵树的"。
+    # #5：共享产物（reports/**，09-16 起含 shared/**）的解析**先走跨树候选序**
+    # （顺序按子目录合并策略定，见 util/tree_scope；fixplan:351），因为共享区
+    # 的落点不保证在读取者自己那棵树里；单一解析点无法表达"哪棵树的"。
     # 非共享路径维持原解析（隔离不受影响）。
     read_tree_tag: str | None = None
-    if _is_platform_reports_read(file_path):
-        got = _resolve_reports_across_trees(
-            file_path, root or "", workspace_path, full,
+    _shared_sub = _platform_shared_read_subdir(file_path)
+    readonly_rel = normalize_shared_rel(file_path)
+    if _shared_sub is not None and cross_tree_read_enabled(_shared_sub):
+        got = _resolve_shared_across_trees(
+            _shared_sub, file_path, root or "", workspace_path, full,
         )
         if got is None:
             from hiveweave.services import fs_errors
 
-            reports_hint = _reports_evidence_hint(
-                file_path, root or "", workspace_path,
+            ev_hint = _shared_evidence_hint(
+                _shared_sub, readonly_rel, root or "", workspace_path,
             )
+            _tried = [
+                tag for tag, _ in _shared_read_scope(
+                    _shared_sub, readonly_rel, root or "", workspace_path,
+                )
+            ]
             fs_errors.observed_absent(
                 full, agent_id=agent_id, project_id=project_id
             )
             return {"success": False, "output": "",
                     "error": f"Error: File not found: {file_path}."
-                             f"{reports_hint}{READ_MISS_HINT}",
+                             f"{ev_hint}{miss_hint_for(_shared_sub, _tried)}",
                     fs_errors.ERROR_CODE_KEY: fs_errors.NOT_FOUND}
         full, read_tree_tag = got
         p = Path(full)
+        # ⚠ **跨树命中后必须复检同一对守卫**（09-16 二轮审计必修）：上面那两次
+        # 检查针对的是**本树**预解析路径，而这里读到的是**另一棵树**上的路径；
+        # 两者分家时守卫形同不存在。审计实测三条越权读：
+        #   ① `.hiveweave/shared/../data.db` → MAIN 的被保护库（已由 rel 归一挡掉）
+        #   ② `shared/` 里放一个指向 `.hiveweave` 的符号链接/junction →
+        #      `_shared_read_scope` 用 realpath ⇒ 链接被解掉 ⇒ 最终落到
+        #      `<MAIN>/.hiveweave/data.db`（此处第 1 条挡）
+        #   ③ 同法指向**项目外** → 目标不在 `.hiveweave` 里、守卫看不见（此处第 2 条挡）
+        # 第 2 条与 reports 侧依赖的是同一条判据（`_resolve_for_read_detail`
+        # 的 `_inside_any` + 本函数的 `_check_hiveweave_dir`），只是这里要
+        # 对**替换后的**路径重跑一遍。
+        if _check_hiveweave_dir(full, root):
+            return {"success": False, "output": "",
+                    "error": 'Error: Access denied: ".hiveweave" is the '
+                             "HiveWeave system directory."}
+        if not _inside_any(p, [Path(root).resolve()]):
+            return {"success": False, "output": "",
+                    "error": f'Error: Sandbox violation — "{file_path}" '
+                             "resolves outside project"}
     elif not p.exists():
         # FS 错误码分类学 + 观察到缺席事件（编排层区分「漏步」vs「不可读」；
         # 带 project_id 的事实才会进 L3 总线触发按事实唤醒——审计 P1-2）
@@ -949,14 +1079,12 @@ async def read_file(
     suffix = f"\n\n(Showing lines {start + 1}-{end} of {total})"
     if truncated_note:
         suffix = truncated_note + suffix
-    if read_tree_tag:
-        # #5：跨树命中要说明**在哪棵树**（多树归因必要条件；共享产物落 MAIN
-        # 是四目录共享设计的正常形态，不是"硬重定向"）
+    if read_tree_tag and _shared_sub is not None:
+        # #5：跨树命中要说明**在哪棵树**（多树归因必要条件）。归因句子**按子目录
+        # 分派** —— 09-16 审计实测：这段曾对 shared 也印 reports 的
+        # "written to MAIN by design"，与本批"shared 无单一权威落点"正面冲突。
         suffix += (
-            f"\n\n[read from {read_tree_tag}"
-            " — shared .hiveweave/reports/ is written to MAIN by design"
-            " (remote worktrees are visible to all agents; see git_worktree"
-            " shared 4-dir contract)]"
+            f"\n\n[read from {read_tree_tag}{hit_note_for(_shared_sub)}]"
         )
     record_file_version(full)
     return {"success": True, "output": body + suffix, "error": None}
@@ -1079,7 +1207,65 @@ async def list_files(
         full = str(Path(ws).resolve())
 
     p = Path(full)
-    # worktrees 内的列表自动放开 ignore 过滤（审查场景）
+    # 跨树候选用的"本树"：**必须**是 agent 的写侧 workspace，不能退化成
+    # `ws = "."`（那会把进程 CWD 混进候选集）。`workspace_path` 为空时用 root。
+    _scope_ws = workspace_path or root
+    if not p.exists():
+        # P1-1: 共享区（`.hiveweave/shared/**`、`.hiveweave/reports/**`）在
+        # worktree 里"空目录不物化"（git 不跟踪空目录），报"不在树内"会让
+        # agent 判定通道不存在（platform-issue-report P1-1：两次误报）。
+        #
+        # 09-16（②）：与 read_file **同一实现** —— 本树没有该目录时，按该子目录
+        # 的合并策略顺序跨树找**目录**；命中就用那棵树列出内容（``listing_header``
+        # 自带树标签 = 多树归因），全都没有才报缺失 + 该子目录自己的教学文案。
+        # 旧实现是**第三份**手写判据（自己按 `_rel` 段匹配拼字符串），与读侧的
+        # 候选序各写一套 ⇒ 一旦顺序调整，两边就会分家。
+        _subdir: str | None = None
+        _tried_tags: list[str] = []
+        try:
+            _resolved = p.resolve()
+            _rel_parts = _resolved.relative_to(Path(root).resolve()).parts
+            _subdir = shared_subdir_of_parts(_rel_parts)
+        except (OSError, ValueError):
+            _resolved = None
+            _subdir = None
+        if _subdir is not None and cross_tree_read_enabled(_subdir):
+            _tried_tags = [
+                tree_tag(b)
+                for b in ordered_tree_roots(
+                    root, _scope_ws, local_first=local_first_for(_subdir)
+                )
+            ]
+            if _resolved is not None:
+                _cross = _resolve_shared_dir_across_trees(
+                    _subdir, _resolved, root, _scope_ws,
+                )
+                if _cross is not None:
+                    full = _cross
+                    p = Path(full)
+        # 跨树目录命中后同样要复检守卫（同 read_file 处注释）：替换进来的
+        # 路径可能经符号链接/junction 落到 `.hiveweave` 的保护面或项目之外。
+        if p.exists():
+            if _check_hiveweave_dir(full, root):
+                return {"success": False, "output": "",
+                        "error": 'Error: Access denied: ".hiveweave" is the '
+                                 "HiveWeave system directory."}
+            if not _inside_any(p, [Path(root).resolve()]):
+                return {"success": False, "output": "",
+                        "error": f"Error: Sandbox violation — {path} "
+                                 "resolves outside project"}
+        if not p.exists():
+            shared_hint = miss_hint_for(_subdir or "", _tried_tags) or READ_MISS_HINT
+            return {"success": False, "output": "",
+                    "error": f"Error: Directory not found: {path}."
+                             f"{shared_hint}"}
+    if not p.is_dir():
+        return {"success": False, "output": "",
+                "error": f"Error: Not a directory: {path}"}
+
+    # worktrees 内的列表自动放开 ignore 过滤（审查场景）。
+    # ⚠ 必须在跨树替换**之后**算：判据是"实际要列的那棵树"，用替换前的
+    # 本树路径算会让"列另一棵树的 worktree 目录"拿到错的 ignore 口径。
     try:
         rel = p.resolve().relative_to(Path(root).resolve())
         if len(rel.parts) >= 2 and rel.parts[0] == HIVEWEAVE_DIR \
@@ -1087,37 +1273,6 @@ async def list_files(
             include_ignored = True
     except ValueError:
         pass
-    if not p.exists():
-        # P1-1: 对 .hiveweave/shared 的探路失败要分支化提示 —— 共享区在
-        # worktree 里"空目录不物化"，报"不在树内"会误导 agent 判定通道
-        # 不存在（platform-issue-report P1-1：两次把它当"真不在树内"）。
-        shared_hint = READ_MISS_HINT
-        try:
-            _rel = p.resolve().relative_to(Path(root).resolve()).parts
-            # 匹配 rel 路径中任意位置的 `.hiveweave` 紧随 `shared` 段对：
-            # 同时覆盖 MAIN（.hiveweave/shared/...）与叶子 worktree 嵌套
-            # （.hiveweave/worktrees/<sid>/.hiveweave/shared/...）两种布局。
-            if any(
-                _rel[i] == HIVEWEAVE_DIR and i + 1 < len(_rel) and _rel[i + 1] == "shared"
-                for i in range(len(_rel) - 1)
-            ):
-                shared_hint = (
-                    " The .hiveweave/shared/ chain may not be materialized "
-                    "in your worktree yet (empty shared/ is not tracked). "
-                    "Write: write_file to .hiveweave/shared/<file> → "
-                    "checkpoint → merge; members see it after their next "
-                    "worktree merge."
-                )
-        except Exception as exc:
-            # 生成 shared 提示失败**不改变**结论（目录本就不存在）：提示是
-            # 附加教学，不是判定依据。吞掉并留痕，让排障时能看到为什么没提示。
-            log.debug("file.shared_hint_failed", path=str(path), err=str(exc))
-        return {"success": False, "output": "",
-                "error": f"Error: Directory not found: {path}."
-                         f"{shared_hint}"}
-    if not p.is_dir():
-        return {"success": False, "output": "",
-                "error": f"Error: Not a directory: {path}"}
 
     lines: list[str] = []
     count = 0

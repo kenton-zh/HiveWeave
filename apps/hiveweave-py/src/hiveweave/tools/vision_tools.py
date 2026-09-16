@@ -139,7 +139,8 @@ async def _resolve_look_at_image_path(
     (``.hiveweave/reports/**``) are written to MAIN by design
     (``service_create.py:99-105``, the 4-dir reverse-checkout contract), so
     a leaf worktree reading them must not fail just because the file is not
-    in its own tree. The note names the tree that was hit.
+    in its own tree. The note names the tree that was hit — **按子目录分派**
+    （``util/tree_scope.hit_note_for``：shared 与 reports 的权威落点不同）。
 
     ``note`` 为空串 = 本树命中（无跨树归因需求）。
     """

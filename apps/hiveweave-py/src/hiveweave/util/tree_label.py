@@ -66,9 +66,16 @@ def cwd_display(cwd: str, relative: str | None = None) -> str:
 # 而 read_file 的读侧多树查找（MAIN → 请求者 → assignee）当时甚至
 # 因 `_is_platform_reports_read` 的 `lstrip("./")` bug 从未生效。
 # ⇒ 现在只报**事实**（不在本树）+ **下一步**（让平台去查），不下断言。
+#
+# 09-16（②）：**去掉 reports 那一段**。原文用一份字符串同时服务 read_file /
+# list_files，讲的却只有 `.hiveweave/reports/**`（"权威落点 = MAIN"）——
+# 对着 `.hiveweave/shared/**` 讲这句是**误导**：shared 是 `merge=binary`、
+# **无单一权威落点**，读侧顺序必须是"本树优先"（否则会把旧版读成本地最新）。
+# ⇒ 该子目录专属的话术下移到 `util/tree_scope.miss_hint_for(subdir)`（与
+# 候选序同处，顺序与文案不会再分家），本常量只留**与子目录无关**的通用部分。
 READ_MISS_HINT = (
     " Not in this tree. Shared contracts are MAIN docs/ after merge "
-    "(empty MAIN is OK). 平台自管共享产物（.hiveweave/reports/**）"
-    "写侧落在 MAIN，读侧会自动跨树查找（MAIN → 请求者树 → assignee 树）"
-    "并在回执说明在哪棵树命中。"
+    "(empty MAIN is OK). 平台自管的共享区（`.hiveweave/` 下的共享子目录）读侧会"
+    "自动跨树查找并在回执说明在哪棵树命中 —— 具体顺序与落地姿势见命中/缺失"
+    "回执里那一段（各子目录不同）。"
 )
