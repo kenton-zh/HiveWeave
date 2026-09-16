@@ -544,7 +544,13 @@ def render(agg: dict, samples: list[dict], roots: list[str], cov: dict,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", action="append", default=None, help="项目根，可重复")
-    ap.add_argument("--out", default=None, help="报告输出路径（UTF-8）")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help=("报告输出路径（UTF-8）。⚠ 缺省时**带当天日期**命名 —— "
+              "此前默认写死 2026-09-15，重跑会把上一份证据**覆盖掉**"
+              "（09-16 已被覆盖过一次，原始证据不可恢复）"),
+    )
     args = ap.parse_args()
 
     roots = args.root or DEFAULT_ROOTS
@@ -562,11 +568,19 @@ def main() -> int:
     agg = analyse(samples, ca)
     report = render(agg, samples, roots, cov, skipped_roots, walk_errors)
 
-    out = Path(args.out) if args.out else (
-        Path(__file__).resolve().parent.parent
-        / "docs" / "platform-issue-research"
-        / "audit-severity-baseline-2026-09-15.txt"
-    )
+    if args.out:
+        out = Path(args.out)
+    else:
+        # ⚠ 默认名**必须带当天日期**（审计 D-5）：此前写死 `…-2026-09-15.txt`，
+        # 09-16 重跑时把那份（离线 148 样本口径的）证据**直接覆盖掉**，
+        # 原始证据不可恢复。日期化之后每次复核各留一份。
+        from datetime import date
+
+        out = (
+            Path(__file__).resolve().parent.parent
+            / "docs" / "platform-issue-research"
+            / f"audit-severity-baseline-{date.today().isoformat()}.txt"
+        )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
 

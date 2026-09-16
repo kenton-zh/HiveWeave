@@ -3163,7 +3163,10 @@ async def _issue_test_run_attestation(
                     )
         except Exception:
             pass
-    if resolved and int(exit_code or 1) == 0:
+    # ⚠ D-4（#12 审计带出）：原为 `int(exit_code or 1) == 0` —— `0 or 1` ⇒ **1**
+    # ⇒ 条件**恒不成立**，其内的 `test_attestation` 事件**永不触发**（观测缺失）。
+    # 同函数另两处（`:3115`/`:3122`）用的正是本条这种写法，一文件内两种口径。
+    if resolved and int(exit_code) == 0:
         try:
             await TaskService().emit_task_event(
                 project_id,

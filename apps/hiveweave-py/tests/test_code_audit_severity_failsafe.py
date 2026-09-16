@@ -4,13 +4,22 @@
 - **fail-safe**：severity **解析不出 ⇒ 视为 high（拦门）**。旧判据 `"[high]" in issue`
   是 **fail-open** 的 → 把"写成了别的形态"静默当成"不是 high" ⇒ 换标点/换语言即放行。
 - **冲突规则**：`SEVERITY:low … 【high】` ⇒ **只认首个 `SEVERITY:` 前缀**，后文忽略。
-- **shadow 试运行**：fail-safe 判定**生效但只记录不拦** —— 先量真实比例再切真拦。
+- **切「真拦」（2026-09-16）**：闸门自本日起用 fail-safe 结论。
+  shadow 观测期（09-15 ~ 09-16）的"只记录不拦"已结束 —— 本文件**相应改过一次断言**：
+  原来钉的是"真闸门必须仍按 legacy（不拦）"，现在钉的是"**闸门必须拦**"
+  （判据 = 审计凭证的 `exit_code`，那是下游 `verify_ids` 真正消费的字段）。
+  改的是断言而不是放宽：旧断言只查算出来的 `legacy_blocking` 字段，
+  该字段切换后**仍是 False**（现为对照值）⇒ 旧断言在新世界里**恒绿、什么也不看**。
 
-⚠ 本文件**同时**钉住"旧闸门此刻仍按 legacy 判定"这一条 —— 否则 shadow 就成了偷偷
-上线 fail-safe，那会让误拦率在无数据的情况下直接生效。
+⚠ 仍然**没有**钉的部分（如实登记）：`verdict` 仍由 LLM 输出**首行文本**
+（`_parse_verdict` 的 `startswith("VERDICT: PASS")`）决定 ⇒ 首行写 PASS 时
+issue 行再乱也不拦。那是 `#12` 的**已知残余**（治本要等结构化输出），
+本条只把"止血"从"记录"推进到"拦门"。
 """
 
 from __future__ import annotations
+
+from unittest.mock import patch
 
 import pytest
 import structlog.testing
@@ -122,28 +131,39 @@ def _intercept_event(logs: list, name: str) -> dict | None:
 
 
 @pytest.mark.asyncio
-async def test_shadow_records_failsafe_decision_without_blocking(
+async def test_gate_now_blocks_unparsable_severity_and_shadow_keeps_the_comparison(
     audit_env,  # noqa: F811 —— fixture 参数，不是重复定义
 ):
-    """★ 端到端：一条 `【high】` 的 issue ⇒ shadow 判定为"该拦"，但**真闸门不拦**。
+    """★ 端到端（**切真拦的闸门级验收**）：`【high】` 的 issue ⇒ **闸门真的拦**。
 
-    这条同时证明三件事：
-      1. shadow 的判定真的被**算出来并落观测**（不是只写在注释里）；
-      2. **真闸门此刻仍按 legacy** ⇒ 没有偷偷上线 fail-safe（否则误拦率会在无数据时生效）；
-      3. `would_flip=True` ⇒ **这一条就是上线 fail-safe 后会新被拦下的样本**（误拦率的分母）。
+    ⚠ **本用例 2026-09-16 改过语义**（#12：`legacy_blocking` → `shadow_blocking`）。
+    切换前它断言「真闸门必须仍按 legacy（不拦）」—— 那时是 shadow 观测期。
+    现在必须拦。**改的是断言，不是放宽**：旧断言只查算出来的 `legacy_blocking`
+    字段，那字段切换后**仍是 `False`**（它现在是对照值）⇒ 旧断言在新世界里
+    **恒绿、什么也不看**。
+
+    闸门级判据是 **审计凭证的 `exit_code`** —— 那才是"拦没拦"的状态；
+    shadow payload 里的字段只说明"切换前会怎么做"。
     """
 
     async def call_llm(system: str, user: str) -> str:
         # 全角括号 —— 旧判据漏、fail-safe 兜。
         return "VERDICT: ISSUES\nsrc/a.py:1 【high】未校验用户输入\n"
 
-    p_wt, p_git, p_save = _run_audit_patches()
-    with p_wt, p_git, p_save, structlog.testing.capture_logs() as logs:
-        result = await run_code_audit(PROJECT_ID, AGENT_ID, call_llm=call_llm)
+    result, gates, logs = await _run_audit_capturing(call_llm)
 
     assert isinstance(result, dict)
     assert result.get("audited") is True, f"审计本身应完成：{result}"
 
+    # ★ 闸门级判据：exit_code=1 = 拦门
+    assert gates, "没抓到审计凭证的 create 调用 ⇒ 无法判定闸门"
+    assert gates[-1]["exit_code"] == 1, (
+        "闸门没拦 —— 切真拦没生效（fail-safe 要求「档位解析不出 ⇒ 视为 high」）："
+        f"{gates[-1]}"
+    )
+
+    # 观测契约照旧（这些字段是「切换前会怎么做」的对照，删了就没法回答
+    # 「这条为什么新被拦」）
     shadow = _intercept_event(logs, "code_audit_severity_shadow")
     assert shadow is not None, (
         "没看到 code_audit_severity_shadow 事件 ⇒ shadow 观测没接线（"
@@ -154,10 +174,11 @@ async def test_shadow_records_failsafe_decision_without_blocking(
     assert shadow["failsafe_high"] == 1
     assert shadow["shadow_blocking"] is True, "fail-safe 判定应为「该拦」"
     assert shadow["legacy_blocking"] is False, (
-        "★ shadow 期间**真闸门必须仍按 legacy**（不拦）—— 否则就是偷偷上线 fail-safe，"
-        "误拦率会在没有任何数据的情况下直接生效"
+        "legacy 判据本应漏掉这条（那正是切换的理由）；它变成 True 说明 legacy "
+        "判据被改过 —— 会掩盖「为什么要切」的证据。⚠ 它现在只是**对照值**，"
+        "不代表闸门行为（闸门行为看上面对 exit_code 的断言）"
     )
-    assert shadow["would_flip"] is True, "这条正是上线后会新被拦下的样本"
+    assert shadow["would_flip"] is True, "这条正是切换后新被拦下的样本"
     # ⚠ 第二轮复审 P2：上面只断 6 个键，剩下 4 个**拼错名字就会静默出货**
     # （观测字段错名 ⇒ 数据看着有、指标算错）。故断言完整键集合 + 剩余取值。
     # structlog 自己会往条目里加 `event`/`log_level`，比较时剔除。
@@ -171,6 +192,37 @@ async def test_shadow_records_failsafe_decision_without_blocking(
     assert shadow["issues_total"] == 1
     assert shadow["unparsed_ratio"] == 1.0
     assert shadow["conflicts"] == 0
+
+
+async def _run_audit_capturing(call_llm):
+    """跑一次 `run_code_audit`，**同时**抓「闸门实际给的 exit_code」与日志。
+
+    为什么需要它：`run_code_audit` 的返回值里**没有** exit_code —— 它落在
+    **审计凭证**（`attestation_service.create(..., exit_code=…)`）上。
+    只断 shadow payload 会漏掉"闸门到底拦没拦"（payload 是算出来的对照值）。
+    因此这里包一层 create：记录 kwargs 后**照常调用真实现**（不改变行为）。
+
+    ⚠ 补丁打在**源模块的单例**上（`services.attestation.attestation_service`），
+    不是 `services.code_audit` 上的名字 —— 后者是函数内 `from … import` 的
+    **局部绑定**，模块级没有这个属性（实测 `AttributeError`）。
+    """
+    from hiveweave.services.attestation import attestation_service as _svc
+
+    gates: list[dict] = []
+    real_create = _svc.create
+
+    async def _spy(*args, **kwargs):
+        gates.append(kwargs)
+        return await real_create(*args, **kwargs)
+
+    p_wt, p_git, p_save = _run_audit_patches()
+    with (
+        p_wt, p_git, p_save,
+        patch.object(_svc, "create", new=_spy),
+        structlog.testing.capture_logs() as logs,
+    ):
+        result = await run_code_audit(PROJECT_ID, AGENT_ID, call_llm=call_llm)
+    return result, gates, logs
 
 
 @pytest.mark.asyncio
@@ -211,3 +263,175 @@ async def test_run_code_audit_actually_goes_through_shadow_decision(
         "（同一事实两处判 ⇒ 切真拦时会有一处漏改）"
     )
     assert calls[0][0] == "ISSUES"
+
+
+# ── ★ 切「真拦」后的闸门级验收 ②④ 与「缓存不得复述策略」 ──────────────
+
+
+@pytest.mark.asyncio
+async def test_gate_lets_explicit_low_through(audit_env):  # noqa: F811
+    """★ 验收②：明确 `SEVERITY:low` ⇒ **不拦**（闸门 exit_code=0）。
+
+    这条与上面那条是一对：没有它，"闸门永远拦"也能让上一条绿 ——
+    那是把闸门关死冒充修缺陷。
+    """
+
+    async def call_llm(system: str, user: str) -> str:
+        return "VERDICT: ISSUES\nsrc/a.py:1 SEVERITY:low 命名风格\n"
+
+    result, gates, logs = await _run_audit_capturing(call_llm)
+
+    assert result.get("audited") is True, result
+    assert gates, gates
+    assert gates[-1]["exit_code"] == 0, (
+        f"明确 low 不该拦门（fail-safe 只兜「解析不出」）：{gates[-1]}")
+
+
+@pytest.mark.asyncio
+async def test_gate_treats_conflict_by_first_prefix_and_logs_it(audit_env):  # noqa: F811
+    """★ 验收④：`SEVERITY:low … 【high】` ⇒ 按 low（不拦）+ **有日志说明忽略了后文**。"""
+
+    async def call_llm(system: str, user: str) -> str:
+        return "VERDICT: ISSUES\nsrc/a.py:1 SEVERITY:low 但这段在喊【high】严重\n"
+
+    result, gates, logs = await _run_audit_capturing(call_llm)
+
+    assert result.get("audited") is True, result
+    assert gates[-1]["exit_code"] == 0, (
+        "冲突用例应按**首个前缀**（low）处理 ⇒ 不拦；"
+        f"若这里被拦，说明冲突规则退化成'看到 high 就拦'：{gates[-1]}"
+    )
+    ign = _intercept_event(logs, "code_audit_severity_conflict_ignored")
+    assert ign is not None, (
+        "冲突被静默吸收 —— 必须有日志说明「忽略了后文」"
+        f"（实际事件：{[e.get('event') for e in logs]}）"
+    )
+    assert ign["conflicts"] == 1, ign
+
+
+@pytest.mark.asyncio
+async def test_cached_row_decision_is_recomputed_under_current_policy(
+    audit_env,  # noqa: F811
+    monkeypatch,
+):
+    """★ **缓存只回放事实，不复述策略**（切真拦的关键副作用，实测出来的）。
+
+    现场：缓存行的 `exit_code` 是**写它那一刻的策略**算出来的。shadow 期写下的
+    行里，`【high】` 那批 `exit_code=0`（那时真闸门按 legacy 不拦）⇒ 若直接回放，
+    **切换会被缓存静默抵消**：同一份 diff（新策略下"该拦"）照旧拿到放行凭证。
+
+    判据：喂一条 shadow 期风格的缓存行（`exit_code=0` + `【high】` issue），
+    命中后**新凭证的 exit_code 必须是 1**，且留下 `..._decision_recomputed` 日志。
+
+    桩法说明：只桩**存储层**（`audit_cache_lookup`）—— 判定与凭证创建都走真实现。
+    """
+    from unittest.mock import AsyncMock
+
+    from hiveweave.services.attestation import attestation_service as _svc
+
+    stale_row = {
+        "verdict": "ISSUES",
+        "exit_code": 0,                      # ← shadow 期写的（legacy 不拦）
+        "top_issues": '["src/a.py:1 【high】未校验用户输入"]',
+        "source_attestation_id": "att-old-1",
+        "attestation_id": "att-old-1",
+    }
+
+    async def _never_called_llm(system: str, user: str) -> str:  # pragma: no cover
+        raise AssertionError("命中缓存不该烧 LLM")
+
+    p_wt, p_git, p_save = _run_audit_patches()
+    gates: list[dict] = []
+    real_create = _svc.create
+
+    async def _spy(*args, **kwargs):
+        gates.append(kwargs)
+        return await real_create(*args, **kwargs)
+
+    # ⚠ `monkeypatch.setattr` 返回 None ⇒ **不能**放进 `with (...)` 元组
+    monkeypatch.setattr(
+        _svc, "audit_cache_lookup", AsyncMock(return_value=stale_row)
+    )
+    with (
+        p_wt, p_git, p_save,
+        patch.object(_svc, "create", new=_spy),
+        structlog.testing.capture_logs() as logs,
+    ):
+        result = await run_code_audit(
+            PROJECT_ID, AGENT_ID, call_llm=_never_called_llm
+        )
+
+    assert result.get("audited") is True, result
+    reuse = [g for g in gates if "cached-reuse" in str(g.get("command_or_url") or "")]
+    assert reuse, f"没走到缓存复用路径：{[g.get('command_or_url') for g in gates]}"
+    assert reuse[-1]["exit_code"] == 1, (
+        "缓存行是旧策略写的（exit_code=0），但新策略下这份 diff 该拦 ⇒ "
+        f"必须按当前策略重算，不能回放旧决定：{reuse[-1]}"
+    )
+    recomputed = _intercept_event(logs, "code_audit.cached_decision_recomputed")
+    assert recomputed is not None, (
+        "重算这件事必须有状态留痕（否则'缓存抵消了切换'没人看得见）："
+        f"{[e.get('event') for e in logs]}"
+    )
+    assert recomputed["stored_exit"] == 0 and recomputed["recomputed_exit"] == 1, recomputed
+
+
+@pytest.mark.asyncio
+async def test_cached_row_with_missing_facts_stays_blocking(
+    audit_env,  # noqa: F811
+    monkeypatch,
+):
+    """★ **事实缺失 ≠ 事实为空**（审计 M-1，实测复现的阻断项）。
+
+    存量缓存行是升级前写的、`top_issues` 为 **NULL**（`tools/code_audit.py:114` 自陈）。
+    `_parse_cached_issues(None) → []` ⇒ 若直接复算，`failsafe_high=0` ⇒
+    **重算成放行** —— 而该行原本 `exit_code=1`（旧 `[high]` 判据拦下的）在切换前是
+    **拦**。那等于"重算"这一步**新开了一个 fail-open**，方向正是 #12 要消灭的。
+    ⇒ 事实不足以复算时按 fail-safe 兜（拦），并留 `cached_facts_incomplete` 痕迹。
+    """
+    from unittest.mock import AsyncMock
+
+    from hiveweave.services.attestation import attestation_service as _svc
+
+    stale_row = {
+        "verdict": "ISSUES",
+        "exit_code": 1,          # ← 旧判据拦下的
+        "top_issues": None,      # ← 存量行：事实缺失（不是"没有 issue"）
+        "attestation_id": "att-old-2",
+    }
+
+    async def _never_called_llm(system: str, user: str) -> str:  # pragma: no cover
+        raise AssertionError("命中缓存不该烧 LLM")
+
+    p_wt, p_git, p_save = _run_audit_patches()
+    gates: list[dict] = []
+    real_create = _svc.create
+
+    async def _spy(*args, **kwargs):
+        gates.append(kwargs)
+        return await real_create(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _svc, "audit_cache_lookup", AsyncMock(return_value=stale_row)
+    )
+    with (
+        p_wt, p_git, p_save,
+        patch.object(_svc, "create", new=_spy),
+        structlog.testing.capture_logs() as logs,
+    ):
+        result = await run_code_audit(
+            PROJECT_ID, AGENT_ID, call_llm=_never_called_llm
+        )
+
+    assert result.get("audited") is True, result
+    reuse = [g for g in gates if "cached-reuse" in str(g.get("command_or_url") or "")]
+    assert reuse, f"没走到缓存复用路径：{[g.get('command_or_url') for g in gates]}"
+    assert reuse[-1]["exit_code"] == 1, (
+        "事实缺失被当成了「事实为空」⇒ 把一条本该拦的缓存行重算成放行 —— "
+        f"这是新开的 fail-open，必须按 fail-safe 兜：{reuse[-1]}"
+    )
+    incomplete = _intercept_event(logs, "code_audit.cached_facts_incomplete")
+    assert incomplete is not None, (
+        "「事实缺失」必须与「策略重算」分开留痕（否则事后分不清是哪一种）："
+        f"{[e.get('event') for e in logs]}"
+    )
