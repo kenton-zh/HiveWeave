@@ -177,19 +177,19 @@ async def _maybe_git_commit(workspace: str) -> str | None:
     if not workspace or not Path(workspace).is_dir():
         return None
     try:
-        from hiveweave.util.win_subprocess import hidden_exec
+        # #19：改走**接信任锚**的 git 入口（原先是裸 `hidden_exec("git", …)`）。
+        from hiveweave.services.git_worktree.git_cmd import _git as _anchored_git
 
-        proc = await hidden_exec(
-            "git",
-            "rev-parse",
-            "HEAD",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            cwd=workspace,
+        # ⚠ **不传 project_root**（审计必修 2）：`workspace` 可能是 agent 的
+        # worktree，而传 `project_root=<worktree>` 会让 `resolve_anchor` 去派生
+        # `<wt>/.git/worktrees/<basename>`（`.git` 是**文件** ⇒ 该路径不可能存在）
+        # ⇒ `AnchorRefusal` ⇒ 拒跑 ⇒ `commit=None` **静默降级**（比不传更差：
+        # 不传时锚自己上溯，平台布局下能正确派生）。
+        ok, out = await _anchored_git(
+            ["rev-parse", "HEAD"], workspace, timeout=5,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0 and out:
-            return out.decode("utf-8", errors="replace").strip()[:40] or None
+        if ok and out:
+            return out.strip()[:40] or None
     except Exception:
         pass
     return None

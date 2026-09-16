@@ -26,7 +26,6 @@ repo 级 `extensions.worktreeConfig` 一律置 **false**（自愈存量项目）
 
 from __future__ import annotations
 
-import asyncio
 
 import structlog
 
@@ -74,32 +73,36 @@ async def retire_worktree_config(project_root: str) -> bool:
     （git 在读 local config 时就决定要不要包含 worktree config）。
     """
     try:
-        from hiveweave.util.win_subprocess import hidden_run
-
+        # #19（AST 网扫出来的**第二处清单外落点**）：原先是
+        # `asyncio.to_thread(hidden_run, ["git", …])` —— 助手**作为值传递**，
+        # 早期的网（只认 `Call.func`）看不见它。这里改走**接信任锚**的 `_git`：
+        # 本函数的调用方（`acl_sandbox.service` 的 standing-grants 阶段、
+        # `service_create` 的 worktree 创建）把它当 **R3 收口的 fail-closed 前提**
+        # ⇒ 它读的 gitdir 必须是平台派生的那一个，否则"R3 已退休"的结论可被
+        # 同路径替换（R4）误导。
         # ⚠ **先读后写**：`.git/config` 在「锁死档」下连平台主体都没有 DELETE ⇒
         # 一旦已经是 false 就**不要**再写（否则每次重启都会因 lock+rename 失败刷 warning）。
-        probe = await asyncio.to_thread(
-            hidden_run,
-            ["git", "config", "--get", "extensions.worktreeConfig"],
-            cwd=project_root, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+        from hiveweave.services.git_worktree.git_cmd import _git
+
+        _ok_p, probe_out = await _git(
+            ["config", "--get", "extensions.worktreeConfig"],
+            project_root, project_root=project_root,
         )
-        if (probe.stdout or "").strip().lower() == "false":
+        if (probe_out or "").strip().lower() == "false":
             return True
-        proc = await asyncio.to_thread(
-            hidden_run,
-            ["git", "config", "extensions.worktreeConfig", "false"],
-            cwd=project_root, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+        _ok_w, _out_w = await _git(
+            ["config", "extensions.worktreeConfig", "false"],
+            project_root, project_root=project_root,
         )
+        proc_ok = _ok_w
     except Exception as exc:  # 仓库/目录不可用等 —— 不阻断调用方
         log.warning("git_identity.retire_worktree_config_error",
                     project_root=project_root, error=str(exc)[:200])
         return False
-    if proc.returncode != 0:
+    if not proc_ok:
         log.warning("git_identity.retire_worktree_config_failed",
                     project_root=project_root,
-                    out=(proc.stdout or "")[:200])
+                    out=(_out_w or "")[:200])
         return False
     return True
 

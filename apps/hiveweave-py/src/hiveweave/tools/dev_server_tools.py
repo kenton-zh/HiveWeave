@@ -486,20 +486,18 @@ async def start_dev_server_tool(
 
     commit = ""
     try:
-        from hiveweave.util.win_subprocess import hidden_run
+        # #19：改走**接信任锚**的 git 入口（原先是裸 `hidden_run(["git", …])`）。
+        # ⚠ 顺带去掉 `asyncio.to_thread` —— `_git` 本身是 async（`_git_sync` 才是
+        # 同步孪生体），不再需要把阻塞调用丢线程池。
+        from hiveweave.services.git_worktree.git_cmd import _git as _anchored_git
 
-        r = await asyncio.to_thread(
-            hidden_run,
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
+        # ⚠ **不传 project_root**（审计必修 2）：`workspace` 可能是 worktree，
+        # 传它会撞 `AnchorRefusal` ⇒ 拒跑 ⇒ commit 静默变空。
+        _ok, _out = await _anchored_git(
+            ["rev-parse", "--short", "HEAD"], workspace, timeout=5,
         )
-        if r.returncode == 0:
-            commit = (r.stdout or "").strip()
+        if _ok:
+            commit = (_out or "").strip()
     except Exception:
         pass
 

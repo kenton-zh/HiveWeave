@@ -58,6 +58,70 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
         return True, output
     return False, output
 
+def _git_sync(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
+              project_root: str | None = None) -> tuple[bool, str]:
+    """`_git` 的**同步**孪生体 —— 锚的接线只此一份，两个入口共用（#19）。
+
+    为什么必须有 sync 面：`services/dispatch_facts.py` 那条"派单时采集 git 快照"
+    的调用链**整条是同步的**（`collect_and_format` → `_main_git_facts`），把它改成
+    async 会牵动派单路径。以前它自带一个 `_git`（裸 `hidden_run(["git", ...])`）
+    ⇒ **未接信任锚**：平台 git 会去读 agent 可写的 `<wt>/.git` 与 `commondir`。
+
+    为什么放在这里而不是各调用点自己写：锚的派生（`anchor_for_git`）与
+    「拒因 ⇒ 不跑」的 fail-closed 纪律必须**只有一份**；本函数与 `_git` 的差别
+    仅在 spawn 原语（`hidden_run` vs `hidden_exec`），注释写明以免日后各自演化。
+
+    与 `_git` 同语义：**stderr 合并进 stdout**（必须显式给 `stdout`/`stderr`
+    两个 PIPE 常量 —— `hidden_run` 内部默认把两者分开；
+    审计实测：不合并时同一次失败 `_git` 给 `fatal: not a git repository…`
+    而本函数给空串 ⇒ **失败原因全丢**，正是本仓定义的一等缺陷）。
+    锚拒绝 ⇒ 返回 ``(False, 拒因)``；`AnchorUnderivable`（派生不出、无篡改证据）
+    ⇒ 按 `git_anchor` 的第三档**不钉锚继续跑**（不是拒跑 —— 这一点原来写错了，
+    审计 D4 订正）。
+    """
+    anchor, refusal = anchor_for_git(cwd, project_root)
+    if refusal is not None:
+        return False, refusal
+    kwargs: dict = {}
+    if anchor is not None:
+        args = [*anchor.args, *args]
+        kwargs["env"] = {**os.environ, **anchor.env}
+    try:
+        from hiveweave.util.win_subprocess import (
+            PIPE,
+            STDOUT,
+            TimeoutExpired,
+            hidden_run,
+        )
+
+        r = hidden_run(
+            ["git", *args],
+            cwd=cwd,
+            # ⚠ stderr 必须并进 stdout（与 `_git` 的 `stderr=STDOUT` 对齐）：
+            # 不合并时"失败原因"整段丢失 —— 而本函数是 `dispatch_facts` 的**唯一**
+            # 入口，那些失败会静默变成空串（审计 §1 实测）。
+            # ⚠ **不能用 `capture_output=True`**：它与 `stderr=STDOUT` 互斥，
+            # `subprocess` 会直接抛 "stdout and stderr arguments may not be used
+            # with capture_output" ⇒ 本函数**100% 失败**（定向回归实测抓到，
+            # 比审计发现的那条更重）。故显式给两个 PIPE 常量。
+            stdout=PIPE,
+            stderr=STDOUT,
+            timeout=timeout,
+            **kwargs,
+        )
+    except FileNotFoundError:
+        return False, "git not found on PATH"
+    except TimeoutExpired:
+        # 与 `_git` 对齐的文案（`_git` 那条由 `asyncio.wait_for` 分支给）
+        return False, f"git {' '.join(args[:2])} timed out after {timeout}s"
+    except Exception as exc:  # noqa: BLE001 — 见下：失败不抛，但回执必须带原因
+        # 与 `_git` 的差别（如实登记）：`_git` 只接 `FileNotFoundError`（超时另分支），
+        # 本函数是同步原语 ⇒ 超时与其它异常都在这里收口（超时已单列）。
+        return False, f"git failed: {exc}"
+    output = (r.stdout or b"").decode("utf-8", errors="replace").strip()
+    return (r.returncode == 0), output
+
+
 async def _current_branch(worktree_path: str) -> str | None:
     """worktree 实际检出的分支 (``git -C <path> rev-parse --abbrev-ref HEAD``)。
 

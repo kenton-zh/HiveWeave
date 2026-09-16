@@ -242,13 +242,16 @@ async def _scan_legacy_stash_warnings() -> None:
         if not ws or not Path(ws).exists():
             continue
         try:
-            from hiveweave.util.win_subprocess import hidden_run
+            # #19：改走**接信任锚**的 git 入口（原先是裸 `hidden_run(["git", …])`）
+            # —— 平台 git 会去读 agent 可写的 `<wt>/.git` / `commondir`，
+            # 锚由 `git_anchor` 平台派生并钉住；拒因 ⇒ 返回 (False, 原因)、不跑。
+            from hiveweave.services.git_worktree.git_cmd import _git as _anchored_git
 
-            out = hidden_run(
-                ["git", "-C", ws, "stash", "list"],
-                capture_output=True, text=True, timeout=10,
-                encoding="utf-8", errors="replace",
-            ).stdout or ""
+            _ok, out = await _anchored_git(
+                ["stash", "list"], ws, timeout=10, project_root=ws
+            )
+            if not _ok:
+                continue
             if out.strip():
                 log.warning(
                     "legacy_stash_pending",

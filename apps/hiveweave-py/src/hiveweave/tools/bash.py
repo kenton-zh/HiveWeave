@@ -438,16 +438,16 @@ async def _run_registered_dev_server(
 
     commit = ""
     try:
-        from hiveweave.util.win_subprocess import hidden_run
+        # #19（收紧后的 AST 网扫出的**第三处**："助手作为值传递"形态 ——
+        # `to_thread(hidden_run, ["git", …])`）。改走接信任锚的 `_git`；
+        # ⚠ 不传 project_root：`cwd` 可能是 agent 的 worktree。
+        from hiveweave.services.git_worktree.git_cmd import _git as _anchored_git
 
-        r = await asyncio.to_thread(
-            hidden_run,
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=cwd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=5,
+        _ok, _out = await _anchored_git(
+            ["rev-parse", "--short", "HEAD"], cwd, timeout=5,
         )
-        if r.returncode == 0:
-            commit = (r.stdout or "").strip()
+        if _ok:
+            commit = (_out or "").strip()
     except Exception:
         pass
 
@@ -3091,21 +3091,20 @@ async def _issue_test_run_attestation(
     commit_hash: str | None = None
     if stamp_workspace:
         try:
-            from hiveweave.util.win_subprocess import hidden_exec
+            # #19（AST 网扫出来的**清单外落点**）：原先是裸
+            # `hidden_exec("git", "rev-parse", "HEAD", …)` —— 走通用漏斗但不接
+            # 信任锚。改走 anchored `_git`（`stamp_workspace` 就是那棵树本身）。
+            from hiveweave.services.git_worktree.git_cmd import _git as _anchored_git
 
-            proc = await hidden_exec(
-                "git",
-                "rev-parse",
-                "HEAD",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                cwd=stamp_workspace,
+            # ⚠ **不传 project_root**（审计必修 2）：`stamp_workspace` 在
+            # executor 分支就是 agent 的 worktree，传它会撞 `AnchorRefusal`
+            # ⇒ 拒跑 ⇒ `commit_hash=None`，且 `attestation` 对 commit 缺失是
+            # **fail-open** ⇒ "提交必须是当前 worktree HEAD 或祖先"这一维度被**静默关掉**。
+            _ok, _out = await _anchored_git(
+                ["rev-parse", "HEAD"], stamp_workspace, timeout=5,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            if proc.returncode == 0 and out:
-                commit_hash = (
-                    out.decode("utf-8", errors="replace").strip()[:40] or None
-                )
+            if _ok and _out:
+                commit_hash = _out.strip()[:40] or None
         except Exception:
             commit_hash = None
     aid = await attestation_service.create(

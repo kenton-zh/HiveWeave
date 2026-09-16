@@ -21,22 +21,26 @@ _MAX_FACTS_PER_GROUP = 4
 _GIT_TIMEOUT_S = 10
 
 
-def _git(args: list[str], cwd: str) -> tuple[bool, str]:
-    """Run a git command, return (ok, stripped stdout)."""
-    from hiveweave.util.win_subprocess import hidden_run
+def _git(args: list[str], cwd: str,
+         project_root: str | None = None) -> tuple[bool, str]:
+    """Run a git command, return (ok, stripped stdout). **接信任锚**（#19）。
 
-    try:
-        r = hidden_run(
-            ["git", *args],
-            cwd=cwd,
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_S,
-        )
-        ok = r.returncode == 0
-        out = (r.stdout or b"").decode("utf-8", errors="replace").strip()
-        return ok, out
-    except Exception:
-        return False, ""
+    ⚠ 以前这里自带一个裸 `hidden_run(["git", ...])`（唯一漏斗 ✅，但**未接锚**）
+    ⇒ 平台 git 会去读 agent 可写的 `<wt>/.git` 指针与 `commondir`
+    （实测形态见 `git_anchor` 模块 docstring 的三条路径）。锚的派生与
+    「拒因 ⇒ 不跑」的 fail-closed 纪律必须只有一份 ⇒ 改走 `git_cmd._git_sync`
+    （它是 `_git` 的同步孪生体，两者只差 spawn 原语）。
+
+    `project_root` 由调用方显式传主仓路径（worktree 那几个调用点）。**不传时保持
+    None**，让锚自己上溯 —— ⚠ **绝不回落到 `or cwd`**：cwd 可能是 worktree，
+    把它当项目根会让 `resolve_anchor` 派生一个不可能存在的 gitdir ⇒
+    `AnchorRefusal` ⇒ 拒跑 ⇒ **静默降级**（审计必修 2 实测）。派生不出时
+    `git_anchor` 的第三档是"不钉锚继续跑"（loud warning），那才是既有行为。
+    """
+    from hiveweave.services.git_worktree.git_cmd import _git_sync
+
+    return _git_sync(args, cwd, timeout=_GIT_TIMEOUT_S,
+                     project_root=project_root)
 
 
 def _main_git_facts(main_ws: str) -> list[str]:
@@ -56,11 +60,16 @@ def _main_git_facts(main_ws: str) -> list[str]:
 
 def _worktree_git_facts(main_ws: str, wt: str, label: str) -> list[str]:
     facts: list[str] = []
-    ok, branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], wt)
+    # ⚠ cwd 是 worktree、项目根是 main_ws ⇒ 两者必须分开传，否则锚会把
+    #   worktree 当项目根派生（#19 的落点之一）。
+    ok, branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], wt,
+                      project_root=main_ws)
     if not ok:
         return facts
-    ok_a, ahead = _git(["rev-list", "--count", f"main..{branch}"], main_ws)
-    ok_b, behind = _git(["rev-list", "--count", f"{branch}..main"], main_ws)
+    ok_a, ahead = _git(["rev-list", "--count", f"main..{branch}"], main_ws,
+                       project_root=main_ws)
+    ok_b, behind = _git(["rev-list", "--count", f"{branch}..main"], main_ws,
+                        project_root=main_ws)
     if ok_a and ok_b:
         facts.append(
             f"worktree {label}（{branch}）：领先 main {ahead} / 落后 {behind}"
@@ -97,11 +106,13 @@ def collect_dispatch_facts(
         facts += _deliverable_file_facts(main_ws)
     if target_worktree and Path(target_worktree).is_dir():
         label = target_label or "目标工位"
-        ok, branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], target_worktree)
+        ok, branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], target_worktree,
+                          project_root=main_ws)
         if ok:
             facts += _worktree_git_facts(main_ws, target_worktree, label) if main_ws else []
             ok_u, untracked = _git(
-                ["status", "--porcelain"], target_worktree
+                ["status", "--porcelain"], target_worktree,
+                project_root=main_ws,
             )
             if ok_u:
                 n = len([l for l in untracked.splitlines() if l.strip()])
