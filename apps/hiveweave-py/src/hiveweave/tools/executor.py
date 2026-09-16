@@ -1468,10 +1468,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "reason=up_to_date). Untracked files MAIN would overwrite are "
             "auto-moved to .hiveweave/merge-quarantine (recoverable — "
             "listed in the receipt and an inbox notice; the merge still "
-            "completes). Predicted content conflicts are rejected BEFORE "
-            "anything runs (nothing is merged, HEAD unchanged): commit or "
-            "resolve them in your worktree, then retry. Prefer this over "
-            "bare `git merge main`."
+            "completes). "
+            "mode=merge (default): predicted content conflicts are rejected "
+            "BEFORE anything runs (nothing is merged, HEAD unchanged) — "
+            "commit or resolve them in your worktree, then retry. "
+            "mode=materialize_conflict: merge anyway and leave the conflict "
+            "in your worktree so you can resolve it by hand (receipt lists "
+            "the conflicted files; checkpoint refuses until that merge is "
+            "resolved or aborted). "
+            "mode=abort: return the worktree to its pre-merge HEAD. "
+            "Prefer this over bare `git merge main`."
         ),
         "properties": {
             "shortId": {
@@ -1482,6 +1488,19 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "your own."
                 ),
             },
+            "mode": {
+                "type": "string",
+                "enum": ["merge", "materialize_conflict", "abort"],
+                "aliases": ["mode", "syncMode", "sync_mode",
+                            "materializeConflict",
+                            "materialize_conflict"],
+                "description": (
+                    "merge (default) = conflict-safe sync; "
+                    "materialize_conflict = keep the conflict in your "
+                    "worktree to resolve by hand; abort = abandon an "
+                    "in-progress merge."
+                ),
+            },
         },
         "required": [],
     },
@@ -1489,8 +1508,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Stage all changes and create a checkpoint commit in the active "
             "worktree. Receipt may include a WARNING about conflicts with "
-            "main — resolve early via `git rebase main` to avoid submit-time "
-            "rejection."
+            "main — resolve early by syncing MAIN into your tree with "
+            "git_worktree_sync (or, to resolve the conflict by hand, "
+            "git_worktree_sync with mode=materialize_conflict) to avoid "
+            "submit-time rejection."
         ),
         "properties": {
             "message": {"type": "string", "aliases": ["commitMessage", "commit_message", "summary"]},
@@ -1658,8 +1679,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "already merged), the gate records attestation_impossible"
             "(reason=tool_limited) and consumes it itself: no waiver needed. "
             "Branch conflicting with main is rejected (merge_conflict_with_main) "
-            "— run `git rebase main` in your worktree, resolve, checkpoint, "
-            "then resubmit. Only the assignee can submit."
+            "— call git_worktree_sync in your worktree (mode=materialize_conflict "
+            "to get the conflict left there for you to resolve by hand), then "
+            "resubmit. Only the assignee can submit."
         ),
         "properties": {
             "taskId": {"type": "string", "aliases": ["task_id", "id"]},

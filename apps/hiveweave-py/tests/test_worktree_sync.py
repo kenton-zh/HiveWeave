@@ -94,9 +94,20 @@ def _head(wt: Path) -> str:
 
 
 def _in_merge_state(wt: Path) -> bool:
-    return (wt / ".git" / "MERGE_HEAD").exists() or (
-        _git(wt, "status", "--porcelain").find("UU") >= 0
+    """半合并态判据 —— **与生产同一实现**（`git rev-parse --verify MERGE_HEAD`）。
+
+    ⚠ 旧实现是恒 False 的（两个分支都不成立）：
+    ① `<wt>/.git` 在 worktree 里是**指针文件**不是目录 ⇒ 拼不出 `MERGE_HEAD`；
+    ② add/add 冲突在 `status --porcelain` 里是 `AA`（deleted/modified 是
+    `DU`/`UD`），**不是** `UU`；而且 `add` 过之后 `UU` 也会消失。
+    ⇒ 那批 `assert not _in_merge_state(wt)` 一直是**恒真**断言（本仓最贵的假绿形态）。
+    本批（③）换成本函数后，它们第一次真的在判"有没有半合并态"。
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        capture_output=True,
     )
+    return proc.returncode == 0
 
 
 # ── 服务核心 ────────────────────────────────────────────────
@@ -279,6 +290,290 @@ async def test_sync_missing_worktree_errors(git_repo: Path) -> None:
     assert result["merged"] is False
 
 
+# ── ③ 半合并态：materialize / abort / mode 校验（2026-09-16）──────────
+
+
+async def _make_diverged_tree(git_repo: Path) -> Path:
+    """双方改同一文件（已提交）⇒ 可预判的内容冲突。返回 worktree。
+
+    ⚠ 留一处**未提交**改动（`wip.txt`）：否则 merge 前的 dirty 自动 checkpoint
+    永不触发 ⇒ `if result.get("checkpoint")` 这类断言**永不执行**（审计实测的
+    假绿形态），`_parent_count` 也失去对照。
+    """
+    wt = await _make_worktree(git_repo)
+    (wt / "file.txt").write_text("branch version\n", encoding="utf-8")
+    _git(wt, "add", "file.txt")
+    _git(wt, "commit", "-m", "branch change")
+    (wt / "wip.txt").write_text("uncommitted work in progress\n", encoding="utf-8")
+    (git_repo / "file.txt").write_text("main version\n", encoding="utf-8")
+    _git(git_repo, "add", "file.txt")
+    _git(git_repo, "commit", "-m", "main change")
+    return wt
+
+
+@pytest.mark.asyncio
+async def test_bad_mode_refused_loudly(git_repo: Path) -> None:
+    """未知 mode 必须 fail-loud —— 静默回落会把"我要制造冲突"变成一次普通拒绝，
+    而 agent 从回执里看不出是自己参数写错了。"""
+    result = await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialise"
+    )
+    assert result["success"] is False
+    assert result["reason"] == "bad_mode"
+    assert "materialize_conflict" in result["message"]
+
+
+def _parent_count(wt: Path) -> int:
+    """HEAD 的父提交数：1 = 普通提交，2 = 合并提交（材料化不该产生）。"""
+    return len(_git(wt, "rev-list", "--parents", "-n", "1", "HEAD").split()) - 1
+
+
+@pytest.mark.asyncio
+async def test_materialize_conflict_leaves_conflict_in_worktree(
+    git_repo: Path,
+) -> None:
+    """⭐ mode=materialize_conflict：跳过预检、真合并、**冲突留在树里**。
+
+    判据全是**状态**：MERGE_HEAD 在、index 里有冲突条目、HEAD 没变成合并提交、
+    文件里真有冲突标记、回执给出未解决路径清单与两条出路。
+    ⚠ 不能断言"HEAD 不动"：merge 前的 dirty 自动 checkpoint 会推一个提交
+    （回执里给了它的 hash，这里就用回执自己的 hash 当判据）。
+    默认 mode=merge 的对照见 test_sync_rejects_predicted_conflict_*（同一构造）。
+    """
+    wt = await _make_diverged_tree(git_repo)
+
+    result = await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+
+    assert result["success"] is True, result
+    assert result["merged"] is False
+    assert result["state"] == "conflict_materialized"
+    assert "file.txt" in result["conflicts"]
+    # 状态判据：git 自己说这是一次未结束的 merge
+    assert _in_merge_state(wt)
+    # HEAD 停在 pre-merge-checkpoint 上：单父 = **没有**生成合并提交
+    assert _parent_count(wt) == 1
+    if result.get("checkpoint"):
+        assert str(result["checkpoint"])[:7] == _head(wt)
+    # index 里真有冲突条目（AA = add/add）
+    assert "AA" in _git(wt, "status", "--porcelain")
+    # 冲突标记真的落到了文件里（agent 要靠它手工解）
+    body = (wt / "file.txt").read_text(encoding="utf-8")
+    assert "<<<<<<<" in body and ">>>>>>>" in body
+    # 回执必须给两条出路（解 / abort），不能只说"你看着办"
+    assert "mode=abort" in result["message"]
+    assert "git add" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_mid_merge_is_refused_on_both_other_modes(git_repo: Path) -> None:
+    """半合并态下 merge/materialize 都必须硬拒（reason=merge_in_progress）。
+
+    旧行为会往下走 `git merge` ⇒ git 报 "You have not concluded your merge"，
+    被归成 merge_failed（文案指向不存在的"非内容冲突"），agent 只能盲试。
+    """
+    wt = await _make_diverged_tree(git_repo)
+    first = await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+    assert first["state"] == "conflict_materialized"
+
+    for mode in ("merge", "materialize_conflict"):
+        again = await sync_main_into_worktree(str(git_repo), "A007", mode=mode)
+        assert again["success"] is False, (mode, again)
+        assert again["reason"] == "merge_in_progress"
+        assert again.get("state") == "merge_in_progress"
+        assert "file.txt" in (again.get("conflicts") or [])
+        assert "mode=abort" in again["message"]
+    # 拒绝不得改变半合并态（不静默 abort —— 那会把 agent 的工作悄悄丢掉）
+    assert _in_merge_state(wt)
+
+
+@pytest.mark.asyncio
+async def test_abort_returns_to_pre_merge_head(git_repo: Path) -> None:
+    """mode=abort：merge 态消失、HEAD 回到 materialize 之后那一刻、本地版本完好。"""
+    wt = await _make_diverged_tree(git_repo)
+    mat = await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+    assert _in_merge_state(wt)
+    head_at_conflict = _head(wt)
+
+    aborted = await sync_main_into_worktree(str(git_repo), "A007", mode="abort")
+
+    assert aborted["success"] is True, aborted
+    assert aborted["state"] == "aborted"
+    assert not _in_merge_state(wt)
+    assert _head(wt) == head_at_conflict      # 合并没推进 HEAD
+    assert _parent_count(wt) == 1             # 也没留下合并提交
+    assert (wt / "file.txt").read_text(encoding="utf-8") == "branch version\n"
+    assert "AA" not in _git(wt, "status", "--porcelain")
+    # 回执里的 checkpoint 与 HEAD 一致（回执没有虚报 pre-merge 状态）
+    if mat.get("checkpoint"):
+        assert str(mat["checkpoint"])[:7] == _head(wt)
+
+
+@pytest.mark.asyncio
+async def test_abort_without_merge_is_idempotent_success(git_repo: Path) -> None:
+    """没有 merge 可 abort ⇒ **成功**（幂等），不是错误 —— 否则 agent 重试
+    会看到"失败"，而它其实已经处于它想要的状态。"""
+    await _make_worktree(git_repo)
+    result = await sync_main_into_worktree(str(git_repo), "A007", mode="abort")
+    assert result["success"] is True
+    assert result["state"] == "no_merge_in_progress"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_refused_while_mid_merge(git_repo: Path) -> None:
+    """⭐ 半合并态下 checkpoint 必须拒绝：`add -A` 会把冲突标记提交成正常提交。"""
+    wt = await _make_diverged_tree(git_repo)
+    await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+    assert _in_merge_state(wt)
+    head_at_conflict = _head(wt)
+
+    gwt = GitWorktreeService()
+    cp = await gwt.checkpoint(str(git_repo), "A007", "should be refused")
+
+    assert cp["success"] is False, cp
+    assert "mid-merge" in cp["message"]
+    assert "mode=abort" in cp["message"]
+    # 状态判据：拒绝 = **什么都没做**（HEAD 不动、半合并态仍在、标记仍在）
+    assert _head(wt) == head_at_conflict
+    assert _in_merge_state(wt)
+    assert "<<<<<<<" in (wt / "file.txt").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_still_works_after_abort(git_repo: Path) -> None:
+    """阳性对照的另一半：abort 之后 checkpoint 必须恢复正常（守卫不能常驻拒）。"""
+    wt = await _make_diverged_tree(git_repo)
+    await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+    await sync_main_into_worktree(str(git_repo), "A007", mode="abort")
+
+    gwt = GitWorktreeService()
+    cp = await gwt.checkpoint(str(git_repo), "A007", "after abort")
+    assert cp["success"] is True, cp
+    assert not _in_merge_state(wt)
+
+
+@pytest.mark.asyncio
+async def test_merge_mode_labels_content_conflict_not_merge_failed(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """预检 fail-open（基础设施失败）时，真 merge 撞上的内容冲突必须归
+    **`merge_conflict`** 而不是 `merge_failed`。
+
+    判据 = 「**abort 之前**先读状态」：旧实现先无条件 `merge --abort` 再读
+    `--diff-filter=U` ⇒ index 已干净 ⇒ 清单恒空 ⇒ 真冲突被报成
+    "failed (not a content conflict)"（`test_merge_failure_attribution` 的表里
+    两者的处方完全不同 ⇒ agent 被引向错误方向）。
+    """
+    wt = await _make_diverged_tree(git_repo)
+    import hiveweave.services.git_worktree.service_sync as svc
+
+    async def _no_conflict(*_a, **_kw):
+        return False, []          # 模拟预检基础设施失败 ⇒ fail-open 放行
+
+    monkeypatch.setattr(svc, "_predict_sync_conflicts", _no_conflict)
+
+    result = await sync_main_into_worktree(str(git_repo), "A007")
+
+    assert result["success"] is False
+    assert result["reason"] == "merge_conflict"
+    assert "file.txt" in result["conflicts"]
+    assert not _in_merge_state(wt)          # 拒绝路径不留半成品
+    assert "materialize_conflict" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_merge_to_main_refused_while_mid_merge(git_repo: Path) -> None:
+    """⭐ 半合并态下 worktree→MAIN 的 merge 必须**拒绝**（审计必修 A1/A2）。
+
+    两条实测危害：① merge 前那条自动 checkpoint 会 `add -A` + commit ⇒ 未解决
+    路径被当作已解决、**MERGE_HEAD 消失**（树看起来干净，本批两个闸门同时失效）；
+    ② merge 会照常报 merged=True 并随后回收 worktree ⇒ agent 正在解的冲突被静默
+    丢弃。⇒ 必须发生在 `add -A` **之前**。
+    """
+    wt = await _make_diverged_tree(git_repo)
+    await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+    assert _in_merge_state(wt)
+    head_at_conflict = _head(wt)
+    body_before = (wt / "file.txt").read_text(encoding="utf-8")
+    assert "<<<<<<<" in body_before
+
+    gwt = GitWorktreeService()
+    result = await gwt.merge(str(git_repo), "A007")
+
+    assert result["success"] is False, result
+    assert result["reason"] == "merge_in_progress"
+    assert "mode=abort" in result["message"]
+    # 状态判据：半合并态**没被洗掉**、没产生任何提交、冲突标记还在
+    assert _in_merge_state(wt)
+    assert _head(wt) == head_at_conflict
+    assert _parent_count(wt) == 1
+    assert "<<<<<<<" in (wt / "file.txt").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_materialize_after_untracked_quarantine_retry(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """⭐ 回执的 `conflicts` 必须等于**树里真实的**未解决路径（审计必修 A3）。
+
+    旧实现的缺口：状态只在**第一次** merge 之后读一次，untracked 隔离后的重试
+    复用残留的 `unmerged` ⇒ 若重试撞上内容冲突，materialize 会把该留的冲突
+    **abort 掉**并误标成 merge_failed。
+
+    ⚠ **本用例守的是不变量，不是那条重试路径** —— 实测：untracked 撞车与内容
+    冲突同时存在时，git 直接进冲突态（`MERGE_HEAD` 在、不报 untracked），所以
+    "先 untracked 失败、重试才冲突"在一次调用内**不可达**；那条重算因此是
+    **防御性**的（同时把两处构造点收成一个 `_materialized()`，避免只修一侧）。
+    本用例仍打桩掉合并前的 untracked 预扫，把 untracked 逼到 merge 时处理，
+    并断言回执与真实状态一致 —— 那是 stale-list 缺口一旦可达就会破的判据。
+    """
+    import hiveweave.services.git_worktree.service_sync as svc
+
+    async def _no_collision(*_a, **_kw):
+        return []
+
+    monkeypatch.setattr(svc, "_worktree_untracked_collisions", _no_collision)
+
+    wt = await _make_worktree(git_repo)
+    # ① 内容冲突：双方各改 c.txt
+    (wt / "c.txt").write_text("branch\n", encoding="utf-8")
+    _git(wt, "add", "c.txt")
+    _git(wt, "commit", "-m", "add c")
+    # ② untracked 撞车：worktree 里有个未跟踪的 u.txt，MAIN 将新增同名文件
+    (wt / "u.txt").write_text("untracked local\n", encoding="utf-8")
+    (git_repo / "c.txt").write_text("main\n", encoding="utf-8")
+    (git_repo / "u.txt").write_text("from main\n", encoding="utf-8")
+    _git(git_repo, "add", "c.txt", "u.txt")
+    _git(git_repo, "commit", "-m", "main adds c and u")
+
+    result = await sync_main_into_worktree(
+        str(git_repo), "A007", mode="materialize_conflict"
+    )
+
+    assert result["success"] is True, result
+    assert result["state"] == "conflict_materialized"
+    assert "c.txt" in result["conflicts"], result
+    assert _in_merge_state(wt)
+    # 不变量：回执的清单 == 树里真实的未解决路径（stale-list 缺口会破这条）
+    actual = [
+        ln.strip().replace("\\", "/")
+        for ln in _git(wt, "diff", "--name-only", "--diff-filter=U").splitlines()
+        if ln.strip()
+    ]
+    assert sorted(result["conflicts"]) == sorted(actual), (result["conflicts"], actual)
+
+
 # ── 接线自检（5+1 全套）────────────────────────────────────
 
 
@@ -293,6 +588,21 @@ def test_wiring_tool_param_schemas() -> None:
     assert "quarantine" in desc.lower()
     assert "reject" in desc.lower()
     assert entry.get("required") == []
+    # ③：mode 三件套的第三件（模型可见面）—— @tool 参数 + pydantic 都有了，
+    # 漏这一件模型端就看不到 mode（本仓"两张表"结构性坑）。
+    mode = entry["properties"].get("mode")
+    assert mode is not None, "TOOL_PARAM_SCHEMAS 缺 mode（模型端将看不到）"
+    assert set(mode["enum"]) == {"merge", "materialize_conflict", "abort"}
+    assert "materialize_conflict" in desc
+
+
+def test_wiring_pydantic_mode_field() -> None:
+    """pydantic 面必须有同名参数（否则 executor 的 canonical 归一也救不回来）。"""
+    from hiveweave.tools.misc_tools import GitWorktreeSyncParams
+
+    params = GitWorktreeSyncParams(mode="materialize_conflict")
+    assert params.mode == "materialize_conflict"
+    assert GitWorktreeSyncParams(mode=None).mode is None
 
 
 def test_wiring_policy_capability() -> None:

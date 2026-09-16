@@ -838,9 +838,11 @@ async def _submit_preflight(
                         + (", ".join(_pred.conflicts[:8])
                            if _pred.conflicts else "(清单解析失败, 以 rebase 实际输出为准)")
                         + ("…" if len(_pred.conflicts) > 8 else "")
-                        + ")。请在你的 worktree 内执行 `git rebase main`"
-                          "(或 `git merge main`), 解决冲突后 "
-                          "git_worktree_checkpoint, 再重新 submit_task。"
+                        + ")。请在你的 worktree 内调用 `git_worktree_sync`"
+                          "（默认先拒绝可预判冲突、不留半成品；要把冲突就地"
+                          "手工解就用 mode=materialize_conflict，解完 "
+                          "`git add` + commit，或 mode=abort 退回）"
+                          "，然后重新 submit_task。"
                           "不要让 coordinator 在合并时替你解冲突。"
                     ),
                 })

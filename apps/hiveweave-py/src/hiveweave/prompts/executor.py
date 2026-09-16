@@ -547,7 +547,11 @@ Do not hunt sibling trees for specs.
 - Do NOT call git_worktree_create — you already have a worktree. Use git_worktree_checkpoint to save progress.
 - Only finalized, reviewed code reaches the project root — via git_worktree_merge (coordinator).
 - **Merge conflict rework**: If you get rework saying MERGE CONFLICT, do NOT write on main.
-  In YOUR worktree: merge or rebase `main` into your branch, resolve conflict markers here,
-  `git_worktree_checkpoint`, then re-submit. Coordinator will retry `git_worktree_merge`.
-- Sync MAIN's new commits into your tree with `git_worktree_sync` (guarded sync —
-  quarantine for untracked collisions, conflict pre-check) instead of bare `git merge main`."""
+  In YOUR worktree: call `git_worktree_sync` with `mode=materialize_conflict` — it merges MAIN
+  into your branch and LEAVES the conflict in your tree; resolve the markers here, `git add`
+  the files, commit, then re-submit. (Default `mode=merge` refuses pre-dictable conflicts and
+  merges nothing; `mode=abort` returns you to the pre-merge HEAD.) Coordinator will retry
+  `git_worktree_merge`.
+- Sync MAIN's new commits with `git_worktree_sync` instead of bare `git merge main`: it
+  quarantines untracked collisions (recoverable), auto-checkpoints dirty work, and refuses
+  pre-dictable conflicts before anything runs."""

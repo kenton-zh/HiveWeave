@@ -27,6 +27,22 @@
 merge 方向的 --no-ff 幂等约定（F13b）不适用本方向：sync 不删分支、不存在
 「已合入分支再次 merge」的幂等判据问题，fast-forward 即裸 ``git merge
 main`` 的自然语义。
+
+## ③（2026-09-16）：半合并态第一次成为合法状态，因此必须被全链识别
+
+此前平台**从不制造**半合并态（两个方向失败即 ``merge --abort``），所以
+"worktree 正处于 merge 中"这个状态在本仓**零处理**（``MERGE_HEAD`` 全仓
+0 命中）。``mode=materialize_conflict`` 把它变成**agent 主动要求**的状态，
+于是新增两件事：
+
+1. 本模块：``merge``/``materialize`` 在已处于 merge 态时**硬拒**（``reason=
+   merge_in_progress``）并给两条出路；``abort`` 是显式退出入口（幂等，
+   ``no_merge_in_progress`` 是成功而不是错误）。
+2. ``service_create.checkpoint``：半合并态下**拒绝 checkpoint**（``add -A``
+   一条未解决路径即视为"已解决"，会把冲突标记提交成正常提交）。
+
+判据一律是 ``git rev-parse --verify --quiet MERGE_HEAD``（状态），不是
+"index 里有 UU"、更不是文案。
 """
 from __future__ import annotations
 
@@ -44,10 +60,48 @@ from .conflict_predict import (
 )
 from .ensure import worktree_commits_behind_main
 from .git_identity import agent_identity_args
-from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_cmd import (
+    _current_branch,
+    _git,
+    _resolve_base_branch,
+    merge_in_progress,
+    unmerged_paths,
+)
 from .merge_support import parse_untracked_overwrite
 
 log = structlog.get_logger(__name__)
+
+# ── ③（2026-09-16）：三个显式模式 ────────────────────────────────────
+# 为什么要有模式而不是"再多一条禁令"：`不要裸 git merge main` 原先只活在
+# prompts/工具描述里（`services/policy.py` 无任何规则拒它）—— 按 DSH 的宪法
+# `packages/AGENTS.md:14`「Enforce a decision in the operation that makes it.
+# … prompt filtering … are not enforcement」，**那根本不算约束**。真实需求
+# 是"把冲突制造出来、在本地手工解"，那就把这件事做成**操作**：
+#   merge（默认）= 现状（冲突左移拒绝，不留半成品）
+#   materialize_conflict = 跳过两道预检、真跑 merge、**冲突留在树里**
+#   abort = 从半合并态退出（`merge --abort` 的显式入口）
+SYNC_MODE_MERGE = "merge"
+SYNC_MODE_MATERIALIZE = "materialize_conflict"
+SYNC_MODE_ABORT = "abort"
+SYNC_MODES = frozenset({SYNC_MODE_MERGE, SYNC_MODE_MATERIALIZE, SYNC_MODE_ABORT})
+
+
+def materialize_prescription(base: str, branch: str) -> str:
+    """半合并态的**两条出路**（唯一一份文案 —— 3–4 处拒绝共用它）。
+
+    形状照 DSH 的 `GoalBlockReason {code, message}`：判据留 `reason`（稳定
+    code，下游与审计按它分支/统计），人读的处方在这一份里。
+    """
+    return (
+        f"Your worktree ({branch}) is mid-merge with {base}: git left the "
+        "conflict in place for you to resolve by hand. Two exits — "
+        "(1) resolve: edit the conflicted file(s), remove every conflict "
+        "marker, `git add <files>`, then commit; "
+        "(2) abandon: call git_worktree_sync with mode=abort to return the "
+        "worktree to its pre-merge HEAD. Do NOT leave it unresolved: "
+        "checkpoint refuses while a merge is in progress (it would commit "
+        "the conflict markers as if they were finished work)."
+    )
 
 # P2-1: 同一 worktree 的 sync 串行化（service_create._create_locks 同款）。
 # key = f"{workspace-resolved}::{short_id}"。
@@ -220,11 +274,20 @@ async def sync_main_into_worktree(
     short_id: str,
     *,
     base_branch: str | None = None,
+    mode: str = SYNC_MODE_MERGE,
 ) -> dict:
     """把 MAIN（默认基分支）的新提交同步进 agent 的 worktree。
 
     参数风格对齐同包 ``service_merge.merge(workspace_path, short_id, ...)``。
     调用方（工具层）负责 caller↔target 越权门 —— 本函数只认 short_id。
+
+    ``mode``（③ 2026-09-16）：
+    - ``merge``（默认）= 冲突左移（两道 merge-tree 预检），拒绝时**不留半成品**；
+    - ``materialize_conflict`` = **跳过两道预检**、真跑 merge，把冲突**留在树里**
+      交给 agent 手工解（回执给未解决路径清单 + 两条出路）。untracked 撞车的
+      隔离护栏与 dirty 自动 checkpoint **照旧**（前者防丢文件、后者是 merge
+      能跑起来的前提）；
+    - ``abort`` = 从半合并态退出（``git merge --abort`` 的显式入口，幂等）。
 
     流程（预演→隔离→checkpoint→merge 整段按 ``workspace::short_id`` 串行）：
     定位/校验 worktree → behind 计数（0 → up_to_date 幂等回执）→ merge-tree
@@ -240,10 +303,29 @@ async def sync_main_into_worktree(
          "quarantined": [{stamp, dest, files}...], "conflicts": [],
          "branch", "base", "message"}
         {"success": True,  "merged": False, "reason": "up_to_date", ...}
+        {"success": True,  "merged": False, "state": "conflict_materialized",
+         "conflicted": [路径...], "conflicts": [路径...], ...}   # mode=materialize
+        {"success": True,  "merged": False, "state": "aborted" |
+         "no_merge_in_progress", ...}                            # mode=abort
         {"success": False, "reason": ..., "message", "conflicts": [...],
          "quarantined": [...], ...}
     """
     from .service_merge import MergeMixin
+
+    # 未知 mode 一律 fail-loud：静默回落到 merge 会让"我要制造冲突"变成
+    # 一次被拒的普通 sync，而 agent 从回执上看不出自己参数写错了。
+    if mode not in SYNC_MODES:
+        return {
+            "success": False,
+            "merged": False,
+            "reason": "bad_mode",
+            "message": (
+                f"Unknown sync mode {mode!r}. Use one of: "
+                f"{', '.join(sorted(SYNC_MODES))}."
+            ),
+            "branch": "", "base": "", "behind_before": 0, "new_head": "",
+            "quarantined": [], "conflicts": [],
+        }
 
     base = (base_branch or "").strip() or (
         await _resolve_base_branch(workspace_path) or "main"
@@ -306,6 +388,76 @@ async def sync_main_into_worktree(
     #    第二个必须重新看到 behind==0 才能给出正确回执。
     lock = await _worktree_sync_lock(workspace_path, short_id)
     async with lock:
+        # ── 1.5 半合并态（③）：`merge`/`materialize` 在"已经处于 merge 态"时
+        #    必须**硬拒并给两条出路**，不能往下走 —— 否则 `git merge` 自己会报
+        #    "You have not concluded your merge"，被归成 merge_failed（文案指向
+        #    不存在的"非内容冲突"，agent 只能盲试）；`abort` 则是明确入口。
+        mid = await merge_in_progress(wt_path, workspace_path)
+        if mode == SYNC_MODE_ABORT:
+            if not mid:
+                return {
+                    "success": True,
+                    "merged": False,
+                    "state": "no_merge_in_progress",
+                    "reason": "no_merge_in_progress",
+                    "message": (
+                        f"Worktree {short_id} ({branch}) is not mid-merge — "
+                        "there is nothing to abort. HEAD unchanged."
+                    ),
+                    "branch": branch, "base": base, "behind_before": 0,
+                    "new_head": await _head_short_async(wt_path),
+                    "conflicted": [], "quarantined": [], "conflicts": [],
+                }
+            ok_ab, ab_out = await _git(["merge", "--abort"], wt_path)
+            # ⚠ 判据只看**状态**（merge 态是否真的消失），**不 OR 退出码**：
+            # `git merge --abort` 会返回非 0 而 MERGE_HEAD 已被清掉（"已经没
+            # 有可 abort 的东西"这类），OR 上去就把成功报成 still-mid-merge
+            # （假失败，agent 重试永远撞同一句）。`ok_ab` 只用于给原因文本。
+            if await merge_in_progress(wt_path, workspace_path):
+                return _reject(
+                    "abort_refused",
+                    "Could not abort the in-progress merge: "
+                    f"{(ab_out or '').strip()[:400] or 'git reported nothing'}"
+                    f" (rc={ok_ab}). The worktree is still mid-merge — move or "
+                    "commit the blocking files, then retry mode=abort.",
+                    branch=branch,
+                    behind=await worktree_commits_behind_main(
+                        workspace_path, wt_path
+                    ),
+                    head=await _head_short_async(wt_path),
+                )
+            return {
+                "success": True,
+                "merged": False,
+                "state": "aborted",
+                "reason": "aborted",
+                "message": (
+                    f"Aborted the in-progress merge in {short_id} "
+                    f"({branch}). HEAD is back to "
+                    f"{await _head_short_async(wt_path)} and the worktree "
+                    "index is clean."
+                ),
+                "branch": branch, "base": base,
+                "behind_before": await worktree_commits_behind_main(
+                    workspace_path, wt_path
+                ),
+                "new_head": await _head_short_async(wt_path),
+                "conflicted": [], "quarantined": [], "conflicts": [],
+            }
+        if mid:
+            return _reject(
+                "merge_in_progress",
+                "Sync refused: this worktree is already mid-merge. "
+                + materialize_prescription(base, branch),
+                branch=branch,
+                behind=await worktree_commits_behind_main(
+                    workspace_path, wt_path
+                ),
+                conflicts=await unmerged_paths(wt_path, workspace_path),
+                head=await _head_short_async(wt_path),
+                extra={"state": "merge_in_progress"},
+            )
+
         # ── 2. behind/ahead：0 → 幂等「已最新」回执 ──
         behind = await worktree_commits_behind_main(workspace_path, wt_path)
         head_before = await _head_short_async(wt_path)
@@ -328,9 +480,16 @@ async def sync_main_into_worktree(
             }
 
         # ── 3. merge-tree 预演第一道（checkpoint/隔离之前）：拒绝路径
-        #    零副作用（只看已提交态；未提交改动 vs MAIN 的冲突由第二道接）──
-        conflicted, conflict_files = await _predict_sync_conflicts(
-            wt_path, branch, base, project_root=workspace_path
+        #    零副作用（只看已提交态；未提交改动 vs MAIN 的冲突由第二道接）。
+        #    ⚠ materialize 模式**刻意跳过**：它就是来要这个冲突的，"提前拒绝"
+        #    等于把需求本身拒掉（真正的护栏是回执给清单 + checkpoint 的半合并
+        #    态闸门，不是"不许产生冲突"）。──
+        conflicted, conflict_files = (
+            (False, [])
+            if mode == SYNC_MODE_MATERIALIZE
+            else await _predict_sync_conflicts(
+                wt_path, branch, base, project_root=workspace_path
+            )
         )
         if conflicted:
             listing = (
@@ -344,7 +503,10 @@ async def sync_main_into_worktree(
                 f"{listing}. Nothing was merged and nothing was changed — "
                 "your worktree HEAD is untouched. Fix in your worktree "
                 "first: commit or resolve the conflicted file(s) on your "
-                "branch, then call git_worktree_sync again.",
+                "branch, then call git_worktree_sync again. To resolve the "
+                "conflict by hand instead, call git_worktree_sync with "
+                "mode=materialize_conflict — it merges and leaves the "
+                "conflict in your tree.",
                 branch=branch,
                 behind=behind,
                 conflicts=conflict_files,
@@ -431,8 +593,13 @@ async def sync_main_into_worktree(
         #    第一道只看已提交态，「worktree 未提交改动 vs MAIN 同路径修改」
         #    的冲突在此（checkpoint 落成提交后）才可预判。拒绝路径可能
         #    留下 checkpoint 提交 —— 回执明示 hash 与处方，不算静默副作用。
-        conflicted, conflict_files = await _predict_sync_conflicts(
-            wt_path, branch, base, project_root=workspace_path
+        #    ⚠ materialize 模式同样跳过（理由同第一道）。──
+        conflicted, conflict_files = (
+            (False, [])
+            if mode == SYNC_MODE_MATERIALIZE
+            else await _predict_sync_conflicts(
+                wt_path, branch, base, project_root=workspace_path
+            )
         )
         if conflicted:
             listing = (
@@ -447,10 +614,13 @@ async def sync_main_into_worktree(
                 + (
                     f"Your uncommitted changes were auto-checkpointed "
                     f"(commit {checkpoint_commit}); resolve the conflicts "
-                    f"with MAIN, then call git_worktree_sync again."
+                    f"with MAIN, then call git_worktree_sync again. To "
+                    f"resolve them by hand, call git_worktree_sync with "
+                    f"mode=materialize_conflict."
                     if checkpoint_commit
                     else "Resolve the conflicted file(s) on your branch, "
-                         "then call git_worktree_sync again."
+                         "then call git_worktree_sync again (or use "
+                         "mode=materialize_conflict to resolve by hand)."
                 ),
                 branch=branch,
                 behind=behind,
@@ -467,8 +637,56 @@ async def sync_main_into_worktree(
         # ── 7. 执行：git merge <base>（fast-forward 即自然语义，无需 --no-ff）──
         ok_merge, merge_out = await _git(["merge", base, "--no-edit"], wt_path)
         if not ok_merge:
-            # 与 merge 方向同款护栏：untracked 撞车 → 隔离后重试一次
+            # ⚠ **顺序即判据**：状态必须在任何 `merge --abort` **之前**读。
+            #   旧实现先无条件 abort，再读 `--diff-filter=U` ⇒ index 已干净，
+            #   清单恒空 ⇒ 真正的内容冲突被归到 `merge_failed`（"not a content
+            #   conflict"，把 agent 引向错误方向），而 `merge_conflict` 分支几乎
+            #   不可达。本批把读取提前（错误标签同时被修正）。
+            mid = await merge_in_progress(wt_path, workspace_path)
+            unmerged = await unmerged_paths(wt_path, workspace_path) if mid else []
             untracked = parse_untracked_overwrite(merge_out or "")
+
+            async def _materialized(files: list[str]) -> dict:
+                """把"冲突已留在树里"的回执收成一个构造点（**两处调用**：
+                首次 merge 与 untracked 隔离后的重试 —— 两处条件必须同源，
+                否则「该留的冲突被 abort 掉」这种缺口只会在一侧被修）。"""
+                log.info(
+                    "git_worktree.sync_conflict_materialized",
+                    short_id=short_id, branch=branch, base=base,
+                    files=len(files),
+                )
+                return {
+                    "success": True,
+                    "merged": False,
+                    "state": "conflict_materialized",
+                    "reason": "conflict_materialized",
+                    "message": (
+                        f"Merging {base} into {branch} produced content "
+                        f"conflicts in {len(files)} file(s) — left in your "
+                        f"worktree for you to resolve: "
+                        f"{', '.join(files[:12])}"
+                        + (f" (checkpoint {checkpoint_commit} was created "
+                           f"first)" if checkpoint_commit else "")
+                        + ". " + materialize_prescription(base, branch)
+                    ),
+                    "branch": branch,
+                    "base": base,
+                    "behind_before": behind,
+                    "new_head": await _head_short_async(wt_path),
+                    "conflicted": files,
+                    "conflicts": files,
+                    "quarantined": quarantined,
+                    **({"post_checkpoint": True,
+                        "checkpoint": checkpoint_commit}
+                       if checkpoint_commit else {}),
+                }
+
+            if mid and mode == SYNC_MODE_MATERIALIZE:
+                # materialize：**刻意不 abort** —— 冲突留在树里。success=True
+                # 因为操作**完成了它被要求的事**（`merged=False` + `state`
+                # 表达"合并没结束"，不是失败）。
+                return await _materialized(unmerged)
+            # 与 merge 方向同款护栏：untracked 撞车 → 隔离后重试一次
             await _git(["merge", "--abort"], wt_path)
             if untracked:
                 event = await _quarantine_untracked_in_worktree(
@@ -479,27 +697,33 @@ async def sync_main_into_worktree(
                     ok_merge, merge_out = await _git(
                         ["merge", base, "--no-edit"], wt_path
                     )
+                    # ⚠ **重试后必须重算状态**：第一次失败是 untracked 撞车
+                    # （git 根本没进 merge 态 ⇒ 上面两个判据都是空的），重试才
+                    # 可能撞上内容冲突。复用第一次的 `unmerged`（恒空）会让
+                    # materialize **把该留的冲突 abort 掉**，并把它误标成
+                    # merge_failed（"not a content conflict"）—— 正是本批要修的
+                    # 那个错误标签，换条路又回来了（审计实测）。
+                    mid = await merge_in_progress(wt_path, workspace_path)
+                    unmerged = (
+                        await unmerged_paths(wt_path, workspace_path)
+                        if mid else []
+                    )
+                    if mid and mode == SYNC_MODE_MATERIALIZE:
+                        return await _materialized(unmerged)
             if not ok_merge:
-                ok_u, u_out = await _git(
-                    ["diff", "--name-only", "--diff-filter=U"], wt_path
-                )
-                conflict_files = [
-                    f.strip().replace("\\", "/")
-                    for f in (u_out or "").splitlines()
-                    if f.strip()
-                ] if ok_u else []
                 await _git(["merge", "--abort"], wt_path)  # 幂等：无 merge 态无害
-                if conflict_files:
+                if unmerged:
                     return _reject(
                         "merge_conflict",
                         f"Merging {base} into {branch} hit content "
-                        f"conflicts: {', '.join(conflict_files[:12])}. The "
+                        f"conflicts: {', '.join(unmerged[:12])}. The "
                         "merge was aborted — resolve the conflicted file(s) "
                         "in your worktree, checkpoint, then retry "
-                        "git_worktree_sync.",
+                        "git_worktree_sync (or use mode=materialize_conflict "
+                        "to get the conflict left in your tree).",
                         branch=branch,
                         behind=behind,
-                        conflicts=conflict_files,
+                        conflicts=unmerged,
                         head=await _head_short_async(wt_path),
                         quarantined=quarantined,
                     )

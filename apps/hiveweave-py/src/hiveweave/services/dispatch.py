@@ -364,12 +364,13 @@ class DispatchService:
                             description_out += (
                                 f"\n\n[WORKTREE BEHIND MAIN] Your worktree is "
                                 f"{behind} commit(s) behind main. "
-                                f"Run `git merge main` (or `git rebase main`) "
-                                f"in your worktree before starting work to "
-                                f"avoid building on stale code. "
-                                f"可调用 git_worktree_sync 工具完成同步"
-                                f"（护栏版：untracked 冲突自动进隔离区、"
-                                f"内容冲突提前拒绝）。"
+                                f"Sync MAIN into your worktree before "
+                                f"starting work so you do not build on stale "
+                                f"code: call `git_worktree_sync` "
+                                f"（untracked 撞车自动进隔离区、dirty 自动 "
+                                f"checkpoint、可预判的内容冲突默认提前拒绝；"
+                                f"要把冲突就地手工解则 "
+                                f"mode=materialize_conflict）。"
                             )
                     except Exception as e:
                         log.debug(

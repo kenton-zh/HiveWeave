@@ -24,7 +24,14 @@ from .constants import (
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
 from .service_lifecycle import _surface_husk_left
 from .git_identity import agent_identity_args
-from .git_cmd import _current_branch, _git, _resolve_base_branch, _target_tip_short
+from .git_cmd import (
+    _current_branch,
+    _git,
+    _resolve_base_branch,
+    _target_tip_short,
+    merge_in_progress,
+    unmerged_paths,
+)
 from .merge_support import (
     _auto_checkpoint_dirty_target,
     _merge_failure_result,
@@ -275,6 +282,40 @@ class MergeMixin:
         # A missing directory is NOT an error — the branch can still be
         # merged from the main repo (worktree deleted, branch preserved).
         if Path(path).is_dir():
+            # 0. **半合并态**（③ 2026-09-16）：这棵 worktree 正在 merge 中
+            #    （`git_worktree_sync mode=materialize_conflict` 合法产生的状态）
+            #    ⇒ 必须挡在这里，两条理由都是实测出来的：
+            #    ① 本函数下方 Step 1 的 pre-merge checkpoint 会跑 `add -A` +
+            #       `commit` ⇒ 未解决路径被当作"已解决"提交，**MERGE_HEAD 随之
+            #       消失** ⇒ 树看起来干净，本批两处新闸门（sync 的 mid-merge 拒绝、
+            #       checkpoint 的 mid-merge 拒绝）**同时失效**，且冲突标记进了
+            #       一次正常提交（探针实证：`rev-list --parents -n1 HEAD` 由 2 词
+            #       变 3 词 = 生成了合并提交）。
+            #    ② merge 会照常报 merged=True 并随后回收 worktree（service_merge
+            #       → service_lifecycle 的 `worktree remove --force`）⇒ agent 正在
+            #       手工解的冲突被静默丢弃，且全程无一处回执提及。
+            if await merge_in_progress(path, workspace_path):
+                conflicts = await unmerged_paths(path, workspace_path)
+                log.warning(
+                    "git_worktree.merge_refused_mid_merge",
+                    short_id=short_id, branch=branch, files=len(conflicts),
+                )
+                return {
+                    "success": False,
+                    "reason": "merge_in_progress",
+                    "conflicts": conflicts,
+                    "message": (
+                        f"Merge refused: worktree for {short_id} ({branch}) is "
+                        "mid-merge. Committing now would discard the "
+                        "in-progress resolution and destroy the merge state "
+                        f"(conflicted file(s): "
+                        f"{', '.join(conflicts[:12]) or 'git did not list them'}). "
+                        "Finish it first: resolve the conflicts, `git add` "
+                        "them and commit, then merge. To throw the merge away "
+                        "instead, call git_worktree_sync with mode=abort."
+                    ),
+                }
+
             # 1. Source directory must have .git (file or dir)
             if not _has_git(path):
                 log.warning(

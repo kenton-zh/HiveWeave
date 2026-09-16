@@ -144,6 +144,51 @@ async def _resolve_base_branch(workspace_path: str) -> str | None:
     return None
 
 
+async def merge_in_progress(
+    worktree_path: str, project_root: str | None = None
+) -> bool:
+    """该工作树是否处于**半合并态**（merge 起了但没结束）。
+
+    判据 = **git 自己的状态** ``MERGE_HEAD`` 在不在（`git merge` 产生冲突时写下它，
+    ``--abort`` 与成功收尾都会清掉它），**不是文案**、不是"index 里有 UU"那种
+    近似 —— 后者在 `add` 过之后会消失。
+
+    为什么需要这个判据（2026-09-16，③）：
+    平台原本**从不制造**半合并态 —— 两个方向（`git_worktree_merge` 进 MAIN、
+    `git_worktree_sync` 进 worktree）失败即 `merge --abort`。新增
+    ``mode=materialize_conflict`` 之后，半合并态第一次成为**合法、可达、且由
+    agent 主动要求**的状态（把冲突就地留给自己手工解）⇒ 所有"消费这棵树"的
+    地方都必须能识别它。最危险的一处是 checkpoint 的 `add -A + commit`：
+    它会把冲突标记当正常改动**提交成一次正常提交**（`git add` 一条未解决路径
+    即视为已解决），于是半成品被当成已完成的代码。
+    """
+    ok, _ = await _git(
+        ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        worktree_path, project_root=project_root,
+    )
+    return bool(ok)
+
+
+async def unmerged_paths(
+    worktree_path: str, project_root: str | None = None
+) -> list[str]:
+    """未解决（unmerged）路径清单 —— 半合并态下给 agent/回执的**可执行事实**。
+
+    ⚠ 必须在任何 ``merge --abort`` **之前**读（abort 之后 index 就干净了，
+    这让"内容冲突"会被误报成"非内容冲突的 merge 失败"，见 service_sync 的注释）。
+    """
+    ok, out = await _git(
+        ["diff", "--name-only", "--diff-filter=U"],
+        worktree_path, project_root=project_root,
+    )
+    if not ok:
+        return []
+    return [
+        f.strip().replace("\\", "/")
+        for f in (out or "").splitlines() if f.strip()
+    ]
+
+
 async def _target_tip_short(workspace_path: str, target_branch: str) -> str | None:
     """目标分支当前 tip 的短 hash（F13b 幂等重入回执用）。best-effort。"""
     ok, out = await _git(

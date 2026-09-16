@@ -1325,6 +1325,23 @@ class GitWorktreeSyncParams(BaseModel):
             "aliases": ["shortId", "short_id", "agentShortId", "target"]
         },
     )
+    mode: str | None = Field(
+        default=None,
+        alias="mode",
+        description=(
+            "merge (default): conflict-safe sync — predicted conflicts are "
+            "refused before anything runs. materialize_conflict: merge and "
+            "leave the conflict in your worktree so you can resolve it by "
+            "hand (skips the pre-checks on purpose). abort: abandon an "
+            "in-progress merge and return to the pre-merge HEAD."
+        ),
+        json_schema_extra={
+            "aliases": [
+                "mode", "syncMode", "sync_mode",
+                "materializeConflict", "materialize_conflict",
+            ]
+        },
+    )
 
 
 async def _resolve_sync_target(
@@ -1392,9 +1409,13 @@ async def _resolve_sync_target(
     "Up-to-date trees no-op. Untracked worktree files that MAIN's incoming "
     "commits would overwrite are moved to .hiveweave/merge-quarantine "
     "(not deleted, recoverable — receipt lists them and an inbox notice "
-    "is sent). Predicted content conflicts are rejected BEFORE anything "
-    "runs — resolve in the worktree, then retry. Use this instead of bare "
-    "`git merge main`.",
+    "is sent). mode=merge (default) refuses predicted content conflicts "
+    "BEFORE anything runs (resolve in the worktree, then retry); "
+    "mode=materialize_conflict merges and leaves the conflict in your "
+    "worktree so you can resolve it by hand (receipt lists the conflicted "
+    "files; checkpoint refuses while that merge is unresolved); "
+    "mode=abort returns the worktree to its pre-merge HEAD. "
+    "Use this instead of bare `git merge main`.",
     requires_workspace=True,
     security_level="standard",
 )
@@ -1424,7 +1445,9 @@ async def git_worktree_sync_tool(
     gwt = GitWorktreeService()
     await gwt.ensure_git_repo(workspace_path)
 
-    result = await sync_main_into_worktree(workspace_path, target_sid)
+    result = await sync_main_into_worktree(
+        workspace_path, target_sid, mode=(params.mode or "merge")
+    )
 
     # 通知面（审计备注 E）：target ≠ caller 时，隔离/同步通知必须同时发
     # 文件属主（target agent）一份 —— 不能只发调用者。
@@ -1440,11 +1463,18 @@ async def git_worktree_sync_tool(
             from hiveweave.services.inbox import InboxService
 
             dest = q_events[0].get("dest") or ".hiveweave/merge-quarantine"
-            outcome = (
-                "合并本体不受影响。"
-                if result.get("success")
-                else "本次 sync 最终失败，请先处理失败原因后重试。"
-            )
+            # ⚠ 不能只看 `success`：materialize 是 `success=True, merged=False`
+            # （操作完成了它被要求的事，但**合并没结束**）—— 那时说"合并本体不受
+            # 影响"是假话。判据要落到 `state`/`merged` 上。
+            if result.get("state") == "conflict_materialized":
+                outcome = (
+                    "合并**尚未结束**：冲突已按你的要求留在树里，"
+                    "隔离只涉及未跟踪文件。"
+                )
+            elif result.get("merged"):
+                outcome = "合并本体不受影响。"
+            else:
+                outcome = "本次 sync 最终失败，请先处理失败原因后重试。"
             for nid in notify_ids:
                 await InboxService().send_message(
                     from_agent_id="system",
@@ -1492,20 +1522,29 @@ async def git_worktree_sync_tool(
         return ToolResult.err(
             result.get("message", "git_worktree_sync failed"),
             reason=result.get("reason"),
+            state=result.get("state"),
             conflicts=result.get("conflicts") or [],
             behind_before=result.get("behind_before", 0),
             quarantined=q_events if isinstance(q_events, list) else [],
         )
 
     if not result.get("merged"):
+        # 三种"没合并"要分开：up_to_date（幂等）/ conflict_materialized
+        # （**成功**，冲突留给 agent 解）/ aborted·no_merge_in_progress。
+        # 旧的硬编码 `conflicts=[]` 会把 materialize 的清单吞掉 —— agent 只能
+        # 自己 `git status` 猜哪些文件要解（正是本仓最烦的"缺事实"）。
         return ToolResult.ok(
             result.get("message", "Worktree already up to date with MAIN."),
             merged=False,
             reason=result.get("reason"),
+            state=result.get("state"),
             new_head=result.get("new_head", ""),
             behind_before=result.get("behind_before", 0),
-            quarantined=[],
-            conflicts=[],
+            quarantined=q_events if isinstance(q_events, list) else [],
+            conflicts=result.get("conflicts") or [],
+            conflicted=result.get("conflicted") or [],
+            post_checkpoint=result.get("post_checkpoint"),
+            checkpoint=result.get("checkpoint"),
         )
 
     msg = result.get("message") or (

@@ -26,7 +26,13 @@ from .constants import (
     is_regenerable_path,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
-from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_cmd import (
+    _current_branch,
+    _git,
+    _resolve_base_branch,
+    merge_in_progress,
+    unmerged_paths,
+)
 
 
 def _anchor_gitdir(project_root: str, worktree_path: str) -> str:
@@ -1085,6 +1091,37 @@ yarn.lock merge=union
                 ),
             }
 
+        # ⚠ **半合并态不得被 checkpoint 静默提交**（③，2026-09-16）。
+        # `mode=materialize_conflict` 让"worktree 正处于 merge 中"第一次成为
+        # **合法可达**状态（此前平台从不制造它 —— 两个方向失败即 abort）。
+        # 而 `git add -A` 对一条未解决路径 = **标记为已解决**，随后的 commit 会把
+        # 冲突标记（<<<<<<< / ======= / >>>>>>>）当成正常改动提交进去 ⇒
+        # "半成品"从此变成一次看似正常的提交，后面所有基于 git 状态的判定
+        # （behind/merged/评审）全部读到假的"干净"。⇒ fail loud，并给两条出路。
+        if await merge_in_progress(path, workspace_path):
+            conflicts = await unmerged_paths(path, workspace_path)
+            log.warning(
+                "git_worktree.checkpoint_refused_mid_merge",
+                short_id=short_id,
+                path=path,
+                files=len(conflicts),
+            )
+            return {
+                "success": False,
+                **self._empty_volume_fields(),
+                "message": (
+                    f"Checkpoint refused: this worktree is mid-merge "
+                    f"(conflicted file(s): "
+                    f"{', '.join(conflicts[:12]) or 'git did not list them'}). "
+                    "Staging now would mark every conflicted path as resolved "
+                    "and commit the conflict markers as if they were finished "
+                    "work. Nothing was committed. Two exits: (1) resolve the "
+                    "conflicts, then `git add <files>` and commit; "
+                    "(2) call git_worktree_sync with mode=abort to return to "
+                    "the pre-merge HEAD."
+                ),
+            }
+
         ok, add_out = await _git(["add", "-A"], path, project_root=workspace_path)
         if not ok:
             # P1-2: 失败必须透传 git 原始输出（此前丢 stderr 只回"Failed to
@@ -1394,13 +1431,14 @@ yarn.lock merge=union
                     + (", ".join(pred.conflicts[:5])
                        if pred.conflicts else "(文件清单解析失败)")
                     + ("…" if len(pred.conflicts) > 5 else "")
-                    + "。建议尽快在你的 worktree 执行 `git rebase main`"
-                      "解决冲突后再继续。"
+                    + "。建议尽快用 `git_worktree_sync` 把 MAIN 并进你的树"
+                      "（默认先拒绝可预判冲突、不留半成品；要就地手工解则 "
+                      "mode=materialize_conflict）。"
                 )
             if pred.degraded and pred.behind > 0 and pred.ahead > 0:
                 return (
                     f" NOTE: main 已领先 {pred.behind} 个提交(本机 git 过旧,"
-                    f"无法预演冲突)。建议 `git rebase main` 后再继续。"
+                    f"无法预演冲突)。建议用 `git_worktree_sync` 同步后再继续。"
                 )
         except Exception:
             pass  # fail-quiet: 预警绝不影响存档
