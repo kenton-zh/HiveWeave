@@ -24,7 +24,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from typing import Any
+
+import structlog
 
 # Re-exports so business code never needs ``import subprocess`` itself
 # (tests/test_spawn_funnel_guard.py bans the import outside this module).
@@ -155,8 +158,12 @@ _GIT_CLEAN_KEYS = (
 
 _HOOKS_DIR: str | None = None
 _HARDENING_PAIRS: list[tuple[str, str]] | None = None
+# 降级告警只打一次（失败不缓存 ⇒ 否则故障期每个 spawn 一条 warning）
+_DEGRADED_WARNED = False
 # 幂等标记：让 apply_git_hardening 对同一 env 只生效一次（并让子进程能自证）
 GIT_HARDENING_MARK = "HIVEWEAVE_GIT_HARDENED"
+
+log = structlog.get_logger(__name__)
 
 
 def _empty_hooks_dir() -> str | None:
@@ -209,14 +216,77 @@ def _hardening_pairs_cached() -> list[tuple[str, str]]:
     **仅在 hooksPath 解析成功时写入缓存**：否则会把「一次失败（数据根不可用）」
     钉成进程级永久状态，与 `_empty_hooks_dir` 承诺的「失败不缓存、下次 spawn
     重试」自相矛盾（复审 2026-09-14 M3）。
+
+    0-3：解析失败这条路径此前**完全静默**（`_empty_hooks_dir` 在
+    `git_hardening_pairs` 里被 `if hooks:` 直接跳过）—— 于是「本次只注入了
+    7 个键里的一部分」与「注入了全套」在数据上长得一样。这与本仓「静默失效
+    是一等缺陷」冲突 ⇒ 补一条可 grep 的降级事件（**不改行为**：仍然照常注入
+    其余键、仍然不缓存失败结果）。
+
+    ⚠ **只告警一次**（0-3 审计）：失败不缓存 ⇒ 不加这个闸门的话，数据根不可用
+    期间**每个 git/shell spawn 都打一条** warning（实测 3 次 spawn → 3 条）。
+    故障期日志洪水会把真正要看的东西淹掉。后续每次降 `debug`，并带
+    `repeat=True` 便于按需排查。
     """
-    global _HARDENING_PAIRS
+    global _HARDENING_PAIRS, _DEGRADED_WARNED
     if _HARDENING_PAIRS is not None:
         return _HARDENING_PAIRS
     pairs = git_hardening_pairs()
     if any(key == "core.hooksPath" for key, _ in pairs):
         _HARDENING_PAIRS = pairs
+    elif not _DEGRADED_WARNED:
+        _DEGRADED_WARNED = True
+        log.warning(
+            "git_hardening_degraded",
+            missing_key="core.hooksPath",
+            reason="platform data root unavailable — hooks path not pinned; "
+            "the other hardening keys are still injected and the failure is "
+            "not cached (next spawn retries). Further occurrences log at "
+            "debug.",
+        )
+    else:
+        log.debug("git_hardening_degraded", missing_key="core.hooksPath",
+                  repeat=True)
     return pairs
+
+
+def git_hardening_applies(
+    args: tuple[Any, ...] | list[Any] | None = None,
+    *,
+    always: bool = False,
+    shell: bool = False,
+) -> bool:
+    """本次 spawn **是否会**带 git 加固配置。
+
+    ⚠ **用途有限，别把它当事实位用**：它回答的是"按判据应不应该加固"，
+    而回执/落库要的是**实测**值 —— 那个由 `git_hardened(env)` 读标记得出
+    （`bash._run_native` 与 `spawn_confined` 都是先 apply 再读，不是拿本函数
+    的结果充数）。本函数存在的理由是**单一判据**：`_with_git_hardening` 与
+    测试共用同一段判定，避免"判据两处各写一份"。
+
+    ⚠ 传 `str` 会**抛 TypeError**：`tuple("cmd /c git status")` 会退化成逐字符
+    元组、head 是 `'c'` ⇒ 静默 `False`。公开函数的误用不该无声（fail loud）。
+    """
+    if isinstance(args, str):
+        raise TypeError(
+            "git_hardening_applies expects an argv sequence, not a raw string "
+            "(pass a list/tuple; a bare string silently degrades to per-char "
+            "iteration and always returns False)"
+        )
+    if always or shell:
+        return True
+    return _argv_needs_git_hardening(tuple(args or ()))
+
+
+def git_hardened(env: Mapping[str, Any] | None) -> bool:
+    """读**已构造好的** env：它是否带了 git 加固（消费者侧唯一读法）。
+
+    与 `apply_git_hardening` 配对：后者写标记，本函数读标记 —— 这样
+    「本次命令注入了加固配置」是一个**可测的状态**，而不是对代码路径的推断。
+    """
+    if not env:
+        return False
+    return str(env.get(GIT_HARDENING_MARK) or "") == "1"
 
 
 def _count_base(env: dict[str, str]) -> int:
@@ -288,7 +358,9 @@ def _with_git_hardening(
     dev server）/ argv 首参是 git 或 shell 入口。
     走 shell 就一定加固 —— 命令行里跑不跑 git 无法预知。
     """
-    if not (always or kwargs.get("shell") or _argv_needs_git_hardening(args)):
+    if not git_hardening_applies(
+        args, always=always, shell=bool(kwargs.get("shell"))
+    ):
         return kwargs
     base = kwargs.get("env")
     out = dict(kwargs)

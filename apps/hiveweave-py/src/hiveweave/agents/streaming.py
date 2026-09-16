@@ -334,6 +334,9 @@ async def on_tool_call(
                 # `acl_sandbox.entry.spawn_agent_command` 无条件盖戳（含原生
                 # 分支）；非 spawn 工具没有该键 ⇒ None ⇒ 列留 NULL（不适用）。
                 enforcement=result.get("enforcement"),
+                # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
+                # 工具层给不出（None）⇒ 列留 NULL = 不适用/未判定，不回填 0。
+                git_hardened=result.get("git_hardened"),
             )
         except Exception as e:
             log.debug("run_ledger.step_end_failed", error=str(e))

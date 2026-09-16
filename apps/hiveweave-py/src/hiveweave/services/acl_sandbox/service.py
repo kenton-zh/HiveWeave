@@ -1063,6 +1063,12 @@ async def spawn_confined(
         try:
             env = _build_sandbox_env(
                 workdir, policy.cache_dir, policy.temp_dir, env_extra)
+            # 0-3：把「这份 env 到底带没带 git 加固」读成事实位随结果上报。
+            # `_build_sandbox_env` 末尾调 `apply_git_hardening`（幂等），所以这里
+            # 读到的是**实际**写进子进程的那份 env —— 不是对代码路径的推断。
+            from hiveweave.util.win_subprocess import git_hardened as _gh_env
+
+            _git_hardened = _gh_env(env)
             runner = _ensure_runner()
             if long_running:
                 job = await runner.run_long_running(
@@ -1079,6 +1085,7 @@ async def spawn_confined(
                     "private_cache_dir": os.path.join(
                         policy.temp_dir, "cache"
                     ),
+                    "git_hardened": _git_hardened,
                     **decision.stamp(boundary_root=policy.boundary_root),
                 }
             result = await runner.run_foreground(
@@ -1087,6 +1094,7 @@ async def spawn_confined(
             )
             result = {
                 **(result or {}),
+                "git_hardened": _git_hardened,
                 **decision.stamp(boundary_root=policy.boundary_root),
             }
         finally:

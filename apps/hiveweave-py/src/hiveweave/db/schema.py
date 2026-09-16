@@ -620,7 +620,8 @@ PROJECT_DB_TABLES = [
         outcome_unknown INTEGER DEFAULT 0,
         not_started INTEGER DEFAULT 0,
         started INTEGER DEFAULT 0,
-        enforcement TEXT
+        enforcement TEXT,
+        git_hardened INTEGER
     )
     """,
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
@@ -694,6 +695,18 @@ PROJECT_DB_TABLES = [
     # ⚠ **不写 DEFAULT**：非 spawn 类工具与升级前遗留行必须是 NULL
     # （= 不适用/未判定）；回填成 'native' 会把"没这条信息"说成"确认无沙箱"。
     """ALTER TABLE run_steps ADD COLUMN enforcement TEXT""",
+    # 0-3（2026-09-16）：**让 `HIVEWEAVE_GIT_HARDENED` 有消费者**。
+    # 该标记由 `util/win_subprocess.apply_git_hardening` 写进 spawn 的 env，
+    # 但此前除"注入器自证幂等"外**零下游** ⇒ git 自毁时无法归因
+    # （实证 #23：22 次 `external diff died` 全发生在 agent 自己的 shell 里，
+    #  而事后无法回答"那次 git 到底有没有跑在加固环境里"）。
+    # 本列 = 该次 spawn 的 env **实际**带没带加固（由 env 构造点读标记得出，
+    # 不是对代码路径的推断）。1/0 是确定值，NULL = 不适用/未判定（非 spawn 类
+    # 工具、spawn 失败未执行、升级前遗留行）。
+    # ⚠ **不写 DEFAULT**（同 `started` / `enforcement` 的理由）：SQLite 的
+    # `ADD COLUMN … DEFAULT 0` 会给**存量行回填 0**，把"没这条信息"说成
+    # "确认未加固" —— 那是假事实。新行由写入点显式给值。
+    """ALTER TABLE run_steps ADD COLUMN git_hardened INTEGER""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -875,7 +888,7 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     "run_steps": {
         "runner_failed", "command_failed", "injection_applied",
         "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
-        "started", "enforcement",
+        "started", "enforcement", "git_hardened",
     },
 }
 

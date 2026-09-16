@@ -86,12 +86,24 @@ _DECISIONS: dict[str, tuple[str, str]] = {
 }
 
 # 上报戳的键名（工具结果 / 日志共用一套，避免两处各起一个名字）。
+# ⚠ 这**只是** `SpawnDecision` 能产出的键：由
+# `test_sandbox_single_entry.py::test_stamp_keys_cover_every_reported_field`
+# 全等断言钉住（声明集 ≠ 实际产出集就会红）。不要往这里塞决策层产不出的键。
 ENFORCEMENT_STAMP_KEYS: tuple[str, ...] = (
     "enforcement",
     "enforcement_level",
     "enforcement_reason",
     "enforcement_boundary",
 )
+
+# **一次 spawn 的全部事实戳** = 决策层产出的执行面键 + 由 env 构造点产出的
+# 加固面键（0-3，2026-09-16）。工具层按这一组做透传，于是新增一种 spawn 面
+# 事实**只需要登记一次**（登记点在这里），不会长成"每个工具各列一份"。
+#
+# 为什么 `git_hardened` 不并进 `ENFORCEMENT_STAMP_KEYS`：`SpawnDecision` 拿不到
+# env（它发生在判定阶段，env 是在执行阶段构造的）—— 并进去会让上面那条全等
+# 断言要么变红、要么被迫放宽。放宽守卫不是修法。
+SPAWN_STAMP_KEYS: tuple[str, ...] = ENFORCEMENT_STAMP_KEYS + ("git_hardened",)
 
 
 @dataclass(frozen=True)

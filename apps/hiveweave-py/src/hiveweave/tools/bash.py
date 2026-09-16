@@ -634,10 +634,16 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
 
 
 def _enforcement_stamp(result: dict) -> dict[str, Any]:
-    """把唯一入口盖的执行面戳原样搬到最终结果（键名以 policy 为准，不另起名）。"""
-    from hiveweave.services.acl_sandbox.policy import ENFORCEMENT_STAMP_KEYS
+    """把唯一入口盖的 spawn 面戳原样搬到最终结果（键名以 policy 为准，不另起名）。
 
-    return {k: result[k] for k in ENFORCEMENT_STAMP_KEYS if k in result}
+    用 `SPAWN_STAMP_KEYS`（= 执行面 4 键 + 加固面 `git_hardened`）：新增一种
+    spawn 面事实只在 policy 那里登记一次 —— 这里的 `if k in result` 决定
+    「没这条信息」时**不补默认值**（NULL/缺键 ≠ 说了否，与 run_steps 的
+    `COALESCE` 语义对齐）。
+    """
+    from hiveweave.services.acl_sandbox.policy import SPAWN_STAMP_KEYS
+
+    return {k: result[k] for k in SPAWN_STAMP_KEYS if k in result}
 
 
 def _native_shaped(result: dict) -> dict[str, Any]:
@@ -1756,6 +1762,19 @@ async def _run_native(
 
     env = _build_safe_env(cwd)
 
+    # 0-3：**这里就把 git 加固落进 env，并把它读成事实**（而不是等下层的漏斗
+    # 顺手注入、事后靠推断）。`apply_git_hardening` 是幂等的（带自证标记，
+    # 见 `win_subprocess`），所以下层 `hidden_exec` 再调一次是 no-op —— 子进程
+    # 拿到的环境逐字节不变，换来的是一条**可测的**事实位：这次命令到底有没有
+    # 带加固配置。没有消费者的事实位就是日志，这正是本条要治的病。
+    from hiveweave.util.win_subprocess import (
+        apply_git_hardening,
+        git_hardened as _git_hardened_env,
+    )
+
+    env = apply_git_hardening(env)
+    _git_hardened = _git_hardened_env(env)
+
     try:
         from hiveweave.util.win_subprocess import hidden_exec
 
@@ -1786,7 +1805,8 @@ async def _run_native(
     except asyncio.TimeoutError:
         await _kill_subprocess(proc)
         return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": True, "error": None}
+                "exit_code": None, "timed_out": True, "error": None,
+                "git_hardened": _git_hardened}
     except asyncio.CancelledError:
         await _kill_subprocess(proc)
         raise
@@ -1803,6 +1823,7 @@ async def _run_native(
         "exit_code": proc.returncode,
         "timed_out": False,
         "error": None,
+        "git_hardened": _git_hardened,
     }
 
 
@@ -3445,6 +3466,11 @@ async def _shell_tool_impl(
         for k in (
             "fact", "runner_failed", "command_failed", "injection_applied",
             "timeout_kind", "timeout_ms", "dialect_failed",
+            # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
+            # ⚠ 登记进白名单是**必须**的一步：只让 execute_bash 放进 result
+            # 而不登记此处，字段会在这一层被静默过滤（本仓踩过两次 ——
+            # runner_failed 与 dialect_failed 都因此恒 None）。
+            "git_hardened",
         )
         if result.get(k) is not None
     }
@@ -3477,12 +3503,33 @@ def _shell_tool_result(
     streak_hint: str = "",
     fact_flags: dict[str, Any] | None = None,
 ) -> ToolResult:
-    """Command ok + VERIFY belt reject must fail the tool, not look like a pass."""
+    """Command ok + VERIFY belt reject must fail the tool, not look like a pass.
+
+    ⚠ **观测位不随成败消失**（0-3 审计实测的真缺口）：成功分支原先只传
+    `public`，把 `fact_flags` 整个丢掉 ⇒ `injection_applied` / `git_hardened`
+    在**每一条成功命令**上都落 NULL，而这两列的文档写的是
+    「NULL = 不适用/未判定」—— 把"适用且成立"记成"不适用"就是 NULL 说谎。
+    ⇒ 成功分支改为**排除归因位后**原样透传：
+      · `fact` 是权威事实位，成功结果上必须是 None（不传）；
+      · `runner_failed` / `command_failed` 在成功结果上自相矛盾
+        （`result.py` 不变式 2 会直接抛）。
+    用**排除法**而不是再列一份白名单：新增一种观测位时不必回来登记第二处
+    （本仓栽在"每处各列一份清单"上不止一次）。
+    """
     if success:
         combined = _combine_attestation_output(output, banner, suffix)
         if _note_is_attest_rejected(suffix) or _note_is_attest_rejected(combined):
             return ToolResult.err(combined.strip(), **public)
-        return ToolResult.ok(combined, **public)
+        _ok_extra = (
+            {
+                k: v
+                for k, v in fact_flags.items()
+                if k not in ("fact", "runner_failed", "command_failed")
+            }
+            if fact_flags
+            else {}
+        )
+        return ToolResult.ok(combined, **{**public, **_ok_extra})
     err_msg = error or "Command failed"
     if streak_hint:
         err_msg = f"{err_msg}{streak_hint}"
@@ -3741,6 +3788,11 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
         for k in (
             "fact", "runner_failed", "command_failed", "injection_applied",
             "timeout_kind", "timeout_ms",
+            # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
+            # ⚠ 登记进白名单是**必须**的一步：只让 execute_bash 放进 result
+            # 而不登记此处，字段会在这一层被静默过滤（本仓踩过两次 ——
+            # runner_failed 与 dialect_failed 都因此恒 None）。
+            "git_hardened",
         )
         if result.get(k) is not None
     }

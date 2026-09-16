@@ -405,6 +405,7 @@ class RunLedger:
         timeout_kind: str | None = None,
         timeout_ms: int | None = None,
         enforcement: str | None = None,
+        git_hardened: bool | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -425,6 +426,13 @@ class RunLedger:
         任何信号（`start_dev_server` 从未接线而照样跑）。
         ⚠ 非 spawn 类工具（write_file 等）与遗留行一律 NULL = 「不适用/未判定」，
         不要回填成 ``native``（那会把"没这条信息"说成"确认无沙箱"）。
+
+        ``git_hardened``（0-3，2026-09-16）：该次 spawn 的 env **实际**带没带
+        平台的 git 加固配置（`HIVEWEAVE_GIT_HARDENED`）。它回答的是
+        「git 自毁时那次调用在不在加固环境里」——#23 的 22 次
+        `external diff died` 全发生在 agent 自己的 shell 里，而事后无从归因。
+        None = 不适用/未判定（非 spawn 工具、spawn 失败未执行）⇒
+        **不要回填成 0**，那会把"没这条信息"说成"确认未加固"。
         """
         now = _now_ms()
         if result_excerpt and len(result_excerpt) > 2048:
@@ -455,7 +463,7 @@ class RunLedger:
             # 或 NULL；不参与 COALESCE 组合语义（一条步骤只可能走一条路）。
             if any(v is not None for v in (
                 runner_failed, command_failed, injection_applied,
-                timeout_kind, timeout_ms, enforcement,
+                timeout_kind, timeout_ms, enforcement, git_hardened,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -466,7 +474,8 @@ class RunLedger:
                     "injection_applied = COALESCE(?, injection_applied), "
                     "timeout_kind = COALESCE(?, timeout_kind), "
                     "timeout_ms = COALESCE(?, timeout_ms), "
-                    "enforcement = COALESCE(?, enforcement) "
+                    "enforcement = COALESCE(?, enforcement), "
+                    "git_hardened = COALESCE(?, git_hardened) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -480,6 +489,7 @@ class RunLedger:
                     timeout_kind,
                     timeout_ms,
                     enforcement,
+                    None if git_hardened is None else (1 if git_hardened else 0),
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层
