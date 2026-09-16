@@ -73,6 +73,25 @@ log = structlog.get_logger(__name__)
 #:
 #: 每条都对应一个已被实测观察到的出口（见各条注释的出处）。
 #: 匹配是**大小写不敏感的子串**匹配（对齐 DSH 的 `fatalSignatures` 语义）。
+#:
+#: ⚠ **E19 收窄（2026-09-16，实测驱动）**：本表跑的是**归一化后的子串**匹配，
+#: 而匹配对象是**含命令 stdout/stderr 的整段回执** ⇒ 一旦 needle 是常见英文词，
+#: 它就会命中**命令的输出内容**，把「命令跑了但失败」误报成「命令从未执行」。
+#: 用 58/59 的真实数据在**有位可判**的行上量（位 = 地面真值）：
+#:   文本层判 `runner_failed` 的 35 行（58）/ 40 行（59）里，
+#:   与位（`command_failed`）**冲突 12 行（34%）/ 24 行（60%）**。
+#: ⚠ **口径（审计 D1）**：这是**纯函数度量**，不是 36 次生产误标 ——
+#: 那些行都带 `command_failed` 位而 `blocked=False`，而文本表**只在 blocked
+#: 分支被咨询** ⇒ 生产上它们走的是位、根本没问文本。所以准确的说法是
+#: 「文本层**若被咨询**会误报 36 次」。收窄它仍然必要：文本表正是**位缺失**
+#: 时（`blocked=False` + 无位 + 有 error，走 `assert_fact_complete` 兜底那条）
+#: 唯一可能被用到的判据源，而那些行恰恰没有地面真值可查。
+#:   冲突行命中的 needle 只有 4 个：`"spawn"` ×25、`"approval"` ×6、
+#:   `"permission"` ×4、`"does not exist"` ×1。它们的现场是命令输出里的
+#:   `post-approval cleanup`、`Permission denied`、`fatal: cannot create directory` 等
+#:   ——**全是内容，不是平台护栏文案**。
+#: ⇒ 这 4 条按「是否只可能出现在**平台自产**文案里」重写（其余条目实测零冲突，
+#:   本批不动 —— 不做没有数据的"顺手清理"）。
 RUNNER_FAILURE_SIGNATURES: tuple[str, ...] = (
     # ── B 组：命令安全 / 封印护栏（bash.py execute_bash / run_command）──
     "command blocked",                     # 自毁/敏感路径/.hiveweave 系统目录
@@ -86,19 +105,47 @@ RUNNER_FAILURE_SIGNATURES: tuple[str, ...] = (
     "沙箱不可用",                           # SandboxUnavailableError（fail-closed）
     # ── D 组：方言 gate（命令没跑）──
     "not available in this shell",
-    "not recognized as",
-    "does not exist",
-    "dialect",
+    # ⚠ E19 审计 D2：原表此处有 `"not recognized as"`，**删** —— 实测它在
+    # 58/59 命中的 8 段文本**全部**同时命中上面那条（边际覆盖 = 0），
+    # 而它出现在平台 gate 文案的**括号说明**里（`bash.py` 的
+    # `running them yields "not recognized as ... cmdlet"`），不是任何出口的主判据。
+    # ⚠ E19：原表此处有裸 `"does not exist"` 与裸 `"dialect"`。
+    #   · `"does not exist"` **删**：cwd 类平台文案由上面那条更具体的
+    #     `"working directory does not exist"` 覆盖；留着只会命中命令输出
+    #     （实测现场：`fatal: cannot create directory at ...` 附近）。
+    #   · `"dialect"` **删**：平台**错误文案**里根本没有这个词（它只出现在
+    #     日志事件名与 docstring 里），即"零验证覆盖 + 潜在误命中"。
     # ── E 组：spawn / runner 自身故障 ──
     "no tool executor",
     "[no tool executor]",
-    "spawn",
-    "failed to start",
+    # ⚠ E19：原为裸 `"spawn"`（实测在**有位可判**的行上冲突 25 次）。
+    # 收窄到**平台自己的两种措辞**（`process_registry.py:989` 的
+    # `Failed to spawn: …` 与 `bash.py:1792` 的 `Failed to spawn shell: …`）。
+    # ⚠ 残余（如实登记）：命令自己的输出若恰好含这两串（如 npm 的
+    # `Failed to spawn child process` 不命中，但含 `Failed to spawn:` 的会）
+    # 仍会被判成 runner —— 这是**文本层当兜底**的固有上限，不靠继续堆词解决。
+    "failed to spawn:",
+    "failed to spawn shell",
+    "failed to start",                     # `dev_server_tools.py:410/434`（实测零冲突）
     "cannot find the path",
-    # ── A 组：审批通道（从未派发）──
-    "permission",
-    "approval",
-    "审批",
+    # ── A 组：审批通道 / 权限拒绝（从未派发）──
+    "approval_channel_unavailable",        # ⚠ E19：原为裸 `"approval"`（实测冲突 6×，
+                                           #    现场是命令输出里的 `post-approval cleanup`）
+    "审批",                                 # 审批通道超时的中文文案（平台自产）
+    # ⚠ E19：原表有裸 `"permission"`，**换成平台自己的两种措辞**（实测冲突 4×，
+    # 现场是命令输出里的 `Permission denied` / `Access is denied` —— 那是**业务失败**，
+    # 命令跑了）。下面两条逐字来自平台源码，不是猜的：
+    #   · `executor.py:3355` / `pipeline.py:421` 的 `f"Permission rejected: {exc}"`
+    #   · `executor.py:3284` / `pipeline.py:336` 的 `f"Error: Permission check failed: {exc}"`
+    # ⚠ 刻意**不**收 `"permission denied:"`：那是 `org_tools.py:1588` 的平台文案，
+    # 但也正是**命令 stderr 的高频措辞**（`Permission denied: /path`）⇒ 收它会立刻
+    # 把 E19 的老毛病带回来。代价是那一条出口只能靠**位**兜（审计 C3 订正：
+    # `pipeline.py:336` 的 `ToolResult.err(...)` **确实不带 fact**，
+    # 所以我原先写的"那几条路径本来就显式置了 fact"只对
+    # `executor.py:3284/3355`、`pipeline.py:421` 成立，不是全部）——
+    # 这条取舍留在「残余」，不在本批扩表。
+    "permission rejected:",
+    "permission check failed:",
 )
 
 #: 调用方参数错的专属签名（L6）。
@@ -391,8 +438,6 @@ SHELL_SECURITY_LEVEL_TOOLS: frozenset[str] = frozenset({
 def finalize_tool_result(
     tool_name: str,
     raw: dict | object,
-    *,
-    judge_blocked: bool = True,
 ) -> dict:
     """**唯一收口**：把工具返回归一为契约 dict，并保证事实位完整。
 
@@ -402,16 +447,30 @@ def finalize_tool_result(
     失败**，恰好全在它覆盖之外。故本函数必须在**两条执行器各自的
     normalize 尾**都被调用。
 
-    **归因阶梯（#15，2026-09-14；顺序即判据）**：`judge_blocked=True`、结果
+    **归因阶梯（#15，2026-09-14；顺序即判据）**：结果
     **失败**且**未声明 fact** 时补位，顺序＝
     **布尔位 → 文本签名表 → 代码作用域（`timeout_kind=="wait"`）→ 不猜
     （`outcome_unknown`）**；位缺失且文本未命中时另落一条 fail-loud 样本
     （见 :func:`note_unclassified_sample`，payload 同时进
     `out["unclassified_sample"]` 供调用方落库）。
 
-    `judge_blocked=False` 用于只做形状归一、不参与事实位归因的调用点。
+    ⚠ **E21（2026-09-16）：原来的 `judge_blocked: bool = True` 开关已删除**。
+    它是个**潜式 opt-out**：任何调用方传 False 就能静默跳过整个归因阶梯，
+    而**没有任何一处会因此报警**（守卫只看"该出口声明的 fact 是否合法"，
+    不看"它有没有走归因"）。全仓核查过：**没有任何调用方传过 False**
+    （`grep -rn "judge_blocked=" ` 只命中定义与文档）⇒ 它是一枚**休眠的
+    旁路**，删掉零影响、留着是隐患。约束应当"住在做那件事的操作内部"，
+    而不是做成一个可被调用方悄悄关掉的参数。
     """
     from hiveweave.tools.result import ToolResult, finalize_fact_dict
+
+    # E23：分母（本收口判过多少次）—— 与样本分子配对才构成"比例"。
+    try:
+        from hiveweave.llm.unknown_error_samples import note_judgement
+
+        note_judgement("fact_position")
+    except Exception:  # noqa: BLE001 — 计数绝不打断收口
+        pass
 
     unclassified: dict = {}
     if isinstance(raw, ToolResult):
@@ -464,7 +523,7 @@ def finalize_tool_result(
     # **严格性由 commit gate 保留**：`test_fact_positions_coverage.py` 对签名表
     # 本身的失配仍以断言封死；`classify_blocked_fact()` 作为**纯函数入口**依旧
     # fail loud（生产路径走本函数的 fail-soft 兜底）。
-    if judge_blocked and not declared and not r.success:
+    if not declared and not r.success:
         bit_fact = fact_from_bits(r)
         if r.blocked:
             # blocked 只接受**平台侧成因**的两格（`tools/result.py::_BLOCKED_FACT_KINDS`）：
@@ -512,7 +571,7 @@ def finalize_tool_result(
                 fact=bit_fact,
                 bits=sorted(state_bits(r)),
             )
-    elif judge_blocked and declared and not r.success:
+    elif declared and not r.success:
         # **只观测、不夺声明权**（#15 审计 7(a)）：构造点声明了 fact 时，
         # 位核对/文本核验/样本**全被跳过**（见上面的 `if ... and not declared`）。
         # 这是 #15 要治的「自我声明当证据」在同一层重新开口 —— 我们不改变归因
@@ -536,66 +595,76 @@ def finalize_tool_result(
     if unclassified:
         # 调用方拿得到 agent_id ⇒ 由它落 agent_events（本函数是同步的、不猜 id）
         out["unclassified_sample"] = unclassified
-    if tool_name in SHELL_SECURITY_LEVEL_TOOLS or judge_blocked:
-        # ⚠ 同上方事实位归因段（:442-459）已确立的原则（**fail loud 但不 fail hard**）：
-        # `assert_fact_complete` 过去在这里**硬抛 AssertionError**，而本函数在
-        # executor 的第 4 步、**dispatch 的 try/except 之外**被调用 ⇒ 未捕获异常
-        # 会砸穿整条工具调用。实测（TEST_DSH_55 P0-3）：55 步以
-        # `[Tool Error] AssertionError: shell tool 'X' failed without a fact
-        # position` 形式炸出，并打断 agents/streaming.py 的 record_step_end ⇒
-        # 115 步滞留 status='running' 后被 sweep 误判 outcome_unknown。
-        # 现改为与 blocked 分支同构：记 ERROR 日志（CI/审计可捞）+ 兜底
-        # `outcome_unknown`（语义=「结果未知：已记录但完成结果未持久化」）。
-        # ⚠ **不得兜底 `runner_failed`**（=「命令从未执行」⇒ 下游读成「无副作用、
-        # 可直接重试」）：本函数的触发点在**执行之后**（normalize 尾），命令可能
-        # 已执行，标它会诱发**副作用双发**（审计 P0-3 第 1 条）。
-        # **严格性仍由 commit gate 保留**：`test_fact_positions_coverage.py`
-        # 对签名表本身的失配依旧以断言封死。
-        try:
-            assert_fact_complete(tool_name, out)
-        except AssertionError as exc:
-            log.error(
-                "fact_position_missing_at_finalize",
+    # ⚠ **对所有工具都跑，不是只对 shell 家族**（E21 审计 M1，2026-09-16）。
+    # 旧写法是 `if tool_name in SHELL_SECURITY_LEVEL_TOOLS or judge_blocked:`，
+    # 而 `judge_blocked` **恒为 True**（全仓无调用方传 False）⇒ 条件恒真。
+    # 删掉那个参数时若把它"顺手收窄成 shell 家族"，会付两笔代价：
+    #   ① 打红 `tests/test_p0_3_orphan_root_cause.py` —— 非 shell 工具拿不到
+    #      兜底 `outcome_unknown` ⇒ `out` 连 `fact` 键都没有；
+    #   ② 掐断 `fact_position` 族样本的**唯一来源**：58/59 实测 104 条
+    #      未分类样本 **100% 来自非 shell 工具**（list_files/read_file/
+    #      git_worktree_sync/submit_task/commit_turn/…）⇒ E23 新加的分母
+    #      会结构性对应一个恒 0 的分子。
+    # ⇒ 结论：这里**没有**开关，也不该有。
+    # ⚠ 同上方事实位归因段（:442-459）已确立的原则（**fail loud 但不 fail hard**）：
+    # `assert_fact_complete` 过去在这里**硬抛 AssertionError**，而本函数在
+    # executor 的第 4 步、**dispatch 的 try/except 之外**被调用 ⇒ 未捕获异常
+    # 会砸穿整条工具调用。实测（TEST_DSH_55 P0-3）：55 步以
+    # `[Tool Error] AssertionError: shell tool 'X' failed without a fact
+    # position` 形式炸出，并打断 agents/streaming.py 的 record_step_end ⇒
+    # 115 步滞留 status='running' 后被 sweep 误判 outcome_unknown。
+    # 现改为与 blocked 分支同构：记 ERROR 日志（CI/审计可捞）+ 兜底
+    # `outcome_unknown`（语义=「结果未知：已记录但完成结果未持久化」）。
+    # ⚠ **不得兜底 `runner_failed`**（=「命令从未执行」⇒ 下游读成「无副作用、
+    # 可直接重试」）：本函数的触发点在**执行之后**（normalize 尾），命令可能
+    # 已执行，标它会诱发**副作用双发**（审计 P0-3 第 1 条）。
+    # **严格性仍由 commit gate 保留**：`test_fact_positions_coverage.py`
+    # 对签名表本身的失配依旧以断言封死。
+    try:
+        assert_fact_complete(tool_name, out)
+    except AssertionError as exc:
+        log.error(
+            "fact_position_missing_at_finalize",
+            tool=tool_name,
+            error_preview=(str(out.get("error") or ""))[:200],
+            fallback="outcome_unknown",
+            action=(
+                "构造点未声明 fact —— 见 fixplan 批次 2 §1.4a；"
+                "不得让断言逃逸到运行时"
+            ),
+            detail=str(exc)[:300],
+        )
+        # 兜底格是 `outcome_unknown`（=「结果未知」），**不是** runner_failed：
+        # 后者语义为「命令从未执行」⇒ 下游读成「无副作用、可直接重试」。而
+        # 本函数的触发点在**执行之后**（normalize 尾）⇒ 命令可能已执行，标
+        # runner_failed 等于给「可能已有副作用」的步骤发安全重试通行证
+        # （审计 P0-3 第 1 条；本仓库纪律：事实位错标 ⇒ 副作用双发）。
+        out["fact"] = "outcome_unknown"
+        # #15 审计：这条兜底（非 blocked 且构造点漏声明 fact）过去**只记日志、
+        # 不产样本** ⇒ fail-loud 有两条通道、其中一条是哑的。统一到同一条：
+        # 判不出来就产样本，由调用方（`_f10_result_hooks`）落 agent_events。
+        if "unclassified_sample" not in out:
+            out["unclassified_sample"] = note_unclassified_sample(
                 tool=tool_name,
-                error_preview=(str(out.get("error") or ""))[:200],
-                fallback="outcome_unknown",
-                action=(
-                    "构造点未声明 fact —— 见 fixplan 批次 2 §1.4a；"
-                    "不得让断言逃逸到运行时"
-                ),
-                detail=str(exc)[:300],
+                error=str(out.get("error") or ""),
+                status=None,
+                # ⚠ 传 `r`（构造点声明的原始位），**禁止改成 `bits=out`** ——
+                # 错法随取样点而变，两种都要防：
+                # ① **就地**用 `out`：`to_dict()` 已把派生键 pop 掉
+                #    （实测 `bits=out` → `['blocked', 'dialect_failed']`）
+                #    ⇒ 恰好**丢掉**最该留的 `runner_failed`（丢证据）；
+                # ② 把取样**挪到 `finalize_fact_dict()` 之后**再传 `out`
+                #    （这是看似的顺理成章改动）：那时派生键按 `fact`
+                #    **重新派生**，`runner_failed` 的 False 是**由归因结果倒推**
+                #    出来的、并非构造点的声明 ⇒ 样本会显示「构造点显式声明
+                #    runner_failed=False」，即**归因结果伪装成构造点的声明**
+                #    —— 把诊断引向反面，比不记还糟。
+                # ⇒ 无论取样点挪到哪，都只传 `r`（位在 `extra` 里，`to_dict` 不清它）。
+                # 与 blocked 分支的 `bits=r` 对称（此前这里传 None ⇒ 样本里
+                # `bits_present={}`，把「显式声明 False」与「啥也没说」混为一谈，
+                # 正是 `bits_present` 带值要解决的那个歧义）。
+                bits=r,
             )
-            # 兜底格是 `outcome_unknown`（=「结果未知」），**不是** runner_failed：
-            # 后者语义为「命令从未执行」⇒ 下游读成「无副作用、可直接重试」。而
-            # 本函数的触发点在**执行之后**（normalize 尾）⇒ 命令可能已执行，标
-            # runner_failed 等于给「可能已有副作用」的步骤发安全重试通行证
-            # （审计 P0-3 第 1 条；本仓库纪律：事实位错标 ⇒ 副作用双发）。
-            out["fact"] = "outcome_unknown"
-            # #15 审计：这条兜底（非 blocked 且构造点漏声明 fact）过去**只记日志、
-            # 不产样本** ⇒ fail-loud 有两条通道、其中一条是哑的。统一到同一条：
-            # 判不出来就产样本，由调用方（`_f10_result_hooks`）落 agent_events。
-            if "unclassified_sample" not in out:
-                out["unclassified_sample"] = note_unclassified_sample(
-                    tool=tool_name,
-                    error=str(out.get("error") or ""),
-                    status=None,
-                    # ⚠ 传 `r`（构造点声明的原始位），**禁止改成 `bits=out`** ——
-                    # 错法随取样点而变，两种都要防：
-                    # ① **就地**用 `out`：`to_dict()` 已把派生键 pop 掉
-                    #    （实测 `bits=out` → `['blocked', 'dialect_failed']`）
-                    #    ⇒ 恰好**丢掉**最该留的 `runner_failed`（丢证据）；
-                    # ② 把取样**挪到 `finalize_fact_dict()` 之后**再传 `out`
-                    #    （这是看似的顺理成章改动）：那时派生键按 `fact`
-                    #    **重新派生**，`runner_failed` 的 False 是**由归因结果倒推**
-                    #    出来的、并非构造点的声明 ⇒ 样本会显示「构造点显式声明
-                    #    runner_failed=False」，即**归因结果伪装成构造点的声明**
-                    #    —— 把诊断引向反面，比不记还糟。
-                    # ⇒ 无论取样点挪到哪，都只传 `r`（位在 `extra` 里，`to_dict` 不清它）。
-                    # 与 blocked 分支的 `bits=r` 对称（此前这里传 None ⇒ 样本里
-                    # `bits_present={}`，把「显式声明 False」与「啥也没说」混为一谈，
-                    # 正是 `bits_present` 带值要解决的那个歧义）。
-                    bits=r,
-                )
     # 裸字典路径可能带进陈旧的 runner_failed/command_failed —— 由 fact 统一
     return finalize_fact_dict(out)
 

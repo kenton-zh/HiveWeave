@@ -143,11 +143,62 @@ def unknown_sample_total() -> int:
     return _total
 
 
+# ── E23（2026-09-16）：**分母**与比例 ───────────────────────────────
+#
+# 原来只有分子（`_total`）：能看见"有多少条不认识"，但答不出
+# "**判据的覆盖率是多少**" ⇒ 也就没人能判断"要不要重建判据、还是本来就该这样"。
+# 分母在**做判定的那一步**记（每个判定动作调一次 `note_judgement`），
+# 于是"分母漏记"与"真的没判定"在数据上不同形（本仓对"看似有指标"过敏）。
+_JUDGED_BY_FAMILY: dict[str, int] = {}
+
+
+def note_judgement(family: str) -> None:
+    """记一次**判定动作**（分母）。`family` 是闭合的判定入口名。
+
+    ⚠ 只记次数、不记内容（内容属样本侧）；本函数**永不抛**（挂在主路径上）。
+    """
+    try:
+        key = str(family or "unknown")
+        _JUDGED_BY_FAMILY[key] = _JUDGED_BY_FAMILY.get(key, 0) + 1
+    except Exception:  # noqa: BLE001 — 计数绝不打断主路径
+        pass
+
+
+def unknown_sample_stats() -> dict[str, Any]:
+    """样本总量 + 分族判定次数 + **比例**（E23）。
+
+    ⚠ **键名刻意不叫 `ratio`**（审计 D5）：分子与分母**不同源** ——
+    分子 `total` 来自 4 个 `note_unknown_sample` 调用点，分母来自 2 个
+    `note_judgement` 调用点；而 `fact_position` 族的样本走的是**另一个**
+    计数器（`note_unclassified_sample` → `agent_events`），不进 `total`。
+    混成一个 `ratio` 会被读成"覆盖率"（58 的量级 ≈ 1.4% ⇒ 看着很好），
+    而这正是 E23 要防的误读 ⇒ 按族看请用 `judgedByFamily` + `bySource`。
+
+    `judged == 0` 时返回 ``None`` —— **不返回 0.0**：
+    0 会被读成"覆盖率完美"，而真相是"还没有数据"（本仓对"用默认值冒充结论"
+    的既有教训）。
+    """
+    judged = sum(_JUDGED_BY_FAMILY.values())
+    by_source: dict[str, int] = {}
+    for s in _samples:
+        src = str(s.get("source") or "unknown")
+        by_source[src] = by_source.get(src, 0) + 1
+    return {
+        "total": _total,
+        "buffered": len(_samples),
+        "bySource": by_source,
+        "judgedByFamily": dict(sorted(_JUDGED_BY_FAMILY.items())),
+        "judged": judged,
+        "unknownPerJudgedCall": None if not judged else round(_total / judged, 4),
+    }
+
+
 def clear_unknown_samples() -> None:
     """清空缓冲与计数（测试用；生产不调用）。"""
     global _total
     _samples.clear()
     _total = 0
+    _JUDGED_BY_FAMILY.clear()
 
 
 async def flush_unknown_samples(agent_id: str) -> int:

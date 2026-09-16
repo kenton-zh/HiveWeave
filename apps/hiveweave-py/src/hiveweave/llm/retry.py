@@ -239,6 +239,11 @@ def classify_http_error(
         message = f"HTTP {status}: {snippet}"
     else:
         message = snippet
+    # E23（2026-09-16）：记**分母** —— 「这一层判过多少次」。没有它，
+    # 样本数只是分子，答不出"不认识占多大比例"。
+    from hiveweave.llm.unknown_error_samples import note_judgement
+
+    note_judgement("http_error")
     # 地域类错误确定性不可恢复：即使状态码/文案恰好命中可重试模式
     # （如 body 里夹带 "server error"），也不重试 —— 退避只会把 7s
     # 快死拖成 476s 慢死。

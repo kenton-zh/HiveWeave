@@ -181,13 +181,22 @@ async def debug_workspaces(
 
 @router.get("/metrics")
 async def debug_metrics() -> dict:
-    """P2 observability counters (wake / no-progress / inbox dedupe)."""
+    """P2 observability counters (wake / no-progress / inbox dedupe).
+
+    ⚠ **E23（2026-09-16）**：这里另挂了「判据认不出来」的**比例**指标 ——
+    此前样本能落库（`agent_events` 里看得见每条），但**没有分母**，
+    于是答不出"覆盖率是多少"、也就没人能判断"该重建判据还是本来就该这样"。
+    分子 = 样本累计数；分母 = 各判定入口记的**判定次数**（`judgedByFamily`
+    可看出分母漏没漏记 —— 漏记与实际没判定必须不同形）。
+    """
+    from hiveweave.llm.unknown_error_samples import unknown_sample_stats
     from hiveweave.services import process_registry as preg
     from hiveweave.services.telemetry import telemetry
 
     return {
         "counters": telemetry.snapshot_counters(),
         "processRegistrySize": len(preg._registry),
+        "unknownSamples": unknown_sample_stats(),
     }
 
 

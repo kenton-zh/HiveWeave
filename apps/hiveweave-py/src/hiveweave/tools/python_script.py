@@ -87,8 +87,14 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
             stdin=asyncio.subprocess.DEVNULL,
         )
     except (FileNotFoundError, OSError) as exc:
+        # M2/T2（2026-09-16）：**spawn 失败 = 命令从未执行** ⇒ 构造点声明位。
+        # 以前这里既没有位、也没有文本可兜（`python_script` 不在
+        # `SHELL_SECURITY_LEVEL_TOOLS` 里，且这两条出口 `blocked=False`），
+        # 于是落 `outcome_unknown`（"结果未知、别盲目重试"）—— 而
+        # `exit_code is None` 已经**明确**说明进程根本没起来。
         return {"output": "", "stdout": "", "stderr": "",
                 "exit_code": None, "timed_out": False,
+                "fact": "runner_failed",
                 "error": f"Failed to spawn python: {exc}"}
     try:
         if timeout_s is None or timeout_s <= 0:
@@ -235,6 +241,9 @@ async def python_script_execute(
             "exit_code": result.get("exit_code"),
             "timed_out": bool(result.get("timed_out", False)),
             "error": result.get("error"),
+            # 构造点声明的 fact must survive （M2/T2）：本处是**重建** dict，
+            # 不带过来等于位又被这一层吃掉。
+            **({"fact": result["fact"]} if result.get("fact") else {}),
             # 执行面戳随结果上报（落 run_steps.enforcement / 日志）
             **{k: v for k, v in result.items() if k.startswith("enforcement")},
         }
@@ -251,7 +260,13 @@ async def python_script_execute(
         pass
 
     if result.get("error"):
-        return ToolResult.err(f"python_script: {result['error']}")
+        # 位要跟着走（M2/T2）：`finalize_tool_result` 的归因阶梯**位优先于文本**，
+        # 只有把构造点声明的位带到这里，spawn 失败才会被判成 `runner_failed`
+        # 而不是靠（不可达的）文本兜底。
+        return ToolResult.err(
+            f"python_script: {result['error']}",
+            fact=result.get("fact"),
+        )
     if result["timed_out"]:
         return ToolResult.err(
             f"python_script: timed out after {int(timeout_s)}s; "

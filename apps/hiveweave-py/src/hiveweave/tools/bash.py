@@ -633,6 +633,22 @@ def _maybe_append_test_anchor_hint(command: str, error_msg: str) -> str:
     )
 
 
+#: shell 工具结果里**必须**透传到 ToolResult 的事实位/观测键 —— **单一清单**。
+#:
+#: ⚠ 两处出口（`_shell_tool_impl` 与 `run_command_tool`）曾**各列一份**，而
+#: `dialect_failed` 只在其中一份里 ⇒ `run_command` 的方言门失败会退化成通用
+#: "命令未运行（执行器/方言/权限/审批）"文案，而生产者
+#: （`execute_run_command` → `bash.py` 的 `"dialect_failed": True`）明明写了位。
+#: 这正是本仓自陈的复发形态（"每处各列一份清单"，事实位白名单上栽过两次），
+#: 故抽成常量：**新增位只改这里**（审计 T1，2026-09-16）。
+_SHELL_FACT_FLAG_KEYS: tuple[str, ...] = (
+    "fact", "runner_failed", "command_failed", "injection_applied",
+    "timeout_kind", "timeout_ms", "dialect_failed",
+    # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
+    "git_hardened",
+)
+
+
 def _enforcement_stamp(result: dict) -> dict[str, Any]:
     """把唯一入口盖的 spawn 面戳原样搬到最终结果（键名以 policy 为准，不另起名）。
 
@@ -666,6 +682,11 @@ def _native_shaped(result: dict) -> dict[str, Any]:
         "timed_out": bool(result.get("timed_out", False)),
         "error": result.get("error"),
     }
+    # 构造点声明的 fact 必须随归一化活下来（M2，2026-09-16）：spawn 失败那两条
+    # 出口现在显式声明 `runner_failed`，而本函数是**重建**一个新 dict ⇒
+    # 不带过来就等于位又被这一层悄悄吃掉（本仓在"归一化抹掉事实位"上栽过）。
+    if result.get("fact") is not None:
+        out["fact"] = result["fact"]
     out.update(_enforcement_stamp(result))
     return out
 
@@ -1787,13 +1808,22 @@ async def _run_native(
             stdin=asyncio.subprocess.DEVNULL,
         )
     except FileNotFoundError as exc:
-        return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": False,
-                "error": f"Failed to spawn shell: {exc}"}
+        # M2（2026-09-16）：**spawn 失败 = 命令从未执行** ⇒ 构造点直接声明位。
+        # 以前靠文本表兜（而文本表只在 `blocked` 分支被咨询、这两条出口
+        # `blocked=False` ⇒ **永不生效**），结果落 `outcome_unknown`（"结果未知、
+        # 别盲目重试"）而不是正确的 `runner_failed`。判据由**状态**给出：
+        # `exit_code is None` = 进程根本没起来。
+        return finalize_fact_dict({
+            "output": "", "stdout": "", "stderr": "",
+            "exit_code": None, "timed_out": False,
+            "fact": "runner_failed",
+            "error": f"Failed to spawn shell: {exc}"})
     except OSError as exc:
-        return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": False,
-                "error": f"Failed to spawn shell: {exc}"}
+        return finalize_fact_dict({
+            "output": "", "stdout": "", "stderr": "",
+            "exit_code": None, "timed_out": False,
+            "fact": "runner_failed",
+            "error": f"Failed to spawn shell: {exc}"})
 
     try:
         if timeout_s is None or timeout_s <= 0:
@@ -3463,15 +3493,7 @@ async def _shell_tool_impl(
     # 都踩过（后者直接导致 F10 方言归因回落到通用文案）。
     _ff = {
         k: result.get(k)
-        for k in (
-            "fact", "runner_failed", "command_failed", "injection_applied",
-            "timeout_kind", "timeout_ms", "dialect_failed",
-            # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
-            # ⚠ 登记进白名单是**必须**的一步：只让 execute_bash 放进 result
-            # 而不登记此处，字段会在这一层被静默过滤（本仓踩过两次 ——
-            # runner_failed 与 dialect_failed 都因此恒 None）。
-            "git_hardened",
-        )
+        for k in _SHELL_FACT_FLAG_KEYS
         if result.get(k) is not None
     }
     return _shell_tool_result(
@@ -3545,12 +3567,25 @@ def _shell_tool_result(
         _kw.update(fact_flags)
     # L3：fact 走具名参数（不再是 extra 里的裸键），避免与派生属性打架。
     _fact = _kw.pop("fact", None)
-    # 兼容旧调用方残留的 runner_failed 裸键 → 归一为 fact
-    if _fact is None and _kw.pop("runner_failed", None):
-        _fact = "runner_failed"
-    else:
-        _kw.pop("runner_failed", None)
-    _kw.pop("command_failed", None)
+    # 兼容旧调用方残留的裸键 → 归一为 fact。
+    # ⚠ **E20：两个位都要归一，且顺序确定** —— 原来只认 `runner_failed`
+    # （`command_failed=True` 被无条件 pop 掉 ⇒ **位永久丢失**：没有 fact 就
+    # 派生不出位，下游只看到"没有位"，于是回落到文本层兜底，而文本层在
+    # 有 stdout 的命令回执上是不可靠的）。对称化后两条路等价。
+    # `runner_failed` 优先于 `command_failed`：与 `_BIT_FACTS` /
+    # `attribution_of` 的既有顺序一致（**顺序单一实现**）。
+    # ⚠ 理由订正（审计 D3）：`runner_failed` 不是"更保守"，它是**乐观**信号 ——
+    # 下游把它读作「无副作用、可放心重试」，而保守格是 `outcome_unknown`
+    # （见 `fact_positions.finalize_tool_result` 的三处长注释）。
+    # ⚠ 两位同时为真本身是**矛盾声明**，这里静默吸收了（与 E21 要治的"静默"
+    # 同族）；实测 58/59 中 rf∧cf 的行数为 0 ⇒ 本批只留注释，不加告警。
+    _legacy_runner = _kw.pop("runner_failed", None)
+    _legacy_command = _kw.pop("command_failed", None)
+    if _fact is None:
+        if _legacy_runner:
+            _fact = "runner_failed"
+        elif _legacy_command:
+            _fact = "command_failed"
     if blocked:
         # H3: 平台护栏拒绝（Command blocked）≠ 模型空转 —— 标 blocked 供
         # stall 检测分流，文本/exit code 语义与 err 一致。
@@ -3785,15 +3820,7 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
     # F4/F7：工具执行事实位透传到 ToolResult
     _ff = {
         k: result.get(k)
-        for k in (
-            "fact", "runner_failed", "command_failed", "injection_applied",
-            "timeout_kind", "timeout_ms",
-            # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
-            # ⚠ 登记进白名单是**必须**的一步：只让 execute_bash 放进 result
-            # 而不登记此处，字段会在这一层被静默过滤（本仓踩过两次 ——
-            # runner_failed 与 dialect_failed 都因此恒 None）。
-            "git_hardened",
-        )
+        for k in _SHELL_FACT_FLAG_KEYS
         if result.get(k) is not None
     }
     return _shell_tool_result(
