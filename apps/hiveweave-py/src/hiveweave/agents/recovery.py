@@ -402,6 +402,24 @@ async def escalate_empty_response(agent: Any) -> None:
     agent._cancel_safety_timer()
     agent._reset_to_idle()
 
+def _llm_identity_fields(
+    status: int | None, provider: str, model: str
+) -> dict:
+    """错误事件/work_log 的「是谁的错 / 哪个模型」字段（#22）。
+
+    缺值**不补**默认（`None`/空串直接不出键）：`error_status=None` 与
+    `error_status=0` 语义完全不同，补一个默认值会把"没这条信息"说成"确认值"。
+    """
+    out: dict = {}
+    if status is not None:
+        out["error_status"] = status
+    if provider:
+        out["provider"] = provider
+    if model:
+        out["model"] = model
+    return out
+
+
 async def handle_error(
     agent: Any, error: Exception, partial_result: dict | None = None
 ) -> None:
@@ -416,6 +434,27 @@ async def handle_error(
     """
     error_msg = str(error)
     error_type = type(error).__name__
+
+    # #22（2026-09-16）：**错误要能回答「是谁的错 / 哪个模型」**。
+    # 现场：58/59 因 `RegionError`（HTTP 403「This model is not available in
+    # your country.」）停摆，而 agent_events 的 payload 只有
+    # `{error, error_type:"ValueError"}` ⇒ 事后无法定位是哪个模型被拦，
+    # 也无法把「该模型永久不可用」与「本次请求偶发失败」区分开。
+    # 三处来源，按可信度取：
+    #   ① `partial_result`（流层盖的"**实际使用**"的 provider/model，见
+    #      `llm/streamer/core.py` 的 `_stamp_error_identity`）；
+    #   ② 异常自带的 `status`（`PermanentError` / `RetryableError` 都带）；
+    #   ③ `agent.config`（未解析到时的配置值）—— 只作兜底。
+    _pr = partial_result if isinstance(partial_result, dict) else {}
+    _err_status = _pr.get("error_status")
+    if not isinstance(_err_status, int):
+        _err_status = getattr(error, "status", None)
+    if not isinstance(_err_status, int):
+        _err_status = None
+    _cfg = getattr(agent, "config", None)
+    _cfg = _cfg if isinstance(_cfg, dict) else {}
+    _provider = str(_pr.get("provider") or _cfg.get("provider_type") or "")
+    _model = str(_pr.get("model") or _cfg.get("model_id") or "")
 
     # E5: 断流类打断（SSL EOF / stream idle / tool-loop stalled …）置位降级
     # 标志——被打断后「续跑重验 vs 就地收口」的选择需要一个标记来拦截
@@ -453,6 +492,9 @@ async def handle_error(
         agent_id=agent.id,
         error=error_msg,
         error_type=error_type,
+        error_status=_err_status,
+        provider=_provider or None,
+        model=_model or None,
     )
 
     # 写 work_log — 确保错误在监控面板可见
@@ -461,7 +503,11 @@ async def handle_error(
             agent.project_id, agent.id, None,
             "error",
             f"[{error_type}] {error_msg}"[:140],
-            details={"error_type": error_type, "error": error_msg[:500]},
+            details={
+                "error_type": error_type,
+                "error": error_msg[:500],
+                **_llm_identity_fields(_err_status, _provider, _model),
+            },
         )
     except Exception:
         pass
@@ -473,7 +519,11 @@ async def handle_error(
             project_id=agent.project_id,
             agent_id=agent.id,
             event_type=f"llm_error.{error_type}",
-            payload={"error": error_msg[:500], "error_type": error_type},
+            payload={
+                "error": error_msg[:500],
+                "error_type": error_type,
+                **_llm_identity_fields(_err_status, _provider, _model),
+            },
         )
     except Exception:
         pass

@@ -1595,13 +1595,29 @@ class Agent:
                     # 换 model = 换缓存域，整条前缀缓存作废；且静默改变模型
                     # 身份会掩盖真实故障。可重试错误已由 llm/retry.py 在 HTTP
                     # 层处理（含退避 + Retry-After），此处直接走错误治理。
+                    #
+                    # ⚠ #22（2026-09-16）：**不要把错误压成裸 `ValueError`**。
+                    # 原来下面两处都写 `ValueError(error_msg)` ⇒
+                    # ① 明确的终态错误（HTTP 403 + `RegionError`：模型地域不可用）
+                    #    被记成 `llm_error.ValueError`，**status 丢了** —— 而这正是
+                    #    #13 刚立下的「优先 HTTP status / 错误码」纪律在这里没兜住；
+                    # ② `ValueError` 本身就是**谎**：它不是参数错。
+                    # 改用 `PermanentError`（`llm/retry.py` 既有、**自带 status**）⇒
+                    # `error_type=PermanentError` + payload 带 `error_status`，
+                    # 与流层用的是同一套错误词汇（不是新发明一个）。
+                    from hiveweave.llm.retry import PermanentError as _PermanentError
+
+                    _err_status_int = err_status if isinstance(err_status, int) else None
 
                     # ── Existing error handling ──
                     # 402 余额耗尽优先判断：账号级、重试必败、全局熔断。
                     # is_balance_error 兜底消息 needle —— 部分错误面
                     # （tool_exec 异常、core.py 通用 except）不带 error_status。
+                    # ⚠ #22：探针也用 `PermanentError`（不是 `ValueError`）——
+                    # `is_balance_error` 的结构化分支认的就是它（`status==402`），
+                    # 用 ValueError 只能走文案 needle，白白丢掉 status 这一层。
                     if err_status == 402 or is_balance_error(
-                        ValueError(error_msg)
+                        _PermanentError(error_msg, status=_err_status_int)
                     ):
                         # TEST19 P0-2: 余额耗尽 → 立即全局停唤醒 + 通知用户。
                         # 402 重试必败，且是账号级问题 —— 所有 agent 的唤醒
@@ -1612,7 +1628,9 @@ class Agent:
 
                         broadcast_balance_exhausted(source_agent_id=self.id)
                         await self._notify_user_balance_exhausted(error_msg)
-                        await self._handle_error(ValueError(error_msg))
+                        await self._handle_error(
+                            _PermanentError(error_msg, status=402)
+                        )
                     elif err_status == 429 or (
                         isinstance(err_headers, dict) and err_headers
                     ):
@@ -1627,7 +1645,7 @@ class Agent:
                         )
                     else:
                         await self._handle_error(
-                            ValueError(error_msg),
+                            _PermanentError(error_msg, status=_err_status_int),
                             partial_result=result,
                         )
 

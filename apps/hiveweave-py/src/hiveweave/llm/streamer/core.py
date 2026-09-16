@@ -113,6 +113,30 @@ class Streamer(
         self._context_rewrote = False
         provider = self._provider_factory.create(model_config)
         provider_name = model_config.get("name") or "primary"
+        # #22（2026-09-16）：**错误 result 必须带「这次用的哪个 provider/model」**。
+        # 现场：58/59 因 `RegionError`（HTTP 403「This model is not available in
+        # your country.」）停摆，而 agent_events 的 payload 只有
+        # `{error, error_type}` ⇒ 事后无法回答"是**哪个模型**被 region 拦"
+        # （对比 `llm_unknown_error_sample` 是带 provider/model 的）。
+        # 在**这里**盖一次即可覆盖全部 7 个错误出口（`_error_result` /
+        # `http_stream` 的 4 处 / `tool_loop` 的 2 处）—— 逐个去改会立刻长出
+        # "某条出口忘了带"的静默缺口（本仓在事实位白名单上栽过两次）。
+        # ⚠ 只盖 `status == "error"` 的结果 ⇒ 正常流**逐字节不变**（缓存前缀纪律）。
+        _llm_identity = {
+            "provider": provider_name,
+            "model": (
+                getattr(provider, "model_name", "")
+                or model_config.get("model_id")
+                or ""
+            ),
+        }
+
+        def _stamp_error_identity(res: Any) -> Any:
+            if isinstance(res, dict) and res.get("status") == "error":
+                for _k, _v in _llm_identity.items():
+                    if _v:
+                        res.setdefault(_k, _v)
+            return res
         # E6: fallback 递归防环 —— 已尝试过的 provider 不再回跳（A→B→A 停）。
         tried = set(skip_providers or ())
         tried.add(provider_name)
@@ -168,7 +192,7 @@ class Streamer(
             result["duration_ms"] = int((time.monotonic() - start_time) * 1000)
             # 前缀改写信号：completion 据此决定是否把等价裁剪回写 DB。
             result["context_rewritten"] = self._context_rewrote
-            return result
+            return _stamp_error_identity(result)
         except TimeoutError:
             # Ultimate safety net — loop should have exited gracefully first.
             log.error(
@@ -202,14 +226,14 @@ class Streamer(
             # 这里置位是为了日志可分类 + 给上层留判断入口，不代表步骤级已覆盖。
             result["timeout_kind"] = "turn"
             result["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
-            return result
+            return _stamp_error_identity(result)
         except Exception as e:
             await self._circuit_breaker.report_failure(provider_name)
             log.exception("stream_error", agent_id=agent_id, error=str(e))
             await self._fire_delta(on_delta, {
                 "type": "error", "content": str(e)
             })
-            return self._error_result(str(e), start_time)
+            return _stamp_error_identity(self._error_result(str(e), start_time))
         finally:
             await self._fire_delta(on_delta, {"type": "done"})
 
