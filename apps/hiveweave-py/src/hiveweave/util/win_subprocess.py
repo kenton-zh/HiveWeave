@@ -108,15 +108,43 @@ def _with_hidden_startupinfo(kwargs: dict[str, Any]) -> dict[str, Any]:
 #
 # ⚠ 覆盖面必须说准（实测 git 2.55.0.windows.3，脚本在 .tmp-test/
 # git_hardening_probe*.py；判据是「无加固时 EXECUTED、注入后 BLOCKED」）：
-#   ✅ 已覆盖 4 类：core.hooksPath→commit、core.fsmonitor→status、
-#      diff.external→diff、attr.tree→add（attr.tree 是「让 .gitattributes
-#      从任意 tree 读」的跳板）。
+#   ✅ 已覆盖 3 类：core.hooksPath→commit、core.fsmonitor→status、
+#      attr.tree→add（attr.tree 是「让 .gitattributes 从任意 tree 读」的跳板）。
+#   🚫 **刻意不覆盖 1 类：diff.external→diff**（#23，2026-09-16）—— 见下。
 #   ❌ **未覆盖 2 类**：filter.<name>.clean→add、merge.<name>.driver→merge。
 #      无加固时 EXECUTED，注入本静态清单后**仍 EXECUTED** —— 原因见边界 ①，
 #      测试以 xfail(strict=True) 如实登记，不粉饰、不声称已堵。
 #   · 覆盖效果与键名大小写无关（local/注入两侧驼峰/小写 4 种组合全 BLOCKED）
 #   · bash 工具传的是 env=env（白名单整段替换）⇒ 加固必须合并进 kwargs
 #     ["env"]，只改 os.environ 会让 P1-1 静默失效
+#
+# ⚠ **`diff.external` 的覆盖在 2026-09-16（#23）被移除，这不是"放宽"而是止损**：
+#   注入空串并不等于"禁用外部 diff" —— git 把它读成「外部 diff 程序的**名字**是
+#   空字符串」，于是真的去 spawn 一个名字为空的程序。实测代价（git 2.55.0：
+#     · `diff.external=""`      → `error: cannot spawn :` + `fatal: external diff died`（rc=128）
+#     · `=false`                → `fatal: external diff died`
+#     · `=true`                 → rc=0 但**输出为空**（拿不到 `@@`）
+#     · `GIT_EXTERNAL_DIFF=""`  → 同第一行
+#   ⇒ **不存在"既不跑攻击者程序、又保留内置 diff"的配置字面值**。
+#   受损面（逐形态实测）：只有「产出内容」的 diff 受影响
+#   （`diff <range>` / `diff HEAD`）；`--name-only/--stat/--quiet/--name-status`
+#   与 `show`/`log` 一律不受影响。而受影响的两处**都是真损失**：
+#     ① agent 自己的 shell 跑 `git diff <file>` —— TEST_DSH_58/59 共 22 次
+#        「external diff died」，59 的榫卯为此白耗 61 分钟；
+#     ② **平台自己的 code audit** —— `code_audit.py:513` 走 anchored
+#        `_git(["diff", f"{base}...HEAD"])`，实测 `ok=False` 且输出就是上面那条
+#        spawn 错误；而 `:515` 是 `if ok and out:` ⇒ **diff 被静默丢掉**，审计员
+#        看不到改动内容却不报错（"静默失效"）。
+#   移交去向（谁接管了这条防线）：**.git/config 已被 #2 批⑤「双阶段锁死」
+#   封住（连平台自己都没有 DELETE）**，`#3` 的关闭前提就是「平台 git 不再读任何
+#   agent 可写 config」；平台 git 全走 anchored `_git`。已逐条核过 `#19` 列的
+#   未接锚调用点（`dispatch_facts` 的 `log -1 --format=%s`、`main.py` 的
+#   `stash list`、`browse_tools`/`dev_server_tools` 的 `rev-parse`、
+#   `conflict_predict` 的 `merge-tree`）：**没有一个跑产出内容的 diff**。
+#   ⚠ 残余：若将来出现"未接锚 + 跑内容 diff"的新调用点，理论上可被利用 ——
+#   这正是 #19 的 AST 网要盖的面（尚未做）。
+#   本条由 `test_hardening_key_classes_split_by_empty_value_semantics` 与
+#   `test_platform_git_diff_content_is_not_broken` 钉住，别"顺手加回安全"。
 #
 # ⚠ 本层是**止血不是治本**。两条已知边界：
 #   ① 键名枚举天然有缺口：`filter.<任意名>.clean`、`merge.<任意名>.driver`
@@ -143,18 +171,31 @@ _SHELL_EXEC_NAMES = frozenset({
     "zsh", "zsh.exe", "wsl", "wsl.exe",
 })
 
-# 值为「程序/命令」的配置键 —— 全部压成空（= 压过 local config 的同一键，
-# 但不删除）。键名固定，可静态枚举；动态键名（filter.*/merge.*/diff.*）
-# 见上方边界 ①。
-_GIT_CLEAN_KEYS = (
-    "core.sshCommand",   # 跑 ssh 时执行
-    "core.askPass",      # 需要口令时执行
-    "core.gitProxy",     # 代理程序
-    "diff.external",     # git diff 时执行
-    "gpg.program",       # 签名程序
-    "credential.helper", # 需要凭据时执行（平台零 push/fetch/pull，实测确认）
-    "attr.tree",         # 让 .gitattributes 从任意 tree 读 ⇒ 挂 filter 的跳板
+# 值为「程序/命令」的配置键 —— 按 **git 对该键空值的语义** 分两类
+# （判据是空值语义，不是触发面宽窄；#23，2026-09-16）。
+#
+# ① 「空 = 禁用」：注入空串即可压过仓库里的同名键，且语义正确。
+_GIT_CLEAN_KEYS_EMPTY_DISABLES: tuple[str, ...] = (
+    "credential.helper",  # 空 = 不启用任何凭据助手（平台零 push/fetch/pull）
+    "attr.tree",          # 空 = 不从任意 tree 读 .gitattributes（拔掉 filter 跳板）
 )
+#
+# ② 「空 = 不安全」：git 把空串读成「程序的名字是空字符串」⇒ **真的去 spawn
+#    一个名为空的程序**（`cannot spawn :`）。⇒ 不注入空串，改注入 `"true"`：
+#    sh 内建 no-op，程序**存在**（不再是"名字为空"），攻击者写的同名键同样被压过，
+#    而平台从不走这些路径（不 fetch/push/pull、不签名、不做交互式提问）
+#    ⇒ 实测行为不变。（`core.editor = "true"` 早已在用同一手法。）
+_GIT_CLEAN_KEYS_NOOP_PROGRAM: tuple[str, ...] = (
+    "core.sshCommand",   # 跑 ssh 时执行 —— 平台零 fetch/push/pull
+    "core.askPass",      # 需要口令时执行 —— 非 tty 本不触发
+    "core.gitProxy",     # 代理程序 —— 仅 git:// 协议
+    "gpg.program",       # 签名程序 —— 平台不签名
+)
+#
+# ③ 已**移除**：`diff.external`。它既不属于①（空值不是禁用），也不能用②的
+#    `true`（实测 rc=0 但**输出为空** ⇒ 拿不到 `@@`），而平台与 agent 都真的在
+#    跑产出内容的 `git diff` ⇒ 见上方模块注释里的实测代价与移交去向（#2 的锁）。
+_GIT_CLEAN_KEYS_REMOVED_BY_DESIGN: tuple[str, ...] = ("diff.external",)
 
 _HOOKS_DIR: str | None = None
 _HARDENING_PAIRS: list[tuple[str, str]] | None = None
@@ -206,7 +247,11 @@ def git_hardening_pairs() -> list[tuple[str, str]]:
         # 必须指向**平台空目录**而不是空串：空串实测虽也 BLOCKED，但那是
         # git 把空路径解析成什么实现的巧合，语义上不可依赖；有目录才确定。
         pairs.insert(0, ("core.hooksPath", hooks))
-    pairs.extend((k, "") for k in _GIT_CLEAN_KEYS)
+    pairs.extend((k, "") for k in _GIT_CLEAN_KEYS_EMPTY_DISABLES)
+    # 「空 = 不安全」类注入 `true`（存在的 no-op 程序），**不注入空串** —— 见
+    # `_GIT_CLEAN_KEYS_NOOP_PROGRAM` 的注释（#23：空串会让 git 去 spawn
+    # 一个名字为空的程序，`cannot spawn :`）。
+    pairs.extend((k, "true") for k in _GIT_CLEAN_KEYS_NOOP_PROGRAM)
     return pairs
 
 

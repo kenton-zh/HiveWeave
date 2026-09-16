@@ -142,18 +142,59 @@ def test_identifies_git_and_shell_commands() -> None:
 
 
 def test_hardening_pairs_cover_the_executable_valued_keys() -> None:
-    """清单必须含报告点名的键，且 hooksPath 指向**平台空目录**（非空串）。"""
+    """清单必须含报告点名的键，且 hooksPath 指向**平台空目录**（非空串）。
+
+    #23（2026-09-16）改口径：键按 **git 的空值语义** 分两类 ——
+    「空 = 禁用」注入空串；「空 = 不安全」（git 把空串读成"程序的名字是空的"
+    ⇒ 真的去 spawn）注入 `"true"`（存在的 no-op）。判据是空值语义，
+    **不是**触发面宽窄。
+    """
     pairs = dict(ws.git_hardening_pairs())
     assert pairs["core.fsmonitor"] == "false"
     assert pairs["core.hooksPath"], "hooksPath 不能为空串（语义不可靠）"
     assert pairs["core.hooksPath"] != ""
     assert "\\" not in pairs["core.hooksPath"], "必须正斜杠（git config 吃反斜杠）"
     assert Path(pairs["core.hooksPath"]).is_dir(), "空 hook 目录必须真实存在"
-    for key in ("core.sshCommand", "core.askPass", "diff.external",
-                "gpg.program", "credential.helper", "attr.tree"):
+
+    # ①「空 = 禁用」：注入空串
+    for key in ("credential.helper", "attr.tree"):
         assert key in pairs, key
-    assert pairs["diff.external"] == ""
-    assert pairs["attr.tree"] == ""
+        assert pairs[key] == "", key
+    # ②「空 = 不安全」：注入 no-op 程序，**不得**是空串
+    for key in ("core.sshCommand", "core.askPass", "core.gitProxy",
+                "gpg.program"):
+        assert key in pairs, key
+        assert pairs[key] == "true", (key, pairs[key])
+    # ③ 刻意移除：`diff.external`
+    assert "diff.external" not in pairs, (
+        "diff.external 已被 #23 刻意移出注入清单 —— 注入空串会让 git 去 spawn "
+        "一个名字为空的程序（rc=128），而 `true` 又会吞掉 diff 输出（拿不到 @@）；"
+        "该键的防御已移交给 #2 的 .git/config 锁 + anchored _git。"
+        "要加回来请先读 util/win_subprocess.py 的模块注释与 fixqueue #23。"
+    )
+
+
+def test_hardening_key_classes_make_the_two_semantics_explicit() -> None:
+    """两类（+ 已移除一类）必须是**显式分列**的常量，不许合并成一个元组。
+
+    为什么单独一条：合并成一个元组正是 #23 的成因 —— 当时 7 个键**用同一种
+    方式**注入空串，于是「空 = 禁用」与「空 = 不安全」在代码上不可区分，
+    只能靠人记住。这条用例让"顺手并回去"变成一次转红。
+    """
+    assert not hasattr(ws, "_GIT_CLEAN_KEYS"), (
+        "_GIT_CLEAN_KEYS 已被拆成按空值语义分的两组（#23）—— 别再建同名聚合常量"
+    )
+    empt = set(ws._GIT_CLEAN_KEYS_EMPTY_DISABLES)
+    noop = set(ws._GIT_CLEAN_KEYS_NOOP_PROGRAM)
+    removed = set(ws._GIT_CLEAN_KEYS_REMOVED_BY_DESIGN)
+    assert not (empt & noop), empt & noop
+    assert not (empt & removed) and not (noop & removed)
+    assert removed == {"diff.external"}
+    # 三类合起来覆盖报告点名的 7 个键（既不能悄悄丢，也不能悄悄加）
+    assert empt | noop | removed == {
+        "core.sshCommand", "core.askPass", "core.gitProxy", "diff.external",
+        "gpg.program", "credential.helper", "attr.tree",
+    }
 
 
 def test_hooks_dir_is_outside_any_project_surface() -> None:
@@ -291,18 +332,68 @@ def test_fsmonitor_attack_is_blocked_through_funnel(repo: Path, tmp_path: Path) 
     assert not _hit(flag), "fsmonitor 攻击穿透了漏斗加固"
 
 
-def test_diff_external_attack_is_blocked_through_funnel(repo: Path, tmp_path: Path) -> None:
-    """diff.external → git diff。"""
-    flag = tmp_path / "flag_diff.txt"
-    payload = _sh_payload(flag)
+def test_platform_git_diff_content_is_not_broken(repo: Path) -> None:
+    """★ #23 验收（状态判据）：**产出内容的 `git diff` 必须能跑出 `@@`**。
+
+    这是取代旧用例 `test_diff_external_attack_is_blocked_through_funnel` 的
+    **强化**形态（不是删除）：旧用例断言的"env 覆盖挡住攻击"在 #23 之后
+    已**不可能**成立（`diff.external` 不再注入），而它保护的威胁模型
+    （agent 写 `.git/config`）已由 #2 批⑤「双阶段锁死」封住。留下"攻击被挡"
+    的断言只会掩盖真实状态。新断言对着**用户可见的功能**：
+    平台侧（`anchored _git`，`code_audit` 就走这条）与 agent 侧都必须拿到 diff。
+
+    ⚠ 曾经的实测代价（git 2.55.0）：`diff.external=""` ⇒ `error: cannot spawn :`
+    + `fatal: external diff died`（rc=128）；而 `code_audit.py:515` 是
+    `if ok and out:` ⇒ **diff 被静默丢掉**、审计看不到改动却不报错。
+    """
+    import asyncio
+
     (repo / "a.txt").write_text("changed\n", encoding="utf-8")
-    _raw_git(repo, "config", "diff.external", _fwd(payload))
+    _raw_git(repo, "add", "-A")
+    _raw_git(repo, "commit", "-q", "-m", "second")
 
-    _raw_git(repo, "diff")
-    assert _hit(flag, reset=True), "阳性对照失败"
+    # ① 经漏斗（= agent 与平台的真实路径）
+    out = _funnel_git(repo, "diff", "HEAD~1...HEAD")
+    assert out.returncode == 0, (out.returncode, out.stdout, out.stderr)
+    assert "@@" in out.stdout, (out.returncode, out.stdout, out.stderr)
 
-    _funnel_git(repo, "diff")
-    assert not _hit(flag), "diff.external 攻击穿透了漏斗加固"
+    # ② 经平台 anchored `_git`（code_audit / attestation 的真实入口）
+    from hiveweave.services.git_worktree import _git
+
+    ok, diff_out = asyncio.run(
+        _git(["diff", "HEAD~1...HEAD"], str(repo), project_root=str(repo))
+    )
+    assert ok is True, diff_out
+    assert "@@" in diff_out, diff_out
+
+    # ③ 未提交改动（`git diff HEAD`）同样必须可用 —— code_audit 的第二条 diff
+    (repo / "a.txt").write_text("uncommitted\n", encoding="utf-8")
+    ok2, diff2 = asyncio.run(
+        _git(["diff", "HEAD"], str(repo), project_root=str(repo))
+    )
+    assert ok2 is True, diff2
+    assert "@@" in diff2, diff2
+
+
+def test_hardening_still_blocks_a_planted_key_in_a_readable_config(repo, tmp_path):
+    """★ 移交后仍要证明「可读的 config 里的键会被压过」—— 用**另一个仍在注入的**键。
+
+    为什么必须留这一条：`diff.external` 退出注入清单后，本文件里"env 能压过
+    config"这条机制就没有任何穿透层用例了。用 `core.hooksPath`（仍在注入）
+    证明机制本身活着，避免"键没了 ⇒ 机制也没了"的静默退化。
+    """
+    flag = tmp_path / "flag_hook2.txt"
+    hookdir = tmp_path / "evil-hooks2"
+    hookdir.mkdir()
+    (hookdir / "post-commit").write_text(
+        f"#!/bin/sh\necho hit > '{_fwd(flag)}'\n", encoding="utf-8", newline="\n")
+    _raw_git(repo, "config", "core.hooksPath", _fwd(hookdir))
+
+    _raw_git(repo, "commit", "--allow-empty", "-q", "-m", "baseline")
+    assert _hit(flag, reset=True), "阳性对照失败：攻击现场未生效，后续断言无意义"
+
+    _funnel_git(repo, "commit", "--allow-empty", "-q", "-m", "via-funnel")
+    assert not _hit(flag), "hooksPath 攻击穿透了漏斗加固"
 
 
 def test_attr_tree_attack_is_blocked_through_funnel(repo: Path, tmp_path: Path) -> None:
