@@ -215,3 +215,8 @@ tasks/check_recovery.py
 tasks/_inline_module_check.mjs
 tasks/_served_*
 tasks/create-*-payload.json
+
+# ComfyUI 节点 schema 快照（**生成物，勿入库**）：一条 `curl /object_info` 即可重导，
+# 随本机 ComfyUI 版本变（09-10 那轮 2.4MB/1410 节点已删过一次、09-16 又出现 ⇒ 按名字防复发）。
+# 需查节点参数时看 skills/comfyui-sprite-sheet/SKILL.md 的 GET /object_info，别把快照提交进来。
+object_info.json
