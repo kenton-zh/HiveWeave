@@ -993,6 +993,7 @@ yarn.lock merge=union
         )
         if not Path(path).is_dir():
             return {"success": False,
+                    **self._empty_volume_fields(),
                     "message": f"Worktree for {short_id} does not exist."}
 
         ok, add_out = await _git(["add", "-A"], path, project_root=workspace_path)
@@ -1004,6 +1005,7 @@ yarn.lock merge=union
             detail = f" | git: {add_detail[:400]}" if add_detail else ""
             return {
                 "success": False,
+                **self._empty_volume_fields(),
                 "message": f"Failed to stage files{detail}",
             }
 
@@ -1166,6 +1168,7 @@ yarn.lock merge=union
             conflict_warning = await self._conflict_warning(path, workspace_path)
             return {"success": True, "hash": head if ok2 else "",
                     "count": 0,
+                    **self._empty_volume_fields(),
                     "message": "no changes to commit" + ignored_warning
                                + generated_note + regen_note + conflict_warning}
 
@@ -1183,12 +1186,20 @@ yarn.lock merge=union
                 "success": True,
                 "hash": head if ok2 else "",
                 "count": 0,
+                **self._empty_volume_fields(),
                 "message": (
                     "no committable changes"
                     + ignored_warning + generated_note + regen_note
                     + runtime_note + conflict_warning
                 ).strip(),
             }
+
+        # ── 体积留痕（09-16 第 0 步 0-1）：**只观测，不拦门** ─────────────
+        # 提交前取「父树体积」与「暂存区分类计数」，提交后取「新树体积」——
+        # 三者的差才是"这次存档到底动了多少"。既有观测量 `count` 做不到这件事
+        # （它数的是近 7 天 checkpoint 提交数）。
+        _tree_before = await self._tree_file_count(path, "HEAD", workspace_path)
+        _vol = await self._staged_change_volume(path, workspace_path)
 
         commit_msg = f"{CHECKPOINT_PREFIX} {message}"
         ok, commit_out = await _git(
@@ -1210,6 +1221,7 @@ yarn.lock merge=union
                 )
             return {
                 "success": False,
+                **self._empty_volume_fields(_tree_before),
                 "message": (
                     "Failed to create checkpoint commit"
                     + (f": {fail_detail}" if fail_detail else "")
@@ -1221,11 +1233,60 @@ yarn.lock merge=union
         conflict_warning = await self._conflict_warning(path, workspace_path)
         ok, head = await _git(["rev-parse", "--short", "HEAD"], path, project_root=workspace_path)
         count = await self._count_checkpoints(path)
+
+        # ── 体积留痕的收口（09-16 第 0 步 0-1）──────────────────────────
+        _tree_after = await self._tree_file_count(path, "HEAD", workspace_path)
+        _deleted_share = (
+            round(_vol["deleted"] / _tree_before, 3) if _tree_before else 0.0
+        )
+        # 触发条件（**留痕，不拦门**）：① 结果树为空 且 父树非空（= 清空全树）；
+        # ② 单次删除量 ≥ 父树 50%。
+        # ⚠ 有意**不做成 gate**：项目里确有"故意删干净再重建"的正常动作，拦门会误伤
+        #   （见 fixplan「★ 下一步执行顺序」的「明确不做」）。这里只求"事后能看见"，
+        #   把"要不要拦"留给 1-4 单独评估。
+        _volume_alarm = bool(
+            (_tree_after == 0 and (_tree_before or 0) > 0)
+            or _deleted_share >= 0.5
+        )
+        _volume_note = ""
+        if _volume_alarm:
+            _volume_note = (
+                f" WARNING: this checkpoint removed {_vol['deleted']} of "
+                f"{_tree_before} tracked file(s) (tree {_tree_before} -> "
+                f"{_tree_after}). If you did not intend that, check that you are "
+                f"operating inside your OWN registered worktree — in a leftover "
+                f"or empty directory git sees every tracked file as deleted."
+            )
+            log.warning(
+                "git_worktree.checkpoint_volume_alarm",
+                short_id=short_id,
+                hash=head if ok else "",
+                staged_deleted=_vol["deleted"],
+                tree_files_before=_tree_before,
+                tree_files_after=_tree_after,
+                deleted_share=_deleted_share,
+                note="单次存档大幅缩小了树（不拦门，仅留痕，供事后定位）",
+            )
+        # 键集合**派生**自 `_empty_volume_fields()`（唯一来源）—— 不在这里重写一遍，
+        # 否则"成功路径"与各早退路径就会有**两份键清单**，单边加键不会被任何守卫发现
+        # （审计 P2：同一事实两处判）。日志行也展开同一份，保证"日志字段 == 回执字段"。
+        _volume_fields = {
+            **self._empty_volume_fields(_tree_before),
+            "staged_total": _vol["total"],
+            "staged_added": _vol["added"],
+            "staged_modified": _vol["modified"],
+            "staged_deleted": _vol["deleted"],
+            "tree_files_after": _tree_after,
+            "deleted_share": _deleted_share,
+            "volume_alarm": _volume_alarm,
+        }
         log.info("git_worktree.checkpoint", short_id=short_id,
-                 hash=head if ok else "", count=count)
+                 hash=head if ok else "", count=count, **_volume_fields)
         return {"success": True, "hash": head if ok else "", "count": count,
+                **_volume_fields,
                 "message": (ignored_warning + generated_note + regen_note
-                            + runtime_note + conflict_warning) or None}
+                            + runtime_note + _volume_note
+                            + conflict_warning) or None}
 
     async def _conflict_warning(self, path: str,
                                workspace_path: str) -> str:
@@ -1266,5 +1327,81 @@ yarn.lock merge=union
         if ok and log_out:
             return len([ln for ln in log_out.split("\n") if ln.strip()])
         return 1
+
+    # ── 体积留痕（09-16 第 0 步 0-1）：**只观测，不拦** ──────────────
+    #
+    # 为什么必须有这两个：本函数的既有观测量 `count` = `_count_checkpoints()`
+    # = **近 7 天的 checkpoint 提交数**，与本次变更量**无关**。实测后果：
+    # A088（TEST_DSH_59）那次 `count=5` 的提交**删掉了 12 个 tracked 文件**
+    # （A087 是 `count=18` 删 17 个）⇒ **那行日志无法区分"正常提交"与"清空全树"**。
+    # 所以"体积"必须从**树**现算，不能从 checkpoint 计数推。
+
+    @staticmethod
+    def _empty_volume_fields(tree_files: int | None = None) -> dict:
+        """未产生提交时的体积字段。
+
+        **键集合与成功路径完全一致** —— 否则调用方读新字段会 KeyError，
+        而"有的返回有、有的没有"正是本项目最忌讳的静默失效形态。
+        本路径**不额外跑 git**（``tree_files=None``），因为它是最热的一条
+        （每次"无变更"的 checkpoint 都走这里）。
+        """
+        return {
+            "staged_total": 0,
+            "staged_added": 0,
+            "staged_modified": 0,
+            "staged_deleted": 0,
+            "tree_files_before": tree_files,
+            "tree_files_after": tree_files,
+            "deleted_share": 0.0,
+            "volume_alarm": False,
+        }
+
+    async def _tree_file_count(
+        self, path: str, rev: str, workspace_path: str | None = None
+    ) -> int | None:
+        """``<rev>`` 树里的 tracked 文件数（= 那棵树的"体积"）。
+
+        失败返回 ``None`` —— 观测旁支，**绝不**影响存档（与 `_conflict_warning`
+        同一条纪律：预警 fail-quiet）。
+        """
+        ok, out = await _git(
+            ["ls-tree", "-r", "--name-only", rev],
+            path,
+            project_root=workspace_path,
+        )
+        if not ok:
+            return None
+        return len([ln for ln in (out or "").splitlines() if ln.strip()])
+
+    async def _staged_change_volume(
+        self, path: str, workspace_path: str | None = None
+    ) -> dict[str, int]:
+        """暂存区按 ``--name-status`` 分类计数：``added``/``modified``/``deleted``/``total``。
+
+        ``R``（重命名）/``C``（复制）**一律计入 modified**：它们不是净删除，
+        算进 deleted 会虚报事故；而"清空全树"必然表现为**大量 ``D``** ——
+        这正是我们要能看见的那一档。
+        """
+        vol = {"added": 0, "modified": 0, "deleted": 0, "total": 0}
+        ok, out = await _git(
+            ["diff", "--cached", "--name-status"],
+            path,
+            project_root=workspace_path,
+        )
+        if not ok or not out:
+            return vol
+        for raw in out.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            status = line.split("\t", 1)[0].strip().upper()[:1]
+            vol["total"] += 1
+            if status == "A":
+                vol["added"] += 1
+            elif status == "D":
+                vol["deleted"] += 1
+            else:
+                vol["modified"] += 1
+        return vol
 
     # ── 3. MERGE ─────────────────────────────────────────────

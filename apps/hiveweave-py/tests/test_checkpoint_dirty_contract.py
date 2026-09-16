@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import structlog.testing
 
 from hiveweave.services.git_worktree import GitWorktreeService
 from hiveweave.services.git_worktree import service_create as sc_module
@@ -340,3 +341,212 @@ async def test_checkpoint_add_failure_carries_git_output(tmp_path: Path, monkeyp
     msg = result.get("message") or ""
     assert "Failed to stage files" in msg
     assert "simulated" in msg
+
+
+# ── 用例 6-8：体积留痕（09-16 第 0 步 0-1）────────────────────────────
+#
+# 背景（实测）：`git_worktree.checkpoint` 原有的 `count` 是
+# `_count_checkpoints()` = **近 7 天 checkpoint 提交数**，与变更量无关 ——
+# TEST_DSH_59 的 A088 那次 `count=5` 却删掉了 12 个 tracked 文件（A087 `count=18` 删 17），
+# 即**日志无法区分"正常提交"与"清空全树"**。这三条用例钉住新的体积字段。
+
+
+async def test_checkpoint_reports_volume_and_alarms_on_tree_wipe(tmp_path: Path):
+    """★ 事故形态：把 worktree 里的 tracked 文件全删掉后存档。
+
+    这就是 #21 的提交形态（husk 目录 ⇒ `git add -A` 把整棵树记成删除）。
+    验收（状态判据）：**删除量、树体积前后、alarm 位**都必须可读，
+    且**常态日志那行**也要带上删除量（否则事后无从定位）。
+    """
+    main, wt = _make_worktree(tmp_path, "volume-wipe")
+    (wt / "src").mkdir()
+    (wt / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
+    (wt / "src" / "b.ts").write_text("export const b = 2;\n", encoding="utf-8")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-m", "checkpoint: seed two files")
+
+    tracked = [ln for ln in _git(wt, "ls-files").splitlines() if ln.strip()]
+    assert len(tracked) == 3, tracked          # README.md + src/a.ts + src/b.ts
+    for rel in tracked:
+        (wt / rel).unlink()
+
+    svc = _service_with_worktree(wt)
+    with structlog.testing.capture_logs() as logs:
+        result = await svc.checkpoint(str(main), "t20", "wipe")
+
+    assert result["success"] is True
+    assert result["staged_deleted"] == 3, result
+    assert result["tree_files_before"] == 3, result
+    assert result["tree_files_after"] == 0, result
+    assert result["volume_alarm"] is True, result
+    assert "removed 3 of 3" in (result.get("message") or "")
+
+    # 常态日志必须带体积字段（验收：日志能读出删除量 N）
+    ck = [e for e in logs if e.get("event") == "git_worktree.checkpoint"]
+    assert ck, [e.get("event") for e in logs]
+    assert ck[0]["staged_deleted"] == 3
+    assert ck[0]["tree_files_after"] == 0
+    assert ck[0]["volume_alarm"] is True
+    assert "count" in ck[0]                        # 旧字段保留（不破坏既有消费者）
+
+    # 独立可 grep 的 alarm 事件（"事后能看见"的抓手）
+    alarm = [e for e in logs if e.get("event") == "git_worktree.checkpoint_volume_alarm"]
+    assert len(alarm) == 1, [e.get("event") for e in logs]
+    assert alarm[0]["staged_deleted"] == 3
+    assert alarm[0]["tree_files_after"] == 0
+
+
+async def test_checkpoint_normal_commit_has_no_deletions_and_no_alarm(
+    tmp_path: Path,
+):
+    """反向对照：正常新增一个文件 ⇒ 删除量 0、不触发 alarm、回执无 WARNING。
+
+    **没有这条，上面那条可能是"永远为真"的假守卫。**
+    """
+    main, wt = _make_worktree(tmp_path, "volume-normal")
+    (wt / "src").mkdir()
+    (wt / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
+
+    svc = _service_with_worktree(wt)
+    with structlog.testing.capture_logs() as logs:
+        result = await svc.checkpoint(str(main), "t21", "add one file")
+
+    assert result["success"] is True
+    assert result["staged_added"] == 1, result
+    assert result["staged_deleted"] == 0, result
+    assert result["tree_files_before"] == 1, result       # README.md
+    assert result["tree_files_after"] == 2, result        # + src/a.ts
+    assert result["volume_alarm"] is False, result
+    assert "WARNING" not in (result.get("message") or "")
+    assert not [
+        e for e in logs
+        if e.get("event") == "git_worktree.checkpoint_volume_alarm"
+    ]
+
+
+async def test_checkpoint_alarms_on_bulk_delete_without_emptying_tree(
+    tmp_path: Path,
+):
+    """★ 第二条 alarm 分支：**删掉一半以上、但树没空**。
+
+    为什么必须有这条（独立审计 P1）：alarm 有两个条件 ——
+    ① 结果树为空；② 删除量 ≥ 父树 50%。**实测把 ② 整条删掉，14 条用例全绿**
+    （因为其余用例只覆盖 ①），而 **② 正是真实事故 A088 的形态**：
+    它删了 12 个文件、父树 17 个（树没空），只由 ② 触发。
+    """
+    main, wt = _make_worktree(tmp_path, "volume-bulk")
+    (wt / "src").mkdir()
+    for name in ("a", "b", "c", "d"):
+        (wt / "src" / f"{name}.ts").write_text(f"export const {name} = 1;\n",
+                                               encoding="utf-8")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-m", "checkpoint: seed four files")
+
+    tracked = [ln for ln in _git(wt, "ls-files").splitlines() if ln.strip()]
+    assert len(tracked) == 5, tracked            # README.md + 4 个
+    # 删 3 留 2 ⇒ share = 3/5 = 0.6 ≥ 0.5，而 tree_after = 2 ≠ 0（只由第二条触发）
+    for rel in [t for t in tracked if not t.endswith(("README.md", "a.ts"))]:
+        (wt / rel).unlink()
+
+    svc = _service_with_worktree(wt)
+    with structlog.testing.capture_logs() as logs:
+        result = await svc.checkpoint(str(main), "t23", "bulk delete")
+
+    assert result["success"] is True
+    assert result["staged_deleted"] == 3, result
+    assert result["tree_files_before"] == 5, result
+    assert result["tree_files_after"] == 2, result      # ← 树非空
+    assert result["deleted_share"] >= 0.5, result
+    assert result["volume_alarm"] is True, result
+    assert "removed 3 of 5" in (result.get("message") or "")
+    alarm = [e for e in logs
+             if e.get("event") == "git_worktree.checkpoint_volume_alarm"]
+    assert len(alarm) == 1, [e.get("event") for e in logs]
+
+
+async def test_all_checkpoint_paths_expose_identical_key_sets(
+    tmp_path: Path, monkeypatch
+):
+    """**跨路径键集合一致性**：成功 / 两条 no-op / 三条失败 路径必须**同一批键**。
+
+    为什么这么写（独立审计 P1）：原先③用**硬编码键列表**断言，等于把实现抄进测试
+    —— 只改成功路径时它仍然绿（审计实测：把 commit 失败路径的字段去掉，14 条全绿）。
+    这里改成**路径之间互相比对**，不再有第二份清单 ⇒ 任一路径单边增/删键都会转红。
+    调用方读新字段才可能不 KeyError，而"有的返回有、有的没有"正是本仓最忌的静默失效。
+    """
+    # 成功路径（作为参照）
+    main, wt = _make_worktree(tmp_path, "keyset-ok")
+    (wt / "src").mkdir()
+    (wt / "src" / "a.ts").write_text("x\n", encoding="utf-8")
+    success = await _service_with_worktree(wt).checkpoint(str(main), "t30", "add")
+
+    # no-op 路径（仓库干净）
+    main2, wt2 = _make_worktree(tmp_path, "keyset-noop")
+    noop = await _service_with_worktree(wt2).checkpoint(str(main2), "t31", "nothing")
+
+    # 失败路径 A：worktree 目录不存在
+    missing = await _service_with_worktree(tmp_path / "no-such-wt").checkpoint(
+        str(main2), "t32", "missing"
+    )
+
+    # 失败路径 B：`git add -A` 失败
+    real_git = sc_module._git
+
+    async def failing_add(args, cwd, timeout=30.0, project_root=None):
+        if args[:2] == ["add", "-A"]:
+            return False, "fatal: index.lock already held (simulated)"
+        return await real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(sc_module, "_git", failing_add)
+    add_failed = await _service_with_worktree(wt).checkpoint(str(main), "t33", "addfail")
+
+    # 失败路径 C：commit 失败
+    # ⚠ 必须先制造一处**新变更**：上一步 `success` 已把 `wt` 提交干净，若不复用同一
+    #   worktree 而不改文件，`checkpoint` 会从 "no changes to commit" 早退 ——
+    #   **根本走不到 commit**，这条守卫就变成"不可达的假守卫"（实测踩过一次：
+    #   去掉 commit 失败路径的体积字段，本条仍绿）。
+    (wt / "src" / "b.ts").write_text("y\n", encoding="utf-8")
+
+    async def failing_commit(args, cwd, timeout=30.0, project_root=None):
+        if "commit" in args:
+            return False, "error: pre-commit hook declined (simulated stderr)"
+        return await real_git(args, cwd, timeout)
+
+    monkeypatch.setattr(sc_module, "_git", failing_commit)
+    commit_failed = await _service_with_worktree(wt).checkpoint(
+        str(main), "t34", "commitfail"
+    )
+    # 钉住"这条路径真的被走到了"——否则下面的键集合比对是在比一条假路径
+    assert commit_failed.get("success") is False, commit_failed
+    assert "Failed to create checkpoint commit" in (
+        commit_failed.get("message") or ""
+    ), commit_failed
+
+    # 参照集**从成功路径派生**（不留第二份清单 —— 否则单边加键不会被发现）。
+    # ⚠ 只比"体积键"这一子集：失败路径本来就没有 `hash`/`count`（**既有设计**，
+    #   它们返回 `{success: False, message}`），要求全键相同会去改既有语义。
+    pre_existing = {"success", "hash", "count", "message"}
+    ref_volume_keys = set(success) - pre_existing
+    assert ref_volume_keys, "参照集为空 ⇒ 这条守卫什么也没守"
+    assert "volume_alarm" in ref_volume_keys and "staged_deleted" in ref_volume_keys
+
+    for label, res in (
+        ("no-op", noop),
+        ("worktree-missing", missing),
+        ("add-failed", add_failed),
+        ("commit-failed", commit_failed),
+    ):
+        missing_keys = ref_volume_keys - set(res)
+        assert not missing_keys, (
+            f"{label} 路径缺体积键 {sorted(missing_keys)} —— "
+            f"调用方读它们会 KeyError"
+        )
+        extra_keys = set(res) - pre_existing - ref_volume_keys
+        assert not extra_keys, (
+            f"{label} 路径多出未在成功路径出现的键 {sorted(extra_keys)} —— "
+            f"两边键清单已经不一致"
+        )
+
+    # 早退路径的体积字段必须是"零"，不能是上一棵树的值
+    assert noop["staged_deleted"] == 0 and noop["volume_alarm"] is False
+    assert add_failed["volume_alarm"] is False
