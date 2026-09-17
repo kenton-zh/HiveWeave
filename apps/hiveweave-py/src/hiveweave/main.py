@@ -67,19 +67,49 @@ class _FlushFile:
         self._rotate = make_rotator(path)
         self._pending_lines = 0
 
-    def _maybe_rotate(self, force: bool = False) -> None:
-        """每 N 行预检一次大小；命中则搬走旧内容并把偏移归零。
+    def _maybe_rotate(self, *, from_flush: bool = False) -> None:
+        """预检一次大小；命中则搬走旧内容并把偏移归零。
 
-        预检**不每行做**：``stat()`` 是系统调用，热路径上日增数万行没必要。
-        行数计数是"大致"的 —— 日志行长度不均，但它只是采样频率，不是判据。
+        **采样节奏只有一个来源**：`_pending_lines` 由 ``write()`` 推进，
+        每写满 ``_ROTATE_CHECK_EVERY_LINES`` 行才真正 ``stat()`` 一次。
+        ``stat()`` 是系统调用，热路径上日增数万行没必要每行做。
+        行数计数是"大致"的 —— 日志行长度不均，但它只是**采样频率，不是判据**。
 
-        ``force`` 供 ``flush()`` 用：调用方显式要"落定"时不该再看采样计数器，
-        否则"我 flush 了但没轮转"会变成一条静默的、只在大写入量下才暴露的缝。
+        ⚠⚠ 2026-09-17 审计必修（三个方向都要避开，前两个是**相反**的坑）：
+
+        ① **不能**让 ``flush()`` 以"强制"身份绕过计数器。早先版本带
+           ``force`` 参数并被 ``flush`` 以 ``force=True`` 调用 ⇒ 而
+           ``_TeeStream.write`` 写完每个 stream 都会调 ``flush`` ⇒
+           **每一行都做一次 ``stat()``**，采样完全失效
+           （实测：写 100 行 → `rotate_if_needed` 被调 100 次，
+           20.30 µs/次；不经 tee 的对照 = 0 次）。
+
+        ② **也不能**在 ``flush`` 里"只在余量够时才检查"——那是**同义反复**：
+           采样计数器由 ``write`` 推进且达到窗口就归零，所以"余量没够"
+           恰恰是常态（200 行 ×130B 的持续写入永远凑不满 256）⇒
+           兜底路恒不触发，等于没有兜底。本轮首版即栽在这里，
+           `test_flush_file_rotates_while_writing` 直接转红。
+
+        ③ 所以正确形态 = **两条路各管各的、互不干扰**：
+           · ``write()`` 按**行数采样**（热路径，摊销 stat 成本）；
+           · ``flush()`` **无条件**做一次检查 —— 它的频率由调用方决定
+             （每条日志一次，量级远低于 write），且**不碰**计数器。
+           代价 = 每次 flush 一次 ``stat()``（20 µs）；换来"零星小写入
+           也能翻转"这条真实契约不被破坏。
+           ⚠ 若日后 `_TeeStream` 改成逐行调 flush，这条会退化成审计①
+             的形态 —— 届时应把 tee 的 flush 改为按条件（见 :119 处的说明）。
         """
-        self._pending_lines += 1
-        if not force and self._pending_lines < _ROTATE_CHECK_EVERY_LINES:
-            return
-        self._pending_lines = 0
+        if not from_flush:
+            # 正常路：本函数是计数器**唯一**的推进点（采样只在这里生效）。
+            self._pending_lines += 1
+            if self._pending_lines < _ROTATE_CHECK_EVERY_LINES:
+                return
+            self._pending_lines = 0
+        # `from_flush` 路：不推进、不重置、也不看余量 —— 直接检查。
+        self._do_rotate()
+
+    def _do_rotate(self) -> None:
+        """真正的一次预检 + 命中后的偏移归零（采样之外的部分）。"""
         rotator = self._rotate
         if rotator is None:
             return  # 轮转功能关闭 / 构造失败 —— 此时**绝不**调 None()
@@ -97,14 +127,14 @@ class _FlushFile:
         return n
 
     def flush(self) -> None:
-        """显式落定时**强制**做一次轮转预检（不看采样计数器）。
+        """把缓冲区落盘 + **兜底预检一次**（不推进采样计数器）。
 
-        只被 ``flush()`` 用；``write()`` 里那次由 ``_maybe_rotate()`` 自己按
-        采样节奏走。注意这**不是**重复定义：早先手写时留过一个无参 ``flush``
-        在下面，Python 后定义者胜 ⇒ ``force=True`` 被静默吞掉。已删。
+        ⚠ 本方法的调用方不只是"显式落定" —— ``_TeeStream``（:119）写完每个
+        stream 都会调它。故这里**必须**保持廉价：只在 `_pending_lines`
+        已攒够时才会真的 ``stat()``（见 ``_maybe_rotate`` 的两向坑记录）。
         """
         self._f.flush()
-        self._maybe_rotate(force=True)
+        self._maybe_rotate(from_flush=True)
 
     def close(self) -> None:
         self._f.close()

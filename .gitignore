@@ -202,8 +202,14 @@ _lib_*.js
 docs/platform-issue-research/
 
 # Office scene working artifacts (备份图 & LaMa 修图中间产物；生产图无后缀已入库)
+# ⚠ 真值源 = `apps/web/vite.config.ts::ARTIFACT_PATTERNS`（构建侧按它剔除
+#   dist）。两处必须同源：漏写一条 ⇒ 文件进 git 且**同时**被打进 EXE 产物
+#   （2026-09-17 审计发现的漂移点：`.pre-lama2.png` 无 `.bak` 那类此前两边
+#   不一致）。新增一条中间产物命名时**两处都要加**。
 apps/web/public/office-assets/*.bak.png
 apps/web/public/office-assets/*.patched.png
+apps/web/public/office-assets/*.pre-lama.png
+apps/web/public/office-assets/*.pre-lama2.png
 
 # Local AI memory backups (AI_MEMORY.local.md 已 ignore，备份同精神)
 AI_MEMORY.local.md.bak*

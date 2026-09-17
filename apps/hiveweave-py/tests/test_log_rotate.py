@@ -321,3 +321,71 @@ def test_rotating_stdout_without_rotator_is_inert(tmp_path):
         proxy.write(f"line-{i}\n")
     assert log.stat().st_size > 1024
     assert not (tmp_path / "launcher.out.log.1").exists()
+
+
+# --- 采样与兜底的关系（2026-09-17 审计必修的守卫）---------------------------
+#
+# 背景：`_TeeStream` 写完每个 stream 都会调 `flush()`。早先 `flush` 以
+# `force=True` 绕过采样计数器 ⇒ 每行一次 `stat()`，采样全废。
+# 修的时候**极易过头**成另一个坑：让 `flush` "只在余量够时才检查" ——
+# 那是同义反复（`write` 达到窗口就归零，所以"余量没够"是常态），
+# 兜底恒不触发。本轮首版即栽在此，被下面第 ② 条测试的同类场景抓出。
+
+
+def test_sampling_actually_amortizes_stat_calls(tmp_path, monkeypatch):
+    """① 采样真的摊销了 `stat()`：不经 flush 连写 N 行，调用数 ≈ N/窗口。
+
+    阳性对照：把 `flush()` 改回 `_maybe_rotate(force=True)`、
+    或用 `_TeeStream` 逐行 flush ⇒ 调用数涨到 N，本用例转红。
+    """
+    monkeypatch.setenv("HIVEWEAVE_LOG_MAX_BYTES", "1000000")  # 大到不翻转
+    log = tmp_path / "server.out.log"
+    stream = hw_main._FlushFile(log)
+    calls = {"n": 0}
+    real = stream._do_rotate
+
+    def _spy():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(stream, "_do_rotate", _spy)
+    try:
+        n_lines = 1000
+        for i in range(n_lines):
+            stream.write(f"{i}\n")   # ⚠ 只走 write，不调 flush
+    finally:
+        stream.close()
+
+    window = hw_main._ROTATE_CHECK_EVERY_LINES
+    assert calls["n"] <= n_lines // window + 1, (
+        f"1000 行只应做 ~{n_lines // window} 次预检（采样窗口 {window}），"
+        f"实际 {calls['n']} 次 —— 采样未生效（每行都在 stat？）"
+    )
+
+
+def test_flush_is_a_real_fallback_not_a_tautology(tmp_path, monkeypatch):
+    """② `flush()` 必须是**真兜底**：写入量凑不满采样窗口时也能翻转。
+
+    这是"同义反复"那个坑的守卫 —— 若 `flush` 改回"只在余量够时才检查"，
+    本条转红（200 行 < 窗口 256 ⇒ 永远不检查 ⇒ 永不翻转）。
+    """
+    monkeypatch.setenv("HIVEWEAVE_LOG_MAX_BYTES", "4096")
+    log = tmp_path / "server.out.log"
+    stream = hw_main._FlushFile(log)
+    window = hw_main._ROTATE_CHECK_EVERY_LINES
+    n_lines = window - 56          # 刻意**少于**一个采样窗口
+    assert n_lines > 0
+    try:
+        for i in range(n_lines):
+            stream.write(f"{i:04d} " + "z" * 120 + "\n")   # 每行 130B
+        stream.flush()             # ← 兜底必须在这里生效
+    finally:
+        stream.close()
+
+    total = n_lines * 130
+    assert total > 4096, "用例前提：总字节确实超过阈值"
+    assert (tmp_path / "server.out.log.1").exists(), (
+        f"写满 {total}B（超阈值 4096）却未翻转 —— `flush` 的兜底没生效。"
+        f"⚠ 若改成「只在 _pending_lines 够时才检查」就会退化成这条（同义反复："
+        f"{n_lines} < 窗口 {window} ⇒ 永远不检查）"
+    )
