@@ -92,7 +92,7 @@ def _seed(space, *, tool: str = "bash", meta: dict | None = None) -> str:
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, tool),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": (
                 f"[失败签名] tool={tool} | {sig}\n"

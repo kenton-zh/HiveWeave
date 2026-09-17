@@ -161,7 +161,7 @@ async def test_preexisting_hint_goes_to_other_agent_not_self(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh 写法重试",
             "source_agent_id": "agent-A",
@@ -204,7 +204,7 @@ async def test_placeholder_solution_not_backfilled(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig),
             "source_agent_id": "agent-A",
@@ -244,7 +244,7 @@ async def test_backfill_idempotent_when_solution_line_exists(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": solved,
             "source_agent_id": "agent-A",
@@ -418,7 +418,7 @@ async def test_expired_pending_is_discarded_not_backfilled(space, clear_pending)
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig),
             "source_agent_id": "agent-A",
@@ -611,7 +611,7 @@ async def test_solution_status_set_on_backfill(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig),
             "source_agent_id": "agent-A",
@@ -636,7 +636,7 @@ async def test_solution_status_repaired_on_idempotent_skip(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 老条目留下的行",
             "source_agent_id": "agent-A",
@@ -670,7 +670,7 @@ async def test_repair_solution_status_fixes_legacy_entries(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": legacy,
             "source_agent_id": "agent-A",
@@ -703,7 +703,7 @@ async def test_repair_solution_status_skips_entries_without_solution_line(space)
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig),
             "source_agent_id": "agent-A",
@@ -738,7 +738,7 @@ async def test_rehit_preserves_solution_status(space):
             "id": "mem-1",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": fs.make_module_id("proj", sig),
+            "module_id": fs.make_module_id("proj", sig, "bash"),  # 批 C：module_id 三元组含 tool
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 已回填的解法",
             "source_agent_id": "agent-A",

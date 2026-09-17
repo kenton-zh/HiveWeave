@@ -80,7 +80,11 @@ _UNIX_PATH_RE = re.compile(r"(?<![\w.@])/(?:[\w.@+-<>]+/)*[\w.@+-<>]+")
 # 前 8 位，见 `_TASK_BRANCH_RE` 的 `t-([0-9a-fA-F]{8})`），与措辞/语言无关。
 # 措辞本身**不剥** —— 两条 stdout 不同的 pwsh 失败是不同的根因，
 # 合并它们等于把共享条目变成大杂烩（本仓明写「错解比无解更贵」）。
-_AGENT_SHORT_ID_RE = re.compile(r"(?<![A-Za-z0-9])A\d{3}(?![0-9A-Za-z])")
+_AGENT_SHORT_ID_RE = re.compile(r"(?<![A-Za-z0-9])A\d{3}(?:-[a-d])?(?![0-9A-Za-z])")
+# 批 C（2026-09-18，#5 应剥未剥）：短号含 worktree 重定位后缀 ——
+# `A075-b`/`A075-c` 是**同一个逻辑 agent** 重定位后的形态（§8.8 实测
+# 发生 10/9 次），后缀不剥会把同根因**拆成多条**。正则吞掉 `-b..-d` 后缀，
+# 与裸短号同归 `<agent>`。
 # 8 位十六进制：**恰好 8 个**十六进制字符（前后不得再有十六进制字符）。
 # ⚠ 为什么**不**要求"至少含一个 a-f"：task id 是 uuid 前 8 位，**纯数字是合法
 # 取值**（概率约 2%）。曾按"含字母"收窄，实测立刻漏掉一条
@@ -99,6 +103,34 @@ _AGENT_SHORT_ID_RE = re.compile(r"(?<![A-Za-z0-9])A\d{3}(?![0-9A-Za-z])")
 _TASK_ID8_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}(?![0-9a-fA-F])")
 # 占位符（用于"信息量"判定：占位符不计入有效长度）。
 _PLACEHOLDER_RE = re.compile(r"<[a-z0-9]+>")
+
+# ── 批 C（2026-09-18，#5 应剥未剥的其余结构化形状）────────────────
+# ⚠ 全部是「平台/运行时自产的变化量」形状，与措辞正交 —— 与上面同一判据，
+# 不是往词表里堆词。**登记在案不补的**：非十六进制随机 id（无稳定形状可
+# 判）；随机 PID/10 位 epoch 秒（无稳定形状）。⚠ 冒号挂接的端口/PID
+# （`localhost:8000` / `pid:12345`）由 _LINE_NO_RE **连带覆盖**（同归
+# :<ln>）—— 行为方向一致（都是运行时变化量），但口径上是连带非显式
+# （批 C 审计 LOW 订正）。
+# 行号/列号：`file.py:123` / `file.py:123:45` —— 测试失败定位是高频噪声。
+# 时间 "12:34:56" 会被部分吞掉 —— 那本就是易变量，方向一致。
+_LINE_NO_RE = re.compile(r"(?<=\w):\d{1,5}(?!\d)")
+# 时长 / 容量 / token 数：`1.2s` / `345ms` / `2 min` / `12.3 MB` / `1234 tokens`。
+# ⚠ 只剥**数字**保留单位（审计 LOW：容量上限常是配置值——"exceeded
+# 512 KB limit" 与 "exceeded 5 MB limit" 可能是不同根因，合并 = 错解温床）；
+# CJK 分支不用 \b（\b 落不到 CJK 与数字之间，「等待30秒」会漏——审计 LOW）。
+_DURATION_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)(\s?(?:ms|s|sec|secs|min|mins|KB|kB|MB|GB))\b|"
+    r"(\d+(?:\.\d+)?)(\s?(?:分钟|秒))(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_TOKEN_COUNT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?tokens?\b", re.IGNORECASE)
+# 临时目录随机名：mkdtemp 真实形态 = `tmp` + **恰好 8 位**小写/数字/下划线
+# （审计 LOW：{6,}+大小写不敏感会误吃 `tmpDirectory` 这类驼峰标识符）。
+_TMP_DIR_RE = re.compile(r"\btmp[a-z0-9_]{8}\b")
+
+
+def _dur_sub(m: "re.Match[str]") -> str:
+    return "<n>" + (m.group(2) or m.group(4) or "")
 
 
 def _keep_path_tail(match: re.Match) -> str:
@@ -160,6 +192,13 @@ def signature_of(error: str | None, root: str | None = None) -> str | None:
     sig = _TASK_ID8_RE.sub("<id8>", sig)
     sig = _WIN_PATH_RE.sub(_keep_path_tail, sig)
     sig = _UNIX_PATH_RE.sub(_keep_path_tail, sig)
+    # 批 C（2026-09-18）：在路径归一**之后**应用 —— 路径规则把
+    # `D:\x\file.py:123` 收成 `x/file.py:123`（含行号尾巴），行号规则再吃掉
+    # `:123`；时长/容量/token 数与临时目录随机名随后。
+    sig = _LINE_NO_RE.sub(":<ln>", sig)
+    sig = _TOKEN_COUNT_RE.sub("<tok>", sig)
+    sig = _DURATION_RE.sub(_dur_sub, sig)
+    sig = _TMP_DIR_RE.sub("<tmp>", sig)
     sig = _WS_RE.sub(" ", sig)
     if len(sig) < _MIN_SIG_LEN:
         return None
@@ -224,15 +263,25 @@ def call_identity(tool_name: str, args: Any) -> str:
     return f"{(tool_name or '').strip()}::{canonicalize(args)}"
 
 
-def make_module_id(project_id: str, sig: str) -> str:
-    """memories.module_id —— 按 (project, sig) 稳定，upsert 保证去重。
+def make_module_id(project_id: str, sig: str, tool_name: str | None = None) -> str:
+    """memories.module_id —— 按 (project, sig, tool) 稳定，upsert 保证去重。
 
     把 project_id 纳入哈希，防止不同项目撞同一签名文本时跨项目去重
     （save_memory 的 upsert 键是 (agent_id, scope, module_id)）。
+
+    批 C / F9-A（2026-09-18）：**tool_name 纳入 module_id** —— 此前按
+    (project, sig) 两元组，同一签名文本由工具 B 再次撞到时会 upsert
+    **覆盖**工具 A 的那一行（首行 tool= 被改写，此后 A 的解法回填因
+    首行 tool 失配恒 `backfill_no_entry`）。三元组后不同工具**并存为
+    多行**。⚠ 数据级后果（批 C 独立提交的理由）：存量行的 module_id
+    不含 tool ⇒ 新写入视为新条目，旧行从此搁浅（解法行读不到）——
+    这是**已拍板接受**的代价（搁浅量由 replay 脚本报出），不做兼容
+    双判据（那会变成两份判据）。
     """
+    tool_part = (tool_name or "").strip()
     return (
         f"failure_sig::{project_id}::"
-        f"{hashlib.sha256(sig.encode('utf-8', errors='replace')).hexdigest()[:16]}"
+        f"{hashlib.sha256(f'{tool_part}|{sig}'.encode('utf-8', errors='replace')).hexdigest()[:16]}"
     )
 
 
@@ -387,8 +436,17 @@ async def record_failure_signature(
                         or None
                     )
                     prev_meta = m.get("metadata") or {}
+                    # 批 C 审计 MEDIUM（2026-09-18）：解法行携带**按 tool 门控**
+                    # —— F9-A 后不同工具并存为独立行，工具 B 撞到工具 A 的同
+                    # 签名时不再覆盖 A 的行，但如果把 A 的「已验证解法」原样
+                    # 携带进 B 的新行，B 自己后续的真实解法回填会因
+                    # _has_verified_solution_line 被幂等跳过 —— 等于从写入侧
+                    # 把「错解」种进 B 的行。preexisting/hit_count 保持签名级
+                    # （撞到同签名文本就是 rehit，不改 P1-3 自指门语义）。
                     for _line in (m.get("content") or "").splitlines():
-                        if _line.startswith(_SOLUTION_LINE_PREFIX):
+                        if _line.startswith(_SOLUTION_LINE_PREFIX) and _first_line_matches_tool(
+                            _line, tool_name
+                        ):
                             carried_solution_line = _line
                             break
                     break
@@ -412,7 +470,7 @@ async def record_failure_signature(
             _lines.insert(_at, carried_solution_line)
             content = "\n".join(_lines)
         now_ms = int(time.time() * 1000)
-        module_id = make_module_id(project_id, sig)
+        module_id = make_module_id(project_id, sig, tool_name)
         metadata = {
             "kind": "failure_signature",
             "signature": sig,
@@ -420,10 +478,14 @@ async def record_failure_signature(
             "first_hit_at_ms": now_ms,
         }
         if preexisting:
-            # 回填溯源字段随 rehit 保留（solved_at/solution_tool + 状态位）
-            for _k in ("solved_at_ms", "solution_tool", "solution_status"):
-                if _k in (prev_meta or {}):
-                    metadata[_k] = prev_meta[_k]
+            # 回填溯源字段随 rehit 保留（solved_at/solution_tool + 状态位）——
+            # 批 C 审计 MEDIUM：**仅当解法行被携带**（tool 门控通过）时才继
+            # 承状态位 —— 否则 B 的行会「状态位=verified 但无解法行」，同样
+            # 违反下方的机检不变式（只是反方向）。
+            if carried_solution_line:
+                for _k in ("solved_at_ms", "solution_tool", "solution_status"):
+                    if _k in (prev_meta or {}):
+                        metadata[_k] = prev_meta[_k]
             metadata["hit_count"] = int((prev_meta or {}).get("hit_count") or 1) + 1
         else:
             # #16-② 状态位显式落 ``none``：机检口径是

@@ -325,3 +325,61 @@ def test_zero_information_signature_is_not_broadcast():
     # 反向：真内容仍照常广播
     assert _sig("A075 A076 A077 A078 patch apply rejected by merge gate") is not None
 
+
+
+# ── #5 批 C（2026-09-18）：应剥未剥的结构化变化量 ──────────────────
+
+
+def test_worktree_relocation_suffix_is_stripped():
+    """worktree 重定位后缀（A075-b）与裸短号（A075）同归 <agent>。
+
+    §8.8 实测重定位发生 10/9 次 —— 后缀不剥会把同根因拆成多条。"""
+    e1 = "A075-b failed to apply patch at src/main.py"
+    e2 = "A075 failed to apply patch at src/main.py"
+    e3 = "A075-c failed to apply patch at src/main.py"
+    assert _sig(e1) == _sig(e2) == _sig(e3)
+
+
+def test_line_numbers_are_stripped():
+    """file.py:123 与 file.py:456 是同一根因（行号是易变量）。"""
+    e1 = "AssertionError in tests/x.py:123 expected 3 got 4"
+    e2 = "AssertionError in tests/x.py:456 expected 3 got 4"
+    assert _sig(e1) == _sig(e2)
+
+
+def test_durations_sizes_and_token_counts_are_stripped():
+    """时长/容量/token 数变化不改变身份。"""
+    a = "Request took 1.2s and 512 KB, used 345 tokens, then connection refused"
+    b = "Request took 8.9s and 2048 KB, used 999 tokens, then connection refused"
+    assert _sig(a) == _sig(b)
+
+
+def test_temp_dir_random_names_are_stripped():
+    """pytest 临时目录随机段不改变身份。"""
+    e1 = "tmpab12x9ab/test_config.py missing in workspace"
+    e2 = "tmpk3lnqm2o/test_config.py missing in workspace"
+    assert _sig(e1) == _sig(e2)
+    # 驼峰标识符不误吃（审计 LOW）：mkdtemp 形态 = tmp + 恰 8 位小写/数字
+    e3 = "tmpDirectory not found in workspace"
+    assert "tmpDirectory" in (_sig(e3) or ""), "驼峰标识符被误剥"
+
+
+def test_wording_still_splits_different_roots():
+    """措辞本身仍不剥（批 C 不改变这条边界）——不同根因不同身份。"""
+    a = "build failed: 3 tests failed in 1.2s"
+    b = "build passed after 3 retries in 1.2s"
+    assert _sig(a) != _sig(b)
+
+
+def test_module_id_includes_tool_name():
+    """F9-A：module_id 三元组化 —— 同签名不同工具并存为多行，不再覆盖。
+
+    阳性对照：把 make_module_id 退回不含 tool ⇒ 本测试转红。"""
+    from hiveweave.services.failure_signature import make_module_id
+
+    sig = "connection refused to upstream"
+    m_bash = make_module_id("p1", sig, "bash")
+    m_pwsh = make_module_id("p1", sig, "pwsh")
+    assert m_bash != m_pwsh, "不同工具必须并存为两行（存储侧不是并读侧）"
+    assert m_bash == make_module_id("p1", sig, "bash"), "同 (project, sig, tool) 稳定"
+    assert make_module_id("p1", sig) != make_module_id("p2", sig, "bash"), "跨项目仍隔离"
