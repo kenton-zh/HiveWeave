@@ -71,6 +71,73 @@ def _prepare_cwd() -> None:
                     pass
 
 
+_OUT_ROTATOR = None  # 回写句柄的轮转器（None＝功能关闭/构造失败，须先判空）
+
+# 与 hiveweave.main._ROTATE_CHECK_EVERY_LINES 同口径：预检采样间隔，非判据
+_OUT_ROTATE_EVERY_LINES = 64
+
+
+class _RotatingStdout:
+    """``sys.stdout`` 代理：逐行轮转 ``launcher.out.log``（EXE 唯一 stdout 出口）。
+
+    为什么不复用 ``hiveweave.main._FlushFile``：launcher 在**导入 hiveweave 之前**
+    就要给 ``sys.stdout`` 一个落点（否则启动早期的 print 全丢），此时包未必可导入。
+    轮转逻辑本身来自同一实现（``hiveweave.util.log_rotate``），仅此薄代理重复。
+    代理不继承 ``io.TextIOBase``：``write/flush/fileno/isatty`` 已覆盖
+    ``print`` / ``structlog`` / ``uvicorn`` 的全部用法（同 ``main._TeeStream``）。
+    """
+
+    def __init__(self, out, rotator=None) -> None:
+        self._out = out
+        self._rotator = rotator
+        self._lines = 0
+
+    def _maybe_rotate(self) -> None:
+        self._lines += 1
+        if self._lines < _OUT_ROTATE_EVERY_LINES:
+            return
+        self._lines = 0
+        rotator = self._rotator
+        if rotator is None:
+            return  # 必须先判空 —— 直接 rotator.rotate_if_needed() 会 None() 崩
+        if rotator.rotate_if_needed() is None:
+            return
+        # 必需收尾：``os.truncate`` 走路径、不改句柄流状态，偏移仍在旧末尾。
+        # inode 没换（本方案不改名），故 seek 即可，无需重开句柄。
+        rotator.reset_offset(self._out)
+
+    def write(self, s: str) -> int:
+        n = self._out.write(s)
+        self._out.flush()
+        self._maybe_rotate()
+        return n
+
+    def flush(self) -> None:
+        self._out.flush()
+
+    def fileno(self) -> int:
+        return self._out.fileno()
+
+    def isatty(self) -> bool:
+        return False
+
+    def reconfigure(self, **kw) -> None:
+        # 后续若有人对 sys.stdout.reconfigure 仍能落地（main.py 顶部就有一位）
+        reconfigure = getattr(self._out, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(**kw)
+
+
+def _make_stdout_rotator(log_path):
+    """构造 stdout 轮转器；hiveweave 不可导入时返回 None（功能优雅关闭）。"""
+    try:
+        from hiveweave.util.log_rotate import make_rotator
+
+        return make_rotator(log_path)
+    except Exception:
+        return None
+
+
 def _frozen_bootstrap_env() -> None:
     """Frozen EXE 启动环境（全部 setdefault 语义：显式导出优先）。
 
@@ -83,7 +150,8 @@ def _frozen_bootstrap_env() -> None:
       ``resolve_browse_bin`` 的 node_modules 祖先走查在 frozen 下不可达，
       与 Electron 壳同一注入法（bin 名口径对齐 config.agent_browser_bin_name）。
     - 窗口版（console=False）``sys.stdout/stderr`` 为 None：重定向到
-      ``<exe>/data/logs/launcher.out.log``，print / FATAL 不丢也不炸。
+      ``<exe>/data/logs/launcher.out.log``，print / FATAL 不丢也不炸；
+      该重定向自 09-17 起带**逐行轮转**（此前是永久 append，实测涨到 72 MB）。
     """
     exe_dir = Path(sys.executable).resolve().parent
     logs_dir = exe_dir / "data" / "logs"
@@ -121,13 +189,17 @@ def _frozen_bootstrap_env() -> None:
     if sys.stdout is None or sys.stderr is None:
         try:
             logs_dir.mkdir(parents=True, exist_ok=True)
+            target = logs_dir / "launcher.out.log"
+            # 轮转器**先**构造：必须在 launcher 自身 print 之前——否则启动早期
+            # 写的行会落进一个纯 append 句柄，那段时间不轮转（可接受但不必要）。
+            globals()["_OUT_ROTATOR"] = _make_stdout_rotator(target)
             # 文本模式 + 行缓冲：print/structlog 都写 str，二进制 FileIO
             # （"ab"+buffering=0）会让第一条日志 TypeError（审计 B1 实锤）
             out = open(  # noqa: SIM115 —— 进程级常驻句柄，随进程生命周期
-                logs_dir / "launcher.out.log", "a", encoding="utf-8", buffering=1
+                target, "a", encoding="utf-8", buffering=1
             )
-            sys.stdout = out
-            sys.stderr = out
+            sys.stdout = _RotatingStdout(out, globals()["_OUT_ROTATOR"])
+            sys.stderr = sys.stdout
         except Exception:
             pass  # 无处可写就维持 None：print 失败静默（GUI 模式本无控制台）
 
