@@ -602,18 +602,22 @@ async def _submit_preflight(
                     "（verdict ∈ {PASS, FAIL}；FAIL 还需非空 blockingIssues）。"
                 ),
             })
+        _cov_kinds = await acceptance_coverage_kinds(task)
         _uncovered = await uncovered_acceptance_items_verified(
             project_id,
             task_id,
             task.get("acceptance_criteria"),
             evidence,
             expected_agent_id=agent_id,
-            kinds=await acceptance_coverage_kinds(task),
+            kinds=_cov_kinds,
         )
         if _uncovered:
             issues.append({
                 "code": "acceptance_coverage",
-                "message": format_acceptance_coverage_error(_uncovered),
+                # F1：处方按本任务 policy 渲染 kind（防照抄 test_run 示例）。
+                "message": format_acceptance_coverage_error(
+                    _uncovered, _cov_kinds
+                ),
             })
 
     # P1-C/N5: code tasks require clean worktree + files_changed proof.

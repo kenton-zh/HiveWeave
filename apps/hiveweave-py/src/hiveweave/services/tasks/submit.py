@@ -59,16 +59,21 @@ class SubmitMixin:
             # 不适用的条目须先由 coordinator/CEO waive_attestation 落平台 waiver 行。
             # 缺覆盖 → 拒绝并列出缺哪几条 + 处方。清单为空的任务不受影响；
             # check_evidence_verifiable 的 VERIFY 跳过保持不动。
+            _cov_kinds = await acceptance_coverage_kinds(task)
             gaps = await uncovered_acceptance_items_verified(
                 project_id,
                 task_id,
                 task.get("acceptance_criteria"),
                 evidence,
                 expected_agent_id=str(task.get("assignee_id") or "") or None,
-                kinds=await acceptance_coverage_kinds(task),
+                kinds=_cov_kinds,
             )
             if gaps:
-                raise ValueError(format_acceptance_coverage_error(gaps))
+                # F1：处方必须按本任务 policy 渲染 kind（否则 agent 照抄
+                # `test_run` 示例 → 撞 attestation 门）。
+                raise ValueError(
+                    format_acceptance_coverage_error(gaps, _cov_kinds)
+                )
             # E5 断流收口纪律：降级中提交 verdict=FAIL 属「waiver 型就地
             # 收口」——必须续跑重验或升级 coordinator，不许抢在续跑前
             # 用 FAIL 提交替豁免收口（复盘终验三连打断后 waiver 收口）。

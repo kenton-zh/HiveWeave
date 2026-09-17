@@ -433,17 +433,67 @@ def uncovered_acceptance_items(
     return gaps
 
 
-def format_acceptance_coverage_error(missing: list[str]) -> str:
-    """E1 验收清单缺覆盖的拒绝文案（点名缺哪几条 + 处方）。"""
+def format_acceptance_coverage_error(
+    missing: list[str], kinds: tuple[str, ...] | None = None
+) -> str:
+    """E1 验收清单缺覆盖的拒绝文案（点名缺哪几条 + 处方）。
+
+    ⚠ **处方里的凭证 kind 必须按本任务的 policy 渲染**（F1，2026-09-17）。
+    原先这里把 `test_run` 写死成通用例子，而"照抄处方"正是 agent 最自然的
+    行为 ⇒ **UI 任务（policy=`ui_browser_e2e`）的 agent 挂上 test_run 后被
+    attestation 门拒**（`'test_run' not in expected ['browse_e2e']`），
+    表现为"两道门互相矛盾、无解"。
+
+    实证（TEST_DSH_61，任务 `309e2489`）：
+      · 05:58:35 第一次 submit → 被本门拒（未声明 acceptance_coverage）
+      · 06:00:14 第二次按处方补挂 `test_run`（`node -e` 静态解析）→
+        被 attestation 门拒（expected=['browse_e2e']）
+      · 该任务当时**已有 24 条 `browse_e2e` 凭证**（全 exit=0，含
+        goto/snapshot/screenshot/click/eval）—— 正确做法本就在手边，
+        是**处方把人指错了路**。
+
+    本函数属 #16「说明书式披露」同族：平台给出的示例被当成规格照搬。
+    修法 = 按 `kinds` 渲染**本任务真正认的**凭证类型，并在多 kind 时
+    说明用什么工具产出（browse_e2e 由 `browse` 工具产出，test_run 由
+    `pwsh`/`run_command` 带 `testEvidence=true` 产出）。
+    """
+    _ks = tuple(k for k in (kinds or ()) if k)
+    if not _ks:
+        _ks = ("test_run",)
+    # 逐 kind 给出「怎么产出」的可操作指引 —— 只报 kind 名等于把问题
+    # 原样退还给 agent。
+    _HOW: dict[str, str] = {
+        "test_run": "跑测试命令（`pwsh`/`run_command`，带 testEvidence=true）",
+        "browse_e2e": "用 `browse` 工具做真实浏览器交互（goto/snapshot/"
+                      "click/screenshot，exit_code=0）",
+        "doc_review": "由 reviewer 对该文档落 `doc_review` 凭证",
+        "code_audit": "`request_code_audit` 唤起的审计凭证",
+        "manual_review": "由 reviewer 落的 `manual_review` 凭证",
+    }
+    _hint_lines = "\n".join(
+        f"  - `{k}`：{_HOW.get(k, '平台认可的该 kind 凭证')}" for k in _ks
+    )
+    _example = (
+        f'{{"1": {{"attestation_ids": ["<{_ks[0]} 凭证 id>"]}}}}'
+    )
+    _multi = (
+        f"（本任务认这 {len(_ks)} 类：" + "、".join(f"`{k}`" for k in _ks) + "）"
+        if len(_ks) > 1
+        else f"（本任务只认 `{_ks[0]}`）"
+    )
     return (
         "SUBMIT REJECTED (verify acceptance checklist): 任务带 "
         "acceptance_criteria，verdict evidence 未体现对以下 "
         f"{len(missing)} 条的覆盖：\n- "
         + "\n- ".join(missing)
-        + "\n处方：在 verdict evidence 加 `acceptance_coverage`，逐条按 id 声明覆盖"
-        "（条目N → id 见上方清单），形如 "
-        '{"1": {"attestation_ids": ["<test_run 凭证 id>"]}}——凭证由平台核验'
-        "（本任务、kind=test_run、未过期、exit_code=0）；确不适用的条目先由 "
+        + f"\n处方：在 verdict evidence 加 `acceptance_coverage`，逐条按 id 声明覆盖"
+        "（条目N → id 见上方清单），形如 " + _example
+        + "——凭证由平台核验"
+        f"（**必须属于本任务要求的凭证类型**{_multi}、"
+        "未过期、成功）：\n" + _hint_lines
+        + "\n⚠ **不要照搬上面的 kind 名**：它是按本任务的 policy 渲染的；"
+        "换成别的 kind（例如给纯 UI 任务挂 test_run）会被 attestation 门拒。"
+        "确不适用的条目先由 "
         "coordinator `waive_attestation` 落平台 waiver 行，再写 "
         '{"id": …, "not_applicable_reason": "<理由>"}。'
         "**照抄条目原文、换措辞、或裸写 `N/A: <理由>` 都不算覆盖**。"
