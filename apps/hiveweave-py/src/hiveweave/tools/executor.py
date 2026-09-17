@@ -2192,8 +2192,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "One-shot LLM audit of your worktree diff. Required before "
             "submit_task when cumulative code edits exceed 20 lines. "
-            "Returns VERDICT PASS/ISSUES; only high-severity issues block "
-            "submit. The audit prompt includes the task's acceptance "
+            "Returns VERDICT PASS/ISSUES. Issues carry a severity tag; the "
+            "platform decides what blocks submit. The audit prompt includes "
+            "the task's acceptance "
             "criteria — spec-mandated behavior is not a defect. If the LLM "
             "call fails (llm_failed) the platform auto-enqueues a background "
             "retry and notifies you in your inbox when it succeeds; wait for "

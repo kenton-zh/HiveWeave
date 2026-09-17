@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import re
 import tempfile
 from contextlib import ExitStack
 from pathlib import Path
@@ -536,6 +537,59 @@ class TestMatrix15FactBits:
 
 # ── #16：(b) 档「绕过配方」零残留 ───────────────────────────────────
 
+#: F8-① 合取判据（2026-09-18）：**档位名（high/medium/low）与阻断动词同句
+#: 近邻（≤24 字符）**才算「披露判据」。单纯字面词表是「换措辞即绕过」在守卫
+#: 自己身上的复发（``identity.py`` 换措辞后旧词表全绿）；合取才能抓住改写。
+#: 窗口 24 字符 ≈ 同一短句：合法枚举说明（``priority (low/medium/high)``）
+#: 与审计输出契约（教模型写 ``SEVERITY:high``）都不含阻断动词，不误报。
+_SEVERITY_BLOCK_RE = re.compile(
+    r"(?:high|medium|low)[^\n]{0,24}(?:blocks?|阻断|拦截|放行|过门|锁门|拦住)"
+    r"|(?:blocks?|阻断|拦截|放行|过门|锁门|拦住)[^\n]{0,24}(?:high|medium|low)",
+    re.IGNORECASE,
+)
+
+
+def _find_severity_block_recipe(text: str) -> str | None:
+    m = _SEVERITY_BLOCK_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _tool_param_schema_descriptions() -> list[str]:
+    """AST 提取 ``tools/executor.py`` 的 ``TOOL_PARAM_SCHEMAS`` 全部字符串常量。
+
+    F8-① 的第二半扫描面：``TOOL_PARAM_SCHEMAS`` 的 description 会进 LLM
+    工具表（``get_tool_schema_for_llm`` 优先读它），与 prompts/ 同为
+    「说明书」，必须同扫。覆盖两种赋值形态：模块级 AnnAssign
+    （``TOOL_PARAM_SCHEMAS: dict = {…}``）与后续 Subscript 增补
+    （``TOOL_PARAM_SCHEMAS["x"] = {…}``）。
+    """
+    path = _SRC_ROOT / "tools" / "executor.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    chunks: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        else:
+            continue
+        if not any(
+            (isinstance(t, ast.Name) and t.id == "TOOL_PARAM_SCHEMAS")
+            or (
+                isinstance(t, ast.Subscript)
+                and isinstance(t.value, ast.Name)
+                and t.value.id == "TOOL_PARAM_SCHEMAS"
+            )
+            for t in targets
+        ):
+            continue
+        if node.value is None:  # 无值裸声明（`x: dict`）没有可扫的字符串
+            continue
+        for sub in ast.walk(node.value):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                chunks.append(sub.value)
+    return chunks
+
 
 def test_matrix16_no_bypass_recipes_in_prompts():
     """§三 #16 收敛后的验收口径：**逐条分档，(b) 档零残留**。
@@ -543,8 +597,13 @@ def test_matrix16_no_bypass_recipes_in_prompts():
     - (a) 接口契约（``test_run:``/``contractWaived`` 等合法取值）与
       (c) 入站协议词汇（``[TURN EXIT BLOCKED]`` 等）**按设计保留**——
       删了 agent 就无法提交/无法认出唤醒信号，净亏；
-    - (b) 绕过配方（告诉模型门禁在读什么文本）必须为零。本用例列的即
-      §三 #16 表里 (b) 档的全部成员；新发现 (b) 档条目时**加进这张表**。
+    - (b) 绕过配方（告诉模型门禁在读什么文本）必须为零。字面词表只收
+      **已知措辞**（快速失败、报错可读）；**改写形态由合取判据兜住**
+      （``_SEVERITY_BLOCK_RE``：档位名 + 阻断动词 ≤24 字符近邻）。
+    - 扫描面（F8-① 扩展，2026-09-18）：prompts/ 全部文本形态 + ``tools/
+      executor.py`` 的 ``TOOL_PARAM_SCHEMAS`` 字符串（后者同样进 LLM
+      —— #16 旧守卫只扫 prompts/，executor.py:2192 的「only high-severity
+      issues block」披露因此逃逸）。
     """
     b_class_recipes = [
         "只拦 high",          # 「code_audit 只拦 high 级问题」
@@ -552,6 +611,7 @@ def test_matrix16_no_bypass_recipes_in_prompts():
         "ISSUES high=0",      # 内部凭证标记名
         "medium/low 会放行",  # 「纯 medium/low 会放行」的诱导（不能只写
                               # "medium/low"——context.py 合法枚举说明会误报）
+        "only high-severity issues block",  # F8-① 旧披露（executor.py:2192）
     ]
     prompts_dir = _SRC_ROOT / "prompts"
     scanned = 0
@@ -566,10 +626,54 @@ def test_matrix16_no_bypass_recipes_in_prompts():
         text = path.read_text(encoding="utf-8")
         for recipe in b_class_recipes:
             assert recipe not in text, f"{path.name} 残留绕过配方：{recipe!r}"
+        hit = _find_severity_block_recipe(text)
+        assert hit is None, f"{path.name} 残留「档位名+阻断动词」披露：{hit!r}"
     assert scanned >= 4, f"prompts 扫描面异常（只扫到 {scanned} 个文件）"
+    schema_strings = _tool_param_schema_descriptions()
+    assert len(schema_strings) >= 40, (
+        f"TOOL_PARAM_SCHEMAS 提取异常（仅 {len(schema_strings)} 条）——"
+        "AST 扫描面失真，守卫在空转"
+    )
+    for desc in schema_strings:
+        for recipe in b_class_recipes:
+            assert recipe not in desc, f"TOOL_PARAM_SCHEMAS 残留绕过配方：{recipe!r}"
+        hit = _find_severity_block_recipe(desc)
+        assert hit is None, f"TOOL_PARAM_SCHEMAS 描述残留披露：{hit!r}"
     # 阳性对照：扫描真的在读文件内容 —— (a) 档合法取值应能扫到
     identity = (prompts_dir / "identity.py").read_text(encoding="utf-8")
     assert "test_run:" in identity
+
+
+def test_matrix16_conjunction_detector_positive_controls():
+    """F8-① 合取判据自身的阳性/阴性对照。
+
+    阳性对照（改坏动作）：把 ``request_code_audit`` 的 description 改回
+    旧披露「only high-severity issues block submit」，或把 identity.py 的
+    「审计报出的**阻断项**」改回「审计报出的 high 级问题必须修掉才会过门」
+    ⇒ ``test_matrix16_no_bypass_recipes_in_prompts`` 必须转红。
+    阴性：新行为契约写法（无档位名）、合法枚举说明、审计输出契约教学
+    （无阻断动词近邻）一律不触发。
+    """
+    # 阳性：旧披露两种措辞（英文原形 + 中文改写形态）
+    assert _find_severity_block_recipe(
+        "Returns VERDICT PASS/ISSUES; only high-severity issues block submit."
+    )
+    assert _find_severity_block_recipe("审计报出的 high 级问题必须修掉才会过门")
+    assert _find_severity_block_recipe("纯 medium/low 会放行")
+    # 阴性：新行为契约（无档位名）
+    assert not _find_severity_block_recipe(
+        "Returns VERDICT PASS/ISSUES. Issues carry a severity tag; the "
+        "platform decides what blocks submit."
+    )
+    # 阴性：合法枚举说明（档位名无阻断动词近邻）
+    assert not _find_severity_block_recipe(
+        "priority (low/medium/high). Mark finished items completed rather "
+        "than deleting them."
+    )
+    # 阴性：审计输出契约教学（severity 枚举自身合法）
+    assert not _find_severity_block_recipe(
+        "每条发现末尾标 [high]、[medium] 或 [low]，供平台分档。"
+    )
 
 
 # ── P-1：棘轮「新增被看见」 ─────────────────────────────────────────

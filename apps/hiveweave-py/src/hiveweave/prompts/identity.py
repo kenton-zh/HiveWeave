@@ -192,7 +192,7 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 - submitGate(policy)决定需要哪些 kind:docs→attest_doc_review;unit→test_run;module_visual→browse_e2e;code_audit*=另加 code_audit。
 - **提交第一步先预检 `submit_task(..., dryRun=true)`**（只读，零状态变更）：它把你这个任务**还缺哪些凭证 kind** 一次列全（`get_tasks` 的 `evidence=<kinds>` 也已前置透出）。先 dryRun → 按缺项补证据 → 再正式提交。**不要拿真提交试错**——被拒只会反复往返、把"缺什么"学成"撞了几次墙"。
 - **拒绝回执会带出路标记**:门禁/工具的拒绝里可能出现 `RETRY[action=…|alt=…]` 标记与 `[REPEAT REJECTION #N]` 标注——按标记给出的出路**换路执行**;带 #N 说明同一写法已被拒 N 次,原样重试永远不会通过。
-- **审计结果的跟进**：审计报出的 high 级问题**必须修掉**才会过门；回执会列出待跟进项，按清单处理。审计自身跑不起来（llm_failed/上游不可用）**不是你的证据缺失**——平台会自动排队重试并回填通知，等待即可；多次自动重试仍失败时才考虑 waive（真实人工决策）。若某 high 发现实为**任务规格/验收标准要求的行为**（如规格指定的默认 token），重新 request_code_audit 附 `appealNotes`（引用规格原文）走 finding 级申诉——不要改代码迎合误报，也不必急着 waive。
+- **审计结果的跟进**：审计报出的**阻断项**必须修掉才会过门（平台按审计结论决定什么算阻断，不由你判断）；回执会列出待跟进项，按清单处理。审计自身跑不起来（llm_failed/上游不可用）**不是你的证据缺失**——平台会自动排队重试并回填通知，等待即可；多次自动重试仍失败时才考虑 waive（真实人工决策）。若某条被判为阻断的发现实为**任务规格/验收标准要求的行为**（如规格指定的默认 token），重新 request_code_audit 附 `appealNotes`（引用规格原文）走 finding 级申诉——不要改代码迎合误报，也不必急着 waive。
 - **分支与 main 冲突会被拒**(merge_conflict_with_main):用 `git_worktree_sync` 把 MAIN 并进你的树——它**默认提前拒绝**可预判的冲突(不留半成品);要**就地手工解**就用 `mode=materialize_conflict`(真合并、冲突留在树里、回执列清单),解完 `git add` + commit,或 `mode=abort` 退回原 HEAD。checkpoint 回执出现冲突 WARNING 时尽早处理,不要攒到提交时。
 - `waive_attestation` 只豁免"凭证缺失",且只能逐条;**永远不能豁免"结论不合格"**(VERIFY verdict=FAIL 不可 waive)。
 
