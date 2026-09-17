@@ -366,15 +366,54 @@ def test_shell_fact_flag_whitelist_is_single_and_covers_dialect():
     两处出口（`_shell_tool_impl` / `run_command_tool`）曾各列一份，而
     `dialect_failed` 只在其中一份里 ⇒ `run_command` 的方言门失败会退化成通用
     "命令未运行（执行器/方言/权限/审批）"文案，而生产者明明写了位。
+
+    ⚠ 2026-09-17 改法订正（F3）：
+      · 原判据 `src.count("_SHELL_FACT_FLAG_KEYS") == 3` 是**文本计数**
+        —— 加一行提到该名字的注释就会假红（本次实测：4 == 3），而
+        真正的复发形态（有人在别处**再列一份新清单**、换个名字）它抓不到。
+        按本仓纪律「测试层守卫必须 AST，禁止文本子串判据」改为 AST 节点计数。
+      · 同时把 `enforcement*` 纳入断言：原先只断言到 `git_hardened`，于是
+        0-3 加 `git_hardened` 时有人记得，而 `enforcement*` 4 键**两份清单
+        都没登记**（实证：58/59/60/61 共 4863 行 run_steps 零落库，
+        而 `git_hardened` 在 61 有 86 条）⇒ 守门范围比它以为的窄。
     """
+    import ast as _ast
+
     from hiveweave.tools import bash as bash_mod
 
     keys = set(bash_mod._SHELL_FACT_FLAG_KEYS)
     assert "dialect_failed" in keys, keys
     assert {"fact", "runner_failed", "command_failed", "git_hardened"} <= keys, keys
-    src = (_SRC / "tools" / "bash.py").read_text("utf-8")
-    assert src.count("_SHELL_FACT_FLAG_KEYS") == 3, (
-        "白名单使用点不是「1 处定义 + 2 处出口」—— 有人又各列了一份清单"
+    # F3：spawn 面戳必须也在白名单里（否则在 `_ff` 过滤处整批丢失）。
+    assert {
+        "enforcement", "enforcement_level",
+        "enforcement_reason", "enforcement_boundary",
+    } <= keys, (
+        "shell 事实位白名单缺 enforcement* —— spawn 面戳会在这层被过滤掉，"
+        "run_steps.enforcement 恒 NULL"
+    )
+    # F5（2026-09-17）：执行面事实同理 —— 「命令到底有没有启动」也要到得了
+    # 消费端，否则 `enforcement="confined"` 没法与"其实没进程"对账。
+    assert "executed" in keys, (
+        "shell 事实位白名单缺 executed —— 执行面事实会在这层被过滤掉，"
+        "「戳说在沙箱里而进程从未启动」在数据里不可判"
+    )
+
+    # ── AST 判据：白名单的**真实引用点**必须恰好是「1 处定义 + 2 处出口」──
+    tree = _ast.parse((_SRC / "tools" / "bash.py").read_text("utf-8"))
+    # 定义点 = 被赋值的目标名（AnnAssign/Assign 的 Name 存进 _SHELL_FACT_FLAG_KEYS）
+    defs = 0
+    refs: list[int] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Name) and node.id == "_SHELL_FACT_FLAG_KEYS":
+            if isinstance(node.ctx, _ast.Store):
+                defs += 1
+            else:
+                refs.append(node.lineno)
+    assert defs == 1, f"白名单定义点应恰有 1 处，实测 {defs}"
+    assert len(refs) == 2, (
+        f"白名单**引用**点应为 2 处出口（_shell_tool_impl / run_command_tool），"
+        f"实测 {len(refs)} 处 @ {refs} —— 有人又各列了一份清单"
     )
 
 

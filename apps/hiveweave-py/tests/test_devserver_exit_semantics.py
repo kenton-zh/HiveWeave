@@ -72,10 +72,46 @@ def test_missing_log_file_still_receipts(tmp_path):
 def test_health_loop_wired_to_receipt_source_guard():
     """接线守卫：health 循环必须真的走 `_early_exit_receipt`（回退成内联
     ``err("Dev server exited …")`` 的旧行为时本测试红 —— 纯单元测试锁不住
-    调用点，源码断言补这个缺口）。"""
+    调用点，源码断言补这个缺口）。
+
+    ⚠ **本守卫原先用文本子串**（`assert "_early_exit_receipt(proc.returncode,
+    cmd, log_path)" in src`）。2026-09-17 F3/M1 给该函数加了第 4 个参数
+    （`stamp`），调用点变成 `_early_exit_receipt(proc.returncode, cmd,
+    log_path, _stamp)` ⇒ 子串不再匹配 ⇒ **本文件转红**，而当时的定向回归
+    用 `-k` 过滤把它漏在外面，差点以"全绿"交付。
+    —— 这正是本仓纪律禁的形态：**文本判据随措辞失效**，且失效方向是
+    「看起来更绿」或「误报红」，两种都不可信。
+
+    改法（不是把子串再补一个变体）：用 **AST** 判「该函数确实被调用，
+    且带够了参数」。这样下次改签名（加参数/换位置）不会假红，而
+    「回退成内联文案」仍然会被抓到。
+    """
+    import ast
+
     from hiveweave.tools import dev_server_tools
 
     src = Path(dev_server_tools.__file__).read_text(encoding="utf-8")
-    assert "_early_exit_receipt(proc.returncode, cmd, log_path)" in src
+    tree = ast.parse(src)
+
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+        if name == "_early_exit_receipt":
+            calls.append(node)
+
+    # 只算**真实调用点**（排除定义处的签名本身 —— 定义不是 Call）
+    assert calls, (
+        "health 循环必须真的调用 `_early_exit_receipt` —— 回退成内联 "
+        'err("Dev server exited …") 时本断言转红'
+    )
+    for c in calls:
+        nargs = len(c.args) + len([k for k in c.keywords if k.arg])
+        assert nargs >= 3, (
+            f"调用点 {c.lineno} 只传了 {nargs} 个参数 —— 回执至少要 "
+            "exit_code / cmd / log_path 才能按事实区分成败"
+        )
     # 旧的内联失败文案（docstring 里的历史引用不算 —— 只查代码里的 f-string 形态）
     assert '"Dev server exited (code={proc.returncode})"' not in src

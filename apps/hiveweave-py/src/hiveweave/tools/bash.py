@@ -40,6 +40,9 @@ from hiveweave.util import path_guard
 from hiveweave.util.tree_label import cwd_display
 from hiveweave.tools.fact_positions import classify_error_text
 from hiveweave.tools.result import finalize_fact_dict
+# F5（2026-09-17）：spawn 面事实的**唯一登记点**（决策面 + 加固面 + 执行面）。
+# 上方 `_SHELL_FACT_FLAG_KEYS` 从此派生 —— 新增一种事实只在 policy 登记一次。
+from hiveweave.services.acl_sandbox.policy import ALL_SPAWN_STAMP_KEYS
 
 log = structlog.get_logger(__name__)
 
@@ -422,11 +425,14 @@ async def _run_registered_dev_server(
             return finalize_fact_dict(sres)
     except SandboxUnavailableError as e:
         # fail-closed：沙箱不可用 → 直接干净拒绝，不重复 spawn / 不落原生。
+        # F5：带上 `executed` 执行面事实（异常由 `spawn_agent_command` 打上
+        # `executed=False` = 命令从未启动）—— 只有「被拒绝」而没有「没跑过」
+        # 这两个正交事实，下游会把 confined 读成"在沙箱里跑过"。
         log.warning(
             "bash.dev_server_sandbox_unavailable",
             error=str(e), command=command[:120], cwd=cwd[:120],
         )
-        return e.to_tool_dict()
+        return e.to_tool_dict(**_executed_stamp(e))
     except Exception as e:
         log.warning(
             "bash.dev_server_spawn_failed",
@@ -727,25 +733,62 @@ def _maybe_append_test_hints(command: str, error_msg: str) -> str:
 #: （`execute_run_command` → `bash.py` 的 `"dialect_failed": True`）明明写了位。
 #: 这正是本仓自陈的复发形态（"每处各列一份清单"，事实位白名单上栽过两次），
 #: 故抽成常量：**新增位只改这里**（审计 T1，2026-09-16）。
+#:
+#: ⚠⚠ 2026-09-17 补正：上面那句"只改这里"当时**不成立**，因为 spawn 面戳
+#: （`enforcement*` / `git_hardened`）还有**第二个登记点**
+#: （`tools/result.py::ToolResult.to_dict` 的透传白名单）。而 0-3 只把
+#: `git_hardened` 加进了**本清单**、没加进 `to_dict` 那份；`enforcement*`
+#: 则**两份都没有** —— 于是本清单就是 `enforcement` 的**唯一丢失点**：
+#: 八处出口都正确调用了 `_enforcement_stamp(result)` 并把戳展开进裸 dict，
+#: 但 `_shell_tool_impl` / `run_command_tool` 用它做 `_ff` 过滤时把 4 个键
+#: 全滤掉 ⇒ 最终 ToolResult 里没有该键 ⇒ `streaming.py` 取到 None ⇒
+#: `run_steps.enforcement` 恒 NULL。**实证**：58/59/60/61 共 4863 行
+#: run_steps 零落库；而 `git_hardened`（已登记进本清单）在 61 有 86 条
+#: （工具分布 pwsh 70 / pwsh_main 14 / run_command 2 —— 恰好是走 shell 这条路的）。
+#: ⇒ 修法不是"再补一次词表"（那正是本仓反复栽的形态），而是把
+#: `ALL_SPAWN_STAMP_KEYS` 当**唯一登记点**并进本清单，让新增一种 spawn 面事实
+#: 只需要在 `policy.py` 登记一次。
+#:
+#: ⚠ 2026-09-17 二次补正（F5）：登记点当时仍**不完整** —— `SPAWN_STAMP_KEYS`
+#: 只覆盖「决策面 + 加固面」，而「命令到底有没有启动」（执行面 `executed`）
+#: 谁都不管。于是 `enforcement="confined"` 在"沙箱判定成立、而 pwsh 缺失
+#: 导致进程根本没起来"时照样宣告，回执说"被约束"、事实是"没有进程"。
+#: ⇒ 登记点扩为 `ALL_SPAWN_STAMP_KEYS`（+ 执行面 1 键），仍只登记一处。
 _SHELL_FACT_FLAG_KEYS: tuple[str, ...] = (
     "fact", "runner_failed", "command_failed", "injection_applied",
     "timeout_kind", "timeout_ms", "dialect_failed",
-    # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
-    "git_hardened",
+    # 0-3 + #1 + F5：spawn 面戳（决策面 4 键 + 加固面 git_hardened +
+    # 执行面 executed）。从 policy 派生而非再列一遍 —— 见上方补正。
+    *ALL_SPAWN_STAMP_KEYS,
 )
 
 
 def _enforcement_stamp(result: dict) -> dict[str, Any]:
     """把唯一入口盖的 spawn 面戳原样搬到最终结果（键名以 policy 为准，不另起名）。
 
-    用 `SPAWN_STAMP_KEYS`（= 执行面 4 键 + 加固面 `git_hardened`）：新增一种
-    spawn 面事实只在 policy 那里登记一次 —— 这里的 `if k in result` 决定
-    「没这条信息」时**不补默认值**（NULL/缺键 ≠ 说了否，与 run_steps 的
-    `COALESCE` 语义对齐）。
-    """
-    from hiveweave.services.acl_sandbox.policy import SPAWN_STAMP_KEYS
+    用 `ALL_SPAWN_STAMP_KEYS`（= 决策面 4 键 + 加固面 `git_hardened` + 执行面
+    `executed`）：新增一种 spawn 面事实只在 policy 那里登记一次 —— 这里的
+    `if k in result` 决定「没这条信息」时**不补默认值**（NULL/缺键 ≠ 说了否，
+    与 run_steps 的 `COALESCE` 语义对齐）。
 
-    return {k: result[k] for k in SPAWN_STAMP_KEYS if k in result}
+    ⚠ 本函数产出的戳**必须同时**落在 `_SHELL_FACT_FLAG_KEYS` 里才到得了
+    消费端（`run_steps.enforcement`）—— 二者现已同源（都派生自
+    `ALL_SPAWN_STAMP_KEYS`），见该常量的 2026-09-17 补正。
+    """
+    return {k: result[k] for k in ALL_SPAWN_STAMP_KEYS if k in result}
+
+
+def _executed_stamp(exc: BaseException) -> dict[str, Any]:
+    """F5：从**异常**上取「命令从未启动」这个事实位（缺属性 ⇒ 空，不猜）。
+
+    与 `_enforcement_stamp` 的分工：那个从**结果 dict** 里取（执行已经发生），
+    这个从**异常**上取（执行没有发生）。两条路都要能把「有没有进程」上报，
+    否则 `enforcement="confined"` 会被下游一律读成"在沙箱里跑过"。
+
+    ⚠ 不改异常类型/文案 —— 本函数只读属性，异常往上抛的那条契约一字不动。
+    """
+    value = getattr(exc, "executed", None)
+    return {"executed": value} if value is not None else {}
 
 
 def _native_shaped(result: dict) -> dict[str, Any]:
@@ -813,9 +856,14 @@ async def _run_sandboxed(
         try:
             argv = build_confined_argv(command, dialect=dialect)
         except PwshUnavailableError as exc:
-            # 受限 shell 不可用 ⇒ 可操作错误（≠「沙箱没开」，后者会走 native）
+            # 受限 shell 不可用 ⇒ 可操作错误（≠「沙箱没开」，后者会走 native）。
+            # ⚠ F5（2026-09-17）：返回**普通 dict 而非 None** ⇒ `entry` 照常盖
+            # `enforcement="confined"`，而进程根本**没启动**（exit_code=None）
+            # ⇒ 戳说"在沙箱里"、事实是"没有进程"。本批只加观测（不改失败形态），
+            # 故显式声明 `executed=False` 让两个事实并排存在。
             return {"output": "", "stdout": "", "stderr": "",
-                    "exit_code": None, "timed_out": False, "error": str(exc)}
+                    "exit_code": None, "timed_out": False, "error": str(exc),
+                    "executed": False, "fact": "runner_failed"}
         return await spawn_confined(
             argv=argv,
             timeout_s=timeout_s or 0,

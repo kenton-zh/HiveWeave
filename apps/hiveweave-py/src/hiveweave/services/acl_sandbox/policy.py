@@ -105,6 +105,30 @@ ENFORCEMENT_STAMP_KEYS: tuple[str, ...] = (
 # 断言要么变红、要么被迫放宽。放宽守卫不是修法。
 SPAWN_STAMP_KEYS: tuple[str, ...] = ENFORCEMENT_STAMP_KEYS + ("git_hardened",)
 
+# F5（2026-09-17）：**戳说「在沙箱里」而进程从未启动** —— `PwshUnavailableError`
+# 这条出口返回的是普通 dict（不是 None）⇒ `entry.py` 的 `result is not None`
+# 成立 ⇒ 照常盖戳 ⇒ `decision.confined == True` ⇒ 宣告
+# `enforcement="confined"/level="partial"/reason="sandbox_enabled"`，而事实是
+# 连进程都没有（`exit_code=None`、`error="pwsh not found"`）。
+#
+# 为什么不能靠"看 exit_code 是不是 None"在下游补救：那是**推断**。本仓纪律
+# ——约束必须住在做那件事的操作内部；下游靠字段猜上游发生过什么，迟早会碰上
+# 一个"跑了但没给出退出码"的正常情形而误判。
+#
+# ⇒ 唯一入口（`spawn_agent_command`）在**执行返回之后**把这一事实**并进戳**：
+# 键名在这里登记一次，工具层与消费端按 `SPAWN_STAMP_KEYS` 派生（不再各列一份）。
+#
+# ⚠ 为什么不并进 `ENFORCEMENT_STAMP_KEYS`：那 4 个键由 `SpawnDecision.stamp()`
+# 产出，而 `SpawnDecision` 在**判定阶段**就冻结了、拿不到执行结果
+# （`test_stamp_keys_cover_every_reported_field` 的全等断言会红）。
+# 与 `git_hardened` 同理：它是**执行阶段**才有的事实。
+SPAWN_OUTCOME_STAMP_KEYS: tuple[str, ...] = ("executed",)
+
+#: 工具层与消费端按这一组做透传 = 决策面 4 键 + 执行面 2 键。
+ALL_SPAWN_STAMP_KEYS: tuple[str, ...] = (
+    SPAWN_STAMP_KEYS + SPAWN_OUTCOME_STAMP_KEYS
+)
+
 
 @dataclass(frozen=True)
 class SpawnDecision:

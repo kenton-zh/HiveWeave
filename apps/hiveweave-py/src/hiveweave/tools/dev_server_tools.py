@@ -76,7 +76,7 @@ def _read_log_tail(log_path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> str:
 
 
 def _early_exit_receipt(
-    exit_code: int, cmd: str, log_path: Path
+    exit_code: int, cmd: str, log_path: Path, stamp: dict[str, Any] | None = None
 ) -> ToolResult:
     """健康窗口内进程已退出 ⇒ 回执按**事实**区分成败（fixplan #4）。
 
@@ -94,9 +94,15 @@ def _early_exit_receipt(
       ``runner_failed`` 的"从未执行"），stall/重试判断不被骗。
 
     两种回执都带 ``exit_code`` 与日志尾。
+
+    ``stamp``（F3，2026-09-17）：执行面戳。这是**两条回执都有值**的场景
+    —— 进程确实被 spawn 出来过（只是很快退了），所以「有没有沙箱」这条
+    观测在这两条路上都是**适用且已判定**的。原先不传 ⇒ 这两条出口在
+    `run_steps.enforcement` 上恒 NULL，把"适用"说成了"不适用"。
     """
     tail = _read_log_tail(log_path)
     suffix = f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}" if tail else ""
+    _st = dict(stamp or {})
     if exit_code == 0:
         return ToolResult.ok(
             "Command completed successfully (exit_code=0) but exited "
@@ -105,12 +111,14 @@ def _early_exit_receipt(
             f"Command was: {cmd}{suffix}",
             exit_code=0,
             server_listening=False,
+            **_st,
         )
     return ToolResult.err(
         f"Dev server command failed (exit_code={exit_code}). "
         f"Command was: {cmd}{suffix}",
         fact="command_failed",
         exit_code=exit_code,
+        **_st,
     )
 
 
@@ -380,6 +388,17 @@ async def start_dev_server_tool(
             **ctx.confined_kwargs(),
         )
 
+    # ── 执行面戳的落点（F3，2026-09-17）────────────────────────────────
+    # ⚠ `spawn_agent_command` 已在 `routed` 上盖了戳，但本函数**每一条出口都
+    # 新构造 ToolResult**（`ToolResult.err(...)` / `.ok(...)`），戳若不显式
+    # 带过去就在类型转换处消失 ⇒ `streaming.py` 取 None ⇒
+    # `run_steps.enforcement` 恒 NULL（实证：58/59/60/61 共 4863 行零落库）。
+    # 与 bash.py 的差别：那边出口返回**裸 dict** 并在 `_shell_tool_result`
+    # 统一收口，戳自然随 extra 走；这边是 ToolResult 类型出口，需要显式注入。
+    # ⇒ 解包后提取一次（键名以 `SPAWN_STAMP_KEYS` 为准，缺键不补默认值），
+    #   再在每个出口 `**stamp` 展开。新增出口时**必须**带上它。
+    _stamp: dict[str, Any] = {}
+
     try:
         routed = await spawn_agent_command(
             entry="dev_server",
@@ -404,13 +423,31 @@ async def start_dev_server_tool(
             proc = _ConfinedDevProc(sres["job"])
             spawn_err = None
             meta = {"command": cmd, "cwd": work_cwd, "pid": proc.pid}
+        # 戳从 `routed.stamp()` 取，**不从 `routed.result` 里捞**（审计必修 M1）。
+        #
+        # 为什么必须换：`routed.result` 的形状**逐分支不同** —— 受限侧是含
+        # `job` 的 dict（戳在里面），原生侧是 `(proc, err, meta)` 三元组。而
+        # `entry._with_stamp`（entry.py:160-169）对非 dict **原样返回**，所以
+        # 「戳在 result 里」只在受限侧成立 ⇒ 按 dict 判定就等于：**原生分支
+        # 永远没有戳**，该出口照旧报不出「这次有没有沙箱」。
+        #
+        # 这**不是**既有事实、也不在"本批之外"：`_with_stamp` 的 docstring
+        # 逐字写着「原生侧的戳只有本层能盖」——盖的落点就是 `RoutedSpawn` 上
+        # 的 `decision`（entry.py:72），它与 result 的形状**无关**。
+        # 原先那句"原生侧本就没有戳"是**读错了设计意图**（本仓形态：把
+        # 「读不到事实位的容器」当成「事实位不存在」）。
+        #
+        # 语义仍守住「缺键不补默认值」：`stamp()` 在原生侧自动不带
+        # `enforcement_boundary`（policy.py:134）—— 「没有边界」本身就是要
+        # 被看见的事实，不补假边界。
+        _stamp = routed.stamp()
         if spawn_err or proc is None:
             log_file.close()
             tail = _read_log_tail(log_path)
             msg = spawn_err or "Failed to start"
             if tail:
                 msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-            return ToolResult.err(msg)
+            return ToolResult.err(msg, **_stamp)
         cmd = meta.get("command") or cmd
     except SandboxUnavailableError as e:
         # ── 中间验收（计划 §三 #1 修法第 2 段）：**fail-closed** ──────────────
@@ -427,14 +464,24 @@ async def start_dev_server_tool(
         # 本工具的函数契约是 `ToolResult` ⇒ 用**类型化**出口。
         # （用 `to_tool_dict()` 会返回裸 dict，调用方按 ToolResult 用即
         #  `AttributeError: 'dict' object has no attribute 'success'`。）
-        return e.to_tool_result()
+        # ⚠ F3：此处**不带**决策面 `_stamp` —— 异常是从 `spawn_agent_command`
+        # 里抛出的（受限分支拿不到结果 ⇒ `entry` 自己 raise），`_stamp`
+        # 必为空；而该出口的语义是「判定说 confined、受限实现起不来」，
+        # 它要表达的是 fail-closed 拒绝，不是一次成功的执行面观测。
+        # 硬塞一个决策面戳会把「拒绝」说成「路由成功」，方向错了。
+        # ⚠ F5（2026-09-17）：但**执行面事实必须带** —— 异常上带着
+        # `executed=False`（命令从未启动），这是这条出口唯一能给出的
+        # "发生了什么"的答案；丢掉它就只剩"被拒绝了"这个结论。
+        from hiveweave.tools.bash import _executed_stamp
+
+        return e.to_tool_result(**_executed_stamp(e))
     except Exception as e:
         log_file.close()
         tail = _read_log_tail(log_path)
         msg = f"Failed to start: {e}"
         if tail:
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-        return ToolResult.err(msg)
+        return ToolResult.err(msg, **_stamp)
 
     # Health: process alive + a non-reserved port eventually listens.
     # Prefer the allocated port; if the app ignores PORT (app.server),
@@ -444,7 +491,7 @@ async def start_dev_server_tool(
         await asyncio.sleep(0.4)
         if proc.poll() is not None:
             log_file.close()
-            return _early_exit_receipt(proc.returncode, cmd, log_path)
+            return _early_exit_receipt(proc.returncode, cmd, log_path, _stamp)
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port),
@@ -477,7 +524,7 @@ async def start_dev_server_tool(
         )
         if tail:
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-        return ToolResult.err(msg)
+        return ToolResult.err(msg, **_stamp)
     port = listening_port
 
     # Server is listening — detach the log file (process keeps the fd).
@@ -515,7 +562,7 @@ async def start_dev_server_tool(
         )
     except Exception as e:
         await asyncio.to_thread(terminate_spawned, proc)
-        return ToolResult.err(f"Failed to register dev server: {e}")
+        return ToolResult.err(f"Failed to register dev server: {e}", **_stamp)
     note = (
         f"Dev server started on http://localhost:{port}/ "
         f"(pid={proc.pid}, {cwd_display(work_cwd, params.cwd)}, listening=ok). "
@@ -534,6 +581,7 @@ async def start_dev_server_tool(
         log_path=str(log_path),
         registry=rec.to_dict(),
         project_servers=[r.to_dict() for r in lookup_by_project(project_id)],
+        **_stamp,
     )
 
 

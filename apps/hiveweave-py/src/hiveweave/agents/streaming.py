@@ -312,6 +312,18 @@ async def on_tool_call(
 
     # ── Durable Run Ledger: record step end ──
     if step_id:
+        # F5（2026-09-17）fail-loud：沙箱**判定成立**、而执行函数**自己声明了
+        # 进程没启动**（`executed=False`，如 pwsh 缺失）。这类调用此前会被记成
+        # `enforcement="confined"` ⇒ 读者以为"它在沙箱里跑过"。降级为 NULL 是
+        # 修正，但**降级本身不产生可捞的信号**（NULL 与"非 spawn 工具"同形）
+        # ⇒ 必须同时留一条日志，否则这个状态又变成沉默的默认值。
+        if result.get("executed") is False:
+            log.warning(
+                "tool_not_started_despite_confined",
+                tool=tool_name,
+                enforcement=result.get("enforcement"),
+                error=result.get("error"),
+            )
         try:
             result_content = result.get("output") or ""
             # F4（平台修复计划 2026-08-30）：正交事实位落库 —— 工具层能确定
@@ -333,7 +345,21 @@ async def on_tool_call(
                 # #1 治本：执行面（confined/native）落库。spawn 类工具由
                 # `acl_sandbox.entry.spawn_agent_command` 无条件盖戳（含原生
                 # 分支）；非 spawn 工具没有该键 ⇒ None ⇒ 列留 NULL（不适用）。
-                enforcement=result.get("enforcement"),
+                #
+                # ⚠ F5（2026-09-17）：**戳说「在沙箱里」而进程从未启动** ——
+                # `PwshUnavailableError` 那条出口返回普通 dict（非 None）⇒
+                # 仍然盖上 `enforcement="confined"`，而命令**根本没启动**
+                # （`exit_code=None`）。回执说"被约束"、事实是"没有进程、没有
+                # 边界"，`run_steps.enforcement` 的列契约（"这次调用有没有被
+                # 沙箱约束"）因此被答错。
+                # ⇒ 执行面事实 `executed is False` 时**不落** enforcement
+                #（NULL = 未判定/不适用，与列契约一致 —— 不回填成 native，
+                # 那会把"没有进程"说成"确认无沙箱"），并 fail-loud 记一条，
+                # 让"沙箱判定成立但没跑起来"在数据里可被捞出来。
+                enforcement=(
+                    None if result.get("executed") is False
+                    else result.get("enforcement")
+                ),
                 # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
                 # 工具层给不出（None）⇒ 列留 NULL = 不适用/未判定，不回填 0。
                 git_hardened=result.get("git_hardened"),

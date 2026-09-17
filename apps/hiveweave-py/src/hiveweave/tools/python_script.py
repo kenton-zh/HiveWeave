@@ -25,6 +25,8 @@ from hiveweave.tools.base import tool
 from hiveweave.tools.bash import (
     MAX_TIMEOUT_S,
     TOOL_DEFAULT_TIMEOUT_MS,
+    _enforcement_stamp,
+    _executed_stamp,
     _truncate_output,
 )
 from hiveweave.tools.result import ToolResult
@@ -216,8 +218,23 @@ async def python_script_execute(
                     f'& "{interp}" "{script_file}"', dialect="pwsh"
                 )
             except PwshUnavailableError as exc:
-                return {"output": "", "stdout": "", "stderr": "",
-                        "exit_code": None, "timed_out": False, "error": str(exc)}
+                # ⚠ F5（2026-09-17）：此处返回的是**普通 dict 而不是 None**
+                # ⇒ `entry` 的 `result is not None` 成立 ⇒ 不抛异常 ⇒ 照常
+                # 盖 `enforcement="confined"`。而进程**根本没启动**
+                #（`exit_code=None`、`error="pwsh not found"`）⇒ 回执说
+                # "被沙箱约束"、事实是没有进程、没有边界 —— **戳在说谎**。
+                #
+                # 本批**只加观测、不改失败形态**（改成 raise 会动调用方的
+                # except 契约，需自己的验收用例 —— 见 fixqueue F5 的
+                # "须独立批次"备注）。故显式声明 `executed=False`：
+                # 让「沙箱判定成立」与「命令从未启动」两个事实**并排**存在，
+                # 下游不必靠 `exit_code is None` 反推。
+                return {
+                    "output": "", "stdout": "", "stderr": "",
+                    "exit_code": None, "timed_out": False, "error": str(exc),
+                    "executed": False,
+                    "fact": "runner_failed",
+                }
             return await spawn_confined(
                 argv=cargv, timeout_s=timeout_s, **ctx.confined_kwargs()
             )
@@ -233,7 +250,13 @@ async def python_script_execute(
         )
         result = routed.result
         if result.get("long_running"):
-            return ToolResult.err("python_script: background unsupported")
+            # F3：spawn **已经成功路由并盖了戳** ⇒ 这条出口属于「适用且已判定」，
+            # 必须带戳（本条是本文件里唯一能拿到戳却在重建 dict 之前 return 的
+            # 出口 —— 戳丢了 agent 就看不到"这次到底在不在沙箱里"）。
+            return ToolResult.err(
+                "python_script: background unsupported",
+                **_enforcement_stamp(result),
+            )
         result = {
             "output": "",
             "stdout": result.get("stdout", "") or "",
@@ -244,13 +267,27 @@ async def python_script_execute(
             # 构造点声明的 fact must survive （M2/T2）：本处是**重建** dict，
             # 不带过来等于位又被这一层吃掉。
             **({"fact": result["fact"]} if result.get("fact") else {}),
-            # 执行面戳随结果上报（落 run_steps.enforcement / 日志）
-            **{k: v for k, v in result.items() if k.startswith("enforcement")},
+            # 执行面戳随结果上报（落 run_steps.enforcement / 日志）。
+            # ⚠ M3（2026-09-17 审计必修）：改用 `bash._enforcement_stamp` ——
+            # 键名以 `policy.SPAWN_STAMP_KEYS` 为**唯一登记点**。原先这里是
+            # `k.startswith("enforcement")` **本地前缀过滤**，与 bash/dev_server
+            # 的口径不同源 ⇒ 加固面 `git_hardened`（不含 "enforcement" 前缀）
+            # 在本工具被**静默丢掉**。这正是本仓反复栽的「每处各列一份清单」
+            # 形态：两份清单必然各自演化。
+            **_enforcement_stamp(result),
         }
     except SandboxUnavailableError as e:
         # fail-closed：判定为受限但受限路径起不来 ⇒ 干净拒绝，绝不落原生
         #（「以为在沙箱里、其实在沙箱外」比明确拒绝糟得多）。
-        return ToolResult.err(f"python_script: sandbox unavailable: {e}")
+        # F5：带上 `executed` 事实位 —— 异常是从 `spawn_agent_command` 抛出的，
+        # 它已在该异常上记了「命令从未启动」（`executed=False`）。不带过来，
+        # 这条出口就只有"被拒绝"而没有"根本没跑"这两个正交事实中的后一个，
+        # 下游会把 `confined` 读成"在沙箱里跑过"。
+        return ToolResult.err(
+            f"python_script: sandbox unavailable: {e}",
+            fact="runner_failed",
+            **_executed_stamp(e),
+        )
     except Exception as e:
         return ToolResult.err(f"python_script: execution failed: {e}")
 
@@ -259,6 +296,16 @@ async def python_script_execute(
     except Exception:
         pass
 
+    # ── 执行面戳的落点（F3，2026-09-17）────────────────────────────────
+    # ⚠ 上方重建 dict 时**已正确**把 `enforcement*` 带了过来（:248），但随后
+    # 每一条出口都新构造 `ToolResult`，不带 extra ⇒ 戳在类型转换处第二次丢失。
+    # 实证：58/59/60/61 共 4863 行 run_steps 的 enforcement 全 NULL。
+    # ⇒ 提取一次，各出口 `**_stamp` 展开（新增出口必须带上）。
+    # ⚠ M3（2026-09-17 审计必修）：改用 `bash._enforcement_stamp`，键名以
+    # `policy.SPAWN_STAMP_KEYS` 为唯一登记点 —— 原先的本地前缀过滤会把
+    # `git_hardened` 静默排除（本工具此前与该键**永不同源**）。
+    _stamp = _enforcement_stamp(result)
+
     if result.get("error"):
         # 位要跟着走（M2/T2）：`finalize_tool_result` 的归因阶梯**位优先于文本**，
         # 只有把构造点声明的位带到这里，spawn 失败才会被判成 `runner_failed`
@@ -266,6 +313,7 @@ async def python_script_execute(
         return ToolResult.err(
             f"python_script: {result['error']}",
             fact=result.get("fact"),
+            **_stamp,
         )
     if result["timed_out"]:
         return ToolResult.err(
@@ -276,6 +324,7 @@ async def python_script_execute(
             # 供 run_steps.timeout_kind/timeout_ms 统一分组统计。
             timeout_kind="command",
             timeout_ms=int(timeout_s * 1000),
+            **_stamp,
         )
 
     stdout = result.get("stdout") or ""
@@ -297,7 +346,7 @@ async def python_script_execute(
     except Exception:
         pass
     if exit_code == 0:
-        return ToolResult.ok(f"{body}\n\nExit code: 0")
+        return ToolResult.ok(f"{body}\n\nExit code: 0", **_stamp)
     # 失败必须带 stderr 尾部（对齐 bash P2-1）：真正的报错（堆栈/缺失依赖）
     # 几乎总在输出末尾，否则 agent 只见 exit code 盲目重试。
     try:
@@ -308,7 +357,8 @@ async def python_script_execute(
         err_tail = stderr[-2000:] if stderr else ""
     detail = f"\n[stderr tail]\n{err_tail}" if err_tail.strip() else ""
     return ToolResult.err(
-        f"python_script exited with code {exit_code}{detail}{stderr_hint}"
+        f"python_script exited with code {exit_code}{detail}{stderr_hint}",
+        **_stamp,
     )
 
 

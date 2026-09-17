@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -66,17 +67,56 @@ class SpawnContext:
 
 @dataclass(frozen=True)
 class RoutedSpawn:
-    """路由结果：结果本体 + 这次走的哪条路（戳随结果一起向上走）。"""
+    """路由结果：结果本体 + 这次走的哪条路（戳随结果一起向上走）。
+
+    ``executed`` 是 F5 的**执行事实**：``True`` 执行函数返回了结果、
+    ``False`` 执行函数抛了（从未启动）、``None`` 不适用/未判定。
+
+    ⚠⚠ **事实只有一个来源**（审计 BLOCKING-1，2026-09-17）：`executed` 是
+    **由 `result` 算出来的**（见 `executed_actual`），不是独立存一份 ——
+    早先版本让它同时存在于 `self.executed` 与 `result["executed"]`，两者
+    一旦不一致（入口写 `True`、执行函数声明 `False`）就会**自相矛盾**。
+    实测复现：`result['executed']=False` 而 `stamp()['executed']=True`。
+    这与本批要修的 F5 是**同一个病**：一个事实存在两份、然后打架。
+
+    本仓纪律：「**一次 spawn 的全部事实**」只登记一次（`policy` 那组常量），
+    同样地「这一条事实的值」也只应有一个权威来源。
+    """
 
     result: Any
     decision: SpawnDecision
+    executed: bool | None = None
 
     @property
     def native(self) -> bool:
         return not self.decision.confined
 
-    def stamp(self, *, boundary_root: str | None = None) -> dict[str, str]:
-        return self.decision.stamp(boundary_root=boundary_root)
+    @property
+    def executed_actual(self) -> bool | None:
+        """事实位的**唯一权威来源**：优先 `result` 里执行函数自己的声明。
+
+        为什么 `result` 优先而不是 `self.executed`：`result` 是**执行函数亲手
+        写的**，它比入口更接近事实（入口只知道"函数返回了个 dict"，不知道那个
+        dict 是"没跑"）。入口的 `self.executed` 只在执行函数**没表态**时兜底
+        —— 即 `entry.py` 的 `_mark_executed` / `_mark_not_executed` 两条路。
+        """
+        if isinstance(self.result, dict):
+            declared = self.result.get("executed")
+            if declared is not None:
+                return bool(declared)
+        return self.executed
+
+    def stamp(self, *, boundary_root: str | None = None) -> dict[str, Any]:
+        """决策面戳 + **执行面事实**（唯一取戳入口，工具层一律用它）。
+
+        ``executed`` 只在**确定**时进戳（缺键不补默认值）。
+        ⚠ 取值一律经 `executed_actual` —— 保证戳与 `result` **永不打架**。
+        """
+        out = dict(self.decision.stamp(boundary_root=boundary_root))
+        actual = self.executed_actual
+        if actual is not None:
+            out["executed"] = actual
+        return out
 
 
 async def spawn_agent_command(
@@ -146,7 +186,14 @@ async def spawn_agent_command(
     if not decision.confined:
         return RoutedSpawn(_with_stamp(await _call(native), decision), decision)
 
-    result = await confined(ctx)
+    try:
+        result = await confined(ctx)
+    except Exception:
+        # F5：受限实现**抛出** = 命令从未启动（例：`PwshUnavailableError`
+        # 从 `build_confined_argv` 冒出来）。执行事实必须跟着异常一起上报，
+        # 否则调用方按 `decision.confined` 盖戳时会宣告
+        # 「被沙箱约束」，而事实是没有进程、没有边界。
+        raise _mark_not_executed(exc=sys.exc_info()[1])
     if result is None:
         # 可达路径：受限实现自身返回「未启用」（例如绕开 decision 直连
         # 未接线的东西）。判定与执行不一致 ⇒ fail-closed，绝不按原生再跑一遍。
@@ -154,7 +201,70 @@ async def spawn_agent_command(
             f"entry {entry!r}: sandbox decision={decision.reason!r} says confined, "
             "but the confined implementation returned no result"
         )
-    return RoutedSpawn(result, decision)
+    return RoutedSpawn(_mark_executed(result), decision)
+
+
+def _mark_not_executed(*, exc: BaseException) -> BaseException:
+    """F5：给「受限实现抛出」的异常打上 ``executed=False`` 事实位。
+
+    为什么打在**异常对象**上而不是另开一个返回值：抛出这条路上没有返回值可用
+    （`raise` 之后就离开本层了），而调用方的 `except` 分支正是**盖戳的地方** ——
+    事实位必须与异常同路到达，否则又回到"调用方靠猜"。
+
+    ⚠ 只加属性、不改异常类型与文案：调用方原有的 `except SandboxUnavailableError`
+    等契约**一字不动**（本批只加观测，不改失败形态 —— 后者需自己的验收用例，
+    见 fixqueue F5 的"须独立批次"备注）。
+    """
+    try:
+        exc.executed = False  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        # 少数内建异常不允许挂属性 —— 这不该让 spawn 本身失败（观测面问题
+        # 不得升格为功能故障）。缺属性时调用方按"未判定"处理。
+        log.warning("acl_sandbox.executed_flag_attach_failed", error=str(exc))
+    return exc
+
+
+def _mark_executed(result: Any) -> Any:
+    """F5：把「命令**到底有没有启动**」与执行面判定**并排**记进结果。
+
+    背景 —— **戳说「在沙箱里」而进程从未启动**：
+
+    `python_script.py` / `bash.py` 的 `_confined` 在 `build_confined_argv` 抛
+    `PwshUnavailableError`（受限 shell 缺失）时，返回的是一个**普通 dict**
+    （``exit_code=None`` / ``error="pwsh not found"``）而**不是 None**。于是
+    `result is not None` 成立、不抛异常、照常返回 `RoutedSpawn(result, decision)`
+    ⇒ `decision.confined is True` ⇒ 戳宣告「被沙箱约束」。
+    而 `exit_code is None` 已排除「跑了但失败」⇒ 进程**从未启动**、根本不存在
+    边界。回执说"被约束"、事实是"没有进程"，**这句戳在说谎**。
+
+    修法**不是**在下游靠 `exit_code is None` 反推（那是推断，且会误伤"跑了但
+    拿不到退出码"的正常情形）—— 而是在**唯一入口**（知道 `confined` 是执行
+    还是抛错的那一层）把这一事实显式记下来，让戳自带答案：
+
+      · ``executed=True``  —— 执行函数**返回了结果** ⇒ 进程启动过（无论成败）。
+      · ``executed=False`` —— 执行函数**抛出**了 ⇒ 从未启动。
+
+    ⚠ **``False`` 不是错误码，是「无边界」的证据**：下游读
+    ``enforcement=="confined" and executed is False`` 时，正确的解读是
+    「沙箱判定成立，但这次没有进程受它约束」，而不是「沙箱坏了」。
+    缺键（``None``）的语义与全局一致 —— **不适用/未判定**，不等于「跑了」。
+
+    与 `_with_stamp` 的关系：本函数只补这一个键，不碰决策面 4 键 ——
+    原生分支的戳仍只有 `_with_stamp` 能盖（原生侧 `executed` 由工具层自报，
+    因为原生路径的"启动"概念属各工具自己的实现）。
+
+    ⚠⚠ **`executed=False` 优先于本函数的 `True`**：受限实现**自己声明**了
+    「我没启动进程」（如 `PwshUnavailableError` 的早返回）时，本函数**不得**
+    用 `True` 覆盖它 —— 那正是 F5 原缺陷的同一个病：入口知道的信息量比
+    执行函数少（它只知道"函数返回了个 dict"，不知道那个 dict 是"没跑"）。
+    ⇒ 只在**没有既有声明**时补 `True`。这条与「缺键不补默认值」同源：
+    **谁更接近事实谁说话**。
+    """
+    if not isinstance(result, dict):
+        return result
+    if result.get("executed") is False:
+        return result
+    return {**result, "executed": True}
 
 
 def _with_stamp(result: Any, decision: SpawnDecision) -> Any:
