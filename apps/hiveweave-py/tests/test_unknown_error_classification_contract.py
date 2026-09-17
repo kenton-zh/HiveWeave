@@ -360,3 +360,142 @@ async def test_flush_only_writes_this_agents_samples(monkeypatch):
         "b-unknown",
         "orphan-unknown",
     ], "写成功的那条应被移出缓冲，其余（含无归属的）保留"
+
+
+# ── #13 批 A：error_codes 生产接线（2026-09-18）───────────────────
+
+
+def test_error_codes_has_production_consumer():
+    """结构性判据（§7.5.4）：``error_codes.ErrorCode`` 的生产消费者数 ≥ 1。
+
+    阳性对照：把 ``llm/retry.py`` 顶部的 ``from hiveweave.llm.error_codes
+    import …`` 删掉 ⇒ 本测试转红（接线被拔，分类表退回零消费者）。
+    AST 判据（import 语句），非文本子串。
+    """
+    src_root = pathlib.Path(__file__).resolve().parents[1] / "src" / "hiveweave"
+    consumers: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        if path.name == "error_codes.py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            continue
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module == (
+                "hiveweave.llm.error_codes"
+            ):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module == "error_codes":
+                names = [a.name for a in node.names]
+            if any(n in ("ErrorCode", "classify_error", "is_retryable_code") for n in names):
+                consumers.append(path.relative_to(src_root).as_posix())
+                break
+    assert consumers, "error_codes 零生产消费者（F9-B 复发：表在、没人用）"
+
+
+def test_classify_http_error_attaches_stable_code():
+    """行为判据：classify_http_error 的返回异常必须携带稳定码（批 A 接线）。
+
+    阳性对照：把 classify_http_error 里的 ``error_code=code.value`` 三处
+    传参删掉 ⇒ 本测试转红。
+    """
+    from hiveweave.llm.retry import classify_http_error
+
+    r = classify_http_error(429, "rate limit exceeded")
+    assert isinstance(r, Exception) and r.error_code == "RATE_LIMIT"
+    r = classify_http_error(503, "service unavailable")
+    assert r.error_code == "SERVER"
+    p = classify_http_error(400, "invalid request body")
+    assert p.error_code == "INVALID_REQUEST"
+    # 判定结果不受接线影响（批 A = 零判定变化）
+    from hiveweave.llm.retry import PermanentError, RetryableError
+
+    assert isinstance(r, RetryableError)
+    assert isinstance(p, PermanentError)
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_records_last_error_code():
+    """熔断器消费稳定码：report_failure(error_code=…) ⇒ snapshot 可读。
+
+    阳性对照：把 snapshot 里的 ``last_error_code`` 键删掉 ⇒ 转红。
+    reset 必须清掉它（否则下次熔断读到的是上一轮的死因）。
+    """
+    from hiveweave.llm.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker()
+    await cb.register("primary")
+    await cb.report_failure("primary", error_code="RATE_LIMIT")
+    snap = {s["provider"]: s for s in cb.snapshot()}
+    assert snap["primary"]["last_error_code"] == "RATE_LIMIT"
+    await cb.report_failure("primary", error_code="SERVER")
+    snap = {s["provider"]: s for s in cb.snapshot()}
+    assert snap["primary"]["last_error_code"] == "SERVER", "应记录最近一次"
+    await cb.reset("primary")
+    snap = {s["provider"]: s for s in cb.snapshot()}
+    assert snap["primary"]["last_error_code"] is None, "reset 必须清空死因"
+
+
+# ── #13 批 B：残余文本判据收敛（2026-09-18）───────────────────────
+
+
+def test_quota_text_single_source():
+    """QUOTA 文案判据收敛到 retry 的容量词表（唯一事实源）。
+
+    - 并集方向 ①：error_codes 原有成员（billing / 余额不足 / 欠费 /
+      insufficient balance）classify_error 仍认 ⇒ QUOTA；
+    - 并集方向 ②：容量表成员（gousagelimiterror / usage_limit_reached）
+      classify_error 现在也认（原 _QUOTA_RE 没有）；
+    - error_codes 不再持有第二份 quota 词表（AST：无 _QUOTA_RE 常量）。
+    """
+    from hiveweave.llm.error_codes import classify_error as ce
+
+    assert ce(body="your billing account is past due") is ErrorCode.QUOTA
+    assert ce(body="余额不足，请充值后重试") is ErrorCode.QUOTA
+    assert ce(body="欠费停机") is ErrorCode.QUOTA
+    assert ce(body="GoUsageLimitError: you've hit your 5h rolling cap") is (
+        ErrorCode.QUOTA
+    ), "容量词并入 QUOTA 判据（唯一事实源的并集方向 ②）"
+    assert ce(body="usage_limit_reached, wait for reset") is ErrorCode.QUOTA
+    # 09-18 审计 medium 修复：裸 quota 覆盖恢复（旧 _QUOTA_RE 语义）
+    assert ce(body="your quota is low") is ErrorCode.QUOTA
+    assert ce(429, "your quota is low") is ErrorCode.QUOTA, (
+        "429 + quota 文案仍归 QUOTA（优先级不变）"
+    )
+    assert ce(body="insufficient funds in wallet") is ErrorCode.QUOTA
+    # error_codes 不再登记 _QUOTA_RE（收编完成的静态证据）
+    import hiveweave.llm.error_codes as ec_mod
+
+    assert not hasattr(ec_mod, "_QUOTA_RE"), "第二份 quota 词表必须已删除"
+
+
+def test_upstream_keyword_table_is_single_registry():
+    """两份并行上游关键字表收编为一个（F9-C 第 3 次复发的治理证据）。
+
+    阳性对照：在 agent.py 或 subagent.py 里重新写一个本地关键字元组 ⇒
+    棘轮（新增表即红）+ 本用例（身份断言）转红。
+    """
+    from hiveweave.llm import retry as retry_mod
+
+    from hiveweave.agents import agent as agent_mod
+    from hiveweave.tools import subagent as subagent_mod
+
+    registry = retry_mod.UPSTREAM_STREAM_ERROR_KEYWORDS
+    assert agent_mod._MAIN_LOOP_UPSTREAM_KEYWORDS is registry, (
+        "agent 主循环还在用本地表 —— 收编被回退"
+    )
+    assert subagent_mod._UPSTREAM_FAILURE_KEYWORDS is registry, (
+        "subagent 还在用本地表 —— 收编被回退"
+    )
+    # 收编带来的主循环扩面（原 9 词 → 全量）：瞬态族新成员必须命中
+    from hiveweave.agents.agent import _is_upstream_stream_error
+
+    assert _is_upstream_stream_error("rate limit reached, slow down")
+    assert _is_upstream_stream_error("upstream overloaded")
+    assert _is_upstream_stream_error("502 bad gateway")
+    # 结构化分支优先不变（status 命中即真，无需文本）
+    assert _is_upstream_stream_error("totally custom", error_status=429)
+    # 非瞬态文本仍然不命中（防扩面变全_match）
+    assert not _is_upstream_stream_error("schema validation failed")

@@ -23,6 +23,8 @@ from typing import Awaitable, Callable, TypeVar
 
 import structlog
 
+from hiveweave.llm.error_codes import ErrorCode, classify_error
+
 log = structlog.get_logger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────────
@@ -135,6 +137,19 @@ _CAPACITY_NEEDLES: tuple[str, ...] = (
     "quota exceeded",
     "quota_exceeded",
     "insufficient quota",
+    # #13 批 B（2026-09-18）：并入原 error_codes._QUOTA_RE 的成员（该表已
+    # 删除、由本表作为 QUOTA/容量词的**唯一事实源**）—— 「余额/billing」
+    # 与配额同族（恢复钥匙都是充值/配额重置，不是重试）。
+    "billing",
+    "quota",  # 裸词：旧 _QUOTA_RE 是任意位置含 quota 即命中（如 "your quota is low"）
+    "insufficient balance",
+    "insufficient funds",
+    "余额不足",
+    "欠费",
+    # ⚠ 登记在案的残余收窄（09-18 审计）：旧 _QUOTA_RE 的
+    # ``insufficient.*balance`` 是**通配**（"insufficient account balance"
+    # 也命中）；本表是子串 needles，跨词形态（insufficient … balance 中间
+    # 插词）不再覆盖。补齐 = 往词表堆正则 = 已知反模式，故显式登记不补。
 )
 
 
@@ -144,6 +159,11 @@ def is_capacity_error(message: str) -> bool:
     与瞬时限流（typical 429 rate limit）区分：容量错误的重置以「窗口」计，
     进重试只会白撞；is_daily_quota（header 解析 > 10min）在此之上给出
     确定的重置时刻。
+
+    ⚠ #13 批 B（2026-09-18）：本表的 needles 是 **QUOTA/容量词的唯一事实
+    源** —— ``error_codes.classify_error`` 的 QUOTA 文案层也走这里（原
+    ``error_codes._QUOTA_RE`` 已删）。改词表 = 同时改 E7 容量链与稳定码
+    分类的 QUOTA 认定，一处改动两边生效。
     """
     if not message:
         return False
@@ -183,6 +203,22 @@ def matches_retryable_message(value: str) -> bool:
     就应视为瞬态故障重试。厂商无关，写死的只是通用英文错误文本。
     """
     return any(pattern.search(value) for pattern in _COMPILED_RETRYABLE_PATTERNS)
+
+
+#: 上游/环境类 stream error 关键字表 —— **唯一登记点**（#13 批 B / F9-C，
+#: 2026-09-18）。此前 ``agents/agent.py::_MAIN_LOOP_UPSTREAM_KEYWORDS``（9 词）
+#: 与 ``tools/subagent.py::_UPSTREAM_FAILURE_KEYWORDS``（**15 词**，与本表
+#: **集合完全相同**）是两份并行表、注释自陈「刻意不共享导入」——同族第 3
+#: 次复发。收编到 llm 层后 agents/tools 都只依赖 llm，分层顾虑不再成立。
+#: ⚠ 语义：**小写子串匹配**，只判「是否上游/环境瞬断」，不是重分类器。
+#: agent 主循环因此从 9 词扩到本表全量（rate limit / overloaded / gateway
+#: 等同为瞬态族；主循环每 turn 重试上限 ``_MAIN_LOOP_STREAM_RETRIES`` 不变）。
+UPSTREAM_STREAM_ERROR_KEYWORDS: tuple[str, ...] = (
+    "stream idle", "ssl", "eof", "connection", "connect",
+    "timed out", "timeout", "reset by peer", "broken pipe",
+    "circuit breaker", "rate limit", "overloaded", "temporarily",
+    "unavailable", "gateway",
+)
 
 
 # ── 地域/不可用类 fast-fail（TEST_DSH_47 #8）────────────────────
@@ -244,15 +280,24 @@ def classify_http_error(
     from hiveweave.llm.unknown_error_samples import note_judgement
 
     note_judgement("http_error")
+    # #13 批 A 接线（2026-09-18）：算一次 provider-neutral 稳定码并挂到
+    # 返回的异常上 —— 判定**仍由下方既有链条决定**（地域 fast-fail → 状态码
+    # / 文本模式 → UNKNOWN 显式决策），稳定码此刻只作结构化随附
+    # （熔断器 / error result 消费），不改任何判定结果。批 B 再收敛判定。
+    # ``note_sample=False``：本函数对「真的不认识」有自己的留样（带 extra），
+    # 别让两层各记一条污染 E23 分母。
+    code = classify_error(status=status, body=body, note_sample=False)
     # 地域类错误确定性不可恢复：即使状态码/文案恰好命中可重试模式
     # （如 body 里夹带 "server error"），也不重试 —— 退避只会把 7s
     # 快死拖成 476s 慢死。
     if is_region_unavailable_error(body):
-        return PermanentError(message, status=status)
+        return PermanentError(message, status=status, error_code=code.value)
     status_retryable = status is not None and is_retryable_status(status)
     text_retryable = matches_retryable_message(body)
     if status_retryable or text_retryable:
-        return RetryableError(message, status=status, headers=headers or {})
+        return RetryableError(
+            message, status=status, headers=headers or {}, error_code=code.value
+        )
     # ── 走到这里 = 没有任何正面识别信号 ─────────────────────────────
     # fixplan #13 修法 2：文本 fallback **未命中**时必须 fail-loud 留样本，
     # 否则上游换措辞/换语言后分类静默退化成 UNKNOWN、无人知晓。
@@ -272,11 +317,14 @@ def classify_http_error(
             extra={
                 "status_retryable": status_retryable,
                 "text_retryable": text_retryable,
+                "error_code": code.value,
             },
         )
     if UNKNOWN_SIGNAL_IS_RETRYABLE:
-        return RetryableError(message, status=status, headers=headers or {})
-    return PermanentError(message, status=status)
+        return RetryableError(
+            message, status=status, headers=headers or {}, error_code=code.value
+        )
+    return PermanentError(message, status=status, error_code=code.value)
 
 
 def should_retry_exception(exc: BaseException) -> bool:
@@ -491,6 +539,11 @@ class RetryableError(Exception):
     """可重试的错误（HTTP 429/503/504/529 或网络错误）。
 
     携带 HTTP 状态码和响应头，供 RetryHandler 解析 Retry-After。
+
+    ``error_code``（#13 批 A 接线，2026-09-18）：provider-neutral 稳定码
+    （``llm/error_codes.ErrorCode`` 的 ``.value`` 字符串），由
+    ``classify_http_error`` 在分类时挂上 —— 下游（熔断器 / error result /
+    agent 层）按码消费，不再各自匹配状态码或文案。
     """
 
     def __init__(
@@ -498,18 +551,26 @@ class RetryableError(Exception):
         message: str,
         status: int | None = None,
         headers: dict[str, str] | None = None,
+        error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.headers = headers or {}
+        self.error_code = error_code
 
 
 class PermanentError(Exception):
     """不可重试的错误（401 认证失败、400 请求错误等）。"""
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.error_code = error_code
 
 
 # ── RetryHandler ────────────────────────────────────────────

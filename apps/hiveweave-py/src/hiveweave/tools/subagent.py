@@ -444,11 +444,11 @@ def _subagent_identity(
 
 #: 上游/环境类失败关键字（小写匹配）—— 只做事实位判定，不是重分类器。
 #: 命中 = 环境瞬断（原样重试常可成）；未命中但有 reason = 子侧逻辑/配置。
-_UPSTREAM_FAILURE_KEYWORDS = (
-    "ssl", "timeout", "timed out", "connection", "connect",
-    "circuit breaker", "rate limit", "overloaded", "temporarily",
-    "unavailable", "gateway", "eof", "reset by peer", "broken pipe",
-    "stream idle",
+#: #13 批 B（2026-09-18）：本地 **15 词**表**收编**到
+#: ``llm/retry.UPSTREAM_STREAM_ERROR_KEYWORDS``（唯一登记点 / F9-C；
+#: 集合完全一致 ⇒ 判定零变化，仅消掉「每处各列一份清单」的第二份）。
+from hiveweave.llm.retry import (
+    UPSTREAM_STREAM_ERROR_KEYWORDS as _UPSTREAM_FAILURE_KEYWORDS,
 )
 #: HTTP error_status 的量程归类（读到什么用什么，不发明新桶）。
 _UPSTREAM_ERROR_STATUS = {429, 500, 502, 503, 504, 529}

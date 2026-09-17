@@ -314,7 +314,9 @@ class HttpStreamMixin:
             return result
         except RetryableError as e:
             # 可重试错误耗尽 → 报告熔断器失败（C10: 让熔断器感知 HTTP 429/503/504/529 + 网络错误）
-            await self._circuit_breaker.report_failure(provider_name)
+            await self._circuit_breaker.report_failure(
+                provider_name, error_code=getattr(e, "error_code", None)
+            )
             return {
                 "status": "error",
                 "text": "",
@@ -327,6 +329,8 @@ class HttpStreamMixin:
                 "error_headers": dict(e.headers or {}),
                 # 45 轮 P1：断流 raise 前已收的部分 usage（保账）
                 "partial_usage": getattr(e, "partial_usage", None),
+                # #13 批 A：稳定错误码（typed error 随行，下游按码消费）
+                "error_code": getattr(e, "error_code", None),
             }
         except PermanentError as e:
             # fixplan #13：本方法作用域内的样本（典型是下面的图像能力短语表失配）
@@ -392,7 +396,9 @@ class HttpStreamMixin:
                 except RetryableError as se:
                     # 剥图重试本身遇到瞬态错误 → 归一化返回（保 error_status/headers），
                     # 不泄漏裸异常（主路径同款契约，TEST19 教训：402 需区分）。
-                    await self._circuit_breaker.report_failure(provider_name)
+                    await self._circuit_breaker.report_failure(
+                        provider_name, error_code=getattr(se, "error_code", None)
+                    )
                     return {
                         "status": "error",
                         "text": "",
@@ -403,6 +409,7 @@ class HttpStreamMixin:
                         "error_status": se.status,
                         "error_headers": dict(se.headers or {}),
                         "partial_usage": getattr(se, "partial_usage", None),
+                        "error_code": getattr(se, "error_code", None),
                     }
                 except PermanentError as se:
                     # 剥图后仍失败（非图像类 400/401 等）→ 归一化返回，不再剥图递归。

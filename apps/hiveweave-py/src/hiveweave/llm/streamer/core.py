@@ -228,8 +228,15 @@ class Streamer(
             result["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
             return _stamp_error_identity(result)
         except Exception as e:
-            await self._circuit_breaker.report_failure(provider_name)
-            log.exception("stream_error", agent_id=agent_id, error=str(e))
+            await self._circuit_breaker.report_failure(
+                provider_name, error_code=getattr(e, "error_code", None)
+            )
+            log.exception(
+                "stream_error",
+                agent_id=agent_id,
+                error=str(e),
+                error_code=getattr(e, "error_code", None),
+            )
             await self._fire_delta(on_delta, {
                 "type": "error", "content": str(e)
             })

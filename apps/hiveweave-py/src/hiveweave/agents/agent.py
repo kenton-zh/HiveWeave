@@ -36,6 +36,7 @@ from hiveweave.db import meta as meta_db
 from hiveweave.llm.retry import (
     MAX_DELAY_MS,
     RetryableError,
+    UPSTREAM_STREAM_ERROR_KEYWORDS as _UPSTREAM_KEYWORDS_FROM_RETRY,
     classify_http_error,
     compute_backoff,
     parse_retry_after_ms,
@@ -106,13 +107,12 @@ from hiveweave.agents import completion as _agent_completion
 from hiveweave.agents import recovery as _agent_recovery
 
 
-#: 上游/环境类 stream error 关键字（46 轮 #2 主循环边界重试用；与
-#: tools/subagent._UPSTREAM_FAILURE_KEYWORDS 同源词汇，刻意不共享导入——
-#: agents 层不依赖 tools 层私有符号）。
-_MAIN_LOOP_UPSTREAM_KEYWORDS = (
-    "stream idle", "ssl", "eof", "connection", "connect",
-    "timed out", "timeout", "reset by peer", "broken pipe",
-)
+#: 上游/环境类 stream error 关键字 —— #13 批 B（2026-09-18）起**收编**到
+#: ``llm/retry.UPSTREAM_STREAM_ERROR_KEYWORDS``（唯一登记点，F9-C 治理：
+#: 原 9 词本地表与 tools/subagent 的 14 词表是同族第 3 次复发；分层顾虑
+#: 「agents 不依赖 tools 私有符号」随表移入 llm 层而消解）。主循环从 9 词
+#: 扩到全量 —— rate limit / overloaded 等同为瞬态族，重试上限不变。
+_MAIN_LOOP_UPSTREAM_KEYWORDS = _UPSTREAM_KEYWORDS_FROM_RETRY
 
 #: 主循环上游类 stream error 每 turn 重试上限（审计 #8：1 次不够，
 #: auto-retry 2 连败后仍可由既有的 429/5xx / 空响应路径接管）。

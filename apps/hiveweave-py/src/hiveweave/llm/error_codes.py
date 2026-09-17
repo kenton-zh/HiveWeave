@@ -31,15 +31,24 @@ class ErrorCode(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-#: 429 优先级低于 QUOTA——quota 文案命中时即便状态码 429 也归 QUOTA
-_QUOTA_RE = re.compile(
-    r"quota|insufficient.*balance|billing|余额不足|欠费", re.IGNORECASE,
-)
+#: 429 优先级低于 QUOTA——QUOTA 文案判据（``_quota_text_hit`` → retry 的
+#: 容量词表，含裸 ``quota``）命中时即便状态码 429 也归 QUOTA。
+#: ⚠ #13 批 B（2026-09-18）：QUOTA 文案判据已**收编**到
+#: ``llm/retry.py::is_capacity_error``（容量 needles 唯一事实源）——
+#: 本模块不再持第二份 quota 词表（F9-C）；裸 ``quota`` 等成员已并入该表，
+#: 跨词通配形态的收窄在该表注释里登记在案。
 _CONTEXT_RE = re.compile(
     r"context.*(length|window|overflow)|maximum.*tokens|too many.*tokens|"
     r"prompt.*too.*long|input.*exceeds",
     re.IGNORECASE,
 )
+
+
+def _quota_text_hit(body: str) -> bool:
+    """QUOTA 文案层：唯一判据来自 retry 的容量词表（延迟导入防循环）。"""
+    from hiveweave.llm.retry import is_capacity_error
+
+    return is_capacity_error(body)
 
 
 def classify_error(
@@ -49,6 +58,7 @@ def classify_error(
     provider: str | None = None,
     model: str | None = None,
     agent_id: str | None = None,
+    note_sample: bool = True,
 ) -> ErrorCode:
     """按 HTTP 状态码 + 响应体文案分类为稳定错误码。
 
@@ -61,8 +71,11 @@ def classify_error(
     措辞/换语言导致的降级是静默的。
 
     ``provider`` / ``model`` 只用于记录样本，不参与判定。
+    ``note_sample=False`` 供**已有自己留样逻辑**的调用方复用本分类
+    （如 ``retry.classify_http_error`` 会落带 ``extra`` 的样本），避免
+    同一次失败被两层各记一条样本、污染 E23 的分母口径。
     """
-    if status == 402 or (body and _QUOTA_RE.search(body)):
+    if status == 402 or (body and _quota_text_hit(body)):
         return ErrorCode.QUOTA
     if status == 429:
         return ErrorCode.RATE_LIMIT
@@ -78,24 +91,25 @@ def classify_error(
         return ErrorCode.SERVER
     if status is None and body:
         # 流内错误（HTTP 200 但 body 含 error）——只能按文案分类。
-        # ⇒ 这里是 fallback 的**唯一位置**：两条正则都不中就是真的不认识。
+        # ⇒ 这里是 fallback 的**唯一位置**：两条判据都不中就是真的不认识。
         if _CONTEXT_RE.search(body):
             return ErrorCode.CONTEXT_WINDOW
-        if _QUOTA_RE.search(body):
+        if _quota_text_hit(body):
             return ErrorCode.QUOTA
     # 无任何正面识别信号 ⇒ fail-loud 留样本（fixplan #13 修法 2）。
     # ⚠ 只有 `status is None` 落到这里才是「fallback 失配」；status 落在
     # 其它值（如 1xx/3xx 异常态）是另一类问题，一并记录便于发现新错误族。
-    from hiveweave.llm.unknown_error_samples import note_unknown_sample
+    if note_sample:
+        from hiveweave.llm.unknown_error_samples import note_unknown_sample
 
-    note_unknown_sample(
-        source="classify_error",
-        status=status,
-        body=body,
-        provider=provider,
-        model=model,
-        agent_id=agent_id,
-    )
+        note_unknown_sample(
+            source="classify_error",
+            status=status,
+            body=body,
+            provider=provider,
+            model=model,
+            agent_id=agent_id,
+        )
     return ErrorCode.UNKNOWN
 
 

@@ -78,7 +78,7 @@ class _BreakerState:
     """单个 provider 的熔断器状态（内部类，非线程安全，由 CircuitBreaker 的锁保护）。"""
 
     __slots__ = ("provider", "state", "fail_count", "opened_at",
-                 "probe_deadline", "fallback")
+                 "probe_deadline", "fallback", "last_error_code")
 
     def __init__(self, provider: str, fallback: str | None = None) -> None:
         self.provider = provider
@@ -87,6 +87,10 @@ class _BreakerState:
         self.opened_at: float | None = None
         self.probe_deadline: float | None = None
         self.fallback = fallback
+        # #13 批 A（2026-09-18）：最近一次失败的稳定错误码（字符串，来自
+        # RetryableError.error_code）—— 熔断器的第一个结构化消费方：
+        # 「为什么熔断」从只读日志变成状态可查（snapshot 暴露）。
+        self.last_error_code: str | None = None
 
     def reset(self) -> None:
         """回到 closed 状态，重置所有计数。"""
@@ -94,6 +98,7 @@ class _BreakerState:
         self.fail_count = 0
         self.opened_at = None
         self.probe_deadline = None
+        self.last_error_code = None
 
     def open(self) -> None:
         """进入 open 状态，开始冷却计时。"""
@@ -230,16 +235,29 @@ class CircuitBreaker:
             if was_open:
                 log.info("circuit_closed_success", provider=name)
 
-    async def report_failure(self, name: str) -> None:
-        """报告请求失败 → 累计失败计数，可能触发熔断。"""
+    async def report_failure(
+        self, name: str, *, error_code: str | None = None
+    ) -> None:
+        """报告请求失败 → 累计失败计数，可能触发熔断。
+
+        ``error_code``（#13 批 A）：稳定错误码字符串（``RetryableError
+        .error_code``），记录最近一次失败属于哪一族 —— 供 snapshot/诊断
+        消费；不传 = 未知（探针路径等无异常上下文的调用方）。
+        """
         async with self._lock:
             b = self._breakers.get(name)
             if b is None:
                 return
+            if error_code is not None:
+                b.last_error_code = error_code
 
             if b.state is CircuitState.HALF_OPEN:
                 # 探针失败 → 回到 open，重新冷却
-                log.warning("circuit_probe_failed", provider=name)
+                log.warning(
+                    "circuit_probe_failed",
+                    provider=name,
+                    error_code=error_code,
+                )
                 b.open()
                 return
 
@@ -313,6 +331,7 @@ class CircuitBreaker:
                 "fail_threshold": self.fail_threshold,
                 "cooldown_left_s": cooldown_left,
                 "fallback": b.fallback,
+                "last_error_code": b.last_error_code,
             })
         return out
 
