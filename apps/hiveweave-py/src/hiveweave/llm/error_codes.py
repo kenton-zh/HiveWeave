@@ -45,10 +45,15 @@ _CONTEXT_RE = re.compile(
 
 
 def _quota_text_hit(body: str) -> bool:
-    """QUOTA 文案层：唯一判据来自 retry 的容量词表（延迟导入防循环）。"""
+    """QUOTA 文案层：容量词表（唯一事实源）∪ **裸 ``quota``**。
+
+    裸 quota 归本函数而不归 retry 的容量表 —— E7 容量链（不逐次重试）
+    的语义由 test_e7_capacity_slowdown 钉住："resource exhausted: quota
+    for current provider" 是瞬态 429 族，不得进容量表（推送前全量实锤）。
+    """
     from hiveweave.llm.retry import is_capacity_error
 
-    return is_capacity_error(body)
+    return "quota" in body.lower() or is_capacity_error(body)
 
 
 def classify_error(

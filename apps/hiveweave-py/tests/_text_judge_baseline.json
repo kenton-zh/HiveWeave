@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 142,
+ "_total": 146,
  "_by_tier": {
   "table": 24,
-  "regex": 118
+  "regex": 122
  },
  "_suffixes": [
   "_NEEDLES",
@@ -97,7 +97,7 @@
   },
   "llm/error_codes.py::_CONTEXT_RE": {
    "tier": "regex",
-   "line": 38
+   "line": 40
   },
   "llm/provider.py::_IMAGE_CAPABILITY_DENIAL_PHRASES": {
    "tier": "table",
@@ -105,7 +105,7 @@
   },
   "llm/retry.py::UPSTREAM_STREAM_ERROR_KEYWORDS": {
    "tier": "table",
-   "line": 210
+   "line": 221
   },
   "llm/retry.py::_CAPACITY_NEEDLES": {
    "tier": "table",
@@ -113,7 +113,7 @@
   },
   "llm/retry.py::_COMPILED_REGION_PATTERNS": {
    "tier": "table",
-   "line": 231
+   "line": 242
   },
   "llm/retry.py::_COMPILED_RETRYABLE_PATTERNS": {
    "tier": "table",
@@ -121,7 +121,7 @@
   },
   "llm/retry.py::_REGION_FASTFAIL_PATTERNS": {
    "tier": "table",
-   "line": 223
+   "line": 234
   },
   "llm/retry.py::_RETRYABLE_MESSAGE_PATTERNS": {
    "tier": "table",
@@ -129,7 +129,7 @@
   },
   "llm/retry.py::_WINDOW_NEEDLES": {
    "tier": "table",
-   "line": 170
+   "line": 181
   },
   "prompts/identity.py::_CHINESE_TRAINED_MARKERS": {
    "tier": "table",
@@ -195,6 +195,10 @@
    "tier": "regex",
    "line": 83
   },
+  "services/failure_signature.py::_DURATION_RE": {
+   "tier": "regex",
+   "line": 121
+  },
   "services/failure_signature.py::_EPOCH_MS_RE": {
    "tier": "regex",
    "line": 50
@@ -207,13 +211,25 @@
    "tier": "regex",
    "line": 47
   },
+  "services/failure_signature.py::_LINE_NO_RE": {
+   "tier": "regex",
+   "line": 116
+  },
   "services/failure_signature.py::_PLACEHOLDER_RE": {
    "tier": "regex",
-   "line": 101
+   "line": 105
   },
   "services/failure_signature.py::_TASK_ID8_RE": {
    "tier": "regex",
-   "line": 99
+   "line": 103
+  },
+  "services/failure_signature.py::_TMP_DIR_RE": {
+   "tier": "regex",
+   "line": 129
+  },
+  "services/failure_signature.py::_TOKEN_COUNT_RE": {
+   "tier": "regex",
+   "line": 126
   },
   "services/failure_signature.py::_UNIX_PATH_RE": {
    "tier": "regex",

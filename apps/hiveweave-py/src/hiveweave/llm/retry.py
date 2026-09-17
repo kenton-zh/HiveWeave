@@ -140,8 +140,12 @@ _CAPACITY_NEEDLES: tuple[str, ...] = (
     # #13 批 B（2026-09-18）：并入原 error_codes._QUOTA_RE 的成员（该表已
     # 删除、由本表作为 QUOTA/容量词的**唯一事实源**）—— 「余额/billing」
     # 与配额同族（恢复钥匙都是充值/配额重置，不是重试）。
+    # ⚠ 裸 "quota" **不进本表**（推送前全量实锤）：本表同时是 E7 容量链
+    # （RetryHandler「不逐次重试」）的判据，"resource exhausted: quota for
+    # current provider" 是瞬态 429 族（test_e7_capacity_slowdown 钉住它
+    # 必须逐次重试）。裸 quota 的 QUOTA 分类覆盖放在
+    # error_codes._quota_text_hit（稳定码层），与本表（E7 行为层）分离。
     "billing",
-    "quota",  # 裸词：旧 _QUOTA_RE 是任意位置含 quota 即命中（如 "your quota is low"）
     "insufficient balance",
     "insufficient funds",
     "余额不足",
@@ -149,7 +153,8 @@ _CAPACITY_NEEDLES: tuple[str, ...] = (
     # ⚠ 登记在案的残余收窄（09-18 审计）：旧 _QUOTA_RE 的
     # ``insufficient.*balance`` 是**通配**（"insufficient account balance"
     # 也命中）；本表是子串 needles，跨词形态（insufficient … balance 中间
-    # 插词）不再覆盖。补齐 = 往词表堆正则 = 已知反模式，故显式登记不补。
+    # 插词）不再覆盖。补齐 = 往文本规则里继续堆词表 = 已知反模式，故显式
+    # 登记不补。
 )
 
 
