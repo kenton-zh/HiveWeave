@@ -65,19 +65,37 @@ def test_ceo_hire_flow_is_one_ask_not_two_letters():
     assert "message HR with specific hiring requests" not in text
 
 
-def test_ceo_script_embeds_plan_prodding_discipline():
-    """一期鞭策纪律：CEO 剧本必须内嵌 Coverage/Challenge/Bottom-line + 2 轮封顶。"""
+def test_ceo_script_embeds_design_review_discipline():
+    """设计稿审查纪律：Coverage + 提升 + 结论三选一 + 2 轮封顶；且不得退化为盖章机。"""
     text = build_coordinator_script("CEO", "归零")
-    assert "计划鞭策纪律" in text
+    # 机制名与骨架
+    assert "设计稿审查" in text
     assert "Coverage" in text
-    assert "Challenge" in text
-    assert "Bottom-line" in text
     assert "2 轮" in text
+    # 「尽力提升」而非「必须提意见」
+    assert "不是「必须提意见」" in text
+    assert "在你能力范围内" in text
+    # 「已达上限」必须附核对痕迹——防零成本放行（P0-2）
+    assert "必须同时交出你实际核过什么" in text
+    assert "不允许不做实际核对就整个放行" in text
+    # 三种结论出口齐备（含「建议已提出，不强制本轮修改」）
+    assert "已达当前合理上限" in text
+    assert "建议修改后定稿" in text
+    assert "建议已提出，不强制本轮修改" in text
+    # 不得改变用户初衷
     assert "不能为了你自以为的提升而改变用户的初衷" in text
 
 
+def test_ceo_design_review_terminology_is_gone():
+    """旧术语「鞭策」/「Bottom-line」全量退场，避免双份口径漂移。"""
+    for role in ("CEO", ARCHITECT):
+        text = build_coordinator_script(role, "归零")
+        assert "鞭策" not in text, role
+        assert "Bottom-line" not in text, role
+
+
 def test_ceo_script_requires_design_before_hiring():
-    """设计先行：中层设计定稿前不得招人派活；Phase 0.5 走设计→鞭策→定稿→招人。"""
+    """设计先行：中层首次设计稿定稿前不得招人派活；Phase 0.5 走设计→审查→定稿→招人。"""
     text = build_coordinator_script("CEO", "归零")
     assert "design/plan document" in text
     assert "定稿前中层不得招人、不得派活" in text
@@ -97,7 +115,7 @@ def test_generic_coordinator_is_designer_and_seamer():
     assert "solo 单兵例外" in text
     # Phase 0.5 改为设计先行 + 分两段汇报
     assert "Domain Design" in text
-    assert "待鞭策定稿" in text
+    assert "待审查定稿" in text
 
 
 def test_ceo_script_no_player_coach_leftover():
