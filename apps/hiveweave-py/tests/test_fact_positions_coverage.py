@@ -693,11 +693,14 @@ class TestAttributionLadder:
 
         为什么不能直接改归因：构造点比通用判据更懂上下文（比如它刚读了一个
         结构化返回），硬覆盖会更糟；但「声明即免检」是个开口 —— 判错了永远
-        没人知道。故只记 WARNING。
+        没人知道。故记 WARNING **并产冲突样本**（F2 形态③②：WARNING 不落库，
+        「真没冲突」与「通道哑了」不可分 —— 状态判据要求
+        ``agent_events`` 里 ``kind='conflict'`` 的行数从 0 变非 0，样本经
+        ``out["unclassified_sample"]`` 通道落库）。
 
-        阳性对照（**实测转红**）：把 `fact_position_declared_conflicts_with_bits`
-        那条 `log.warning` 删掉（或删掉整个 `elif judge_blocked and declared ...`
-        分支）⇒ 本用例转红。
+        阳性对照（**实测转红**）：把冲突分支的样本调用（或
+        `fact_position_declared_conflicts_with_bits` 那条 `log.warning`）
+        删掉 ⇒ 本用例转红。
         """
         from structlog.testing import capture_logs
 
@@ -713,12 +716,63 @@ class TestAttributionLadder:
                     "error": "boom",
                 },
             )
-        # 归因**按声明**（不改动）
+        # 归因**按声明**（不改动）—— PC4：产样本后 fact 仍等于构造点声明值
         assert out["fact"] == "outcome_unknown"
         assert any(
             e.get("event") == "fact_position_declared_conflicts_with_bits"
             for e in logs
         ), [e.get("event") for e in logs]
+        # F2：冲突样本走同一落库通道，payload 带 kind/declared/bits_fact
+        sample = out.get("unclassified_sample")
+        assert isinstance(sample, dict), "冲突必产样本（F2 形态③②）"
+        assert sample["kind"] == "conflict"
+        assert sample["declared"] == "outcome_unknown"
+        assert sample["bits_fact"] == "runner_failed"
+        # PC3：声明支路样本**不得打 ERROR**（shell 声明失败是常态流量，
+        # 四轮 164 行；无条件 ERROR = 日志爆炸）
+        assert not [e for e in logs if e.get("level") == "error"], [
+            (e.get("event"), e.get("level")) for e in logs
+        ]
+
+    def test_declared_sampled_bidirectional_rate_control(self, monkeypatch):
+        """PC2 双向标定：分母 1 ⇒ 恒采样；分母 0 ⇒ 关。均为状态判据。"""
+        from hiveweave.tools.fact_positions import finalize_tool_result
+
+        raw = {
+            "success": False,
+            "fact": "command_failed",  # 无位可核 ⇒ 非冲突 ⇒ 走降采样支路
+            "error": "shell boom",
+        }
+        monkeypatch.setenv("HIVEWEAVE_FACT_SAMPLE_DECLARED", "1")
+        out = finalize_tool_result("bash", dict(raw))
+        sample = out.get("unclassified_sample")
+        assert isinstance(sample, dict) and sample["kind"] == "declared_sampled"
+        assert sample["declared"] == "command_failed"
+        assert out["fact"] == "command_failed", "PC4：归因未被观测改动"
+
+        monkeypatch.setenv("HIVEWEAVE_FACT_SAMPLE_DECLARED", "0")
+        out = finalize_tool_result("bash", dict(raw))
+        assert "unclassified_sample" not in out
+        assert out["fact"] == "command_failed"
+
+    def test_declared_sampling_is_deterministic(self, monkeypatch):
+        """PC5：同一 (tool, fact, error) 两次调用采样决策一致（禁 random）。"""
+        from hiveweave.tools.fact_positions import (
+            _declared_sample_due,
+            finalize_tool_result,
+        )
+
+        monkeypatch.setenv("HIVEWEAVE_FACT_SAMPLE_DECLARED", "1")
+        assert _declared_sample_due("bash", "command_failed", "boom") is True
+        monkeypatch.setenv("HIVEWEAVE_FACT_SAMPLE_DECLARED", "2")
+        a = _declared_sample_due("bash", "command_failed", "boom")
+        b = _declared_sample_due("bash", "command_failed", "boom")
+        assert a == b, "同一输入必须同判（哈希取模，非随机）"
+        # 端到端一致性：同 raw 两次 finalize，样本有/无一致
+        raw = {"success": False, "fact": "command_failed", "error": "boom"}
+        monkeypatch.setenv("HIVEWEAVE_FACT_SAMPLE_DECLARED", "20")
+        outs = [finalize_tool_result("bash", dict(raw)) for _ in range(2)]
+        assert ("unclassified_sample" in outs[0]) == ("unclassified_sample" in outs[1])
 
     def test_blocked_without_fact_does_not_raise(self):
         """blocked=True 且无 fact **不得抛**（fail loud 但不 fail hard）。

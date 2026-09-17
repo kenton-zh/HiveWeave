@@ -59,6 +59,8 @@ normalize 尾）⇒ 可能诱发**副作用双发**（见 :func:`finalize_tool_r
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from typing import Literal, NamedTuple
 
@@ -404,6 +406,79 @@ def note_unclassified_sample(
         return {}
 
 
+#: F2 声明支路降采样分母（``HIVEWEAVE_FACT_SAMPLE_DECLARED``）：非冲突的
+#: 声明失败按 1/N 产样本，证明观测通道是活的。``1`` = 恒采样、``0`` = 关、
+#: 默认 20。⚠ 判据是**哈希取模**不是 ``random`` —— 守卫与事后取证必须
+#: 可复现（同一输入两次调用结果一致）。
+_DECLARED_SAMPLE_ENV = "HIVEWEAVE_FACT_SAMPLE_DECLARED"
+_DECLARED_SAMPLE_DEFAULT_N = 20
+
+
+def _declared_sample_due(tool: str, declared_fact: str, error: str) -> bool:
+    """确定性降采样判定：``sha1(tool|fact|error 前 120 字) % N == 0``。
+
+    哈希输入**不含时间戳/随机数** ⇒ 同一失败重复撞到时采样决策一致；
+    错误原文参与哈希 ⇒ 不同错误错开落点，避免永远只采到同一条。
+    """
+    raw = os.environ.get(_DECLARED_SAMPLE_ENV, "")
+    try:
+        n = int(raw) if raw.strip() else _DECLARED_SAMPLE_DEFAULT_N
+    except ValueError:
+        n = _DECLARED_SAMPLE_DEFAULT_N
+    if n <= 0:
+        return False
+    digest = hashlib.sha1(
+        f"{tool}|{declared_fact}|{error[:120]}".encode("utf-8")
+    ).hexdigest()
+    return int(digest, 16) % n == 0
+
+
+def note_declared_sample(
+    *,
+    tool: str,
+    declared: str,
+    kind: str,
+    bits_fact: str | None = None,
+    error: str = "",
+    status: object = None,
+    bits: dict | object | None = None,
+) -> dict:
+    """记一条「构造点已声明 fact 的失败」样本（F2，**只观测、不改归因**）。
+
+    与 :func:`note_unclassified_sample` 走**同一落库通道**
+    （``out["unclassified_sample"]`` → ``executor._emit_unclassified_sample``
+    → ``agent_events``，event_type 同为 ``fact_position_unclassified_sample``），
+    payload 用 ``kind`` 区分来源：``conflict`` = 声明与布尔位打架（**必产**），
+    ``declared_sampled`` = 非冲突降采样（1/N，通道活性证据）。
+
+    ⚠ **绝不打 ERROR 日志**（§3.5 最大风险）：shell 家族的声明失败是常态
+    流量（58-61 四轮 164 行），无条件 ERROR 会把日志炸掉；冲突场景另有
+    ``fact_position_declared_conflicts_with_bits`` WARNING 快信号，本函数
+    只落 state 证据。
+    ⚠ 本函数**必须永不抛异常**（挂在归因路径上）；**同样脱敏**。
+    """
+    try:
+        mapping = _bits_mapping(bits) if bits is not None else {}
+        payload: dict = {
+            "kind": kind,
+            "declared": declared,
+            "bits_fact": bits_fact,
+            "tool": tool,
+            "error_preview": redact_secrets(str(error or ""))[:_SAMPLE_PREVIEW],
+            "status": status,
+            "bits_present": {
+                k: bool(mapping[k])
+                for k in sorted(_SAMPLE_BITS)
+                if mapping.get(k) is not None
+            },
+        }
+        log.debug("fact_position_declared_sample", **payload)
+        return payload
+    except Exception as e:  # noqa: BLE001 — 见 docstring：绝不抛
+        log.debug("declared_sample_note_failed", error=str(e)[:200])
+        return {}
+
+
 def assert_fact_complete(tool_name: str, result: dict) -> None:
     """启动/收口断言：shell 类失败结果**必须**带可用事实位。
 
@@ -590,6 +665,31 @@ def finalize_tool_result(
                     "构造点声明的 fact 与它自己给的布尔位不一致 —— 归因**按声明**"
                     "（未改动），但请核对构造点是不是写错了。"
                 ),
+            )
+            # F2 形态③②：冲突**必产样本**。只留 WARNING 不够 —— 它不落库，
+            # 「真没冲突」与「通道哑了」永远不可分；状态判据要求
+            # agent_events 里 kind='conflict' 的行数**从 0 变非 0**。
+            unclassified = note_declared_sample(
+                tool=tool_name,
+                declared=str(r.fact),
+                kind="conflict",
+                bits_fact=bit_fact_declared,
+                error=r.error or "",
+                status=(r.extra or {}).get("status"),
+                bits=r,
+            )
+        elif _declared_sample_due(tool_name, str(r.fact), r.error or ""):
+            # F2 形态③①：非冲突的声明失败按 1/N **确定性**降采样 ——
+            # 非零样本本身就是「声明支路观测通道是活的」的状态证据
+            #（58-61 四轮 108 条归因样本里 shell 家族 0 条的盲区由此打开）。
+            unclassified = note_declared_sample(
+                tool=tool_name,
+                declared=str(r.fact),
+                kind="declared_sampled",
+                bits_fact=bit_fact_declared,
+                error=r.error or "",
+                status=(r.extra or {}).get("status"),
+                bits=r,
             )
 
     out = r.to_dict()
