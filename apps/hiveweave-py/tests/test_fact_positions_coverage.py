@@ -11,9 +11,14 @@ DSH 的收口（`packages/core/tools/src/invariant.ts`）挂在总线上，「**
 
 ## 三条断言
 
-1. **裸字典出口**（`bash.py`）必须经 `finalize_fact_dict` 收口 —— 否则
-   `fact` 的派生键（runner_failed / command_failed）不会展开，下游
-   `result["runner_failed"]` 直接 KeyError（本轮实测到的回归）。
+1. **裸字典出口**必须经 `finalize_fact_dict` 收口 —— 否则 `fact` 的派生键
+   （runner_failed / command_failed）不会展开 ⇒ **静默误归因**
+   （`tool_loop` 少发归因提示；`streaming` 落库 `None` 而非 `False`）。
+   ⚠ 早先此处写作「下游 `result["runner_failed"]` 直接 KeyError」——
+   第三轮审计（2026-09-17）复核当前消费者**全用 `.get()`**，KeyError
+   **不可复现**；漏斗依然必须，但理由要换成上面那条。
+   ⚠ **扫描范围**同样是被测对象：原先只扫 `bash.py` ⇒ `python_script.py`
+   的两处同族缺陷（其一自 M2/T2 起就存在）**一直看不见**。
 2. **`ToolResult` 构造点**必须显式声明 `fact=`（或在 blocked 情形由漏斗判）。
 3. **签名表**对真实错误文本逐条命中 —— 「声明了却没人写」的第 3 次复发防范
    （同 L15 的取值域绊线思路）。
@@ -85,7 +90,8 @@ class TestRawDictExitsAreFunneled:
         )
         assert not unwrapped, (
             f"bash.py:{unwrapped} 的裸字典出口声明了 fact 却未经 finalize_fact_dict "
-            f"→ 下游 result['runner_failed'] 会 KeyError"
+            f"→ 派生键缺失 ⇒ **静默误归因**（agent 少发「命令未执行」提示；"
+            f"落库 None 而非 False）。⚠ 不是 KeyError（消费者全用 .get()）"
         )
 
     @pytest.mark.parametrize(
@@ -117,7 +123,8 @@ class TestRawDictExitsAreFunneled:
                     unwrapped.append(node.lineno)
         assert not unwrapped, (
             f"{mod_name}.py:{unwrapped} 的裸字典出口声明了 fact 却未经 "
-            f"finalize_fact_dict → 下游 result['runner_failed'] 会 KeyError"
+            f"finalize_fact_dict → 派生键缺失 ⇒ **静默误归因**"
+            f"（不是 KeyError —— 消费者全用 .get()，见 bash.py:898 实测说明）"
         )
 
     def test_no_raw_dict_declares_derived_keys(self):

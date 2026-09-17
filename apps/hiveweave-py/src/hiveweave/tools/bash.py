@@ -894,8 +894,19 @@ async def _run_sandboxed(
             #
             # ⚠⚠ 必须经 `finalize_fact_dict` 收口（AST 守卫
             # `test_bash_dict_returns_with_fact_go_through_funnel` 把关）：
-            # 裸字典声明 `fact` 而不展开派生键 ⇒ 下游 `result['runner_failed']`
-            # 直接 KeyError。本处是**本批（F5）新引入**的裸字典出口 ——
+            # 裸字典声明 `fact` 而不展开派生键 ⇒ 派生键**缺失**。
+            #
+            # ⚠ 真实后果是**静默误归因**，不是崩溃（2026-09-17 第三轮审计
+            # 更正：早先五处写作 "下游 `result['runner_failed']` 直接 KeyError"
+            # 是**误述** —— 实际消费者全用 `.get()`，KeyError 在仓库内不可
+            # 复现）。实测差别：
+            #   · 漏斗后：`{'runner_failed': True, ...}` ⇒ `tool_loop.py:1388`
+            #     的 `if _rf.get("runner_failed")` 成立 ⇒ agent 得到「命令未执行」
+            #     的归因提示；
+            #   · 裸字典：`{'runner_failed': False, ...}` ⇒ 该提示**不发**，
+            #     且 `streaming.py:340/420` 落库 `None`（"未判定"）而非
+            #     `False`（"已判定为非"）—— 与 `result.py` 的 COALESCE 语义冲突。
+            # 本处是**本批（F5）新引入**的裸字典出口 ——
             # 原实现（返回 None）没有这个问题，加 `fact` 时才需要漏斗。
             return finalize_fact_dict({
                 "output": "", "stdout": "", "stderr": "",

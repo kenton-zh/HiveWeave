@@ -59,7 +59,8 @@ _JOB_INFO_CLASS = 9  # JobObjectExtendedLimitInformation
 def _require() -> None:
     if win32process is None:
         raise SandboxUnavailableError(
-            "ACL sandbox requires Windows (pywin32 unavailable) on this platform"
+            "ACL sandbox requires Windows (pywin32 unavailable) on this platform",
+            platform_side=True,
         )
 
 

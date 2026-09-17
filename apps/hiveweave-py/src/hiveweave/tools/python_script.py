@@ -96,8 +96,9 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
         # `exit_code is None` 已经**明确**说明进程根本没起来。
         #
         # ⚠⚠ 必须经 `finalize_fact_dict` 收口（2026-09-17 补，第三处同族）：
-        # 裸字典声明 `fact` 而不展开派生键 ⇒ 下游 `result['runner_failed']`
-        # 直接 KeyError。本条自 M2/T2 起就存在，只是守卫此前**只扫 bash.py**
+        # 裸字典声明 `fact` 而不展开派生键 ⇒ 派生键**缺失** ⇒ **静默误归因**
+        # （不是崩溃 —— 消费者全用 `.get()`，详见 `bash.py:898` 处的实测说明）。
+        # 本条自 M2/T2 起就存在，只是守卫此前**只扫 bash.py**
         # 而看不见它（扫描范围缺口，本轮一并补上）。
         return finalize_fact_dict({
             "output": "", "stdout": "", "stderr": "",

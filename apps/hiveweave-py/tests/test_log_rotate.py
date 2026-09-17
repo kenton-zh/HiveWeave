@@ -406,3 +406,193 @@ def test_flush_is_a_real_fallback_not_a_tautology(tmp_path, monkeypatch):
         f"⚠ 若改成「只在 _pending_lines 够时才检查」就会退化成这条（同义反复："
         f"{n_lines} < 窗口 {window} ⇒ 永远不检查）"
     )
+
+
+# --- "不丢日志"契约守卫（2026-09-17 第三轮审计 NEW-3）----------------------
+#
+# 背景：`_TeeStream.write` 原先对每个 stream 逐行 `flush()`。它**同时**承担着
+# 两件事：① 轮转兜底预检（性能问题，见 `test_sampling_actually_amortizes_stat_calls`）；
+# ② **TEST21 M10 的「不丢」契约** —— 进程被 kill 时日志必须已在盘上。
+#
+# 修 ① 时把 tee 的逐行 flush 去掉了。契约 ② 由**上游**接住：
+#   · `structlog.PrintLogger` → `print(..., file=f, flush=True)`；
+#   · `logging.StreamHandler.emit()` → 自身调用 `flush()`；
+#   · `_FlushFile.write()` 自身也做 `self._f.flush()`。
+#
+# ⚠ 这条契约**依赖上游库行为**，原先**没有任何守卫看着** —— 若将来升级这两个
+# 库改动 flush 语义，"不丢"会静默失效（本轮审计 NEW-3 指出的缺口）。
+# 故补一条端到端断言：经**真实装配**写一条日志，在**任何 close 之前**读盘。
+
+
+def test_log_reaches_disk_before_close_via_logging(tmp_path, monkeypatch):
+    """`logging` 路：经真实装配（`_TeeStream(stdout, _FlushFile)`）写一条，
+    **不 close** 就读盘 ⇒ 必须已在。
+
+    ⚠ 「不 close 就读」是关键 —— close 时任何缓冲都会被冲掉，
+    那样测的是 close 而不是"不丢"。
+
+    ⚠⚠ 本用例的**阳性对照较弱**（实测过）：把 `_FlushFile.write` 内部的
+    `self._f.flush()` 删掉，它**仍然绿** —— 因为 `StreamHandler.emit` 自己
+    会调 tee 的 `flush()`，落盘由**那条**保证。故它守的是"整条链上还有人在
+    flush"，**不**能定位到具体哪一环。要定位到环，看下面那条结构性断言 +
+    `test_flush_chain_actually_reaches_the_file`。
+    """
+    import logging as _logging
+
+    monkeypatch.setenv("HIVEWEAVE_LOG_MAX_BYTES", "1000000")
+    log = tmp_path / "server.out.log"
+    stream = hw_main._FlushFile(log)
+
+    class _Null:
+        def write(self, s):  # noqa: ANN001
+            return len(s)
+
+        def flush(self):  # noqa: ANN002
+            pass
+
+    tee = hw_main._TeeStream(_Null(), stream)
+    handler = _logging.StreamHandler(tee)
+    handler.setFormatter(_logging.Formatter("%(message)s"))
+    lg = _logging.getLogger("hw-log-contract-probe")
+    lg.handlers = [handler]
+    lg.setLevel(_logging.DEBUG)
+    lg.propagate = False
+    try:
+        lg.info("PAYLOAD-MUST-BE-ON-DISK")
+        # ⚠ 这里**没有** close、也**没有**显式 flush tee
+        on_disk = log.read_text(encoding="utf-8")
+    finally:
+        handler.close()
+        stream.close()
+
+    assert "PAYLOAD-MUST-BE-ON-DISK" in on_disk, (
+        "去掉 `_TeeStream.write` 的逐行 flush 后，日志在 close 之前**没有**落盘 "
+        "—— TEST21 M10 的「不丢」契约被破坏。修法：让上游（`logging.StreamHandler`"
+        "/`structlog.PrintLogger`）的 flush 生效，或恢复 tee 的条件 flush。"
+        f"实测盘上内容：{on_disk[:200]!r}"
+    )
+
+
+def test_flush_chain_actually_reaches_the_file(tmp_path, monkeypatch):
+    """⭐ **定位到环**：flush 链必须真的把**未换行结尾**的内容写到文件。
+
+    ⚠⚠ 本条守卫连栽**两次**，两次都是同一形态（「守卫绕过了它自己声明要防的
+    路」），记下来别再犯：
+
+    **第 1 版 —— 内容带 `\\n`。**
+    `_FlushFile` 用 `open(..., buffering=1)` 打开，`line_buffering=True`（实测），
+    任何以 `\\n` 结尾的写入由 `TextIOWrapper` 自己落盘，**不需要**显式 flush ⇒
+    测到的是行缓冲，不是 flush 链。阳性对照双双改空仍绿。
+
+    **第 2 版 —— 换成不带 `\\n` 的内容，仍然不转红。** 根因：
+    ``_FlushFile.write`` 内部有一次 `self._f.flush()`（:135），它**先于**
+    ``tee.flush()`` 就把 payload 落盘了 ⇒ 后面 `_TeeStream.flush` /
+    `_FlushFile.flush` 双双断链也**没有任何可观测差异**。
+    （这正是本仓「空转的守卫」形态：判据挂在一条不决定结果的路径上。）
+
+    **本版 —— 分阶段替身，让 flush 链成为唯一出路。**
+    用替身 `_RecordingSink` 换掉 `stream._f`：`write` 阶段（含
+    `_FlushFile.write` 的先行 flush）**只留痕不落盘**，只有 `tee.flush()` 之后
+    才开闸落盘 ⇒ 内容要出现在盘上**必须**走完
+    `_TeeStream.flush` → `_FlushFile.flush` 这条链。
+
+    ⚠ 校准结果（`_pc_round4c.py` 实测，三个方向都要对）：
+      · B1 删 `_FlushFile.flush` 里的 `self._f.flush()` → **转红** ✓（链尾受守）
+      · B2 `_TeeStream.flush` 改成空实现           → **转红** ✓（转发受守）
+      · B3 删 `_FlushFile.write` 里的先行 flush    → **仍绿** ✓（**故意如此**）
+    B3 之所以**必须**仍绿：那个先行 flush 只是额外保险，"不丢"由
+    `_FlushFile.flush` 承接（`StreamHandler.emit` 会调）；把它当契约来守
+    就是**过度绑定实现细节**（第一版用 `flush_calls >= 2` 时 B3 误报转红，
+    绑到了"调几次 flush"而不是"内容最终有没有落盘"）。
+    """
+    import logging as _logging
+
+    monkeypatch.setenv("HIVEWEAVE_LOG_MAX_BYTES", "1000000")
+    log = tmp_path / "server.out.log"
+    stream = hw_main._FlushFile(log)
+    real_f = stream._f
+
+    class _Null:
+        def write(self, s):  # noqa: ANN001
+            return len(s)
+
+        def flush(self):  # noqa: ANN002
+            pass
+
+    class _RecordingSink:
+        """`write` 攒着不落盘；落盘**只**发生在"flush 阶段"（由测试显式开启）。
+
+        为什么要分阶段（本用例栽的第 3 次，形态仍是「判据挂在错的环上」）：
+        ``_FlushFile.write``（:135）**自己**就会调 ``self._f.flush()`` —— `write`
+        阶段 flush 链已被走过一遍。若替身每次 flush 都落盘，内容会在 `tee.write()`
+        时就进文件 ⇒ 之后 `tee.flush()` 断链**没有可观测差异**，守卫又成空转
+        （实测：阳性前置断言当场抓住）。
+
+        ⚠ 用**阶段开关**而不是"第 N 次 flush"来切分：起初试过
+        ``flush_calls >= 2``，结果 `_FlushFile.write` 里那次先行 flush 一被删
+        （见 `_pc_round4c.py` 的 B3），tee.flush 就变成第 1 次调用 ⇒ 替身不落盘
+        ⇒ **B3 也转红**。那是**守卫过度绑定实现细节**（绑到了 flush 的**次数**，
+        而不是"内容最终有没有落盘"这条契约）—— 一次误报。
+        阶段开关只区分"这次 flush 属于哪个阶段"，与实现里调几次 flush 无关。
+
+        ⚠ 落盘那一步**必须**跟着 `real_f.flush()`：替身冒充的是 `_FlushFile._f`
+        这个角色，真实 `_f`（`TextIOWrapper`）的 flush 自己会贯通到 OS；
+        替身不补这步，内容会停在 `real_f` 的 `BufferedWriter` 里
+        （实测 `real_f.tell() = 18` 而盘上为空）。
+        """
+
+        def __init__(self) -> None:
+            self.written: list[str] = []
+            self.flush_calls = 0
+            self.allow_landing = False  # 只有 flush 阶段才允许落盘
+
+        def write(self, s):  # noqa: ANN001
+            self.written.append(s)
+            return len(s)
+
+        def flush(self) -> None:
+            self.flush_calls += 1
+            if not self.allow_landing:
+                return  # write 阶段的先行 flush：只留痕，不落盘
+            if self.written:
+                real_f.write("".join(self.written))
+                self.written.clear()
+            real_f.flush()
+
+    sink = _RecordingSink()
+    stream._f = sink  # type: ignore[assignment]
+
+    tee = hw_main._TeeStream(_Null(), stream)
+    try:
+        # ⚠ **不带 `\n`**（行缓冲替不掉 flush）+ 经 `write` 进入（这样才能证明
+        # 先行 flush 被替身拦住、结果只能由 flush 链决定）
+        tee.write("NO-NEWLINE-PAYLOAD")
+        mid = log.read_text(encoding="utf-8") if log.exists() else ""
+        assert "NO-NEWLINE-PAYLOAD" not in mid, (
+            "**阳性前置不成立**：`write` 阶段内容就已落盘 ⇒ 本条守卫测不出 flush 链"
+            f"（替身没拦住先行 flush）。实测盘上：{mid!r}"
+        )
+        # ★ 开启落盘闸门 —— 之后只有 flush 链能决定内容是否出现在盘上
+        sink.allow_landing = True
+        tee.flush()
+        on_disk = log.read_text(encoding="utf-8")
+    finally:
+        stream._f = real_f  # type: ignore[assignment]
+        teardown = getattr(sink, "written", [])
+        if teardown:
+            real_f.write("".join(teardown))
+        stream.close()
+
+    assert sink.flush_calls >= 1, (
+        "`_FlushFile.flush()` 没有调用 `self._f.flush()` —— 「不丢」契约的"
+        f"最后一环断了（sink.flush_calls={sink.flush_calls}）"
+    )
+    assert "NO-NEWLINE-PAYLOAD" in on_disk, (
+        "flush 链**没有**把未换行结尾的内容写到文件 —— 「不丢」契约断了。"
+        "排查：`_TeeStream.flush` 是否转发给各 stream；`_FlushFile.flush` 是否先 "
+        "`self._f.flush()`。"
+    )
+    assert "flush" in _logging.StreamHandler.emit.__code__.co_names, (
+        "标准库 `StreamHandler.emit` 不再调用 `flush` —— 去掉 tee 的逐行 flush 后"
+        "它是承接口，契约会静默失效"
+    )

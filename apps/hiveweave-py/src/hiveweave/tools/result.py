@@ -244,8 +244,18 @@ class ToolResult:
 #
 # `bash.py` 的 15 处 shell 出口直接返回**裸字典**（历史原因：这些路径在
 # `_shell_tool_result` 之前就 return 了）。裸字典绕过 `ToolResult` 类型，
-# 于是 `fact` 的派生属性（runner_failed / command_failed）不会自动展开 ——
-# 下游 `result["runner_failed"]` 直接 KeyError（本次实测到的回归）。
+# 于是 `fact` 的派生属性（runner_failed / command_failed）不会自动展开。
+#
+# ⚠ 危害形态（2026-09-17 更正）：早先这里写作「下游 `result["runner_failed"]`
+# 直接 KeyError」。第三轮审计复核当前 `src/` 的消费者**全用 `.get()`**，
+# KeyError **不可复现**；当时（2026-09-11）确有 `[]` 下标消费者，随手改成了
+# `.get()`，但**注释没跟着改** ⇒ 留下一条"找不到罪犯的罪状"。
+# 现役的真实危害是**静默误归因**：派生键缺失 ⇒
+#   · `tool_loop.py:1388` 的 `if _rf.get("runner_failed")` 不成立 ⇒
+#     agent 少一句「命令未执行」的归因提示（把平台问题当成自己的）；
+#   · `streaming.py:340/420` 落库 `None`（"未判定"）而非 `False`（"已判定为
+#     非"）—— 与 `COALESCE` 要区分这两者的设计冲突。
+# 漏斗依然必须，只是**理由要说成后一条**。
 #
 # 修法不是「每处手写两个键」（那正是「约束写在调用方看得见的地方」的
 # 复发），而是**唯一漏斗**：所有裸字典出口经此函数收口，fact → 派生键

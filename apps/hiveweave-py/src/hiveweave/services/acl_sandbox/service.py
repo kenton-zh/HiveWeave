@@ -636,7 +636,9 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
         if leaking:
             raise SandboxUnavailableError(
                 f"seal read-back failed: {path} 仍有能力 SID 写位 {leaking} "
-                f"—— git 引导文件未封住，拒绝继续执行 agent 命令")
+                f"—— git 引导文件未封住，拒绝继续执行 agent 命令",
+                platform_side=True,
+            )
         if wrote or created:
             changed.append(f"{'create+' if created else ''}seal:{path}")
 
@@ -696,7 +698,9 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     if leaking_root:
         raise SandboxUnavailableError(
             f"seal read-back failed: {git_dir} 仍可被 agent 写 {leaking_root} "
-            f"—— 配置载体可被 lock+rename 替换，拒绝继续执行 agent 命令")
+            f"—— 配置载体可被 lock+rename 替换，拒绝继续执行 agent 命令",
+            platform_side=True,
+        )
     # git 真正需要 agent 写的子目录（agent 自己的 add/commit 落在 worktree gitdir
     # + 共享 objects/refs/logs；**不含** `.git` 根、不含 `info/`、不含 `hooks/`）
     for name in ("objects", "refs", "logs"):
@@ -802,7 +806,9 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         raise SandboxUnavailableError(
             f"workspace 根 {root} 无真实主体写 ACE（OWNER_RIGHTS-only 或缺失 ACL），"
             f"write-restricted 令牌不可用。请把 workspace 放在用户常规目录下"
-            f"（如 C:\\Users\\<user>\\ 或含 AuthUsers:Modify 的目录）。")
+            f"（如 C:\\Users\\<user>\\ 或含 AuthUsers:Modify 的目录）。",
+            platform_side=True,
+        )
 
     # §4.9：必须先裁剪 .hiveweave 再授予项目根 —— 否则根的可继承 ACE 会先
     # 传播进 .hiveweave、随后被 PROTECTED 固化为显式 ACE，形成泄漏。
@@ -929,7 +935,9 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         if not await agrant.has_subject_write_ace_async(d):
             raise SandboxUnavailableError(
                 f"附加可写目录 {d} 无真实主体写 ACE（OWNER_RIGHTS-only 或缺失 ACL），"
-                f"write-restricted 令牌不可用。请把目录放在用户常规目录下。")
+                f"write-restricted 令牌不可用。请把目录放在用户常规目录下。",
+                platform_side=True,
+            )
         await _grant_if_missing(d, extra_sid(d), GRANT_MASK, agrant)
 
 

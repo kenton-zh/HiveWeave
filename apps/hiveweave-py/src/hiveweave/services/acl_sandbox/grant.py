@@ -59,7 +59,8 @@ _EVERYONE_SID = "S-1-1-0"
 def _require_win32() -> None:
     if win32security is None:
         raise SandboxUnavailableError(
-            "ACL sandbox requires Windows (pywin32 unavailable) on this platform"
+            "ACL sandbox requires Windows (pywin32 unavailable) on this platform",
+            platform_side=True,
         )
 
 

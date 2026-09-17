@@ -32,10 +32,15 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
 
 import pytest
 
 from hiveweave.services.acl_sandbox import entry as entry_mod
+
+def hiveweave_root():
+    import hiveweave
+    return pathlib.Path(hiveweave.__file__).resolve().parent
 from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
 from hiveweave.services.acl_sandbox.policy import (
     ALL_SPAWN_STAMP_KEYS,
@@ -713,3 +718,167 @@ def test_platform_side_survives_cycle_in_exception_chain():
     a.__cause__ = b
     b.__cause__ = a
     assert _is_platform_side(a) is False   # 能返回即通过（不死循环）
+
+
+# --- I 组：平台侧构造点必须**亲笔声明**（2026-09-17 第三轮审计 NEW-1）------
+#
+# 背景：`is_platform_side` 最初只认 `api_name` 非空 / 链里有 `PwshUnavailableError`。
+# 但 30 处构造点里 19 处不传 `api_name`，其中至少 7 处**是真实平台故障**
+# （pywin32 不可用 / 令牌缺 logon SID / ACL 前置未满足 / seal read-back 失败）
+# ⇒ 修复后它们被**静默降级**为 `outcome_unknown`。
+# 这是过度矫正的另一头：修复前全报 `runner_failed`（过度归因），
+# 只加 2 条判据后全不报（**欠归因**）—— 而"平台加固失败"恰恰应当让 agent
+# 知道不是自己的问题。
+#
+# 修法：`SandboxUnavailableError(..., platform_side=True)` —— 由**构造点**
+# 亲笔声明（它最清楚自己是不是在检查平台前置条件）。
+#
+# ⚠ 默认 `False` 是安全侧：漏判 ⇒ 上游按既有阶梯归因（无害）；
+#   误判 ⇒ agent 放弃自查真 bug（代价更大）。
+
+
+def test_platform_side_flag_is_honoured():
+    """`platform_side=True` 且无 `api_name` ⇒ 判为平台侧。"""
+    from hiveweave.services.acl_sandbox.errors import (
+        SandboxUnavailableError,
+        is_platform_side,
+    )
+
+    exc = SandboxUnavailableError("pywin32 unavailable", platform_side=True)
+    assert exc.api_name == "", "本用例前提：没有 api_name 也想被判为平台侧"
+    assert is_platform_side(exc) is True
+
+
+def test_platform_side_flag_defaults_to_false():
+    """**默认不表态** —— 裸的容器异常不得被判成平台侧（否则又回到误判）。"""
+    from hiveweave.services.acl_sandbox.errors import (
+        SandboxUnavailableError,
+        is_platform_side,
+    )
+
+    assert SandboxUnavailableError("who knows").platform_side is False
+    assert is_platform_side(SandboxUnavailableError("who knows")) is False
+
+
+def test_platform_side_flag_survives_wrapping():
+    """包在外层时仍能经 `__cause__` 找到内层的亲笔声明。"""
+    from hiveweave.services.acl_sandbox.errors import (
+        SandboxUnavailableError,
+        is_platform_side,
+    )
+
+    inner = SandboxUnavailableError("pywin32 unavailable", platform_side=True)
+    outer = SandboxUnavailableError("ACL sandbox execution failed")
+    outer.__cause__ = inner
+    assert is_platform_side(outer) is True
+
+
+@pytest.mark.parametrize(
+    "rel_path,needle",
+    [
+        ("grant.py", "ACL sandbox requires Windows (pywin32 unavailable)"),
+        ("spawn.py", "ACL sandbox requires Windows (pywin32 unavailable)"),
+        ("token.py", "ACL sandbox requires Windows (pywin32 unavailable)"),
+        ("token.py", "no logon SID in token groups"),
+        ("service.py", "workspace 根 {root} 无真实主体写 ACE"),
+        ("service.py", "附加可写目录 {d} 无真实主体写 ACE"),
+        ("service.py", "seal read-back failed: {path}"),
+        ("service.py", "seal read-back failed: {git_dir}"),
+    ],
+)
+def test_known_platform_faults_are_annotated(rel_path, needle):
+    """**逐点**守卫：已定性的平台侧构造点必须带 `platform_side=True`。
+
+    ⚠⚠ 首版是"文件里有**任意一个** raise 带了标注即通过" ⇒ **假绿**
+    （实测：摘掉 `token.py` 的 no-logon-SID 标注后仍绿 —— 因为同文件
+    `_require` 的 pywin32 那条还带着）。本版改为**按文案锚点定位到那一个
+    `raise`**，再断言它自己带标注。
+
+    ⚠ 判据仍走 **AST**（用户 09-14 钦定「永远」）：`needle` 只用于**定位**
+    是哪一个构造点（多构造点文件里必须能区分），判定"有没有标注"是 AST
+    读关键字参数 —— 换引号/换行/换措辞都不影响。
+    """
+    import ast
+
+    path = (
+        pathlib.Path(hiveweave_root())
+        / "services" / "acl_sandbox" / rel_path
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    # 1) 用 needle 定位**唯一**一个目标构造点（needle 是文档化的定位锚）
+    located: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+        if fname != "SandboxUnavailableError":
+            continue
+        text = ast.unparse(call)
+        if needle in text:
+            located.append(call.lineno)
+    assert len(located) == 1, (
+        f"{rel_path} 里锚点 {needle!r} 应恰好定位 1 个 `SandboxUnavailableError` "
+        f"构造点，实测 {len(located)} 个（{located}）—— 锚点漂移时本守卫会静默失效"
+    )
+
+    # 2) 断言**那一个**构造点带 platform_side=True
+    target_line = located[0]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        if not isinstance(call.func, ast.Name):
+            continue
+        if call.func.id != "SandboxUnavailableError" or call.lineno != target_line:
+            continue
+        ok = any(
+            kw.arg == "platform_side"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value is True
+            for kw in call.keywords
+        )
+        assert ok, (
+            f"{rel_path}:{target_line} 的构造点（{needle}）**没有** "
+            f"`platform_side=True` —— 它会被静默降级为 outcome_unknown，"
+            f"agent 收到「是你自己的问题」而放弃重试（第三轮审计 NEW-1）"
+        )
+        return
+    pytest.fail(f"{rel_path}:{target_line} 定位到了却没有配对的 raise 节点")
+
+
+def test_no_platform_side_annotation_on_the_catch_all_wrapper():
+    """⭐ **反面对照**：`service.py` 的兜底包装点**不得**标 `platform_side`。
+
+    那是「一切意外异常的容器」—— 真代码 bug 也从这里过。给它标上
+    `platform_side=True` 就等于把 F5/第二轮审计那条缺陷**原样种回来**
+    （真 bug 被判成平台故障 ⇒ agent 放弃自查）。本条守的是"别矫枉过正"。
+    """
+    import ast
+
+    path = (
+        pathlib.Path(hiveweave_root())
+        / "services" / "acl_sandbox" / "service.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    bad: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+        if fname != "SandboxUnavailableError":
+            continue
+        # 兜底包装点的特征：`raise ... from e`（有 __cause__ 绑定）
+        if node.cause is None:
+            continue
+        for kw in call.keywords:
+            if kw.arg == "platform_side":
+                val = kw.value
+                if isinstance(val, ast.Constant) and val.value is True:
+                    bad.append(node.lineno)
+    assert not bad, (
+        f"service.py:{bad} 的**兜底包装点**（`raise ... from e`）标了 "
+        f"platform_side=True —— 它会把真代码 bug 也判成平台故障（F5 的病原样复发）"
+    )

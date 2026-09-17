@@ -22,20 +22,39 @@ def is_platform_side(exc: BaseException) -> bool:
 
     看**异常链**（``__cause__`` / ``__context__``）里有没有平台侧的特征打标：
 
-      1. ``SandboxUnavailableError.api_name`` 非空 —— 该字段只在
-         `grant.py` / `service.py` / `spawn.py` / `token.py` 一族**真的调了
-         Win32 API 并拿到错误码**时构造，是"平台设施故障"的**亲笔签名**；
-      2. 链里出现 ``PwshUnavailableError``（`integration.py`）—— 受限 shell
+      1. ``platform_side=True`` —— **构造点亲笔声明**。该字段由
+         `raise SandboxUnavailableError(..., platform_side=True)` 显式给出，
+         用于那些**本身就是平台故障**、但不是某一次具体 Win32 调用失败的
+         情形（pywin32 不可用 / 令牌缺 logon SID / ACL 前置条件未满足 /
+         seal read-back 失败 / pwsh 缺失）；
+      2. ``api_name`` 非空 —— 该字段只在 `grant.py` / `service.py` /
+         `spawn.py` / `token.py` 一族**真的调了 Win32 API 并拿到错误码**时
+         构造，是"平台设施故障"的另一种**亲笔签名**；
+      3. 链里出现 ``PwshUnavailableError``（`integration.py`）—— 受限 shell
          缺失，同属平台侧。
+
+    ⚠⚠ **为什么需要 ①（2026-09-17 第三轮审计 NEW-1）**：只有 ②③ 时，
+    30 处构造点里 19 处不传 `api_name`，其中至少 7 处**是真实平台故障**
+    （见下列清单）⇒ 它们会被**静默降级**为 `outcome_unknown`。
+    这是过度矫正：修复前它们全报 `runner_failed`（过度归因），
+    只加 ②③ 后它们全不报（**欠归因**），而"平台加固失败"恰恰应当让 agent
+    知道不是自己的问题。
+
+    已按此标注的构造点（平台侧，无 api_name）：
+      · `token.py` `no logon SID in token groups`
+      · `grant.py` / `spawn.py` / `token.py` `pywin32 unavailable`
+      · `service.py` `workspace 根无真实主体写 ACE`
+      · `service.py` `附加可写目录无真实主体写 ACE`
+      · `service.py` `seal read-back failed`（两处：git 引导文件 / 配置载体）
+      · `integration.py` `pwsh not found`（经 `PwshUnavailableError`）
 
     其余一律**不表态**（连 ``SandboxUnavailableError`` 本身都不够 —— 它会
     把真 bug 包进来）。不表态不等于说"不是平台问题"，只是不替上游做它自己
     会做的归因。
 
-    ⚠ 「无 API 名 + 无 pwsh 缺失」的 ``SandboxUnavailableError`` 依然**可能**
-    是平台故障（比如 runner 内部某个非 Win32 的失败）。这里选择**宁缺勿滥**：
-    漏判 ⇒ 上游按既有阶梯归因（不会错判成"不是你的问题"）；误判 ⇒ agent
-    放弃自查真 bug（**代价更大**）。
+    ⚠ 取舍方向：**误判为平台侧 ⇒ agent 放弃自查真 bug**（代价更大），
+    **漏判 ⇒ 上游按既有阶梯归因**（无害）。故「未标注」是安全的默认，
+    而**标注必须是构造点主动做的动作**（判据来自状态/显式字段，不来自文案）。
     """
     from hiveweave.services.acl_sandbox.integration import PwshUnavailableError
 
@@ -43,7 +62,9 @@ def is_platform_side(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if isinstance(cur, SandboxUnavailableError) and cur.api_name:
+        if isinstance(cur, SandboxUnavailableError) and (
+            cur.platform_side or cur.api_name
+        ):
             return True
         if isinstance(cur, PwshUnavailableError):
             return True
@@ -59,10 +80,30 @@ class SandboxUnavailableError(RuntimeError):
     其余一切异常（含意外 bug）都必须以本异常向上抛，绝不降级 native。
     """
 
-    def __init__(self, message: str, *, api_name: str = "", win32_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        api_name: str = "",
+        win32_code: int | None = None,
+        platform_side: bool = False,
+    ):
         super().__init__(message)
         self.api_name = api_name
         self.win32_code = win32_code
+        # ⚠ 2026-09-17 第三轮审计 NEW-1：**构造点亲笔声明**"这确属平台故障"。
+        #
+        # 为什么需要它（而不是让 `is_platform_side` 去猜）：本异常是**一切异常
+        # 的容器** —— 真代码 bug 也被包进来。故"平台侧"这个判断**只有构造点
+        # 知道得最清楚**（它要么真的调了 Win32 API、要么真的在检查平台前置
+        # 条件）。默认 `False`（不表态）是安全侧：漏判 ⇒ 上游按既有阶梯归因；
+        # 误判 ⇒ agent 收到「不是你的 bug」而放弃自查（代价更大）。
+        #
+        # 与 `api_name` 的分工：`api_name` 是"某一次具体 Win32 调用失败"的
+        # 签名（带得出，就顺手带上）；本字段给"本身就是平台故障但不是某次
+        # 具体调用"的那些（pywin32 不可用 / 令牌缺 SID / ACL 前置未满足 /
+        # seal read-back 失败）。
+        self.platform_side = platform_side
 
     def _detail(self) -> str:
         detail = self.win32_code if self.win32_code is not None else "n/a"

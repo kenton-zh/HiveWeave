@@ -43,13 +43,16 @@ def find_logon_sid(token):
     for sid, attr in groups:
         if (attr & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID:
             return sid
-    raise SandboxUnavailableError("no logon SID in token groups")
+    raise SandboxUnavailableError(
+        "no logon SID in token groups", platform_side=True
+    )
 
 
 def _require() -> None:
     if win32security is None:
         raise SandboxUnavailableError(
-            "ACL sandbox requires Windows (pywin32 unavailable) on this platform"
+            "ACL sandbox requires Windows (pywin32 unavailable) on this platform",
+            platform_side=True,
         )
 
 
