@@ -42,24 +42,69 @@ from fastapi.middleware.cors import CORSMiddleware
 import structlog
 
 from hiveweave.config import settings
+from hiveweave.util.log_rotate import make_rotator
 
 
 class _FlushFile:
-    """Line-buffered-ish file that flushes every write (TEST21 M10)."""
+    """Line-buffered-ish file that flushes every write (TEST21 M10).
+
+    TEST21 M10 契约的**后半段**（09-17 补）：每写一行都做一次**轮转预检**。
+    只靠"每行 flush"保证的是"不丢"，不保证"不涨" —— 一份永久的 append 句柄
+    （本进程 + launcher 的 stdout 重定向都是）会让单个日志文件无限增长，实测
+    ``data/logs/`` 曾达 163 MB。轮转实现在 ``util/log_rotate``，这里只负责
+    在正确的时机调它、并在真的翻转后立刻重开句柄。
+
+    ⚠ 翻转判据只能来自 ``rotate_if_needed()`` 的**返回值**（None＝没翻转）。
+    不要用 ``path.stat().st_size`` 或文本内容重新推断 —— 那会在文件被外部
+    截断/替换时误判，且不是状态判据（用户 09-14 钦定禁用文本判据）。
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         # buffering=1 is line-buffered only in text mode for tty; force flush.
         self._f = open(path, "a", encoding="utf-8", buffering=1)
+        self._rotate = make_rotator(path)
+        self._pending_lines = 0
+
+    def _maybe_rotate(self, force: bool = False) -> None:
+        """每 N 行预检一次大小；命中则搬走旧内容并把偏移归零。
+
+        预检**不每行做**：``stat()`` 是系统调用，热路径上日增数万行没必要。
+        行数计数是"大致"的 —— 日志行长度不均，但它只是采样频率，不是判据。
+
+        ``force`` 供 ``flush()`` 用：调用方显式要"落定"时不该再看采样计数器，
+        否则"我 flush 了但没轮转"会变成一条静默的、只在大写入量下才暴露的缝。
+        """
+        self._pending_lines += 1
+        if not force and self._pending_lines < _ROTATE_CHECK_EVERY_LINES:
+            return
+        self._pending_lines = 0
+        rotator = self._rotate
+        if rotator is None:
+            return  # 轮转功能关闭 / 构造失败 —— 此时**绝不**调 None()
+        if rotator.rotate_if_needed() is None:
+            return
+        # 必需收尾：``os.truncate`` 走路径、不改句柄流状态，句柄偏移还在旧末尾
+        # ⇒ 不归零的话下一次写就从旧偏移开始，中间留一段 NUL 空洞。
+        # inode 没换（本方案不改名），所以这里 seek 就够了，无需 reopen。
+        rotator.reset_offset(self._f)
 
     def write(self, s: str) -> int:
         n = self._f.write(s)
         self._f.flush()
+        self._maybe_rotate()
         return n
 
     def flush(self) -> None:
+        """显式落定时**强制**做一次轮转预检（不看采样计数器）。
+
+        只被 ``flush()`` 用；``write()`` 里那次由 ``_maybe_rotate()`` 自己按
+        采样节奏走。注意这**不是**重复定义：早先手写时留过一个无参 ``flush``
+        在下面，Python 后定义者胜 ⇒ ``force=True`` 被静默吞掉。已删。
+        """
         self._f.flush()
+        self._maybe_rotate(force=True)
 
     def close(self) -> None:
         self._f.close()
@@ -98,6 +143,10 @@ class _TeeStream:
 
 
 _LOG_FILE_STREAM: _FlushFile | None = None
+
+# 日志轮转预检的采样间隔（行）。只影响"多久发现一次该翻转"，不是判据：
+# 8 MiB 阈值下一行才几十字节，256 行的延迟约 10 KB，相对阈值可忽略。
+_ROTATE_CHECK_EVERY_LINES = 256
 
 
 def _default_log_file() -> Path:

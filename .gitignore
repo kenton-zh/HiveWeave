@@ -28,6 +28,9 @@ Thumbs.db
 
 # Logs
 *.log
+# 轮转备份代（util/log_rotate.py 产出 .1/.2…）。⚠ `*.log` 匹配不到
+# `server.out.log.1`，不加这条每代备份都会变成未跟踪文件、并混进 OCR 审计。
+*.log.[0-9]*
 npm-debug.log*
 tasks/*.output
 
