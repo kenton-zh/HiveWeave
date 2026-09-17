@@ -63,6 +63,11 @@ CEO_TOOLS = _BASE_TOOLS | frozenset({
     "git_worktree_merge", "git_worktree_remove",
     # 终验对用户说
     "message_user",
+    # 交付状态写者（DOC_WRITE 硬门 ⇒ CEO 专属；这里才是 CEO 真正消费的
+    # 可见面清单 —— 放进 READWRITE_TOOLS/ALL_TOOLS 对 ceo 家族无效，
+    # get_tools_for_agent 对 family == "ceo" 只读本集合。F4 守卫：
+    # test_blocked_producers_h3::test_doc_write_exclusive_tools_visible_to_ceo）
+    "mark_delivery_complete",
     # 团队开会（仅 ceo/coordinator 可开；family 硬门见 policy）
     "start_team_meeting",
 })

@@ -276,6 +276,41 @@ def test_executor_qa_keep_start_dev_server():
         assert "start_dev_server" in svc.get_tools_for_agent(a)
 
 
+def test_doc_write_exclusive_tools_visible_to_ceo():
+    """F4 守卫：DOC_WRITE 独占工具必须进 CEO 可见表，且其他家族不可见。
+
+    阳性对照：把 ``mark_delivery_complete`` 从 permission.CEO_TOOLS 删除
+    ⇒ 本测试转红。缺陷史（2026-09-17 确证）：该工具曾被加进
+    READWRITE_TOOLS / ALL_TOOLS，但 get_tools_for_agent 对 family=="ceo"
+    只读 CEO_TOOLS ⇒ CEO 的模型工具表从未包含它，四轮真实运行 0 触发，
+    且既有守卫全部绕过角色 allowlist（方向：硬门允许但不可见）。
+    """
+    from hiveweave.services.policy import TOOL_CAPABILITY, Capability
+
+    svc = PermissionService()
+    doc_write_only = {
+        name
+        for name, req in TOOL_CAPABILITY.items()
+        if req == frozenset({Capability.DOC_WRITE})
+    }
+    assert doc_write_only, "DOC_WRITE 独占工具集合为空——探针失效，守卫失真"
+    ceo_tools = svc.get_tools_for_agent(
+        _agent(role="ceo", permission_type="coordinator")
+    )
+    missing = doc_write_only - set(ceo_tools)
+    assert missing == set(), f"DOC_WRITE 独占工具未进 CEO 可见表: {sorted(missing)}"
+    # 反向：其余家族均不持 DOC_WRITE ⇒ 可见即「可见但硬门必拒」，
+    # 违反第 4 节不变量（可见列表 ∩ 硬门拒绝 = ∅）。
+    for role, ptype in (
+        ("hr", "coordinator"),
+        ("前端架构师", "coordinator"),
+        ("测试工程师", "executor"),
+    ):
+        other = svc.get_tools_for_agent(_agent(role=role, permission_type=ptype))
+        leaked = doc_write_only & set(other)
+        assert leaked == set(), f"{role} 可见 DOC_WRITE 独占工具: {sorted(leaked)}"
+
+
 # ── 5. build_child_env 分叉 + SDK 白名单 ──────────────────────────────
 
 
