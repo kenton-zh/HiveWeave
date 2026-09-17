@@ -221,6 +221,29 @@ class ObligationsMixin:
             )
             return True  # fail-closed
 
+    async def can_idle(self, project_id: str, agent_id: str) -> bool:
+        """F6 本体：**「许可收尾 / 许可不唤醒」的唯一判定源**。
+
+        = ``not has_open_work(...)``。为什么必须存在一个具名的许可谓词：
+        F6 的根因不是"没有正确判据"，而是**判据没被工程化管住** ——
+        两个消费点（``poll._build_obligations_snapshot`` /
+        ``turn_exit.build_exit_contract_hint``）各自拿**白名单**
+        ``get_actionable_obligations`` 判空并把空结果当"许可收尾"输出，
+        账本因此对 agent 说谎（砺石五次被告知「名下无待办」）。
+        ADR-001 已把另外 4 个消费者切到闭式谓词、漏了这 2 个 ——
+        「每处各判一次」正是漏网形态；本方法是那"唯一一次"。
+
+        不可删答辩（设计稿 §4.1.3）：删掉它 = 回到"每个消费点自己挑
+        一个谓词"的世界 —— 白名单对 agent 不可见地长大（未来新增
+        ACTIVE 状态默认不进白名单），而闭式负空间自动把新状态算作"有活"
+        （fail-safe）。许可语义必须锚在一个**闭式**谓词上，且名字要
+        把"许可"说出口，守卫（``scripts/verify_commit_license.py``）
+        才有可判定的登记点。
+
+        fail-closed：``has_open_work`` 查询异常按 True（不许 idle）。
+        """
+        return not await self.has_open_work(project_id, agent_id)
+
     async def list_delegated_in_flight(
         self, project_id: str, agent_id: str
     ) -> list[dict]:

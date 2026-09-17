@@ -101,3 +101,17 @@ python scripts/scan_judgement_field.py --kinds A B        # 只跑指定类别
   ⇒ **逐条人核**。做成 gate 的唯一后果是训练人「红了就 append」。
 - 同类纪律见 `ratchet_positive_controls.py`。
 
+
+### verify_commit_license.py — F6 收尾许可守卫（gate，exit 1）
+
+```bash
+python scripts/verify_commit_license.py            # 默认扫仓库根
+python scripts/verify_commit_license.py <root>     # 指定根
+```
+
+- 判「白名单谓词（get_actionable_obligations）的空结果产生收尾许可文案」的
+  调用点（三 AST 事实合取，PLATFORM-ISSUES §11.7 订正版）。
+- **这是 gate 不是盘点**：违规 exit 1。许可语义唯一判定源 =
+  `services/tasks/obligations.py::TaskService.can_idle`。
+- 规格与正/负 fixture：`apps/hiveweave-py/tests/test_commit_license_guard.py`
+  （全量 pytest 时作为第二道拦截执行）。

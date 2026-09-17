@@ -2369,7 +2369,13 @@ class GameTimeService:
     ) -> dict:
         """wait 豁免穿透探针：该 agent 是否有未履约义务。
 
-        口径与 turn-exit 履约门同源：
+        口径（F6 §11.4 订正，2026-09-18）：本探针消费**白名单**
+        ``get_actionable_obligations`` —— 它是「醒后行动清单」语义
+        （§11.7 分类②：probe 返回的 obligations 供唤醒后行动，不是
+        收尾许可），**并非**与 turn-exit 履约门（闭式 has_open_work /
+        can_idle）同源 —— 旧 docstring 称「口径同源」是失实的
+        「声明同源但漂移」。跨函数数据流（probe["has_duty"] →
+        _check_silent_agents）AST 守卫看不穿，靠本声明钉住语义。
         - ledger 义务（get_actionable_obligations：assignee/reviewer/creator，
           含 creator+submitted —— 下属 resubmit 后 creator 必须审）
         - 未解除回复契约（outstanding ask contracts，含 read=1 —— read≠replied）

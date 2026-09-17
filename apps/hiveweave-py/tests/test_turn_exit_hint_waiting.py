@@ -33,7 +33,7 @@ async def test_hint_empty_branch_documents_wait_rule(monkeypatch):
         "hiveweave.services.turn_exit._unreplied_ask_contracts", _no_asks
     )
     monkeypatch.setattr(
-        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        "hiveweave.services.task.TaskService.get_open_work_obligations",
         _no_obligations,
     )
     monkeypatch.setattr(
@@ -72,7 +72,7 @@ async def test_hint_busy_branch_keeps_obligations(monkeypatch):
         "hiveweave.services.turn_exit._unreplied_ask_contracts", _no_asks
     )
     monkeypatch.setattr(
-        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        "hiveweave.services.task.TaskService.get_open_work_obligations",
         _some_obligations,
     )
     monkeypatch.setattr(

@@ -35,7 +35,7 @@ async def test_exit_hint_includes_ask_body_snippet(monkeypatch):
         "hiveweave.services.turn_exit._unreplied_ask_contracts", fake_asks
     )
     monkeypatch.setattr(
-        "hiveweave.services.task.TaskService.get_actionable_obligations",
+        "hiveweave.services.task.TaskService.get_open_work_obligations",
         _no_obligations,
     )
     monkeypatch.setattr(
@@ -318,6 +318,8 @@ async def test_trigger_complete_skips_without_ghost_ask(monkeypatch):
     )
     # complete-skip 的 ledger 义务检查（无债才跳过）——不 mock 会真实
     # 查 workspace → fail-open 不跳过 → 后续 handoff 调用炸 DB
+    # ⚠ 这里 mock 白名单是对的：trigger.py:1024 的 complete-skip 是 R4
+    # 显式例外（只认 reviewer/creator 债），消费 get_actionable_obligations。
     monkeypatch.setattr(
         "hiveweave.services.task.TaskService.get_actionable_obligations",
         empty,

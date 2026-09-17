@@ -324,6 +324,11 @@ class HealthSupervisor:
         except Exception:
             inbound_ask = True  # fail closed
 
+        # F6 §11.4 注记（2026-09-18）：这里的白名单空结果语义 =
+        # 「许可【不唤醒】」（看门狗降级兜底，仅 gt_stale 时跑），
+        # 不是「许可 agent 收尾」—— 与 turn-exit 的收尾许可（can_idle
+        # 闭式）不同源也**不应**同源；守卫 verify_commit_license 的
+        # 判据 (c) 排除 return True/None 正是为此。
         if not obligations and not inbound_ask and not waits:
             return True
         return False

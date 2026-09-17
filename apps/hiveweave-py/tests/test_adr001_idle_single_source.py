@@ -644,3 +644,126 @@ async def test_ship_nudge_terminal_statuses_converged(env):
     await _insert_task(env, status="running", assignee_id=EXECUTOR_ID,
                        creator_id=COORD_ID, claimed_at=old)
     assert await _has_remaining_open_tasks(PROJECT_ID) is True
+
+
+# ── F6 本体（2026-09-18）：hint 侧 + 反向回归 + 单调性压测 ──────────
+
+
+@pytest.mark.asyncio
+async def test_exit_contract_hint_blocked_assignee_visible(env):
+    """★ F6 hint 侧（§11.11 对照 2）：blocked-only assignee 必须看到
+    blocked 义务条目，而不是「无未完成义务」。
+
+    变异约定（§11.3）：把 ``build_exit_contract_hint`` 的 obligations 源
+    换回白名单 ``get_actionable_obligations`` ⇒ blocked 被排除 ⇒ hint 落进
+    「无未完成义务、仅需提交 commit_turn 收尾」分支 ⇒ 本测试转红
+    （TEST_DSH_61：砺石五次被账本谎告「名下无待办」）。
+    """
+    from hiveweave.services.turn_exit import build_exit_contract_hint
+
+    await _insert_agent(env, EXECUTOR_ID, "墨白")
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_task(env, status="blocked", assignee_id=EXECUTOR_ID,
+                       creator_id=COORD_ID, claimed_at=old)
+
+    svc = TaskService()
+    obs = await svc.get_open_work_obligations(PROJECT_ID, EXECUTOR_ID)
+    assert obs and obs[0]["status"] == "blocked", "前置：闭式谓词含 blocked"
+    assert await svc.has_open_work(PROJECT_ID, EXECUTOR_ID) is True
+
+    hint = await build_exit_contract_hint(EXECUTOR_ID, PROJECT_ID)
+    assert "无未完成义务" not in hint, hint
+    assert "仅需提交 commit_turn 收尾" not in hint, hint
+    assert "blocked" in hint, hint
+    assert obs[0]["id"][:8] in hint, "hint 须点名义务（短 id）"
+    # 存量显形（escalation_stalled 形态）：blocked 条目带卡置时长提示
+    assert "h）" in hint or "小时" in hint, hint
+
+
+@pytest.mark.asyncio
+async def test_new_blocked_obligation_still_blocks_completion(env):
+    """反向回归（§11.11 对照 5）：closed-form 纳入 blocked 后，完成闸对
+    running 与 blocked 混合义务仍拒绝 —— 存量豁免语义未被削弱
+    （The fix must not weaken enforcement）。"""
+    await _insert_agent(env, EXECUTOR_ID, "墨白")
+    old = _now_ms() - 40 * 60 * 1000
+    await _insert_task(env, status="running", assignee_id=EXECUTOR_ID,
+                       creator_id=COORD_ID, claimed_at=old)
+    await _insert_task(env, status="blocked", assignee_id=EXECUTOR_ID,
+                       creator_id=COORD_ID, claimed_at=old)
+    obs = await TaskService().get_open_work_obligations(
+        PROJECT_ID, EXECUTOR_ID)
+    decision = _gate_with_pending(
+        agent_id=EXECUTOR_ID, obligations=obs)
+    assert not decision.ok
+    assert "OPEN_TASKS_UNDECLARED" in decision.violations
+
+
+@pytest.mark.asyncio
+async def test_exit_hint_permission_monotonic_under_random_walks(env):
+    """★ F6 不变式压测（设计稿 §5 ⭐⭐，MasDrift 形态）：随机多跳下
+    **收尾许可单调性**恒成立 —— ``has_open_work=True ⇒ hint 绝不输出
+    收尾许可（「仅需提交 commit_turn 收尾」）``。
+
+    随机序列：单任务在 claimed/running/rework/blocked 间随机游走，
+    偶发终结（closed）后再派新任务（blocked → 唤醒 → 收尾 → 再唤醒 的
+    抽象）。种子固定 ⇒ 可复现。AST 守卫查静态写法，本压测抓
+    「写法对但状态流转错」—— 正是 F6 的真实形态。
+    """
+    import random
+
+    from hiveweave.services.turn_exit import build_exit_contract_hint
+
+    rng = random.Random(0xF6)
+    await _insert_agent(env, EXECUTOR_ID, "墨白")
+    conn = await ensure_project_db(env["workspace_path"])
+    statuses = ("claimed", "running", "rework", "blocked")
+    task_no = 0
+    await _insert_task(env, status="blocked", assignee_id=EXECUTOR_ID,
+                       creator_id=COORD_ID, claimed_at=_now_ms(),
+                       title=f"walk-{task_no}")
+    task_id = (
+        await TaskService().get_open_work_obligations(PROJECT_ID, EXECUTOR_ID)
+    )[0]["id"]
+    checked_open = 0
+    for hop in range(120):
+        roll = rng.random()
+        if roll < 0.08:
+            # 终结当前任务 → 有概率完全空闲
+            await conn.execute(
+                "UPDATE tasks SET status='closed', updated_at=? WHERE id=?",
+                [_now_ms(), task_id])
+            await conn.commit()
+        elif roll < 0.18 and task_no < 6:
+            # 派新任务（默认 blocked，等裁决）
+            task_no += 1
+            await _insert_task(env, status="blocked",
+                               assignee_id=EXECUTOR_ID,
+                               creator_id=COORD_ID, claimed_at=_now_ms(),
+                               title=f"walk-{task_no}")
+            rows = await TaskService().get_open_work_obligations(
+                PROJECT_ID, EXECUTOR_ID)
+            open_ids = {o["id"] for o in rows}
+            missing = [i for i in open_ids if i != task_id]
+            if missing:
+                task_id = missing[-1]
+        else:
+            new_status = rng.choice(statuses)
+            await conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                [new_status, _now_ms(), task_id])
+            await conn.commit()
+
+        svc = TaskService()
+        open_work = await svc.has_open_work(PROJECT_ID, EXECUTOR_ID)
+        hint = await build_exit_contract_hint(EXECUTOR_ID, PROJECT_ID)
+        if open_work:
+            checked_open += 1
+            assert "仅需提交 commit_turn 收尾" not in hint, (
+                f"hop {hop}: has_open_work=True 但 hint 给出收尾许可：{hint}"
+            )
+            assert "无未完成义务" not in hint, f"hop {hop}: {hint}"
+    assert checked_open >= 60, (
+        f"压测退化：120 跳里仅 {checked_open} 跳处于 has_open_work=True —— "
+        "随机游走参数失效，压测不再覆盖不变式"
+    )

@@ -42,6 +42,15 @@ async def _build_obligations_snapshot(agent_id: str) -> str:
 
     让 agent 被禁止继续轮询时仍拿到可行动信息（任务 id / 状态 / 角色），
     直接对任务操作，而不是盲目重试 get_tasks。best-effort：失败返回空串。
+
+    ⚠ F6 本体（2026-09-18）两段式：**白名单查询先行**（它带
+    ``promote_assigned_created`` 自愈写副作用，不能因短路漏跑），再取
+    **闭式** ``get_open_work_obligations``（与完成闸同源）判「有没有活」。
+    **空结果不再输出 "safe to commit_turn(waiting)"**——那是许可语义，
+    白名单排 blocked ⇒ blocked-only 的 agent 曾被谎告可收尾
+    （PLATFORM-ISSUES §1.3）；「能否收尾」归 ``TaskService.can_idle``，
+    poll 只报账本。闭式有活而白名单空（blocked 等）⇒ 明说「还有活、
+    但现在不可行动」。
     """
     try:
         from hiveweave.db import meta as meta_db
@@ -50,11 +59,30 @@ async def _build_obligations_snapshot(agent_id: str) -> str:
         project_id = await meta_db.get_agent_project_id(agent_id)
         if not project_id:
             return ""
-        obligations = await TaskService().get_actionable_obligations(
+        svc = TaskService()
+        obligations = await svc.get_actionable_obligations(
             project_id, agent_id
         )
-        if not obligations:
-            return "\nCurrent obligations: none — safe to commit_turn(waiting)."
+        open_work = await svc.get_open_work_obligations(project_id, agent_id)
+        if not open_work:
+            return "\nCurrent obligations: none."
+        # 分支条件用「闭式 − 可行动」的 id 集差表达（不用白名单的**空**做
+        # 门槛 —— 那正是 scripts/verify_commit_license.py 禁的判据形态；
+        # 本分支输出的是反许可提示，按 id 集差写才与真实条件同构）。
+        actionable_ids = {str(o.get("id") or "") for o in obligations}
+        non_actionable = [
+            o
+            for o in open_work
+            if str(o.get("id") or "") not in actionable_ids
+        ]
+        if not actionable_ids and non_actionable:
+            return (
+                f"\nYou still hold open work ({len(non_actionable)} item(s), "
+                "e.g. blocked / awaiting arbitration) that is NOT currently "
+                "actionable. Do NOT claim done or 'no obligations'; "
+                "commit_turn(phase='blocked', waiting_on=[…]) to park with "
+                "an explicit reason, or escalate to the creator."
+            )
         lines = ["\nCurrent obligations (act directly, do NOT re-poll):"]
         for ob in obligations[:8]:
             # #9（2026-09-11）：此前这里印的是 `taskId=<前 8 位>` —— **把一个
@@ -74,6 +102,12 @@ async def _build_obligations_snapshot(agent_id: str) -> str:
             )
         if len(obligations) > 8:
             lines.append(f"  ... and {len(obligations) - 8} more")
+        if non_actionable:
+            # F6 审计 LOW-3：混合态下 blocked 义务也要显形（不构成许可输出）
+            lines.append(
+                f"  ... plus {len(non_actionable)} open item(s) NOT currently "
+                "actionable (e.g. blocked) — do not claim 'no obligations'"
+            )
         return "\n".join(lines)
     except Exception:
         return ""

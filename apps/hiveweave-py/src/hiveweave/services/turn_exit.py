@@ -6,6 +6,7 @@ phase=in_progress never implies unlimited continue_work.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import structlog
@@ -1526,9 +1527,17 @@ async def _worktree_dirty_flag(agent_id: str, project_id: str) -> dict:
 async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
     """回合开始时的出口条件提示（F1）— agent 收工决策前可见本轮 gate 要求。
 
-    数据源与 gate 一致（ask 合约 / actionable obligations / worktree
-    dirty flag）。任一源失败则忽略该项；全部失败返回空串（不注入）。
+    数据源与 gate 一致（ask 合约 / **闭式** open-work obligations /
+    worktree dirty flag）。任一源失败则忽略该项；全部失败返回空串（不注入）。
     无待办时返回单行「仅需提交 commit_turn」，不膨胀上下文。
+
+    ⚠ F6 本体（2026-09-18）：obligations 源从**白名单**
+    ``get_actionable_obligations`` 换成**闭式** ``get_open_work_obligations``
+    （与完成闸 completion.py 同源）。白名单排 blocked ⇒ blocked-only 的
+    agent 曾被告知「无未完成义务、仅需提交收尾」——账本对 agent 说谎
+    （TEST_DSH_61 砺石五次被谎告「名下无待办」，PLATFORM-ISSUES §1.3）。
+    闭式把 blocked 算"有活"⇒ hint 列出它；「能否收尾」的权威判定是
+    ``TaskService.can_idle``（唯一许可源），本函数只负责把账本念对。
     """
     asks: list[dict] = []
     obligations: list[dict] = []
@@ -1541,7 +1550,7 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
     try:
         from hiveweave.services.task import TaskService
 
-        obligations = await TaskService().get_actionable_obligations(
+        obligations = await TaskService().get_open_work_obligations(
             project_id, agent_id
         )
         checked += 1
@@ -1629,6 +1638,25 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         if actionable:
             tids = [str(o.get("id") or "")[:8] for o in actionable if o.get("id")]
             items.append(f"未完成义务: {len(actionable)} 个（{_fmt_ids(tids)}）")
+            # F6 存量显形（设计稿 §5「escalation_stalled」形态）：blocked
+            # 义务在 hint 里点名并给卡置时长 —— 不追溯改状态，只让它显形。
+            stale_blocked = [
+                o for o in actionable if o.get("status") == "blocked"
+            ]
+            if stale_blocked:
+                now_ms = int(time.time() * 1000)
+                max_h = min(
+                    max(
+                        (now_ms - int(o.get("updated_at") or 0)) / 3_600_000
+                        for o in stale_blocked
+                    ),
+                    999.0,  # F6 审计 LOW-4：updated_at 缺失(0)时时长爆炸，钳制
+                )
+                items.append(
+                    f"⚠ blocked 义务 {len(stale_blocked)} 个（最长 ~{max_h:.0f}h）："
+                    "不得自称「无待办」收尾；用 commit_turn(phase='blocked', "
+                    "waiting_on=[…]) 显式挂账等裁决，或请 creator/上级裁决"
+                )
     if wt_git_err:
         loc = f" at {wt.get('path')}" if wt.get("path") else ""
         items.append(f"git status failed{loc} (not necessarily dirty)")
