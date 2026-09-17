@@ -29,7 +29,7 @@ from hiveweave.tools.bash import (
     _executed_stamp,
     _truncate_output,
 )
-from hiveweave.tools.result import ToolResult
+from hiveweave.tools.result import ToolResult, finalize_fact_dict
 
 
 class PythonScriptParams(BaseModel):
@@ -94,10 +94,17 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
         # `SHELL_SECURITY_LEVEL_TOOLS` 里，且这两条出口 `blocked=False`），
         # 于是落 `outcome_unknown`（"结果未知、别盲目重试"）—— 而
         # `exit_code is None` 已经**明确**说明进程根本没起来。
-        return {"output": "", "stdout": "", "stderr": "",
-                "exit_code": None, "timed_out": False,
-                "fact": "runner_failed",
-                "error": f"Failed to spawn python: {exc}"}
+        #
+        # ⚠⚠ 必须经 `finalize_fact_dict` 收口（2026-09-17 补，第三处同族）：
+        # 裸字典声明 `fact` 而不展开派生键 ⇒ 下游 `result['runner_failed']`
+        # 直接 KeyError。本条自 M2/T2 起就存在，只是守卫此前**只扫 bash.py**
+        # 而看不见它（扫描范围缺口，本轮一并补上）。
+        return finalize_fact_dict({
+            "output": "", "stdout": "", "stderr": "",
+            "exit_code": None, "timed_out": False,
+            "fact": "runner_failed",
+            "error": f"Failed to spawn python: {exc}",
+        })
     try:
         if timeout_s is None or timeout_s <= 0:
             out_b, err_b = await proc.communicate()
@@ -229,12 +236,19 @@ async def python_script_execute(
                 # "须独立批次"备注）。故显式声明 `executed=False`：
                 # 让「沙箱判定成立」与「命令从未启动」两个事实**并排**存在，
                 # 下游不必靠 `exit_code is None` 反推。
-                return {
+                #
+                # ⚠⚠ 必须经 `finalize_fact_dict` 收口（与 `bash.py:894` 同族，
+                # 2026-09-17 第三处）：裸字典声明 `fact` 而不展开派生键 ⇒
+                # 下游 `result['runner_failed']` 直接 KeyError。
+                # 本处是**本批（F5）新引入**的裸字典出口 —— 原实现（返回 None）
+                # 没有这个问题，加 `fact` 时才需要漏斗。
+                # ⚠ 该守卫原先只扫 `bash.py` ⇒ 漏看本文件（本轮补上扫描范围）。
+                return finalize_fact_dict({
                     "output": "", "stdout": "", "stderr": "",
                     "exit_code": None, "timed_out": False, "error": str(exc),
                     "executed": False,
                     "fact": "runner_failed",
-                }
+                })
             return await spawn_confined(
                 argv=cargv, timeout_s=timeout_s, **ctx.confined_kwargs()
             )

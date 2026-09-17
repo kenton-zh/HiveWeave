@@ -638,3 +638,78 @@ async def test_record_step_end_writes_executed_and_none_keeps_old_value(ledger_e
         f"实际 enforcement={row[0]!r} executed={row[1]!r}"
     )
 
+
+# --- G 组：平台侧归因不得吞掉真代码 bug（2026-09-17 第二轮审计必修）---------
+#
+# 背景：`dev_server_tools.py` 的 `except Exception` 出口要补 `fact`。首版判据是
+# `if _executed_stamp(e):` —— **恒为真**（`service.py:1105-1107` 把一切意外异常
+# 都包成 `SandboxUnavailableError(...) from e`，到 `entry` 后经
+# `_mark_not_executed` 恒带 `executed=False`）⇒ 承诺的「不把真 bug 判成平台
+# 故障」**没有落地**。本组守的就是这条承诺。
+
+
+def test_platform_side_true_only_for_win32_signature():
+    """`api_name` 非空 = 真调了 Win32 API ⇒ 平台侧（亲笔签名）。"""
+    from hiveweave.services.acl_sandbox.errors import is_platform_side as _is_platform_side
+
+    exc = SandboxUnavailableError(
+        "SetNamedSecurityInfo failed", api_name="SetNamedSecurityInfo", win32_code=5
+    )
+    assert _is_platform_side(exc) is True
+
+
+def test_platform_side_false_for_wrapped_code_bug():
+    """⭐ 真代码 bug 被包进 `SandboxUnavailableError` ⇒ **不得**判成平台侧。
+
+    这是本轮审计抓到的死代码那条的守卫：若退回 `if _executed_stamp(e):`
+    （恒真），本用例转红。
+    """
+    from hiveweave.services.acl_sandbox.errors import is_platform_side as _is_platform_side
+
+    try:
+        raise TypeError("unsupported operand type(s) for +: 'int' and 'str'")
+    except TypeError as bug:
+        wrapped = SandboxUnavailableError(f"ACL sandbox execution failed: {bug}")
+        wrapped.__cause__ = bug
+
+    assert _is_platform_side(wrapped) is False, (
+        "真代码 bug 被包成 SandboxUnavailableError 后判成了平台侧 —— "
+        "agent 会收到「不是你的问题」而放弃自查（`_BLOCKED_FACT_KINDS` 的"
+        "定档理由被推翻）"
+    )
+
+
+def test_platform_side_true_when_pwsh_missing_in_chain():
+    """异常链里有 `PwshUnavailableError` ⇒ 平台侧（受限 shell 缺失）。"""
+    from hiveweave.services.acl_sandbox.integration import PwshUnavailableError
+    from hiveweave.services.acl_sandbox.errors import is_platform_side as _is_platform_side
+
+    try:
+        raise PwshUnavailableError("pwsh not found on PATH")
+    except PwshUnavailableError as pwsh:
+        wrapped = SandboxUnavailableError("ACL sandbox execution failed")
+        wrapped.__cause__ = pwsh
+
+    assert _is_platform_side(wrapped) is True
+
+
+def test_platform_side_false_for_bare_container_error():
+    """裸的 `SandboxUnavailableError`（无 API 名、无 pwsh）⇒ **不表态**。
+
+    它是"一切异常的容器" —— 含真 bug 被包进来的情形，故单独一个类型不够。
+    宁缺勿滥：漏判 ⇒ 上游按既有阶梯归因；误判 ⇒ agent 放弃自查真 bug。
+    """
+    from hiveweave.services.acl_sandbox.errors import is_platform_side as _is_platform_side
+
+    assert _is_platform_side(SandboxUnavailableError("something odd")) is False
+
+
+def test_platform_side_survives_cycle_in_exception_chain():
+    """异常链成环时不得死循环（历史上有 `self.__cause__ = self` 的脏数据）。"""
+    from hiveweave.services.acl_sandbox.errors import is_platform_side as _is_platform_side
+
+    a = SandboxUnavailableError("a")
+    b = SandboxUnavailableError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+    assert _is_platform_side(a) is False   # 能返回即通过（不死循环）

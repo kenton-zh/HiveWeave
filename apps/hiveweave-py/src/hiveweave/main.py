@@ -92,12 +92,22 @@ class _FlushFile:
 
         ③ 所以正确形态 = **两条路各管各的、互不干扰**：
            · ``write()`` 按**行数采样**（热路径，摊销 stat 成本）；
-           · ``flush()`` **无条件**做一次检查 —— 它的频率由调用方决定
-             （每条日志一次，量级远低于 write），且**不碰**计数器。
+           · ``flush()`` **无条件**做一次检查 —— 它的频率由调用方决定，
+             且**不碰**计数器。
            代价 = 每次 flush 一次 ``stat()``（20 µs）；换来"零星小写入
            也能翻转"这条真实契约不被破坏。
-           ⚠ 若日后 `_TeeStream` 改成逐行调 flush，这条会退化成审计①
-             的形态 —— 届时应把 tee 的 flush 改为按条件（见 :119 处的说明）。
+
+        ⚠⚠ 2026-09-17 **第二轮审计必修（HIGH）**：上面 ③ 写的"flush 的频率
+        远低于 write"**在本仓的实际装配下不成立** —— ``_TeeStream.write``
+        （:155-163）**每写一行、对每个 stream 都调一次 ``flush()``** ⇒
+        频率与 write **完全同级** ⇒ 采样被整体抵消。实测（审计复现）：修后
+        ``rotate_if_needed`` 调用数 1000 → **1003**（不降反升），因为每行
+        变成 write 一次 + tee 的 flush 一次。
+
+        根因不在本函数 —— 本函数的两条路各自都是对的（write 采样 / flush
+        兜底）—— 而在 ``_TeeStream`` **无条件**逐行 flush：它把"兜底"路
+        变成了热路径。故修法在 ``_TeeStream``（见 :149 处），本条注释保留
+        是为了记住"③ 的前提条件"是什么。
         """
         if not from_flush:
             # 正常路：本函数是计数器**唯一**的推进点（采样只在这里生效）。
@@ -147,7 +157,28 @@ class _FlushFile:
 
 
 class _TeeStream:
-    """Write to multiple streams (console + durable log file)."""
+    """Write to multiple streams (console + durable log file).
+
+    ⚠⚠ F（2026-09-17 **第二轮审计必修 HIGH**）：``write`` **不能**对每个
+    stream 逐行 ``flush()``。
+
+    为什么（这是本轮"声称修好、实测没修好"的那一条）：``_FlushFile.flush()``
+    按设计会对日志文件做一次**轮转兜底预检**（``_maybe_rotate(from_flush=True)``
+    ⇒ 一次 ``stat()``）。而 ``write`` 里那次 ``flush`` 是**逐行**的 ⇒ 兜底路
+    的频率被抬到与热路径同级 ⇒ ``_FlushFile`` 里"按行数采样摊销 stat"的
+    设计**被整体抵消**。实测（审计复现）：写 1000 行时 ``rotate_if_needed``
+    被调 **1003** 次 —— 比修复前的 1000 次**还多**（每行多了一次 tee 的 flush）。
+
+    修法的取舍：``write`` 内**不再 flush**（只写），把落盘交给：
+      · ``logging`` 的 ``StreamHandler`` —— 它每次 ``emit`` 后自己调
+        ``flush()``（这正是"每条日志一次"的**真实**频率，与 ``_FlushFile``
+        的假设一致）；
+      · ``_FlushFile.write`` 内部的 ``self._f.flush()``（行缓冲已关，
+        但显式 flush 保证"不丢"这条 TEST21 M10 契约不受本改动影响）。
+
+    ⚠ 保留 tee 自己的 ``flush()``（:171）不变 —— 它是**显式落定**的入口，
+    由调用方按需触发；本改动只是不让 ``write`` 顺手调它。
+    """
 
     def __init__(self, *streams: object) -> None:
         self._streams = streams
@@ -157,9 +188,6 @@ class _TeeStream:
             write = getattr(st, "write", None)
             if write is not None:
                 write(s)
-            flush = getattr(st, "flush", None)
-            if flush is not None:
-                flush()
         return len(s)
 
     def flush(self) -> None:

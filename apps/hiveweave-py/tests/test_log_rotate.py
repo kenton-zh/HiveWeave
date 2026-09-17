@@ -333,10 +333,17 @@ def test_rotating_stdout_without_rotator_is_inert(tmp_path):
 
 
 def test_sampling_actually_amortizes_stat_calls(tmp_path, monkeypatch):
-    """① 采样真的摊销了 `stat()`：不经 flush 连写 N 行，调用数 ≈ N/窗口。
+    """① 采样真的摊销了 `stat()`：**经真实装配**（`_TeeStream`）连写 N 行。
 
-    阳性对照：把 `flush()` 改回 `_maybe_rotate(force=True)`、
-    或用 `_TeeStream` 逐行 flush ⇒ 调用数涨到 N，本用例转红。
+    ⚠⚠ 2026-09-17 **第二轮审计必修**：本用例原先**只调 `stream.write()`、
+    不套 `_TeeStream`** ⇒ 它守的是"write 路自己摊销"，而缺陷正长在
+    `write` 与 `flush` **两个出口之间**（tee 逐行 flush 把兜底路抬成热路径）
+    ⇒ 守卫**绕过了它自己声明要防的那条路**，永远抓不到。
+
+    审计原话：「并把这个守卫改成套 `_TeeStream` 驱动，否则永远守不住」。
+    故现在按 `_configure_logging` 的**同一装配**（`_TeeStream(stdout, flushfile)`）
+    驱动；阳性对照：把 `_TeeStream.write` 里的 `flush` 加回去 ⇒ 调用数
+    约翻倍（实测 1003 vs ~4），本用例转红。
     """
     monkeypatch.setenv("HIVEWEAVE_LOG_MAX_BYTES", "1000000")  # 大到不翻转
     log = tmp_path / "server.out.log"
@@ -349,17 +356,27 @@ def test_sampling_actually_amortizes_stat_calls(tmp_path, monkeypatch):
         return real()
 
     monkeypatch.setattr(stream, "_do_rotate", _spy)
+
+    class _Sink:
+        """替掉 `sys.stdout`：只吞字节，绝不触发额外 flush。"""
+
+        def write(self, s):
+            return len(s)
+
+    tee = hw_main._TeeStream(_Sink(), stream)
     try:
         n_lines = 1000
         for i in range(n_lines):
-            stream.write(f"{i}\n")   # ⚠ 只走 write，不调 flush
+            tee.write(f"{i}\n")          # ← 真实路径：经 tee
     finally:
         stream.close()
 
     window = hw_main._ROTATE_CHECK_EVERY_LINES
     assert calls["n"] <= n_lines // window + 1, (
-        f"1000 行只应做 ~{n_lines // window} 次预检（采样窗口 {window}），"
-        f"实际 {calls['n']} 次 —— 采样未生效（每行都在 stat？）"
+        f"经 `_TeeStream` 写 1000 行只应做 ~{n_lines // window} 次预检"
+        f"（采样窗口 {window}），实际 {calls['n']} 次 —— 采样未生效。"
+        f"⚠ 最常见原因：`_TeeStream.write` 又对每个 stream 逐行调了 `flush()`，"
+        f"把 `flush` 的兜底路抬成与 write 同级的**热路径**（实测 1003 次）。"
     )
 
 

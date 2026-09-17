@@ -472,9 +472,26 @@ async def start_dev_server_tool(
         # ⚠ F5（2026-09-17）：但**执行面事实必须带** —— 异常上带着
         # `executed=False`（命令从未启动），这是这条出口唯一能给出的
         # "发生了什么"的答案；丢掉它就只剩"被拒绝了"这个结论。
+        #
+        # ⚠⚠ 第二轮审计必修（2026-09-17）：**`fact` 不能无条件跟着
+        # `to_tool_result` 的硬编码走**。本分支是**绝大多数**异常的落点 ——
+        # `service.py:1105-1107` 把一切意外异常（含真代码 bug）都包成
+        # `SandboxUnavailableError` ⇒ 而 `errors.py` 把 `fact` **写死**成
+        # `runner_failed` ⇒ 「不把真 bug 判成平台故障」在这条路上**同样**
+        # 没有落地。
+        #
+        # 而且下面 `except Exception` 分支对本情形**根本不可达** —— 异常在
+        # 上一层就被 `except SandboxUnavailableError` 接走了。审计实测：
+        # 只修下面那条分支时，真 bug 场景回执里 `fact='runner_failed'` 照旧。
+        #
+        # 修法：经 `errors.to_tool_result(platform_side=...)` 显式表态 ——
+        # 判据在 `errors.is_platform_side`（异常链里有没有平台侧的亲笔签名）。
+        from hiveweave.services.acl_sandbox.errors import is_platform_side
         from hiveweave.tools.bash import _executed_stamp
 
-        return e.to_tool_result(**_executed_stamp(e))
+        return e.to_tool_result(
+            platform_side=is_platform_side(e), **_executed_stamp(e)
+        )
     except Exception as e:
         # ⚠⚠ F5（2026-09-17 审计必修 HIGH）：**「沙箱起不来」在这条路上走的是
         # 这个分支，不是上面那个** —— `build_confined_argv` 抛的是
@@ -495,10 +512,10 @@ async def start_dev_server_tool(
         #      executed = None | fact = None
         #
         # 修法：与上面那条出口同口径，从异常上取执行事实。
-        # ⚠ 同时补 `fact="runner_failed"`：本分支到达即「命令从未启动」且属
-        # 平台侧（受限 shell 缺失 / spawn 设施故障），与
-        # `SandboxUnavailableError.to_tool_result` 的 L6 定档同源。
+        # ⚠ 补 `fact="runner_failed"` **只在确属平台侧时**
+        # （判据 = `errors.is_platform_side`，判据只有一份）。
         # ⚠ 不硬塞 `_stamp`（此刻必为 `{}`，理由同上条出口注释）。
+        from hiveweave.services.acl_sandbox.errors import is_platform_side
         from hiveweave.tools.bash import _executed_stamp
 
         _ex_stamp = _executed_stamp(e)
@@ -507,19 +524,13 @@ async def start_dev_server_tool(
         msg = f"Failed to start: {e}"
         if tail:
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-        # ⚠ **只在异常真的带了执行事实时才补 `fact`**（`_ex_stamp` 非空 ⇔
-        # 该异常经 `entry._mark_not_executed`，即"受限路径自己起不来"）。
-        # 绝不无条件写 `fact="runner_failed"` —— 这个分支同时兜着**真正的
-        # 代码 bug**（`TypeError`/`AttributeError`…），把那些也判成
-        # 「平台侧 runner 故障」等于给 agent 发「不是你的问题」，与
-        # `result.py::_BLOCKED_FACT_KINDS` 的定档理由直接冲突
-        # （本仓「构造器不变式」教训：改判 fact 必须逐个构造点核，不能一刀切）。
-        # 无执行事实 ⇒ 维持原样（不表态），让上游按既有阶梯归因。
         _extra: dict[str, Any] = dict(_stamp)
         _extra.update(_ex_stamp)
-        if _ex_stamp:
-            _extra["fact"] = "runner_failed"
-        return ToolResult.err(msg, **_extra)
+        # ⚠ `fact` 走**打卡位参数**（不走 extra）—— 它是类型化的四格事实位，
+        # `ToolResult.__post_init__` 会校验合法值；塞进 extra 只会在 `to_dict`
+        # 里并被派生循环覆盖，等于绕过那道校验。
+        _fact = "runner_failed" if is_platform_side(e) else None
+        return ToolResult.err(msg, fact=_fact, **_extra)
 
     # Health: process alive + a non-reserved port eventually listens.
     # Prefer the allocated port; if the app ignores PORT (app.server),

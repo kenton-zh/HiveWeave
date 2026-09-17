@@ -447,11 +447,22 @@ async def _run_registered_dev_server(
         # F5：带上 `executed` 执行面事实（异常由 `spawn_agent_command` 打上
         # `executed=False` = 命令从未启动）—— 只有「被拒绝」而没有「没跑过」
         # 这两个正交事实，下游会把 confined 读成"在沙箱里跑过"。
+        #
+        # ⚠⚠ 2026-09-17 第二轮审计必修（与 `dev_server_tools` 同族）：
+        # `SandboxUnavailableError` 是**一切异常的容器** ——
+        # `service.py:1105-1107` 把意外异常（含真代码 bug）都包成它
+        # ⇒ `fact` **不能**由类型硬编码推出（旧形态恒判 `runner_failed`，
+        # 会把 `TypeError` 之类的真缺陷说成"平台故障"，让 agent 放弃自查）。
+        # ⇒ 按证据表态：`errors.is_platform_side` 查异常链里的 Win32/pwsh 亲笔签名。
         log.warning(
             "bash.dev_server_sandbox_unavailable",
             error=str(e), command=command[:120], cwd=cwd[:120],
         )
-        return e.to_tool_dict(**_executed_stamp(e))
+        from hiveweave.services.acl_sandbox.errors import is_platform_side
+
+        return e.to_tool_dict(
+            platform_side=is_platform_side(e), **_executed_stamp(e)
+        )
     except Exception as e:
         log.warning(
             "bash.dev_server_spawn_failed",
@@ -880,9 +891,17 @@ async def _run_sandboxed(
             # `enforcement="confined"`，而进程根本**没启动**（exit_code=None）
             # ⇒ 戳说"在沙箱里"、事实是"没有进程"。本批只加观测（不改失败形态），
             # 故显式声明 `executed=False` 让两个事实并排存在。
-            return {"output": "", "stdout": "", "stderr": "",
-                    "exit_code": None, "timed_out": False, "error": str(exc),
-                    "executed": False, "fact": "runner_failed"}
+            #
+            # ⚠⚠ 必须经 `finalize_fact_dict` 收口（AST 守卫
+            # `test_bash_dict_returns_with_fact_go_through_funnel` 把关）：
+            # 裸字典声明 `fact` 而不展开派生键 ⇒ 下游 `result['runner_failed']`
+            # 直接 KeyError。本处是**本批（F5）新引入**的裸字典出口 ——
+            # 原实现（返回 None）没有这个问题，加 `fact` 时才需要漏斗。
+            return finalize_fact_dict({
+                "output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": False, "error": str(exc),
+                "executed": False, "fact": "runner_failed",
+            })
         return await spawn_confined(
             argv=argv,
             timeout_s=timeout_s or 0,

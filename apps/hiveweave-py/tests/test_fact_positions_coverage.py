@@ -25,6 +25,7 @@ DSH 的收口（`packages/core/tools/src/invariant.ts`）挂在总线上，「**
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 from pathlib import Path
 
@@ -85,6 +86,38 @@ class TestRawDictExitsAreFunneled:
         assert not unwrapped, (
             f"bash.py:{unwrapped} 的裸字典出口声明了 fact 却未经 finalize_fact_dict "
             f"→ 下游 result['runner_failed'] 会 KeyError"
+        )
+
+    @pytest.mark.parametrize(
+        "mod_name",
+        ["bash", "python_script", "dev_server_tools"],
+    )
+    def test_raw_dict_exits_with_fact_go_through_funnel(self, mod_name):
+        """**全工具面**扫：任何模块的裸字典出口声明了 `fact` 就必须过漏斗。
+
+        ⚠⚠ 2026-09-17 补（第三处同族缺陷）：上面那条只扫 `bash.py` ⇒
+        `python_script.py:232` 与 `bash.py:894` **结构完全相同**的裸字典出口
+        （F5 本批新引入的 `"fact": "runner_failed"`）**不在扫描范围内** ——
+        缺陷存在但守卫看不见（"守卫绕过了它自己声明要防的路"的又一种形态：
+        这次绕过的是**文件范围**）。
+
+        ⚠ 判据用 AST 而**不是**文本子串（用户 09-14 钦定「永远」）：
+        换措辞 / 换行 / 换引号都不该影响判定。
+        """
+        mod = importlib.import_module(f"hiveweave.tools.{mod_name}")
+        tree = _parse(mod)
+        unwrapped: list[int] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Return):
+                continue
+            v = node.value
+            if isinstance(v, ast.Dict):
+                keys = [k.value for k in v.keys if isinstance(k, ast.Constant)]
+                if "fact" in keys:
+                    unwrapped.append(node.lineno)
+        assert not unwrapped, (
+            f"{mod_name}.py:{unwrapped} 的裸字典出口声明了 fact 却未经 "
+            f"finalize_fact_dict → 下游 result['runner_failed'] 会 KeyError"
         )
 
     def test_no_raw_dict_declares_derived_keys(self):
