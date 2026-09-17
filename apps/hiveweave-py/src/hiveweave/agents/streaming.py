@@ -363,6 +363,21 @@ async def on_tool_call(
                 # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
                 # 工具层给不出（None）⇒ 列留 NULL = 不适用/未判定，不回填 0。
                 git_hardened=result.get("git_hardened"),
+                # F5（2026-09-17 审计必修）：**执行面事实独立落库**。
+                #
+                # ⚠ 上一版只把「executed is False ⇒ enforcement 落 NULL」，
+                # 却**没把 executed 本身传下去** ⇒ 落库面只有一根 enforcement
+                # 列，于三种语义完全不同的情况**在数据里同形**（都是 NULL）：
+                #   ① executed=False 判定成立但进程没起来 ← 要捞的正是这个
+                #   ② 非 spawn 工具（write_file 等）—— 不适用
+                #   ③ executed=None 未判定
+                # ⇒ 「宣告了沙箱却根本没跑」不可查 —— **这正是 F5 的病本身**
+                #（两个正交事实挤进一个字段），不能修了内存、又留在数据里。
+                # 故本列与 `enforcement` **并列上报**，各答一个问题：
+                #   enforcement = 打算走哪条路（判定）
+                #   executed    = 命令到底有没有启动（执行）
+                # 缺键 ⇒ None ⇒ NULL（不适用/未判定），**不回填成 1**。
+                executed=result.get("executed"),
             )
         except Exception as e:
             log.debug("run_ledger.step_end_failed", error=str(e))

@@ -476,12 +476,50 @@ async def start_dev_server_tool(
 
         return e.to_tool_result(**_executed_stamp(e))
     except Exception as e:
+        # ⚠⚠ F5（2026-09-17 审计必修 HIGH）：**「沙箱起不来」在这条路上走的是
+        # 这个分支，不是上面那个** —— `build_confined_argv` 抛的是
+        # `PwshUnavailableError`（`integration.py:22`，继承 `RuntimeError`），
+        # 而它与 `SandboxUnavailableError`（`errors.py:6`，同继承 `RuntimeError`）
+        # 是**兄弟关系、互不继承** ⇒ 上面的 `except SandboxUnavailableError`
+        # **接不住它**，异常坠到这里。
+        #
+        # 区别的根源：`bash.py` / `python_script.py` 的 `_confined` 自己把
+        # pwsh 缺失**捕获**并转成普通 dict（那是 F5 的主路径）；而本文件的
+        # `_confined`（:378-383）直接把 `build_confined_argv(cmd)` 写在
+        # `spawn_confined(...)` 的实参里、**没有包 try** ⇒ 异常冒到
+        # `spawn_agent_command`，被 `entry.py` 打上 `executed=False` 后重抛。
+        #
+        # 实证（审计探针 J2）：这条出口原先 `executed = None`、`fact = None`
+        # ⇒ **两个事实位全丢** —— F3 与 F5 在此**都没生效**：
+        #     {'success': False, 'error': '…', 'blocked': False}
+        #      executed = None | fact = None
+        #
+        # 修法：与上面那条出口同口径，从异常上取执行事实。
+        # ⚠ 同时补 `fact="runner_failed"`：本分支到达即「命令从未启动」且属
+        # 平台侧（受限 shell 缺失 / spawn 设施故障），与
+        # `SandboxUnavailableError.to_tool_result` 的 L6 定档同源。
+        # ⚠ 不硬塞 `_stamp`（此刻必为 `{}`，理由同上条出口注释）。
+        from hiveweave.tools.bash import _executed_stamp
+
+        _ex_stamp = _executed_stamp(e)
         log_file.close()
         tail = _read_log_tail(log_path)
         msg = f"Failed to start: {e}"
         if tail:
             msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
-        return ToolResult.err(msg, **_stamp)
+        # ⚠ **只在异常真的带了执行事实时才补 `fact`**（`_ex_stamp` 非空 ⇔
+        # 该异常经 `entry._mark_not_executed`，即"受限路径自己起不来"）。
+        # 绝不无条件写 `fact="runner_failed"` —— 这个分支同时兜着**真正的
+        # 代码 bug**（`TypeError`/`AttributeError`…），把那些也判成
+        # 「平台侧 runner 故障」等于给 agent 发「不是你的问题」，与
+        # `result.py::_BLOCKED_FACT_KINDS` 的定档理由直接冲突
+        # （本仓「构造器不变式」教训：改判 fact 必须逐个构造点核，不能一刀切）。
+        # 无执行事实 ⇒ 维持原样（不表态），让上游按既有阶梯归因。
+        _extra: dict[str, Any] = dict(_stamp)
+        _extra.update(_ex_stamp)
+        if _ex_stamp:
+            _extra["fact"] = "runner_failed"
+        return ToolResult.err(msg, **_extra)
 
     # Health: process alive + a non-reserved port eventually listens.
     # Prefer the allocated port; if the app ignores PORT (app.server),

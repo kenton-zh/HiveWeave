@@ -384,10 +384,29 @@ async def _run_registered_dev_server(
                 _prep_fact = classify_error_text(prep_err) or "runner_failed"
                 # 仍经唯一漏斗收口（`finalize_fact_dict` 幂等；调用方拿到后
                 # 也会再收一次 —— 不能因为"外面会收"就在出口裸奔字典）。
+                #
+                # ⚠ F5（2026-09-17 审计必修 BLOCKING，本批第二处同族落点）：
+                # **必须显式声明 `executed=False`** —— 本分支同样「命令根本没
+                # 启动」，而它返回的是**普通 dict**（非 None）⇒ `entry` 的
+                # `result is not None` 成立 ⇒ `_mark_executed` 按「函数返回了
+                # ⇒ 启动过」**补 `executed=True`**。实测复刻（审计探针 K）：
+                #     result['executed'] = True
+                #     stamp() = {'enforcement': 'confined', …, 'executed': True}
+                # ⇒ F5 的病（戳说"在沙箱里"而进程从未启动）**在这条路上原样
+                # 复发**，且因为 `executed is True`，连 `streaming.py` 的
+                # fail-loud 告警（条件 `is False`）都不触发 —— **谎报且无声**。
+                #
+                # ⚠ 与 `fact` 的关系是**正交**、不冲突：`fact` 管「**成因**是
+                # 哪一类」（runner 故障 / 调用方参数错），`executed` 管
+                # 「**进程有没有起来**」。两类的答案都是"没起来" —— 保留
+                # 端口是参数错（`bad_args`）不影响这个事实。故此处无条件写
+                # `False`，**不改 `fact`**（改判 `fact` 是另一码事，见本仓
+                # 「构造器不变式」那条教训）。
                 return finalize_fact_dict({
                     "success": False, "output": "",
                     "error": prep_err, "blocked": True,
                     "fact": _prep_fact,
+                    "executed": False,
                 })
             prepared["command"] = cmd2
             prepared["env_port"] = extra_env.get("PORT") or extra_env.get("VITE_PORT")

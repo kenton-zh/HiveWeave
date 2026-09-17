@@ -197,10 +197,16 @@ async def spawn_agent_command(
     if result is None:
         # 可达路径：受限实现自身返回「未启用」（例如绕开 decision 直连
         # 未接线的东西）。判定与执行不一致 ⇒ fail-closed，绝不按原生再跑一遍。
-        raise SandboxUnavailableError(
+        #
+        # ⚠ F5（2026-09-17 审计必修 LOW）：**本分支同样"命令从未启动"**，
+        # 也要经 `_mark_not_executed` —— 否则调用方 `_executed_stamp(e)`
+        # 取不到属性返回 `{}`，这条出口就只有"被拒绝了"而没有"没跑过"
+        # （下游第三次回到"沉默的默认值"，见 B3 审计项）。
+        # 语义与「受限实现抛出」完全同档：判定说 confined、而执行面没起来。
+        raise _mark_not_executed(exc=SandboxUnavailableError(
             f"entry {entry!r}: sandbox decision={decision.reason!r} says confined, "
             "but the confined implementation returned no result"
-        )
+        ))
     return RoutedSpawn(_mark_executed(result), decision)
 
 

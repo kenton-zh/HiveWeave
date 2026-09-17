@@ -406,6 +406,7 @@ class RunLedger:
         timeout_ms: int | None = None,
         enforcement: str | None = None,
         git_hardened: bool | None = None,
+        executed: bool | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -433,6 +434,14 @@ class RunLedger:
         `external diff died` 全发生在 agent 自己的 shell 里，而事后无从归因。
         None = 不适用/未判定（非 spawn 工具、spawn 失败未执行）⇒
         **不要回填成 0**，那会把"没这条信息"说成"确认未加固"。
+
+        ``executed``（F5，2026-09-17）：命令**到底有没有启动**。
+        ``False`` = 判定说 confined、而执行函数自己声明进程没起来
+        （`PwshUnavailableError` 这类"受限 shell 缺失"）—— 此时
+        ``enforcement`` 会落 NULL（见 `agents/streaming.py`），**必须靠本列
+        才能把这个状态捞出来**：否则它与"非 spawn 工具"（同样 NULL）
+        在数据里同形，「宣告了沙箱却没跑」从此不可查。
+        ⚠ 同样**无 DEFAULT、未知留 NULL** —— ``None`` ≠ 「没启动」。
         """
         now = _now_ms()
         if result_excerpt and len(result_excerpt) > 2048:
@@ -464,6 +473,7 @@ class RunLedger:
             if any(v is not None for v in (
                 runner_failed, command_failed, injection_applied,
                 timeout_kind, timeout_ms, enforcement, git_hardened,
+                executed,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -475,7 +485,8 @@ class RunLedger:
                     "timeout_kind = COALESCE(?, timeout_kind), "
                     "timeout_ms = COALESCE(?, timeout_ms), "
                     "enforcement = COALESCE(?, enforcement), "
-                    "git_hardened = COALESCE(?, git_hardened) "
+                    "git_hardened = COALESCE(?, git_hardened), "
+                    "executed = COALESCE(?, executed) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -490,6 +501,9 @@ class RunLedger:
                     timeout_ms,
                     enforcement,
                     None if git_hardened is None else (1 if git_hardened else 0),
+                    # F5：False **必须**写成 0（不能与 None 混同）——
+                    # 「确认没启动」正是本列存在的理由。
+                    None if executed is None else (1 if executed else 0),
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层

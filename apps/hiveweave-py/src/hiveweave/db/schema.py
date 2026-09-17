@@ -621,9 +621,24 @@ PROJECT_DB_TABLES = [
         not_started INTEGER DEFAULT 0,
         started INTEGER DEFAULT 0,
         enforcement TEXT,
-        git_hardened INTEGER
+        git_hardened INTEGER,
+        executed INTEGER
     )
     """,
+    # F5（2026-09-17）：`executed` 执行面事实 —— 「命令**到底有没有启动**」。
+    #
+    # 为什么必须独立成列（审计 B2 的核心质疑，成立）：只有 `enforcement` 一列
+    # 时，三种**语义完全不同**的情况在数据里**同形**（都是 NULL）：
+    #   ① `executed=False` 判定成立但进程没起来（pwsh 缺失 / 受限路径抛错）
+    #   ② 非 spawn 工具（write_file 等）—— 这个问题**不适用**
+    #   ③ `executed=None` 未判定
+    # ⇒ 想回答「哪些调用宣告了沙箱却根本没跑」，在数据上**不可判**。
+    # 这正是 F5 本身的病：**两个正交事实被塞进一个字段**。工具层把它们并排
+    # 存在了内存里，落库面若只有一个 `enforcement`，又坍缩回一根列。
+    #
+    # 形态纪律与 `enforcement` 完全一致：**无 DEFAULT**（未知 = NULL，
+    # 不是 0/否），新行由 INSERT 显式写值，写入方只在能确定时传。
+    """ALTER TABLE run_steps ADD COLUMN executed INTEGER""",
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
     """ALTER TABLE run_steps ADD COLUMN result_excerpt TEXT""",
     # P2-1: 既有库迁移 — run_steps 增加工具参数原文摘录列（观测性，
@@ -889,6 +904,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
         "runner_failed", "command_failed", "injection_applied",
         "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
         "started", "enforcement", "git_hardened",
+        # F5（2026-09-17）：执行面事实。登记进启动自检 ⇒ 迁移断裂（ALTER 排到
+        # CREATE 前被吞、或旧库没跑 ALTER）会在启动时 fail-loud，而不是让
+        # 「宣告了沙箱却没跑」再次静默退化成 NULL（本仓 TEST_DSH_37 P0-1 形态）。
+        "executed",
     },
 }
 

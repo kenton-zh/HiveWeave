@@ -44,6 +44,16 @@ from hiveweave.services.acl_sandbox.policy import (
     SpawnDecision,
 )
 
+# F 组（落库面）复用 0-3 那套现成夹具：`task_env` 建项目库 + workspace，
+# `ledger_env` 额外把 agent→workspace 塞进 project_db 缓存（`record_step_start`
+# 走 `get_project_db_for_agent`，不塞会拿 "agent not registered in Meta DB"）。
+# ⚠ 复用而不是自己造：那套夹具的注释已论证"走缓存是设计上的合法路径"，
+#   且 `EXEC` 与 `record_step_end` 的真实签名同源。
+# ⚠ `ledger_env` **依赖 `task_env`** —— 两者都要 import 进本模块命名空间，
+#   只 import 后者会报 "fixture 'task_env' not found"（本轮实测）。
+from tests.test_git_hardening_consumer import ledger_env  # noqa: F401
+from tests.test_idle_architecture_p0 import EXEC, task_env  # noqa: F401
+
 
 def _confined_decision() -> SpawnDecision:
     """构造一个「判定为受限」的 decision（不走 DB，纯状态对象）。"""
@@ -390,3 +400,241 @@ def test_enforcement_not_recorded_when_not_executed():
         None if legacy.get("executed") is False else legacy.get("enforcement")
     )
     assert recorded_legacy == "native"
+
+
+# ════════════════════════════════════════════════════════════════════
+# E 组（2026-09-17 审计必修后新增）：三条**同一批里漏掉的落点**
+#
+# 上一轮审计用独立探针抓到：本批只修了「pwsh 缺失 ⇒ 返回普通 dict」这一条
+# 主路径，而**同族还有三处**，且其中一处的谎报**连日志都没有**。以下每条
+# 对应一个审计发现，判据都要求"缺陷回来它必须转红"。
+# ════════════════════════════════════════════════════════════════════
+
+
+def test_bash_prep_err_early_return_declares_not_executed():
+    """E1（审计 BLOCKING）：`bash.py` 的 `prep_err` 早返回也必须声明 False。
+
+    ⚠ 这条是**本批第二处 F5 落点**，且比第一处更隐蔽 —— 上一轮把它归成
+    "同族遗留、未进范围"，实测它原样复发：
+
+        result['executed'] = True
+        stamp() = {'enforcement': 'confined', …, 'executed': True}
+
+    `entry._mark_executed` 按「函数返回了 ⇒ 启动过」补 `True`，而命令
+    **根本没启动**；又因为值是 `True`——不是 `False`——`streaming.py` 的
+    fail-loud 告警（条件 `is False`）**也不触发** ⇒ **谎报且无声**。
+
+    判据用 AST **从源码取常量**而不是 import 后读行为：本函数在真实
+    `_bash` 闭包内、依赖整套 `prepared`/`ctx`，直接跑成本过高；而这里要钉住的
+    恰恰是「**这个 return 语句里有没有那个键**」这条字面事实。
+    阳性对照：把 `"executed": False,` 从该 dict 里删掉 ⇒ 本用例转红。
+    """
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "hiveweave" / "tools" / "bash.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    # 定位：`if prep_err:` 分支里那个 `return finalize_fact_dict({...})`
+    hits: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        cond = ast.unparse(node.test).strip()
+        if cond != "prep_err":
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            if ast.unparse(sub.func).strip() != "finalize_fact_dict":
+                continue
+            for arg in sub.args:
+                if isinstance(arg, ast.Dict):
+                    hits.append({
+                        k.value: ast.unparse(v)
+                        for k, v in zip(arg.keys, arg.values)
+                        if isinstance(k, ast.Constant)
+                    })
+
+    assert hits, (
+        "没找到 `if prep_err:` 里的 finalize_fact_dict 返回 —— 结构变了，"
+        "本守卫已失效（**不是**缺陷消失），请对照 bash.py 更新定位"
+    )
+    for d in hits:
+        assert "executed" in d, (
+            f"prep_err 早返回缺 `executed` ⇒ `_mark_executed` 会补 True ⇒ "
+            f"戳宣告「在沙箱里」而命令从未启动；且 `is False` 的 fail-loud "
+            f"不触发 ⇒ 谎报无声。实际键：{sorted(d)}"
+        )
+        assert d["executed"] == "False", (
+            f"prep_err 早返回的 executed 必须是 False（命令从未启动），"
+            f"实际 {d['executed']!r}"
+        )
+        # ⚠ 与 fact 正交：两类成因（runner_failed / bad_args）都不该被改写
+        assert "fact" in d and d["fact"] == "_prep_fact", (
+            f"executed 是执行事实、fact 是成分类别，二者正交 —— "
+            f"不得因补 executed 而改 fact（实际 {d.get('fact')!r}）"
+        )
+
+
+@pytest.mark.asyncio
+async def test_entry_result_none_branch_marks_not_executed():
+    """E2（审计 LOW）：`entry.py` 的「返回 None」fail-closed 分支同样打标。
+
+    该分支与「受限实现抛出」**完全同档**：判定说 confined、执行面没起来。
+    原先直接 `raise SandboxUnavailableError(...)` 不经 `_mark_not_executed`
+    ⇒ 调用方 `_executed_stamp(e)` 取不到属性返回 `{}` ⇒ 这条出口第三次回到
+    "沉默的默认值"（审计 B3 的实证形态）。
+    """
+    from hiveweave.services.acl_sandbox.entry import (
+        spawn_agent_command as _spawn,
+    )
+    from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
+    from hiveweave.tools.bash import _executed_stamp
+
+    async def _native():
+        return {}
+
+    async def _confined_none(ctx):
+        return None  # 「判定说 confined、实现返回空」的 fail-closed 路
+
+    with pytest.raises(SandboxUnavailableError) as ei:
+        await _spawn(
+            entry="probe",
+            agent_id="a1",
+            workspace_path="C:/w",
+            workdir="C:/w",
+            project_id=None,
+            native=_native,
+            confined=_confined_none,
+            decision=_confined_decision(),
+        )
+
+    assert _executed_stamp(ei.value) == {"executed": False}, (
+        "「受限实现返回 None」这条 fail-closed 出口也必须带上 executed=False —— "
+        "否则它与「非 spawn 工具」在数据里同形，下游分不出「没跑」与「不适用」"
+    )
+    # 既有契约一字不动：类型与文案都不许被这次改动碰到
+    assert "returned no result" in str(ei.value)
+
+
+# ════════════════════════════════════════════════════════════════════
+# F 组：**落库面** —— 审计核心质疑 ④ 的守卫
+#
+# 上一版只把「executed is False ⇒ enforcement 落 NULL」写进 streaming，
+# 却**没把 executed 本身落库** ⇒ 三种语义完全不同的情况在数据里同形：
+#   ① executed=False 判定成立但没跑 ← 要捞的正是这个
+#   ② 非 spawn 工具（write_file）—— 不适用
+#   ③ executed=None 未判定
+# ⇒ 「宣告了沙箱却根本没跑」在数据上**不可查** ——
+# **这正是 F5 的病本身**（两个正交事实挤进一个字段）。
+# ════════════════════════════════════════════════════════════════════
+
+
+def test_run_steps_has_executed_column_and_migration():
+    """列 + 迁移**都**要有：只改 CREATE ⇒ 新库有列、老库永远没有。"""
+    from hiveweave.db.schema import PROJECT_DB_COLUMN_CHECKS, PROJECT_DB_TABLES
+
+    assert "executed" in PROJECT_DB_COLUMN_CHECKS["run_steps"], (
+        "executed 未登记进启动自检 ⇒ 迁移断裂不会被 fail-loud 抓住，"
+        "「宣告了沙箱却没跑」会再次静默退化成 NULL"
+    )
+    assert any(
+        s.strip().endswith("ALTER TABLE run_steps ADD COLUMN executed INTEGER")
+        for s in PROJECT_DB_TABLES
+    ), "迁移未登记 —— 已有项目库永远不会长出这一列"
+
+    # ⚠ F5 反回归：CREATE 里的该列**不得带 DEFAULT**（本仓已栽过：
+    # SQLite 会给存量行回填 DEFAULT 值 ⇒ 方向写反，见 fixqueue「新列的迁移
+    # 形态本身就是判据」）。`executed` 的语义是"未知=NULL"，不是"默认没跑"。
+    # ⚠ 定位必须**精确匹配表名**：其他语句的注释里也出现过 "run_steps"
+    #（如 project_meta 的注释）⇒ 用子串 `next()` 会抓错条目（本轮首跑即栽）。
+    create = next(
+        s for s in PROJECT_DB_TABLES
+        if "CREATE TABLE IF NOT EXISTS run_steps (" in s
+    )
+    line = next(
+        (ln.strip() for ln in create.splitlines() if ln.strip().startswith("executed")),
+        None,
+    )
+    assert line == "executed INTEGER", (
+        f"executed 列定义必须是无 DEFAULT 的 `executed INTEGER`（实际 {line!r}）"
+        f" —— 带 DEFAULT 会让存量行被回填成假事实"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_step_end_writes_executed_and_none_keeps_old_value(ledger_env):
+    """写入语义：True→1、False→**0**、None→不覆盖（未判定不冒充否）。
+
+    ⚠ 这条是 ④ 的**核心守卫**：`False → 0` 是本列存在的全部理由。若把
+    `False` 也写成 NULL，那「判定成立但没跑」与「非 spawn 工具」又同形了。
+    """
+    from hiveweave.db import project as project_db
+    from hiveweave.services.run_ledger import RunLedger
+
+    ledger = RunLedger()
+    conn = await project_db.ensure_project_db(ledger_env["workspace"])
+
+    async def _mk() -> str:
+        sid = await ledger.record_step_start(
+            agent_id=EXEC, run_id="run-f5", step_index=0,
+            step_type="tool_call", tool_name="bash",
+        )
+        assert sid, "record_step_start returned no id"
+        return sid
+
+    async def _val(sid: str):
+        cur = await conn.execute(
+            "SELECT executed FROM run_steps WHERE id = ?", [sid]
+        )
+        row = await cur.fetchone()
+        return None if row is None else row[0]
+
+    # ① executed=True → 1（跑了）
+    sid1 = await _mk()
+    await ledger.record_step_end(
+        agent_id=EXEC, step_id=sid1, status="completed", executed=True,
+    )
+    assert await _val(sid1) == 1
+
+    # ② executed=False → **0**（"确认没启动" —— 与 NULL 是两回事）
+    sid2 = await _mk()
+    await ledger.record_step_end(
+        agent_id=EXEC, step_id=sid2, status="blocked", executed=False,
+    )
+    assert await _val(sid2) == 0, (
+        "False 必须落成 0 —— 若落成 NULL，它与「非 spawn 工具」同形，"
+        "「宣告了沙箱却根本没跑」永远捞不出来（F5 的病原样留在数据里）"
+    )
+
+    # ③ None → 不覆盖既有 1（未判定不得冒充否）
+    await ledger.record_step_end(
+        agent_id=EXEC, step_id=sid1, status="completed", executed=None,
+    )
+    assert await _val(sid1) == 1, "None 覆盖了既有值 —— 未判定被写成了否"
+
+    # ④ 非 spawn 类步骤不写 ⇒ NULL（不适用；与 0 必须可区分）
+    sid3 = await _mk()
+    await ledger.record_step_end(agent_id=EXEC, step_id=sid3, status="completed")
+    assert await _val(sid3) is None, "非 spawn 步骤被写入了默认值"
+
+    # ⑤ **正交性**：同一次调用里 enforcement 与 executed 各答各的
+    sid4 = await _mk()
+    await ledger.record_step_end(
+        agent_id=EXEC, step_id=sid4, status="blocked",
+        enforcement=None,      # 判定成立但没跑 ⇒ 不落 confined
+        executed=False,        # ← 这个才是"发生了什么"
+    )
+    cur = await conn.execute(
+        "SELECT enforcement, executed FROM run_steps WHERE id = ?", [sid4]
+    )
+    row = await cur.fetchone()
+    assert row[0] is None and row[1] == 0, (
+        f"两列必须各答一个问题（enforcement=打算走哪条路 / executed=有没有启动），"
+        f"实际 enforcement={row[0]!r} executed={row[1]!r}"
+    )
+
