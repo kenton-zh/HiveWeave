@@ -6,6 +6,26 @@
 ``asyncio.create_subprocess_*`` / ``os.system`` / ``os.popen`` / ``os.spawn*``
 / loop 级 ``subprocess_exec``。扫描 src/hiveweave 源码文本，命中即 fail
 （注释行从宽跳过）。
+
+**⚠ 本网不覆盖什么（2026-09-18 补记，§6.9.6 —— 引用本守卫前必读）**
+
+1. **``CreateProcessAsUserW`` 语法上就不含任何 FORBIDDEN_TOKENS** ⇒ 扫不到
+   是**设计结果、不是漏网**：agent 的 bash/pwsh 命令在沙箱开启时走
+   ``acl_sandbox`` 的 ``ConfinedRunner``（``CreateProcessAsUserW``），完全
+   绕过 subprocess 漏斗。排除清单不在本文件（本文件唯一排除机制是
+   ``WHITELIST_FILES``），理由记录在
+   ``src/hiveweave/util/win_subprocess.py``（"已排除项而非漏网之鱼"注释）
+   与 ``tests/test_git_callsites_anchored.py``。**补偿守卫**：
+   ``tests/test_git_spawn_hardening_guard.py`` 端到端断言
+   ``_build_sandbox_env`` 的 env 与 ``git_hardening_pairs()`` 一致，并真跑
+   ``git commit`` 断言 hook 未被执行 —— 别把"漏斗守卫全绿"读成
+   "所有 spawn 都收口了"。
+2. **判据是逐行文本 token（非 AST）**，以下形态**全部漏过**：
+   ``importlib.import_module("subprocess")``、``getattr(subprocess, "run")``、
+   ``globals()["subprocess"]``、以及把模块名拆开拼接的任何写法。
+   本守卫是全仓**唯一**仍以逐行文本 token 作主判据的守卫（其余已按用户
+   09-14 钦定改 AST）；AST 化列为**独立批次**（token 辨识度尚可）。
+3. **只扫 ``src/hiveweave``**：apps/desktop、scripts/、tests/ 不在扫描面。
 """
 
 from __future__ import annotations

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import sys
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -65,6 +66,19 @@ _ACTIVE_VIEW_ALLOWLIST: frozenset[str] = frozenset({
     "tools/bash.py::_pwsh_is_effective_shell",
     "main.py::lifespan",
     "api/system.py::acl_sandbox_stats",
+})
+
+# F5（§6.9.4，2026-09-18）：包内「不判 / 跳过」豁免从**目录前缀一刀切**收成
+# **显式登记**（形态对齐 `_ACTIVE_VIEW_ALLOWLIST`）。现状唯一合法成员 =
+# sentinel 探针：它用字符串形态 `build_confined_command` 构造探测命令、
+# **不传 decision**、native 判定时返回 `None`（不是抛错），且**不消费**戳、
+# 不进 run_steps —— 收编进 spawn_agent_command 反而会让探针**真的以平台
+# 身份执行一次越权写**（§6.9.4 方案 2 的三条真成本之一，是安全倒退）。
+# ⚠ 目录前缀豁免的危险形态：日后任何**新建**在 `services/acl_sandbox/` 下、
+# 且直调 `spawn_confined` 的文件都会**静默继承**豁免 —— 收成登记后，
+# 包内新增未登记直调点转红，而不是被豁免。
+_CONFINED_DIRECT_CALL_ALLOWLIST: frozenset[str] = frozenset({
+    "services/acl_sandbox/sentinel.py::_probe_via_spawn",
 })
 
 
@@ -336,41 +350,102 @@ def _call_sites(name: str) -> list[tuple[str, str, int, ast.Call]]:
     return hits
 
 
+def _carries_decision(call: ast.Call) -> bool:
+    for k in call.keywords:
+        if k.arg == "decision":
+            return True
+        # **ctx.confined_kwargs() —— 唯一被批准的接线展开
+        if (
+            k.arg is None
+            and isinstance(k.value, ast.Call)
+            and getattr(k.value.func, "attr", None) == "confined_kwargs"
+        ):
+            return True
+    return False
+
+
+def _confined_sites_without_decision(
+    sites: list[tuple[str, str, int, ast.Call]],
+) -> list[str]:
+    """不带 decision、且**不在显式登记** ``_CONFINED_DIRECT_CALL_ALLOWLIST``
+    里的 ``spawn_confined`` 直调点。
+
+    F5（§6.9.4，2026-09-18）：豁免判据从「目录前缀一刀切」改成
+    「前缀 **且** 命中登记」—— 包内新建文件不再静默继承豁免。
+    """
+    return [
+        f"{rel}:{lineno} ({owner})"
+        for rel, owner, lineno, call in sites
+        if not _carries_decision(call)
+        and f"{rel}::{owner}" not in _CONFINED_DIRECT_CALL_ALLOWLIST
+    ]
+
+
 def test_every_confined_call_carries_a_decision():
     """受限执行器**不许**被「自己判出来的许可」调用：必须显式带 `decision`。
 
-    只允许包内（`services/acl_sandbox/`，即判定与探针自己）不传 —— 那里调用
-    时本函数自己走唯一判定点。包外必须二选一：显式 `decision=…`，或
-    展开唯一接线助手 `ctx.confined_kwargs()`（它带 decision）。
+    包内豁免走**显式登记** ``_CONFINED_DIRECT_CALL_ALLOWLIST``（现状唯一
+    成员 = sentinel 探针，理由见该常量注释）；登记外的包内直调点一律转红。
+    包外必须二选一：显式 `decision=…`，或展开唯一接线助手
+    `ctx.confined_kwargs()`（它带 decision）。
 
     ⚠ 不守什么：不守「伪造一个 confined 判定」。它守的是**默认路径**——
     新增一条受限执行接线时，作者必须显式表态「这次走哪条路」
     （`make_decision` 要求给理由），而不是写个 `if` 自己判。
     """
-    def _carries_decision(call: ast.Call) -> bool:
-        for k in call.keywords:
-            if k.arg == "decision":
-                return True
-            # **ctx.confined_kwargs() —— 唯一被批准的接线展开
-            if (
-                k.arg is None
-                and isinstance(k.value, ast.Call)
-                and getattr(k.value.func, "attr", None) == "confined_kwargs"
-            ):
-                return True
-        return False
-
-    offenders = [
-        f"{rel}:{lineno} ({owner})"
-        for rel, owner, lineno, call in _call_sites("spawn_confined")
-        if not rel.startswith("services/acl_sandbox/")
-        and not _carries_decision(call)
-    ]
+    offenders = _confined_sites_without_decision(_call_sites("spawn_confined"))
     assert not offenders, (
         "这些地方直接调 spawn_confined 却没带 decision —— 即「自己判沙箱」"
         "（#1 的复发形态）："
         f"{offenders}\n请改用 entry.spawn_agent_command（判定+路由+盖戳）。"
     )
+
+
+def test_confined_allowlist_is_registry_not_directory_prefix():
+    """F5 阳性/反向对照（§6.9.8）：登记真的在咬，目录前缀不再是一刀切豁免。
+
+    阳性①：清空 ``_CONFINED_DIRECT_CALL_ALLOWLIST`` ⇒ sentinel 现状转红
+    （证明豁免来自**登记**，不是来自目录前缀——改坏动作＝把登记成员删掉）。
+    阳性②：在 ``services/acl_sandbox/`` 下**新增**未登记直调点 ⇒ 转红
+    （旧写法里它会被目录前缀静默豁免）。
+    反向：登记成员保持绿；包外带 decision 的调用不进 offender。
+    """
+    real_sites = _call_sites("spawn_confined")
+    sentinel_sites = [
+        s for s in real_sites if s[0] == "services/acl_sandbox/sentinel.py"
+    ]
+    assert sentinel_sites, "扫描器没看见 sentinel 直调点 —— 探针失真"
+    assert _confined_sites_without_decision(sentinel_sites) == [], (
+        "sentinel 登记成员被报 offender —— allowlist 未生效"
+    )
+    # 阳性①：清空登记 ⇒ sentinel 转红
+    mod = sys.modules[__name__]
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(mod, "_CONFINED_DIRECT_CALL_ALLOWLIST", frozenset())
+        assert _confined_sites_without_decision(sentinel_sites), (
+            "清空 allowlist 后 sentinel 仍绿 ⇒ 豁免其实来自目录前缀（改造失败）"
+        )
+    finally:
+        monkey.undo()
+    # 阳性②：包内新增未登记直调点 ⇒ 转红
+    snippet = ast.parse("def _fake_new_probe():\n    spawn_confined(cmd)\n")
+    fake_call = next(n for n in ast.walk(snippet) if isinstance(n, ast.Call))
+    fake_sites = [
+        ("services/acl_sandbox/fake_new_module.py", "_fake_new_probe", 2, fake_call)
+    ]
+    assert _confined_sites_without_decision(fake_sites), (
+        "包内新增未登记直调点没有转红 ⇒ 目录前缀豁免仍是一刀切"
+    )
+    # 反向：带 decision 的调用不进 offender
+    with_d = ast.parse(
+        "def _with_decision():\n"
+        "    spawn_confined(cmd, decision=make_decision('r'))\n"
+    )
+    d_call = next(n for n in ast.walk(with_d) if isinstance(n, ast.Call))
+    assert _confined_sites_without_decision(
+        [("tools/some_tool.py", "_with_decision", 2, d_call)]
+    ) == []
 
 
 def test_no_new_route_judgment_sites():
@@ -604,10 +679,15 @@ def test_spawn_callers_transport_the_enforcement_stamp():
     checked = 0
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         rel = path.relative_to(_SRC_ROOT).as_posix()
-        if rel.startswith("services/acl_sandbox/"):
-            continue  # 判定与入口自身，不构造 ToolResult
+        # F5（§6.9.4，2026-09-18）：原「包内整目录跳过」已删 —— 现状包内
+        # **零个** spawn_agent_command 调用点（sentinel 调的是 spawn_confined
+        # 且不构造 ToolResult，见 ``_CONFINED_DIRECT_CALL_ALLOWLIST`` 注释），
+        # 无需豁免；日后包内若真出现 spawn_agent_command + ToolResult 的
+        # 组合，应当**被扫到**而不是静默豁免。tools/bash.py 的豁免保留：
+        # 裸 dict + 统一漏斗，形态不同，已由
+        # `test_fact_position_taxonomy_fixes.py` 的白名单守卫覆盖。
         if rel == "tools/bash.py":
-            continue  # 裸 dict + 统一漏斗，见 docstring
+            continue
         bad = _functions_without_stamp_transport(path)
         if bad:
             offenders.append(f"{rel}: {bad}")
@@ -651,6 +731,28 @@ def test_shell_whitelist_covers_every_spawn_stamp_key():
     )
 
 
+def _stamp_list_offenders_in_tree(rel: str, tree: ast.AST) -> list[str]:
+    """本模块 AST 里「按 ``"enforcement"`` 字面量做 ``startswith`` 过滤」的
+    取值动作（M3 的唯一可检形态；已知漏检形态见
+    ``test_stamp_list_guard_known_misses_executable_evidence``）。"""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        # `...startswith("enforcement")`
+        if (
+            isinstance(f, ast.Attribute)
+            and f.attr == "startswith"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.startswith("enforcement")
+        ):
+            found.append(f"{rel}:{node.lineno} startswith(前缀过滤)")
+    return found
+
+
 def test_no_tool_reimplements_the_stamp_key_list():
     """★ M3（2026-09-17 审计必修）：**不许有第二份戳键清单**。
 
@@ -688,24 +790,43 @@ def test_no_tool_reimplements_the_stamp_key_list():
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (SyntaxError, UnicodeDecodeError, OSError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            f = node.func
-            # `...startswith("enforcement")`
-            if (
-                isinstance(f, ast.Attribute)
-                and f.attr == "startswith"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-                and node.args[0].value.startswith("enforcement")
-            ):
-                offenders.append(f"{rel}:{node.lineno} startswith(前缀过滤)")
+        offenders.extend(_stamp_list_offenders_in_tree(rel, tree))
     assert not offenders, (
         "这些地方又写了一份戳键清单（前缀过滤）—— 键名必须由 "
         f"`policy.SPAWN_STAMP_KEYS` 单点登记、经 `bash._enforcement_stamp` 提取："
         f"{offenders}"
+    )
+
+
+def test_stamp_list_guard_known_misses_executable_evidence():
+    """F5（§6.9.5）：「实际保护面远窄于名字」的**可执行反例清单**。
+
+    下方每个形态都是「第二份戳键清单」的等价写法，本守卫（M3）
+    **全部漏过**——本用例把 docstring 的断言变成可执行证据：漏检形态
+    进探测函数必须返回空（green 漏过被钉死为**已知边界**，而非巧合），
+    唯一可检形态必须真的转红（探测器自身不是空转）。真拦截者是行为测试
+    （`test_python_script_stamp_transport.py` 的 ``git_hardened`` 断言等），
+    引用本守卫时不要把它当成通用防线。
+    """
+    # 已知漏检形态（2026-09-17 审计构造，全部 GREEN 漏过）：
+    known_misses = [
+        "def _f(k):\n    return k in ('enforcement', 'enforcement_level')\n",
+        "def _f(k):\n    return k.startswith('enf')\n",
+        "def _f(k):\n    return 'enforc' in k\n",
+        'def _f(k):\n    import re\n    return re.match(r"^enforcement", k)\n',
+        "def _f(k):\n    return k.split('_')[0] == 'enforcement'\n",
+        "_KEYS = ('enforcement',)\n\n\ndef _f(k):\n    return k in _KEYS\n",
+    ]
+    for snippet in known_misses:
+        tree = ast.parse(snippet)
+        assert _stamp_list_offenders_in_tree("<synthetic>", tree) == [], (
+            f"该形态已被探测函数捕获 ⇒ 本反例清单过期（守卫变严了，"
+            f"请更新本用例）：{snippet!r}"
+        )
+    # 唯一可检形态必须真的转红（证明探测器在工作，不是恒空）：
+    caught = ast.parse('def _f(k):\n    return k.startswith("enforcement")\n')
+    assert _stamp_list_offenders_in_tree("<synthetic>", caught), (
+        "startswith('enforcement') 没有转红 ⇒ 探测器空转（阳性对照失败）"
     )
 
 
