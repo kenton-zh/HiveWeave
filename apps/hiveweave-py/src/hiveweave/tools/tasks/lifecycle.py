@@ -136,8 +136,8 @@ class UpdateTaskStatusParams(BaseModel):
         description=(
             "When blocking on dependencies: the blocker task ids (list). "
             "Auto-unblocks when all of them are approved/closed. A block "
-            "needs dependsOnTaskIds or wakeAt — a block with neither can "
-            "never auto-unblock."
+            "needs dependsOnTaskIds, wakeAt, or waitKind='user'/'external' — "
+            "a block with none of these can never auto-unblock."
         ),
         json_schema_extra={
             "aliases": [
@@ -154,7 +154,10 @@ class UpdateTaskStatusParams(BaseModel):
         alias="waitKind",
         description=(
             "Structured wait kind when blocking. Inferred from dependsOnTaskIds "
-            "(dependency) or wakeAt (timer) when omitted. Never inferred from "
+            "(dependency) or wakeAt (timer) when omitted. Use 'user' when "
+            "waiting on a person's decision and 'external' when waiting on the "
+            "outside world — these have no auto-unblock path, so the platform "
+            "escalates them to your org parent instead. Never inferred from "
             "blockedReason text."
         ),
         json_schema_extra={"aliases": ["waitKind", "wait_kind"]},
@@ -220,20 +223,45 @@ async def update_task_status_tool(
                     f"but waitKind={params.wait_kind!r} was given. Drop one of "
                     f"them (wakeAt implies waitKind=timer)."
                 )
-            if not deps and wake_ms is None:
+            # OCR 评审（2026-09-17）：deps 与 user/external 语义矛盾 ——
+            # 有未满足依赖就有自动解封路径（reconcile 解封），且升级判据
+            # 对 deps 非空的任务**不升级**（「出口未到」≠「出口失效」）。
+            # 同传会让回执谎称「无自动解封、会被升级」⇒ 工具层直接拒。
+            if params.wait_kind in ("user", "external") and deps:
                 return ToolResult.err(
-                    "update_task_status: blocking requires an auto-unblock "
-                    "path — pass dependsOnTaskIds (blocker task ids) or "
-                    "wakeAt (ISO-8601 or epoch-ms deadline). A block with "
-                    "neither can never auto-unblock and parks the task for "
-                    "everyone waiting on it."
+                    f"update_task_status: waitKind={params.wait_kind!r} "
+                    f"conflicts with dependsOnTaskIds — a task with unmet "
+                    f"dependencies has an auto-unblock path (reconcile wakes "
+                    f"it), i.e. a 'dependency' wait, not a person/external "
+                    f"wait. Pass one of them."
                 )
+            # 2026-09-17（PLATFORM-ISSUES §11.6）：waitKind=user/external 是
+            # **合法且必要**的出口 —— 它表达「等一个 agent 做裁决 / 等外部世界」，
+            # 这类等待**没有机器可判的自动解封路径**，由平台的升级兜底负责
+            # （obligations.arbitration → scan_overdue → org parent）。
+            # 此前这两值虽在枚举里，却因下面「必须有 deps 或 wakeAt」的校验
+            # **无法产出** ⇒ agent 只能把裁决等待**伪装成 timer**（现场
+            # TEST_DSH_61 309e2489 实证），平台因此看不到真实意图。
+            kind: str
             if params.wait_kind:
                 kind = params.wait_kind
             elif deps:
                 kind = "dependency"
             else:
                 kind = "timer"
+            if kind in ("user", "external"):
+                # 无自动解封路径是有意的：这类 blocked 由升级兜底接手。
+                pass
+            elif not deps and wake_ms is None:
+                return ToolResult.err(
+                    "update_task_status: blocking requires an auto-unblock "
+                    "path — pass dependsOnTaskIds (blocker task ids), "
+                    "wakeAt (ISO-8601 or epoch-ms deadline), or "
+                    "waitKind='user'/'external' (waiting on a person / the "
+                    "outside world; the platform escalates these instead of "
+                    "auto-unblocking). A block with none of these parks the "
+                    "task for everyone waiting on it."
+                )
             await ts.block_task(
                 project_id,
                 params.task_id,
@@ -242,6 +270,12 @@ async def update_task_status_tool(
                 wait_kind=kind,
                 wake_at=wake_ms,
             )
+            if kind in ("user", "external"):
+                return ToolResult.ok(
+                    f"Task {params.task_id} blocked: {reason} (wait_kind={kind}; "
+                    f"no auto-unblock path — the platform will escalate to your "
+                    f"org parent if this stays blocked, so a decision is required)."
+                )
             return ToolResult.ok(
                 f"Task {params.task_id} blocked: {reason} (wait_kind={kind})"
             )

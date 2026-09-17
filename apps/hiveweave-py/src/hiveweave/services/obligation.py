@@ -50,6 +50,19 @@ MAX_ESCALATIONS = 3  # stop escalating after 3 levels
 # Review escalate only when the task is actually awaiting review
 _REVIEW_ESCALATABLE_STATUSES = frozenset({"submitted", "reviewing"})
 
+#: 「等人裁决」义务的默认 deadline（PLATFORM-ISSUES §11.6）。
+#:
+#: 比 review/verify 长：这类义务的成因是「等一个 agent 做裁决」，升级太快会
+#: 变成噪音（裁决本身可能合理地需要跨轮往返）。30min 与
+#: `lifecycle.ARBITRATION_GRACE_MS` 对齐 —— 先让 reconcile 有机会解封，
+#: 确认真的卡住了再升级。
+ARBITRATION_DEADLINE_MS = 30 * 60 * 1000  # 30 minutes
+
+#: arbitration 义务**不套用** `_REVIEW_ESCALATABLE_STATUSES`（TEST18 P0-1 的
+#: parked 语义只针对 review）。它的判据是「任务仍在 blocked」—— 任务一旦离开
+#: blocked（被裁决 / 被 reconcile 解封 / 关闭），义务就该被结清而不是升级。
+_ARBITRATION_ESCALATABLE_STATUSES = frozenset({"blocked"})
+
 
 # ── DB helpers (Pattern B: keyed by project_id) ──────────────
 
@@ -141,6 +154,7 @@ class ObligationLedger:
                 "merge": MERGE_DEADLINE_MS,
                 "review": REVIEW_DEADLINE_MS,
                 "verify": VERIFY_DEADLINE_MS,
+                "arbitration": ARBITRATION_DEADLINE_MS,
             }.get(obligation_type, REVIEW_DEADLINE_MS)
 
         task_id = await _normalize_task_id(project_id, task_id)
@@ -392,23 +406,43 @@ class ObligationLedger:
 
             # TEST18 P0-1: review obligations only escalate when the task is
             # actually awaiting review — never while running/claimed/created.
+            # arbitration（2026-09-17）：判据独立 —— 只认「任务仍在 blocked」，
+            # **不套用** _REVIEW_ESCALATABLE_STATUSES（那套是 review 专属的
+            # parked 语义；套用会让 arbitration 在 blocked 态永不升级，
+            # 正是本机制要修的那个洞）。
             task_status: str | None = None
-            if ob.get("obligation_type") == "review" and ob.get("task_id"):
+            ob_type = ob.get("obligation_type")
+            if ob_type in ("review", "arbitration") and ob.get("task_id"):
                 task_status = await self._task_status(
                     project_id, str(ob["task_id"])
+                )
+                escalatable = (
+                    _REVIEW_ESCALATABLE_STATUSES
+                    if ob_type == "review"
+                    else _ARBITRATION_ESCALATABLE_STATUSES
                 )
                 if task_status is None:
                     # Fail-open lookup miss — observable so ops can spot
                     # ledger/task drift; skip behavior unchanged.
+                    # 事件名用**固定字面量**（不插值）：review 保持原字面量
+                    # （既有测试 test_m7_h8_h4_sweep.py:226 依赖它），
+                    # 其余类型用通用名，类型由 obligation_type 字段区分
+                    # （OCR 评审 2026-09-17：插值事件名不利于按名检索）。
                     log.warning(
-                        "obligation.review_escalate_task_missing",
+                        "obligation.review_escalate_task_missing"
+                        if ob_type == "review"
+                        else "obligation.escalate_task_missing",
                         obligation_id=ob["id"],
+                        obligation_type=ob_type,
                         task_id=ob.get("task_id"),
                     )
-                if task_status not in _REVIEW_ESCALATABLE_STATUSES:
+                if task_status not in escalatable:
                     log.debug(
-                        "obligation.review_escalate_skipped",
+                        "obligation.review_escalate_skipped"
+                        if ob_type == "review"
+                        else "obligation.escalate_skipped",
                         obligation_id=ob["id"],
+                        obligation_type=ob_type,
                         task_id=ob.get("task_id"),
                         task_status=task_status,
                     )
@@ -534,6 +568,65 @@ class ObligationLedger:
         )
         return len(ids)
 
+    async def settle_arbitration_on_unblock(
+        self, project_id: str, task_id: str
+    ) -> int:
+        """任务离开 blocked ⇒ 结清 pending 的 arbitration 义务（审计 P1）。
+
+        2026-09-17（PLATFORM-ISSUES §11.6）：arbitration 义务的 escalatable
+        判据是「任务仍在 blocked」—— 任务离开 blocked（裁决解封 / reconcile
+        解封）后升级会被跳过，但行仍停在 pending。陈旧 pending 行（deadline
+        早已过期、escalation_count 续用）会让任务**下一次** block 时**立即**
+        升级（30min 宽限被旧账吞掉），甚至 MAX_ESCALATIONS 提前耗尽后彻底
+        静默（审计实证）。故解封点必须结清。
+
+        与 `reconcile_closed_task`（任务终态 → 结清全部类型）互补：本方法只
+        清 ``arbitration`` —— blocked 期间 review/merge 等义务可能仍有效
+        （parked review 义务不得被解封顺手清掉）。无 pending arbitration 行
+        是**常态**（义务只在陈旧 blocked 上登记），故静默返回 0——
+        不学 ``fulfill`` 打 fulfill_miss 警告（解封是高频路径）。
+        """
+        raw_ref = (task_id or "").strip()
+        task_id = await _normalize_task_id(project_id, task_id) or raw_ref
+        if not task_id:
+            return 0
+        id_candidates = [task_id]
+        if raw_ref and raw_ref != task_id:
+            id_candidates.append(raw_ref)
+        if len(task_id) >= 8:
+            id_candidates.append(task_id[:8])
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for c in id_candidates:
+            if c and c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        placeholders = ",".join("?" * len(uniq))
+        rows = await _query(
+            project_id,
+            f"SELECT id FROM obligations WHERE task_id IN ({placeholders}) "
+            "AND obligation_type = 'arbitration' AND status = 'pending'",
+            uniq,
+        )
+        if not rows:
+            return 0
+        now = int(time.time() * 1000)
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        await _execute(
+            project_id,
+            f"UPDATE obligations SET status = 'fulfilled', fulfilled_at = ? "
+            f"WHERE id IN ({placeholders})",
+            [now] + ids,
+        )
+        log.info(
+            "obligation.arbitration_settled",
+            project_id=project_id,
+            task_id=task_id,
+            count=len(ids),
+        )
+        return len(ids)
+
     async def audit_missing_review_obligations(
         self, project_id: str, *, limit: int = 40
     ) -> list[str]:
@@ -588,6 +681,83 @@ class ObligationLedger:
                     error=str(e),
                 )
         return fixed
+
+    async def audit_missing_arbitration_obligations(
+        self, project_id: str, *, limit: int = 40
+    ) -> list[str]:
+        """Backfill escalation obligations for stale「等人裁决」blocked tasks.
+
+        2026-09-17（PLATFORM-ISSUES §11.6）：`reconcile_blocked_tasks` 只覆盖
+        「等依赖 / 等定时器」两类出口。**第三类成因「等人裁决」没有出口** ——
+        没有任何机制把它推回裁决者面前（`[BLOCKED STALE]` / `[BLOCKED ESCALATION]`
+        inbox 已在 `game_time.py` 明写禁用）。本方法给这类 blocked 登记一条
+        `arbitration` 义务，由 `scan_overdue` 统一升级到 org parent。
+
+        ⚠ **只登记、不推进状态**：解封仍由 `reconcile_blocked_tasks`（deps/timer）
+        或**人的裁决动作**完成 ⇒ 不产生第二解封路径、不与既有 timer 出口打架。
+        ⚠ 判据在 `blocked_task_needs_arbitration_escalation`（**纯状态判据**，
+        唯一登记点；禁止文案）。
+        ⚠ 幂等：同 task 已有 pending `arbitration` 义务则跳过。
+        """
+        from hiveweave.services.tasks.lifecycle import (
+            blocked_task_needs_arbitration_escalation,
+        )
+
+        rows = await _query(
+            project_id,
+            "SELECT id, status, is_archived, claimed_at, assignee_id, creator_id, "
+            "wait_kind, wake_at, depends_on, updated_at FROM tasks "
+            "WHERE status = 'blocked' AND is_archived = 0 "
+            "ORDER BY updated_at ASC LIMIT ?",
+            [max(1, int(limit))],
+        )
+        created: list[str] = []
+        for row in rows or []:
+            tid = str(row.get("id") or "")
+            if not tid:
+                continue
+            if not blocked_task_needs_arbitration_escalation(row):
+                continue
+            existing = await _query(
+                project_id,
+                "SELECT id FROM obligations WHERE task_id = ? "
+                "AND obligation_type = 'arbitration' AND status = 'pending' "
+                "LIMIT 1",
+                [tid],
+            )
+            if existing:
+                continue
+            # 升级对象 = creator（派单方）；无 creator 的已在判据里排除。
+            owner = str(row.get("creator_id") or "")
+            if not owner:
+                continue
+            try:
+                await self.create(
+                    project_id,
+                    owner,
+                    "arbitration",
+                    task_id=tid,
+                    context={
+                        "source": "arbitration_backfill",
+                        "assignee_id": row.get("assignee_id"),
+                        "wait_kind": row.get("wait_kind"),
+                    },
+                )
+                created.append(tid)
+                log.warning(
+                    "obligation.arbitration_registered",
+                    project_id=project_id,
+                    task_id=tid,
+                    owner=owner,
+                    wait_kind=row.get("wait_kind"),
+                )
+            except Exception as e:
+                log.warning(
+                    "obligation.arbitration_backfill_failed",
+                    task_id=tid,
+                    error=str(e),
+                )
+        return created
 
     # ── Internal helpers ─────────────────────────────────────
 
@@ -818,6 +988,17 @@ class ObligationLedger:
         )
         if ob_type == "merge":
             msg += "run git_worktree_merge on the assignee's worktree, or reassign the merge duty."
+        elif ob_type == "arbitration":
+            # 2026-09-17：第三类出口（等人裁决）。文案必须给**正确下一步**，
+            # 且不声称任务已解封（本机制只升级、不推进状态）。
+            # ⚠ 不说 "wait path never fired"：user/external 本就无自动出口
+            # （审计 P5）；status 已在公共前缀里给过，此处不重复。
+            msg += (
+                "this task is blocked waiting on a decision and nothing "
+                "has auto-unblocked it. Decide it: unblock it "
+                "(update_task_status status=running) once the decision is "
+                "made, or reassign / cancel it."
+            )
         elif ob_type == "review":
             # TEST18 P0-1: never claim "submitted" unless status confirms it
             if task_status in _REVIEW_ESCALATABLE_STATUSES:

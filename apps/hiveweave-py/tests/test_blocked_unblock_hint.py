@@ -45,6 +45,22 @@ async def test_blocked_message_no_path_warns():
     assert "永久 parked" in hint
 
 
+async def test_blocked_message_arbitration_path():
+    """F6 前置项（PLATFORM-ISSUES §11.6，审计 P3）：等人裁决/等外部世界
+    的提示不得再说「永久 parked」—— 无自动解封是**有意的**，由 platform
+    升级兜底（obligations.arbitration）。"""
+    relay = TaskEventRelay()
+    for kind in ("user", "external"):
+        hint = relay._blocked_unblock_hint({
+            "depends_on": [],
+            "wait_kind": kind,
+            "wake_at": None,
+        })
+        assert "解封路径：等裁决" in hint, kind
+        assert "升级" in hint, kind
+        assert "永久 parked" not in hint, kind
+
+
 async def test_blocked_message_without_hint_unchanged():
     relay = TaskEventRelay()
     msg = relay._build_message("task.blocked", "t-1", {}, title="x")

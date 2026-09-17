@@ -289,7 +289,8 @@ class TaskEventRelay:
         """blocked 任务的结构化解封路径说明（duty 增强第一部分）。
 
         与 lifecycle.blocked_task_has_wake_path 同口径：deps → 依赖解封；
-        timer → wake_at 到期；两者皆无 → 无自动解封（需人工介入）。
+        timer → wake_at 到期；user/external → 等裁决（无自动解封，逾期平台
+        升级兜底，审计 P3）；其余 → 无自动解封（需人工介入）。
         """
         deps = task.get("depends_on") or []
         if isinstance(deps, str):
@@ -314,6 +315,14 @@ class TaskEventRelay:
             except Exception:
                 when = str(wake_at)
             return f"解封路径：timer 到期（{when}）自动解封——assignee 会被唤醒。"
+        if kind in ("user", "external"):
+            # 2026-09-17（PLATFORM-ISSUES §11.6）：等人裁决 / 等外部世界 ——
+            # 无自动解封是**有意的**，由 arbitration 义务升级兜底（审计 P3）。
+            return (
+                "解封路径：等裁决（无自动解封）——拿到结论后 "
+                "`update_task_status(status=running)` 解封；逾期平台会升级"
+                "到上级。"
+            )
         return (
             "解封路径：无自动解封——需要你 reassign / unblock / cancel，"
             "否则任务将永久 parked。"

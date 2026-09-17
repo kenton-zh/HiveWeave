@@ -598,6 +598,9 @@ class GameTimeService:
                 await ledger.scan_overdue(project_id)
                 # TEST6 S11: backfill missing review obligations for review-pipe
                 await ledger.audit_missing_review_obligations(project_id)
+                # 2026-09-17（PLATFORM-ISSUES §11.6）：第三类出口 —— 给陈旧
+                # 的「等人裁决」blocked 登记升级义务（只登记、不推进状态）。
+                await ledger.audit_missing_arbitration_obligations(project_id)
             except Exception as e:
                 log.error(
                     "obligation_scan_failed",

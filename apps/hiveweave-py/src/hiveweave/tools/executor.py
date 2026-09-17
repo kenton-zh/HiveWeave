@@ -1627,9 +1627,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "update_task_status": {
         "description": (
             "Set status to running (start or unblock) or blocked. "
-            "blocked requires dependsOnTaskIds and/or wakeAt — a block "
-            "with neither is rejected. dependsOnTaskIds = other task ids "
-            "only (self-id rejected). Waiting for a person keeps the task "
+            "blocked requires dependsOnTaskIds, wakeAt, or "
+            "waitKind='user'/'external' — a block with none is rejected. "
+            "dependsOnTaskIds = other task ids only (self-id rejected). "
+            "waitKind='user'/'external' = waiting on a person / the outside "
+            "world: no auto-unblock path, the platform escalates to your org "
+            "parent instead. Waiting for a person keeps the task "
             "running and uses commit_turn(waiting, waiting_on kind=agent). "
             "Status omitted defaults to running. "
             "blockedReason is a note only, never an unblock path. "
@@ -1647,11 +1650,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "aliases": ["depends_on_task_ids", "dependsOnTaskId",
                             "depends_on_task_id", "dependsOn"],
-                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is commit_turn, not this list. Passing dependsOnTaskIds or wakeAt is REQUIRED when blocking."},
+                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is commit_turn, not this list. Passing dependsOnTaskIds, wakeAt, or waitKind='user'/'external' is REQUIRED when blocking."},
             "waitKind": {"type": "string",
                 "aliases": ["wait_kind"],
                 "enum": ["dependency", "timer", "user", "external"],
-                "description": "Structured wait kind. Inferred from dependsOnTaskIds (dependency) or wakeAt (timer) when omitted. Never inferred from blockedReason text."},
+                "description": "Structured wait kind. Inferred from dependsOnTaskIds (dependency) or wakeAt (timer) when omitted. Use 'user' for waiting on a person's decision, 'external' for waiting on the outside world — no auto-unblock path, the platform escalates these to your org parent. Never inferred from blockedReason text."},
             "wakeAt": {"type": "string",
                 "aliases": ["wake_at"],
                 "description": "Deadline for timer waits: ISO-8601 datetime (naive = UTC) or epoch milliseconds. Auto-unblocks at this time."},

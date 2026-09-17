@@ -57,6 +57,95 @@ def blocked_task_has_wake_path(task: dict, now_ms: int | None = None) -> bool:
     return False
 
 
+#: 「等一个 agent 做裁决」的等待类 blocked 的升级判据宽限（PLATFORM-ISSUES §11.6）。
+#:
+#: 现场取证（2026-09-17，TEST_DSH_61 `309e2489`）：该任务 `wait_kind='timer'`、
+#: `wake_at` 已过期 5.4h，**却仍是 blocked** —— 即「声明了出口但出口没生效」。
+#: 成因是工具层当时不给「等人裁决」出口（见 `tools/tasks/lifecycle.py` 的
+#: `waitKind` 校验），agent 只能把裁决等待**伪装成 timer**。
+#:
+#: ⇒ 本判据因此认两种形态（**只认结构化字段，禁止文案**）：
+#:   ① **无出口**：deps 空 且 非 timer —— reconcile 永远不会碰它；
+#:   ② **出口失效**：`wait_kind='timer'` 且 `wake_at` 已过期超过宽限 ——
+#:      本该被 reconcile 解封却没解封（现场正是此形态）。
+#:
+#: ⚠ 宽限必须 > 0：`reconcile_blocked_tasks` 每 120s 跑一次，刚过期的 timer
+#: 尚未被扫到属正常；判「出口失效」要留出至少一个 reconcile 周期。
+ARBITRATION_GRACE_MS = 30 * 60 * 1000  # 30 minutes
+
+#: 等一个 agent 的 wait_kind 值（无机器可判的自动解封路径，须由升级兜底）。
+_ARBITRATION_WAIT_KINDS = frozenset({"user", "external"})
+
+
+def blocked_task_needs_arbitration_escalation(
+    task: dict, now_ms: int | None = None
+) -> bool:
+    """「等一个 agent 做裁决」且**已陈旧**的 blocked —— 需要升级兜底。
+
+    2026-09-17 现场取证（PLATFORM-ISSUES §11.6）：`reconcile_blocked_tasks` 只
+    覆盖两类出口（deps 满足 / timer 到期）。**第三类成因「等人裁决」没有出口**：
+    `[BLOCKED STALE]` / `[BLOCKED ESCALATION]` inbox 已在 `game_time.py` 明写
+    禁用，且 `obligations` 表里没有对应义务 ⇒ 没有任何机制把它推回裁决者面前。
+
+    判据（**纯状态判据**，只读 DB 行 / 结构化字段）：
+
+        status == 'blocked' 且 is_archived == 0
+        且 claimed_at 非空            （曾被告认领 —— 排除"出生即 blocked"的依赖任务）
+        且 assignee_id 非空           （有人担责）
+        且 creator_id 非空            （有升级对象）
+        且 deps 为空                  （有依赖出口 ⇒ reconcile 在管，不升级）
+        且 [ 等人(②) 或 出口失效(③) 或 无出口(④) ]
+        且 陈旧 (now - updated_at) > ARBITRATION_GRACE_MS
+
+    ⚠ **不判** `blocked_reason` 文案（本仓 HARD RULE：禁止用文案猜意图）。
+    ⚠ **不判** `wait_kind` 的字符串前缀 —— 只认**集合成员资格**。
+    """
+    if (task.get("status") or "") != "blocked":
+        return False
+    if task.get("is_archived"):
+        return False
+    if task.get("claimed_at") is None:
+        return False
+    if not task.get("assignee_id") or not task.get("creator_id"):
+        return False
+
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    updated_at = task.get("updated_at") or 0
+    if now - int(updated_at) <= ARBITRATION_GRACE_MS:
+        return False  # 刚 block 的，留给 reconcile / 正常流程
+
+    kind = (task.get("wait_kind") or "").lower()
+    wake_at = task.get("wake_at")
+
+    # ① 有依赖出口 ⇒ 不升级（审计 P4）：deps 非空时 reconcile 在管，
+    # 「出口未到」≠「出口失效」—— 不该被升级噪音打扰。同时防
+    # `waitKind='user'` + deps 并存时被误判（工具层现已拒绝该组合，
+    # 此处仍自防御 DB 直写 / 历史行）。
+    deps = task.get("depends_on") or []
+    if isinstance(deps, str):
+        try:
+            deps = json.loads(deps) if deps else []
+        except (json.JSONDecodeError, TypeError):
+            deps = []
+    if isinstance(deps, list) and deps:
+        return False
+
+    if kind in _ARBITRATION_WAIT_KINDS:
+        return True  # ② 显式声明「等人」—— 无自动解封路径
+
+    # ③ 出口失效：声明了 timer 出口，却已过期超过宽限仍 blocked
+    if kind == "timer" and wake_at is not None:
+        try:
+            if int(wake_at) + ARBITRATION_GRACE_MS < now:
+                return True
+        except (TypeError, ValueError):
+            return False
+
+    # ④ 无出口：deps 空且非 timer（`blocked_task_has_wake_path` 为假）
+    return not blocked_task_has_wake_path(task, now)
+
+
+
 def _deps_merged_head_note(merge_commit: str | None) -> str:
     """新 HEAD 合流复核提示（duty 增强第二部分）。
 
@@ -317,6 +406,12 @@ class LifecycleMixin:
         意图) — new callers must pass it explicitly. A block with no deps and
         no timer has no auto-unblock path and parks the task forever; callers
         that need that (QA dead zone) must use the dedicated system paths.
+
+        ⚠ **2026-09-17 例外（PLATFORM-ISSUES §11.6）**：``wait_kind`` 为
+        ``"user"`` / ``"external"`` 时**无自动解封路径是有意的** —— 它表达
+        「等一个 agent 做裁决 / 等外部世界」，由平台的**升级兜底**接手
+        （``audit_missing_arbitration_obligations`` → ``scan_overdue`` →
+        org parent）。这类 blocked **不需要** deps/timer，也不再是「永久 parked」。
         ``depends_on`` that includes this task's own id is rejected before
         the transition (self-dep never unblocks).
         """
@@ -452,6 +547,23 @@ class LifecycleMixin:
                 project_id,
                 "UPDATE tasks SET blocked_reason = NULL, updated_at = ? WHERE id = ?",
                 [now_ms, task_id],
+            )
+        # 2026-09-17（PLATFORM-ISSUES §11.6，审计 P1）：离开 blocked ⇒ 结清
+        # arbitration 义务。否则陈旧 pending 行（deadline 已过、escalation
+        # count 续用）会让任务**下一次** block 无宽限立即升级。fail-open
+        # （与 close.py 同模式）：结清失败不得阻断解封。
+        # 覆盖两条路径：手动 unblock + reconcile_blocked_tasks（同走本入口）。
+        try:
+            from hiveweave.services.obligation import ObligationLedger
+
+            await ObligationLedger().settle_arbitration_on_unblock(
+                project_id, task_id
+            )
+        except Exception as e:
+            log.warning(
+                "obligation.arbitration_settle_failed",
+                task_id=task_id,
+                error=str(e),
             )
 
     @staticmethod

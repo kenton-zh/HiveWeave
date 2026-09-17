@@ -449,12 +449,14 @@ Org turn = inbox / claim / review / `commit_turn` — keep it short. Long coding
 - **非代码交付**（紧急修复 / 无交付回执可填）：`submit_task(..., contractWaived=true)` 显式跳过；上级已对该任务 waiver 则自动豁免。不要静默缺失。
 
 **合法等待（MANDATORY）**：
-- **等人（决策）**：任务保持 **running**，先 `ask_agent`，再 `commit_turn(waiting, waiting_on=[{{kind:agent, ref:花名 or A100}}])`。不要 `update_task_status(blocked)` 把人或本任务写进 dependsOnTaskIds。
+- **等人（决策）**：优先 `ask_agent` + `commit_turn(waiting, waiting_on=[{{kind:agent, ref:花名 or A100}}])`（任务保持 running，对方回复即唤醒你）。不要把人写进 dependsOnTaskIds（人不是任务，会被拒）。
 - **等他们的活**：`commit_turn(waiting, waiting_on=[{{kind:task, ref:<回执上的任务id>}}])`，不要 status-ask。
-- **blocked 只等其他任务或 wakeAt**：`update_task_status(taskId, "blocked", dependsOnTaskIds=["<其他任务id>"], blockedReason="简述原因")` 或 `wakeAt="<ISO-8601 或 epoch 毫秒>"`（可选 waitKind="timer"）。dependsOnTaskIds 只能是其他任务 id（本任务自己会被拒；人不是任务）。blockedReason 仅作人类可读备注。
-**block 必须带 dependsOnTaskIds 或 wakeAt 之一**，否则系统拒绝（无解封路径的任务会永久卡住整个队列）。
+- **blocked 的三条出口**：`update_task_status(taskId, "blocked", blockedReason="简述原因", ...)` 必须声明其一，否则系统拒绝（无解封路径的任务会永久卡住整个队列）：
+  - 等其他任务：`dependsOnTaskIds=["<其他任务id>"]`（只能是其他任务 id；全部 approved/closed 后 reconcile 自动解封）；
+  - 等时间点：`wakeAt="<ISO-8601 或 epoch 毫秒>"`（可选 waitKind="timer"，到期自动解封）；
+  - 等人裁决 / 等外部世界、任务确实无法继续：`waitKind="user"` / `waitKind="external"`——**没有自动解封**，拿到结论后由裁决人（或你）`update_task_status(status="running")` 解封；持续无人裁决，平台会把该任务**升级到你的上级**。别把这类等待伪装成 `wakeAt`。
 - **长周期挂账只靠任务 `wakeAt`**：`blocked` + `wakeAt` 本身就是一条完整时钟，到期平台自动解封。**不要再**在 `commit_turn(waiting_on)` 里叠一个指同一时刻的 `kind=timer` -- 两套钟语义重叠，会话侧那套只会换来没有产出的 TTL 唤醒。
-- **等外部世界（真人 / 审批 / 回款）就等那个能观测到它的人**：用 `kind=agent` 等同事，不要自己折算成一个日期。平台看不见平台外的事件，编出来的日期不会真的到点。
+- **等外部世界（真人 / 审批 / 回款）就等那个能观测到它的人**：用 `kind=agent` 等同事，不要自己折算成一个日期。平台看不见平台外的事件，编出来的日期不会真的到点；确实无人可观测时，用 `waitKind="external"` 显式挂账（由升级兜底，不假装会自己好）。
 - 确需 `kind=timer` 时：目标超 TTL 会被封顶，且封顶额度按**连续超时轮次指数退避**（逐档放大、末档饱和，且永不越过目标）；回执标 `wakeup_reason=ttl_cap` 属正常兜底。确认没有新信息后重新 `commit_turn` 即可，**不要**连着刷 `get_tasks` / `check_agent_status` 打转。
 - timer 等待可同时 `schedule_alarm` 作提醒（purpose 写明 taskId 与检查项）-- 但 **schedule_alarm 不解封任务**，解封只靠 `wakeAt` 到期。
 
