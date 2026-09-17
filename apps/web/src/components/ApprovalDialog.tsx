@@ -1,3 +1,4 @@
+import EmptyState from "./EmptyState";
 import { useState, useEffect, useCallback } from "react";
 import { useAppStore } from "../store";
 import { getPendingApprovals, respondToApproval } from "../api";
@@ -50,9 +51,9 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
     fetchApprovals();
   }, [fetchApprovals]);
 
-  // Auto-refresh: poll every 3 seconds to pick up new requests while dialog is open
+  // Auto-refresh: poll every 10 seconds (P4-1: was 3s) to pick up new requests while dialog is open
   useEffect(() => {
-    const timer = setInterval(fetchApprovals, 3000);
+    const timer = setInterval(fetchApprovals, 10000); // P4-1：3s 过密 → 10s（20→6 req/min）
     return () => clearInterval(timer);
   }, [fetchApprovals]);
 
@@ -103,8 +104,8 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-g-border">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-amber-50 ring-1 ring-amber-200/60 rounded-gm flex items-center justify-center">
-              <svg className="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <div className="w-8 h-8 bg-g-yellow-bg ring-1 ring-g-yellow/60 rounded-gm flex items-center justify-center">
+              <svg className="w-5 h-5 text-g-yellow-vivid" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
               </svg>
             </div>
@@ -130,11 +131,11 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
               <div className="w-6 h-6 border-2 border-g-blue border-t-transparent rounded-full animate-spin" />
             </div>
           ) : approvals.length === 0 ? (
-            <div className="text-center py-10">
-              <div className="text-3xl mb-2">✅</div>
-              <p className="text-sm text-g-fg-3">暂无待审批的请求</p>
-              <p className="text-xs text-g-fg-4 mt-1">Agent 发起敏感操作时会出现在这里</p>
-            </div>
+            <EmptyState
+              icon={<span className="text-g-green text-2xl leading-none">✓</span>}
+              title="暂无待审批的请求"
+              description="Agent 发起敏感操作时会出现在这里"
+            />
           ) : (
             approvals.map((approval) => {
               const formattedArgs = formatToolArgs(approval.toolArguments);
@@ -169,14 +170,14 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                     <button
                       onClick={() => handleRespond(approval.id, true)}
                       disabled={processing === approval.id}
-                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
+                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-g-green hover:bg-g-green-vivid disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                     >
                       {processing === approval.id ? "处理中..." : "同意"}
                     </button>
                     <button
                       onClick={() => handleRespond(approval.id, false)}
                       disabled={processing === approval.id}
-                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
+                      className="flex-1 px-3 py-1.5 text-xs font-medium bg-g-red hover:bg-g-red-vivid disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                     >
                       {processing === approval.id ? "处理中..." : "拒绝"}
                     </button>
@@ -196,7 +197,7 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                 type="checkbox"
                 checked={remember}
                 onChange={(e) => setRemember(e.target.checked)}
-                className="rounded border-g-border bg-g-bg text-g-blue focus:ring-g-blue/50"
+                className="rounded-gm border-g-border bg-g-bg text-g-blue focus:ring-g-blue/50"
               />
               <span>记住此选择（以后同类操作自动允许）</span>
             </label>
@@ -216,14 +217,14 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                 <button
                   onClick={() => handleBulkRespond(true)}
                   disabled={processing !== null}
-                  className="flex-1 px-3 py-2 text-sm font-medium bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
+                  className="flex-1 px-3 py-2 text-sm font-medium bg-g-green hover:bg-g-green-vivid disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                 >
                   全部同意 ({approvals.length})
                 </button>
                 <button
                   onClick={() => handleBulkRespond(false)}
                   disabled={processing !== null}
-                  className="flex-1 px-3 py-2 text-sm font-medium bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
+                  className="flex-1 px-3 py-2 text-sm font-medium bg-g-red hover:bg-g-red-vivid disabled:opacity-50 text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all"
                 >
                   全部拒绝
                 </button>

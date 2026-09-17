@@ -32,6 +32,15 @@ export default {
           "green-bg": "#e4f5eb",
           yellow: "#c77400",
           "yellow-bg": "#fbf0dc",
+          // P0 新增：亮色档（状态点 / 图标在深底或紧凑行的可读性）
+          // 与 purple（合并中 / 特殊状态语义）
+          "red-vivid": "#f87171",
+          "green-vivid": "#34d399",
+          "yellow-vivid": "#fbbf24",
+          "blue-vivid": "#818cf8",
+          purple: "#7c3aed",
+          "purple-bg": "#f3e8ff",
+          "purple-vivid": "#a78bfa",
         },
       },
       borderRadius: {

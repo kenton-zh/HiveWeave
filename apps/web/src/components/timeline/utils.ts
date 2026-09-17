@@ -46,80 +46,80 @@ export interface StatusStyle {
 export const STATUS_STYLES: Record<TaskStatus, StatusStyle> = {
   created: {
     label: "待认领",
-    bar: "bg-slate-200",
-    barText: "text-slate-600",
-    chipBg: "bg-slate-100",
-    chipText: "text-slate-600",
+    bar: "bg-g-bg-muted",
+    barText: "text-g-fg-2",
+    chipBg: "bg-g-bg-muted",
+    chipText: "text-g-fg-2",
   },
   claimed: {
     label: "已认领",
-    bar: "bg-emerald-200",
-    barText: "text-emerald-900",
-    chipBg: "bg-emerald-50",
-    chipText: "text-emerald-700",
+    bar: "bg-g-green-bg",
+    barText: "text-g-green",
+    chipBg: "bg-g-green-bg",
+    chipText: "text-g-green",
   },
   running: {
     label: "执行中",
-    bar: "bg-emerald-500",
+    bar: "bg-g-green-vivid",
     barText: "text-white",
-    chipBg: "bg-emerald-50",
-    chipText: "text-emerald-700",
+    chipBg: "bg-g-green-bg",
+    chipText: "text-g-green",
   },
   rework: {
     label: "返工",
-    bar: "bg-emerald-500",
+    bar: "bg-g-green-vivid",
     barText: "text-white",
-    chipBg: "bg-red-50",
-    chipText: "text-red-600",
+    chipBg: "bg-g-red-bg",
+    chipText: "text-g-red",
   },
   blocked: {
     label: "阻塞",
-    bar: "bg-orange-500",
+    bar: "bg-g-yellow-vivid",
     barText: "text-white",
-    chipBg: "bg-orange-50",
-    chipText: "text-orange-700",
+    chipBg: "bg-g-yellow-bg",
+    chipText: "text-g-yellow",
   },
   submitted: {
     label: "待评审",
-    bar: "bg-amber-400",
-    barText: "text-amber-950",
-    chipBg: "bg-amber-50",
-    chipText: "text-amber-700",
+    bar: "bg-g-yellow-vivid",
+    barText: "text-g-yellow",
+    chipBg: "bg-g-yellow-bg",
+    chipText: "text-g-yellow",
   },
   reviewing: {
     label: "评审中",
-    bar: "bg-violet-500",
+    bar: "bg-g-purple-vivid",
     barText: "text-white",
-    chipBg: "bg-violet-50",
-    chipText: "text-violet-700",
+    chipBg: "bg-g-purple-bg",
+    chipText: "text-g-purple",
   },
   approved: {
     label: "已通过",
-    bar: "bg-sky-500",
+    bar: "bg-g-blue-vivid",
     barText: "text-white",
-    chipBg: "bg-sky-50",
-    chipText: "text-sky-700",
+    chipBg: "bg-g-blue-bg",
+    chipText: "text-g-blue",
   },
   verifying: {
     label: "验证中",
-    bar: "bg-sky-300",
-    barText: "text-sky-950",
-    chipBg: "bg-sky-50",
-    chipText: "text-sky-700",
+    bar: "bg-g-blue-bg",
+    barText: "text-g-blue",
+    chipBg: "bg-g-blue-bg",
+    chipText: "text-g-blue",
   },
   closed: {
     label: "已完成",
-    bar: "bg-sky-500",
+    bar: "bg-g-blue-vivid",
     barText: "text-white",
-    chipBg: "bg-sky-50",
-    chipText: "text-sky-700",
+    chipBg: "bg-g-blue-bg",
+    chipText: "text-g-blue",
   },
   cancelled: {
     label: "已取消",
-    bar: "bg-slate-400",
+    bar: "bg-g-fg-4",
     barText: "text-white",
-    chipBg: "bg-slate-100",
-    chipText: "text-slate-500",
+    chipBg: "bg-g-bg-muted",
+    chipText: "text-g-fg-3",
     striped: true,
   },
 };
@@ -141,7 +141,7 @@ export const STRIPED_OVERLAY: CSSProperties = {
 
 /** 待认领空段（agent 无任务区间）：灰底虚线边框，与空白区分。 */
 export const UNCLAIMED_SEGMENT_CLASSES =
-  "bg-slate-100 border border-dashed border-slate-300";
+  "bg-g-bg-muted border border-dashed border-g-border-strong";
 
 // ── 事件流视觉 ─────────────────────────────────────────────────
 
@@ -155,7 +155,7 @@ export function eventAccent(ev: TimelineEvent): {
     return { dot: "bg-g-blue", chipBg: "bg-g-blue-bg", chipText: "text-g-blue" };
   }
   if (ev.type === "inbox.message") {
-    return { dot: "bg-teal-500", chipBg: "bg-teal-50", chipText: "text-teal-700" };
+    return { dot: "bg-g-green-vivid", chipBg: "bg-g-green-bg", chipText: "text-g-green" };
   }
   if (ev.type === "work_log") {
     return {

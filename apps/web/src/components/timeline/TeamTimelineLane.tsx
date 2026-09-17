@@ -66,15 +66,15 @@ export default function TeamTimelineLane({
             {lane.name}
           </p>
           {lane.role && (
-            <p className="text-[9px] text-g-fg-4 truncate leading-3">{lane.role}</p>
+            <p className="text-[10px] text-g-fg-4 truncate leading-3">{lane.role}</p>
           )}
         </div>
         {lane.assignment && (
           <span
-            className={`shrink-0 px-1 py-px rounded text-[9px] font-medium ${
+            className={`shrink-0 px-1 py-px rounded-gm text-[10px] font-medium ${
               lane.assignment.kind === "busy"
                 ? "bg-g-green-bg text-g-green"
-                : "bg-g-yellow-bg text-amber-700"
+                : "bg-g-yellow-bg text-g-yellow"
             }`}
             title={lane.assignment.task_title}
           >
@@ -105,7 +105,7 @@ export default function TeamTimelineLane({
               onMouseEnter={(e) => onHover(seg, e)}
               onMouseMove={(e) => onHover(seg, e)}
               onMouseLeave={() => onHover(null)}
-              className={`absolute top-1/2 -translate-y-1/2 h-[22px] rounded overflow-hidden text-left animate-fade-in transition-shadow hover:shadow-gm-md hover:z-10 ${
+              className={`absolute top-1/2 -translate-y-1/2 h-[22px] rounded-gm overflow-hidden text-left animate-fade-in transition-shadow hover:shadow-gm-md hover:z-10 ${
                 unclaimed ? UNCLAIMED_SEGMENT_CLASSES : `${st.bar}`
               }`}
               style={{ left: `${left}%`, width: `${width}%`, minWidth: 3 }}
@@ -116,7 +116,7 @@ export default function TeamTimelineLane({
               )}
               {width > 6 && (
                 <span
-                  className={`relative block px-1 text-[9px] leading-[22px] truncate ${
+                  className={`relative block px-1 text-[10px] leading-[22px] truncate ${
                     unclaimed ? "text-g-fg-3" : st.barText
                   }`}
                 >

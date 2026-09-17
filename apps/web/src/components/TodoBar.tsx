@@ -6,10 +6,10 @@ interface Props {
 }
 
 const statusLabels: Record<string, { icon: string; color: string }> = {
-  completed: { icon: "✅", color: "text-emerald-700" },
-  in_progress: { icon: "🔄", color: "text-amber-700" },
+  completed: { icon: "✅", color: "text-g-green" },
+  in_progress: { icon: "🔄", color: "text-g-yellow" },
   pending: { icon: "⬜", color: "text-g-fg-3" },
-  cancelled: { icon: "❌", color: "text-red-500/60" },
+  cancelled: { icon: "❌", color: "text-g-red-vivid/60" },
 };
 
 export default function TodoBar({ agentId }: Props) {
@@ -51,12 +51,12 @@ export default function TodoBar({ agentId }: Props) {
         {/* Mini progress bar */}
         <span className="w-16 h-1 bg-g-bg-muted rounded-full overflow-hidden shrink-0">
           <span
-            className="block h-full bg-gradient-to-r from-g-blue to-emerald-400 rounded-full transition-all duration-500"
+            className="block h-full bg-gradient-to-r from-g-blue to-g-green-vivid rounded-full transition-all duration-500"
             style={{ width: `${total > 0 ? Math.round((done / total) * 100) : 0}%` }}
           />
         </span>
         {done === total && total > 0 && (
-          <span className="text-emerald-700 text-[10px] px-1.5 py-0.5 bg-emerald-50 border border-emerald-100 rounded-gm">全部完成</span>
+          <span className="text-g-green text-[10px] px-1.5 py-0.5 bg-g-green-bg border border-g-green rounded-gm">全部完成</span>
         )}
       </button>
 

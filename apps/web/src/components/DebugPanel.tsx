@@ -1,12 +1,14 @@
+import EmptyState from "./EmptyState";
+import { Terminal } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { useAppStore, type DebugLogEntry } from "../store";
 
 const CATEGORY_COLORS: Record<string, string> = {
-  api: "text-blue-400",
-  ws: "text-green-400",
-  error: "text-red-400",
+  api: "text-g-blue-vivid",
+  ws: "text-g-green-vivid",
+  error: "text-g-red-vivid",
   info: "text-g-fg-3",
-  state: "text-yellow-400",
+  state: "text-g-yellow-vivid",
 };
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -57,7 +59,7 @@ export default function DebugPanel() {
         <span className="text-xs font-semibold text-g-fg">调试日志</span>
         <span className="text-xs text-g-fg-4">({debugLogs.length})</span>
         {errorCount > 0 && (
-          <span className="text-xs text-red-600 px-1.5 py-0.5 bg-red-50 border border-red-100 rounded-gm">
+          <span className="text-xs text-g-red px-1.5 py-0.5 bg-g-red-bg border border-g-red rounded-gm">
             {errorCount} 错误
           </span>
         )}
@@ -65,7 +67,7 @@ export default function DebugPanel() {
         <select
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          className="text-xs bg-g-bg border border-g-border rounded-gm px-2 py-1 text-g-fg focus:outline-none focus:border-g-blue/50 cursor-pointer"
+          className="text-xs bg-g-bg border border-g-border rounded-gm px-2 py-1 text-g-fg focus:border-g-blue/50 cursor-pointer"
         >
           <option value="all">全部</option>
           <option value="api">API ({apiCount})</option>
@@ -84,7 +86,7 @@ export default function DebugPanel() {
         </button>
         <button
           onClick={clearDebugLogs}
-          className="text-xs px-2 py-1 rounded-gm border border-g-border text-g-fg-3 hover:text-red-600 hover:border-red-200 hover:bg-red-50 active:scale-[0.96] transition-all"
+          className="text-xs px-2 py-1 rounded-gm border border-g-border text-g-fg-3 hover:text-g-red hover:border-g-red hover:bg-g-red-bg active:scale-[0.96] transition-all"
         >
           清除
         </button>
@@ -93,10 +95,7 @@ export default function DebugPanel() {
       {/* Log entries */}
       <div className="flex-1 overflow-y-auto font-mono text-xs">
         {filtered.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-1.5 text-g-fg-4/70">
-            <span className="text-2xl">🛰️</span>
-            <span>暂无日志</span>
-          </div>
+          <EmptyState icon={<Terminal />} title="暂无日志" description="打开调试开关并复现操作后，这里会显示平台日志" />
         ) : (
           filtered.map((entry) => (
             <div

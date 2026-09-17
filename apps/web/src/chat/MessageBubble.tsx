@@ -28,10 +28,10 @@ function ThinkingBlock({ content }: { content: string }) {
         type="button"
         onClick={() => setOpen(!open)}
         aria-expanded={open}
-        className="w-full flex items-center gap-2 text-left py-1 px-1 -mx-1 rounded-md hover:bg-g-bg-muted/70 transition-colors"
+        className="w-full flex items-center gap-2 text-left py-1 px-1 -mx-1 rounded-gm hover:bg-g-bg-muted/70 transition-colors"
       >
         <svg
-          className="w-3 h-3 shrink-0 text-purple-400"
+          className="w-3 h-3 shrink-0 text-g-purple-vivid"
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -44,7 +44,7 @@ function ThinkingBlock({ content }: { content: string }) {
             d="M12 3a6 6 0 00-3.6 10.8V17a1 1 0 001 1h5.2a1 1 0 001-1v-3.2A6 6 0 0012 3z"
           />
         </svg>
-        <span className="text-[11px] font-medium text-purple-500 shrink-0">Think</span>
+        <span className="text-[11px] font-medium text-g-purple-vivid shrink-0">Think</span>
         <span className="text-g-fg-4 text-[11px] shrink-0">·</span>
         <span className={`text-[11px] text-g-fg-4 min-w-0 ${open ? "hidden" : "truncate"}`}>
           {preview}
@@ -56,7 +56,7 @@ function ThinkingBlock({ content }: { content: string }) {
         )}
       </button>
       {open && (
-        <div className="mt-1 ml-5 border-l border-purple-200 pl-2.5">
+        <div className="mt-1 ml-5 border-l border-g-purple pl-2.5">
           <div className="text-[11px] text-g-fg-3 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed font-mono select-text">
             {content}
           </div>
@@ -88,7 +88,7 @@ function ToolStatusIcon({ status }: { status?: ToolCall["status"] }) {
   if (status === "error") {
     return (
       <svg
-        className="w-3 h-3 text-red-500 shrink-0"
+        className="w-3 h-3 text-g-red-vivid shrink-0"
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
@@ -102,7 +102,7 @@ function ToolStatusIcon({ status }: { status?: ToolCall["status"] }) {
   }
   return (
     <svg
-      className="w-3 h-3 text-emerald-500 shrink-0"
+      className="w-3 h-3 text-g-green-vivid shrink-0"
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -150,9 +150,9 @@ function FileToolChip({ call, path }: { call: ToolCall; path: string }) {
   };
   return (
     // 可达性：整行是展示性 chip，唯一交互是复制按钮（见下），行本身不带点击。
-    <div className="my-0.5 flex items-center gap-2 py-1 px-1 -mx-1 rounded-md" data-file-chip="">
+    <div className="my-0.5 flex items-center gap-2 py-1 px-1 -mx-1 rounded-gm" data-file-chip="">
       <svg
-        className="w-3 h-3 shrink-0 text-slate-500"
+        className="w-3 h-3 shrink-0 text-g-fg-3"
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
@@ -173,7 +173,7 @@ function FileToolChip({ call, path }: { call: ToolCall; path: string }) {
         <>
           <span className="text-g-fg-4 text-[11px] shrink-0">·</span>
           <span
-            className={`text-[11px] truncate min-w-0 ${isError ? "text-red-600" : "text-g-fg-4"}`}
+            className={`text-[11px] truncate min-w-0 ${isError ? "text-g-red" : "text-g-fg-4"}`}
             title={call.result}
           >
             {summary}
@@ -186,11 +186,11 @@ function FileToolChip({ call, path }: { call: ToolCall; path: string }) {
           aria-label={copied ? "已复制文件路径" : "复制文件路径"}
           title="复制路径"
           onClick={copy}
-          className="p-0.5 rounded text-g-fg-4 hover:text-g-fg-2 hover:bg-g-bg-muted/70 transition-colors"
+          className="p-0.5 rounded-gm text-g-fg-4 hover:text-g-fg-2 hover:bg-g-bg-muted/70 transition-colors"
         >
           {copied ? (
             <svg
-              className="w-3 h-3 text-emerald-500"
+              className="w-3 h-3 text-g-green-vivid"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -229,7 +229,7 @@ function FileAttachmentChip({ att, onUserSide }: { att: AttachmentRef; onUserSid
     typeof att.bytes === "number" && att.bytes > 0 ? formatBytes(att.bytes) : undefined;
   return (
     <span
-      className={`inline-flex max-w-[16rem] items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] ${
+      className={`inline-flex max-w-[16rem] items-center gap-1.5 rounded-gm px-2 py-1 text-[11px] ${
         onUserSide ? "bg-white/15 text-white ring-1 ring-white/30" : "border border-g-border bg-g-bg-muted/60 text-g-fg-2"
       }`}
       title={att.mediaType ? `${att.name} · ${att.mediaType}` : att.name}
@@ -292,7 +292,7 @@ function ToolCallRow({ call }: { call: ToolCall }) {
         onClick={() => hasDetail && setShowDetail(!showDetail)}
         aria-expanded={hasDetail ? showDetail : undefined}
         disabled={!hasDetail}
-        className={`w-full flex items-center gap-2 text-left py-1 px-1 -mx-1 rounded-md transition-colors ${
+        className={`w-full flex items-center gap-2 text-left py-1 px-1 -mx-1 rounded-gm transition-colors ${
           hasDetail ? "hover:bg-g-bg-muted/70" : "cursor-default"
         }`}
       >
@@ -311,14 +311,14 @@ function ToolCallRow({ call }: { call: ToolCall }) {
       {showDetail && hasDetail && (
         <div className="mt-1 ml-3.5 space-y-1.5 border-l border-g-border pl-2.5">
           {call.input && Object.keys(call.input).length > 0 && (
-            <pre className="text-[10px] text-amber-600 whitespace-pre-wrap break-all font-mono leading-relaxed max-h-56 overflow-y-auto select-text">
+            <pre className="text-[10px] text-g-yellow whitespace-pre-wrap break-all font-mono leading-relaxed max-h-56 overflow-y-auto select-text">
               {JSON.stringify(call.input, null, 2)}
             </pre>
           )}
           {resultText && (
             <pre
               className={`text-[10px] whitespace-pre-wrap break-all font-mono leading-relaxed max-h-56 overflow-y-auto select-text ${
-                call.status === "error" ? "text-red-600" : "text-g-fg-3"
+                call.status === "error" ? "text-g-red" : "text-g-fg-3"
               }`}
             >
               {resultText}
@@ -347,12 +347,12 @@ function ContextMarkerRow({ kind, content }: { kind: ContextMarkerKind; content:
     <div className="my-4 hw-msg-in" role="note">
       <div className="flex items-center gap-2">
         <span
-          className="h-px flex-1 bg-gradient-to-r from-transparent to-amber-300"
+          className="h-px flex-1 bg-gradient-to-r from-transparent to-g-yellow-vivid"
           aria-hidden="true"
         />
-        <span className="flex items-center gap-1.5 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-1 shrink-0">
+        <span className="flex items-center gap-1.5 rounded-full border border-g-yellow bg-g-yellow-bg px-2.5 py-1 shrink-0">
           <svg
-            className="w-3 h-3 text-amber-600 shrink-0"
+            className="w-3 h-3 text-g-yellow shrink-0"
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -361,9 +361,9 @@ function ContextMarkerRow({ kind, content }: { kind: ContextMarkerKind; content:
           >
             <path strokeLinecap="round" strokeLinejoin="round" d="M4 8h16M7 12h10M10 16h4" />
           </svg>
-          <span className="text-[10px] font-semibold text-amber-700">{label}</span>
+          <span className="text-[10px] font-semibold text-g-yellow">{label}</span>
         </span>
-        <span className="h-px flex-1 bg-gradient-to-l from-transparent to-amber-300" aria-hidden="true" />
+        <span className="h-px flex-1 bg-gradient-to-l from-transparent to-g-yellow-vivid" aria-hidden="true" />
       </div>
       <p className="mt-1.5 text-center text-[10px] leading-relaxed text-g-fg-4">{content}</p>
     </div>
@@ -392,27 +392,27 @@ function RoundBoundaryRow({ round }: { round?: number }) {
 function SourceBadge({ source }: { source: "agent" | "system" | "watchdog" }) {
   if (source === "watchdog") {
     return (
-      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 border border-orange-200 shrink-0">
+      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-g-yellow-bg text-g-yellow border border-g-yellow shrink-0">
         看门狗
       </span>
     );
   }
   if (source === "agent") {
     return (
-      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-200 shrink-0">
+      <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-g-blue-bg text-g-blue border border-g-blue shrink-0">
         AGENT
       </span>
     );
   }
   return (
-    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 border border-gray-200 shrink-0">
+    <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-g-bg-muted text-g-fg-2 border border-g-border shrink-0">
       系统
     </span>
   );
 }
 
 /** 来源视觉样式：右缘色条 + 琥珀系淡底（输入侧统一色系，靠右微信式）。
- * 三个来源同底色系（bg-amber-50），只以色条+徽章区分来源——
+ * 三个来源同底色系（bg-g-yellow-bg），只以色条+徽章区分来源——
  * "发给 AI 的消息"整体一种背景，与 AI 绿底输出成对照。
  */
 const SOURCE_STYLES: Record<"agent" | "system" | "watchdog", { bar: string }> = {
@@ -444,7 +444,7 @@ function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: str
   return (
     <div className="flex justify-end my-1.5 hw-msg-in">
       <div
-        className={`w-full max-w-[88%] rounded-2xl rounded-tr-md border border-r-4 ${style.bar} bg-amber-50 border-amber-200 overflow-hidden cursor-pointer transition-colors hover:bg-amber-100/70`}
+        className={`w-full max-w-[88%] rounded-gmLg rounded-tr-gm border border-r-4 ${style.bar} bg-g-yellow-bg border-g-yellow overflow-hidden cursor-pointer transition-colors hover:bg-g-yellow-bg/70`}
         role="button"
         tabIndex={0}
         aria-expanded={open}
@@ -485,8 +485,8 @@ function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: str
           </span>
         </div>
         {open && (
-          <div className="px-3.5 pb-2.5 pt-1 border-t border-amber-200/70 select-text">
-            <div className="text-[13px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
+          <div className="px-3.5 pb-2.5 pt-1 border-t border-g-yellow/70 select-text">
+            <div className="text-[12px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
               {msg.content || "（无正文）"}
             </div>
           </div>
@@ -520,7 +520,7 @@ function MessageBubbleInner({
   if (msg.role === "system") {
     return (
       <div className="flex justify-center my-4 hw-msg-in">
-        <div className="rounded-xl px-4 py-2 bg-g-bg-muted/80 border border-g-border text-g-fg-3 text-xs text-center leading-relaxed shadow-gm-sm">
+        <div className="rounded-gmLg px-4 py-2 bg-g-bg-muted/80 border border-g-border text-g-fg-3 text-xs text-center leading-relaxed shadow-gm-sm">
           <p className="whitespace-pre-wrap">{msg.content}</p>
         </div>
       </div>
@@ -573,8 +573,8 @@ function MessageBubbleInner({
       <div
         className={
           isUser
-            ? "max-w-[88%] rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-gm-sm"
-            : "w-full max-w-[88%] rounded-2xl rounded-tl-md border border-g-border bg-white px-3.5 py-2.5 text-[14px] leading-relaxed text-g-fg shadow-gm-sm"
+            ? "max-w-[88%] rounded-gmLg rounded-br-gm px-4 py-2.5 text-[14px] leading-relaxed text-white shadow-gm-sm"
+            : "w-full max-w-[88%] rounded-gmLg rounded-tl-gm border border-g-border bg-white px-3.5 py-2.5 text-[14px] leading-relaxed text-g-fg shadow-gm-sm"
         }
         style={
           isUser
@@ -585,7 +585,7 @@ function MessageBubbleInner({
         {!isUser && (
           <div className="flex items-center gap-1.5 mb-1.5 pb-1.5 border-b border-g-border/70">
             <span
-              className="w-5 h-5 rounded-md flex items-center justify-center text-[9px] font-bold text-white shadow-gm-sm shrink-0"
+              className="w-5 h-5 rounded-gm flex items-center justify-center text-[10px] font-bold text-white shadow-gm-sm shrink-0"
               style={{ background: "linear-gradient(135deg, #10b981 0%, #059669 100%)" }}
             >
               AI
@@ -594,7 +594,7 @@ function MessageBubbleInner({
               {agentName || "回复"}
             </span>
             {isStreaming && !isEmpty && (
-              <span className="text-[10px] text-emerald-600 font-medium shrink-0">· 生成中</span>
+              <span className="text-[10px] text-g-green font-medium shrink-0">· 生成中</span>
             )}
             {genTokens > 0 && (
               <span className="text-[10px] text-g-fg-4 ml-auto shrink-0 font-mono">
@@ -665,10 +665,10 @@ function MessageBubbleInner({
           <div
             data-testid="delivery-badge"
             className={
-              "mt-1.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
+              "mt-1.5 inline-flex items-center gap-1 rounded-gm px-1.5 py-0.5 text-[11px] " +
               (msg.deliveryBadge.state === "complete"
-                ? "bg-emerald-50 text-emerald-700"
-                : "bg-amber-50 text-amber-700")
+                ? "bg-g-green-bg text-g-green"
+                : "bg-g-yellow-bg text-g-yellow")
             }
             title={(msg.deliveryBadge.blockers || []).join("\n")}
           >

@@ -1,3 +1,5 @@
+import EmptyState from "./EmptyState";
+import { Users } from "lucide-react";
 import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
@@ -211,7 +213,7 @@ function measureTree(root: LayoutNode, nodeH: number): { w: number; h: number } 
   return { w: maxX - minX, h: maxY };
 }
 
-// ── Connectors (orthogonal + rounded corners) ──────────────────
+// ── Connectors (orthogonal + rounded-gm corners) ──────────────────
 
 function Connectors({
   parent, children, nodeH, strokeWidth,
@@ -226,7 +228,7 @@ function Connectors({
   const midY = py + (childY - py) * 0.5;
   const r = Math.min(8, (childY - py) * 0.25);
 
-  // Single child — rounded orthogonal connector (matches multi-child style)
+  // Single child — rounded-gm orthogonal connector (matches multi-child style)
   if (children.length === 1) {
     const cx = children[0].x + children[0].w / 2;
     // Directly below — straight vertical line
@@ -261,7 +263,7 @@ function Connectors({
     );
   }
 
-  // Multiple children — trunk + branch with rounded corners
+  // Multiple children — trunk + branch with rounded-gm corners
   const xs = children.map((c) => c.x + c.w / 2);
   const x0 = xs[0];
   const xn = xs[xs.length - 1];
@@ -428,8 +430,8 @@ function TreeNodeCard({
       {/* Row 1: role avatar + name + expand + status dot */}
       <div className={`flex items-center ${compact ? "gap-1 px-1.5 pt-1" : "gap-1.5 px-2 pt-1.5"}`}>
         <span
-          className={`shrink-0 rounded-md flex items-center justify-center font-semibold ${
-            compact ? "w-3.5 h-3.5 text-[8px]" : "w-[18px] h-[18px] text-[10px]"
+          className={`shrink-0 rounded-gm flex items-center justify-center font-semibold ${
+            compact ? "w-3.5 h-3.5 text-[10px]" : "w-[18px] h-[18px] text-[10px]"
           }`}
           style={{ background: `${accentColor}16`, color: accentColor }}
         >
@@ -467,13 +469,13 @@ function TreeNodeCard({
         <span
           className={`rounded-full shrink-0 ${compact ? "w-1.5 h-1.5" : "w-2 h-2"} ${
             node.status === "active"
-              ? isProcessing ? "bg-emerald-500 animate-pulse" : "bg-g-fg-4/70"
+              ? isProcessing ? "bg-g-green-vivid animate-pulse" : "bg-g-fg-4/70"
               : node.status === "idle" || node.status === "inactive" ? "bg-g-fg-4/70"
               : node.status === "promoted" ? "bg-g-blue"
-              : node.status === "receiving" ? "bg-amber-400 animate-pulse"
-              : node.status === "merging" ? "bg-purple-400 animate-pulse"
+              : node.status === "receiving" ? "bg-g-yellow-vivid animate-pulse"
+              : node.status === "merging" ? "bg-g-purple-vivid animate-pulse"
               : node.status === "dissolving" || node.status === "archived" ? "bg-g-red"
-              : "bg-gray-500"
+              : "bg-g-fg-3"
           }`}
         />
       </div>
@@ -482,7 +484,7 @@ function TreeNodeCard({
       <div className={`flex items-center ${compact ? "gap-0.5 px-1.5 pb-1 pt-0.5" : "gap-1 px-2 pb-1.5 pt-1"}`}>
         {positionLabel ? (
           <span
-            className={`font-medium rounded-md truncate ${compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"}`}
+            className={`font-medium rounded-gm truncate ${compact ? "text-[10px] px-1" : "text-[10px] px-1.5 py-px"}`}
             style={{
               background: `${accentColor}14`,
               color: accentColor,
@@ -494,8 +496,8 @@ function TreeNodeCard({
         {live && (
           <span
             title={`${LIVE_PHASE_LABEL[live.phase]}${live.detail ? `：${live.detail}` : ""}${live.since_ms ? ` · ${Math.max(1, Math.floor((Date.now() - live.since_ms) / 1000))}s` : ""}`}
-            className={`shrink-0 font-medium rounded-md leading-none flex items-center gap-0.5 ${
-              compact ? "text-[8px] px-1" : "text-[10px] px-1.5 py-px"
+            className={`shrink-0 font-medium rounded-gm leading-none flex items-center gap-0.5 ${
+              compact ? "text-[10px] px-1" : "text-[10px] px-1.5 py-px"
             } ${LIVE_PHASE_STYLE[live.phase]}`}
           >
             <span className={`rounded-full bg-current ${compact ? "w-1 h-1" : "w-1.5 h-1.5"} ${live.phase === "llm" || live.phase === "subagent" ? "animate-pulse" : ""}`} />
@@ -506,8 +508,8 @@ function TreeNodeCard({
         {alarmLabel && (
           <span
             title={alarmTitle}
-            className={`shrink-0 font-medium bg-g-blue-bg text-g-blue rounded-md leading-none flex items-center gap-0.5 ${
-              compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
+            className={`shrink-0 font-medium bg-g-blue-bg text-g-blue rounded-gm leading-none flex items-center gap-0.5 ${
+              compact ? "text-[10px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
             <svg className={compact ? "w-1.5 h-1.5" : "w-2 h-2"} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
@@ -519,8 +521,8 @@ function TreeNodeCard({
         {pendingCount > 0 && (
           <span
             onClick={(e) => { e.stopPropagation(); onApproval(node.id); }}
-            className={`shrink-0 font-medium bg-g-yellow-bg text-g-yellow rounded-md cursor-pointer hover:bg-g-yellow/20 leading-none ${
-              compact ? "text-[8px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
+            className={`shrink-0 font-medium bg-g-yellow-bg text-g-yellow rounded-gm cursor-pointer hover:bg-g-yellow/20 leading-none ${
+              compact ? "text-[10px] px-0.5 py-px" : "text-[10px] px-1 py-0.5"
             }`}
           >
             {pendingCount}
@@ -545,7 +547,7 @@ function ZoomControls({
     <div
       data-interactive="true"
       onPointerDown={(e) => e.stopPropagation()}
-      className="absolute bottom-3 right-3 flex items-center gap-0.5 glass rounded-lg border border-g-border p-0.5 z-20 shadow-gm-md"
+      className="absolute bottom-3 right-3 flex items-center gap-0.5 glass rounded-gm border border-g-border p-0.5 z-20 shadow-gm-md"
     >
       {[
         { label: "−", onClick: onZoomOut, title: "缩小" },
@@ -563,7 +565,7 @@ function ZoomControls({
             key={i}
             onClick={btn.onClick}
             title={btn.title}
-            className={`rounded-md text-g-fg-3 hover:text-g-fg hover:bg-g-bg-soft transition-colors flex items-center justify-center ${
+            className={`rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-soft transition-colors flex items-center justify-center ${
               "isText" in btn && btn.isText
                 ? "text-[10px] px-1.5 py-1 min-w-[40px] font-mono"
                 : "w-7 h-7 text-sm"
@@ -728,7 +730,9 @@ function OrgTree() {
       } catch { /* ignore */ }
     }
 
-    const jitter = () => 10000 + Math.random() * 2000 - 1000; // 9000–11000ms
+    // P4-1（2026-09-18）：comms 轮询 10s→15s（approvals 搭同一班车且无
+    // WS 事件 ⇒ 不能删只能放缓）；pings/alarms 频率保留（计划判定非冗余）。
+    const jitter = () => 15000 + Math.random() * 2000 - 1000; // 14000–16000ms
 
     // Initial polls staggered by 200ms to avoid thundering-herd
     pollComms();
@@ -1000,9 +1004,11 @@ function OrgTree() {
       onPointerUp={handlePointerUp}
     >
       {roots.length === 0 ? (
-        <div className="flex items-center justify-center h-full text-g-fg-3 text-sm">
-          暂无组织成员
-        </div>
+        <EmptyState
+          icon={<Users />}
+          title="暂无组织成员"
+          description="创建项目并点「上班」启动后，CEO 与团队成员会出现在这里"
+        />
       ) : (
         <>
           <div
@@ -1093,9 +1099,9 @@ function OrgTree() {
       {meetingBadge && (
         <div
           data-testid="org-meeting-badge"
-          className="absolute top-3 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full bg-amber-100 border border-amber-300 text-xs text-amber-800 shadow-gm-sm flex items-center gap-2 pointer-events-none"
+          className="absolute top-3 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-full bg-g-yellow-bg border border-g-yellow text-xs text-g-yellow shadow-gm-sm flex items-center gap-2 pointer-events-none"
         >
-          <span className="w-1.5 h-1.5 rounded-full bg-amber-500 hw-status-live shrink-0" />
+          <span className="w-1.5 h-1.5 rounded-full bg-g-yellow-vivid hw-status-live shrink-0" />
           <span className="font-semibold shrink-0">
             {meetingBadge.status === "assembling" ? "会议集合中" : "开会中"}
           </span>

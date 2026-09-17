@@ -55,11 +55,11 @@ interface PermissionRules {
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; desc: string }> = {
   created: { label: "待激活", color: "text-g-fg-3", desc: "Agent 已创建，尚未开始工作" },
-  active: { label: "工作中", color: "text-emerald-700", desc: "Agent 正在执行任务" },
-  promoted: { label: "已晋升", color: "text-blue-700", desc: "Agent 已晋升为协调者" },
-  receiving: { label: "交接中", color: "text-amber-700", desc: "正在接收工作交接" },
-  merging: { label: "合并中", color: "text-purple-700", desc: "代码正在合并" },
-  dissolving: { label: "解散中", color: "text-red-600", desc: "Agent 正在解散" },
+  active: { label: "工作中", color: "text-g-green", desc: "Agent 正在执行任务" },
+  promoted: { label: "已晋升", color: "text-g-blue", desc: "Agent 已晋升为协调者" },
+  receiving: { label: "交接中", color: "text-g-yellow", desc: "正在接收工作交接" },
+  merging: { label: "合并中", color: "text-g-purple", desc: "代码正在合并" },
+  dissolving: { label: "解散中", color: "text-g-red", desc: "Agent 正在解散" },
   archived: { label: "已归档", color: "text-g-fg-4", desc: "Agent 已归档，不再活跃" },
 };
 
@@ -86,8 +86,8 @@ function isDownloadedSkill(slug: string): boolean {
 }
 
 const SKILL_PILL = "px-2 py-0.5 text-[10px] rounded-gm max-w-full break-all";
-const SKILL_PILL_DISCIPLINE = `${SKILL_PILL} bg-purple-100 text-purple-700`;
-const SKILL_PILL_DOWNLOADED = `${SKILL_PILL} bg-teal-100 text-teal-800`;
+const SKILL_PILL_DISCIPLINE = `${SKILL_PILL} bg-g-purple-bg text-g-purple`;
+const SKILL_PILL_DOWNLOADED = `${SKILL_PILL} bg-g-green-bg text-g-green`;
 
 export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   const [agent, setAgent] = useState<AgentDetail | null>(null);
@@ -263,7 +263,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
 
   if (error && !agent) {
     return (
-      <div className="h-full flex items-center justify-center text-red-600 text-sm p-4 text-center">
+      <div className="h-full flex items-center justify-center text-g-red text-sm p-4 text-center">
         {error}
       </div>
     );
@@ -285,7 +285,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
   // Override status display for "active" agents based on runtime processing state
   const runtimeStatus = agent.status === "active"
     ? isProcessing
-      ? { label: "工作中", color: "text-emerald-700", desc: "Agent 正在执行任务" }
+      ? { label: "工作中", color: "text-g-green", desc: "Agent 正在执行任务" }
       : { label: "空闲", color: "text-g-fg-3", desc: "Agent 已激活，等待任务" }
     : statusConfig;
   const roleLabel = ROLE_LABELS[agent.role] || agent.role;
@@ -296,9 +296,9 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
       <div className="max-w-2xl mx-auto p-6 space-y-6">
         {/* Error banner */}
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-2 rounded-gm shadow-gm-sm text-sm">
+          <div className="bg-g-red-bg border border-g-red text-g-red px-4 py-2 rounded-gm shadow-gm-sm text-sm">
             {error}
-            <button onClick={() => setError("")} className="ml-2 text-red-600 hover:text-red-700">×</button>
+            <button onClick={() => setError("")} className="ml-2 text-g-red hover:text-g-red">×</button>
           </div>
         )}
 
@@ -326,13 +326,13 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
               <span
                 className={`w-2.5 h-2.5 rounded-full ${
                   agent.status === "active"
-                    ? isProcessing ? "bg-emerald-400 animate-pulse" : "bg-gray-500"
-                    : agent.status === "idle" || agent.status === "inactive" ? "bg-gray-500"
-                    : agent.status === "promoted" ? "bg-blue-400"
-                    : agent.status === "receiving" ? "bg-amber-400 animate-pulse"
-                    : agent.status === "merging" ? "bg-purple-400 animate-pulse"
-                    : agent.status === "dissolving" || agent.status === "archived" ? "bg-red-600"
-                    : "bg-gray-400"
+                    ? isProcessing ? "bg-g-green-vivid animate-pulse" : "bg-g-fg-3"
+                    : agent.status === "idle" || agent.status === "inactive" ? "bg-g-fg-3"
+                    : agent.status === "promoted" ? "bg-g-blue-vivid"
+                    : agent.status === "receiving" ? "bg-g-yellow-vivid animate-pulse"
+                    : agent.status === "merging" ? "bg-g-purple-vivid animate-pulse"
+                    : agent.status === "dissolving" || agent.status === "archived" ? "bg-g-red"
+                    : "bg-g-fg-4"
                 }`}
               />
               <span className={`text-sm font-medium ${runtimeStatus.color}`}>{runtimeStatus.label}</span>
@@ -358,7 +358,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     value={goalDraft}
                     onChange={(e) => setGoalDraft(e.target.value)}
                     rows={3}
-                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-lg text-g-fg focus:outline-none focus:border-g-blue resize-none"
+                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-gm text-g-fg focus:border-g-blue resize-none"
                     autoFocus
                   />
                   <div className="flex gap-2 justify-end">
@@ -371,7 +371,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     <button
                       onClick={() => { saveField("goal", goalDraft); setEditingGoal(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:brightness-110 active:scale-[0.97] transition-all disabled:opacity-50"
                     >
                       保存
                     </button>
@@ -401,7 +401,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     value={backstoryDraft}
                     onChange={(e) => setBackstoryDraft(e.target.value)}
                     rows={3}
-                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-lg text-g-fg focus:outline-none focus:border-g-blue resize-none"
+                    className="w-full px-3 py-2 text-sm bg-g-bg border border-g-blue/40 rounded-gm text-g-fg focus:border-g-blue resize-none"
                     autoFocus
                   />
                   <div className="flex gap-2 justify-end">
@@ -414,7 +414,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                     <button
                       onClick={() => { saveField("backstory", backstoryDraft); setEditingBackstory(false); }}
                       disabled={saving}
-                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
+                      className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:brightness-110 active:scale-[0.97] transition-all disabled:opacity-50"
                     >
                       保存
                     </button>
@@ -443,7 +443,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   value={agent.modelId || ""}
                   onChange={(e) => changeModel(e.target.value)}
                   disabled={saving}
-                  className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-lg text-g-fg focus:outline-none focus:border-g-blue disabled:opacity-50"
+                  className="w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:border-g-blue disabled:opacity-50"
                 >
                   <option value="">
                     {resolvedModel?.modelName
@@ -474,8 +474,8 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
               {/* Live model indicator — updates on turn start.
                   自动故障切换已移除（对标 DSH），source 恒为 tier_resolved。 */}
               {agentActiveModel[agentId] && (
-                <div className="mt-2 px-2.5 py-1.5 rounded-md text-[11px] flex items-center gap-1.5 bg-g-blue/5 text-g-fg-3 border border-g-border/50">
-                  <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-green-500" />
+                <div className="mt-2 px-2.5 py-1.5 rounded-gm text-[11px] flex items-center gap-1.5 bg-g-blue/5 text-g-fg-3 border border-g-border/50">
+                  <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-g-green-vivid" />
                   <span>当前使用: <b>{agentActiveModel[agentId].modelName}</b></span>
                 </div>
               )}
@@ -524,7 +524,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                           onClick={() => setPendingUnbind(s)}
                           disabled={mcpBusy}
                           title={`解绑 ${s}`}
-                          className="text-g-blue/60 hover:text-red-600 transition-colors disabled:opacity-50"
+                          className="text-g-blue/60 hover:text-g-red transition-colors disabled:opacity-50"
                         >
                           ×
                         </button>
@@ -538,7 +538,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   value=""
                   onChange={(e) => { if (e.target.value) handleBindMcp(e.target.value); }}
                   disabled={mcpBusy}
-                  className="mt-1.5 w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-lg text-g-fg focus:outline-none focus:border-g-blue disabled:opacity-50"
+                  className="mt-1.5 w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:border-g-blue disabled:opacity-50"
                 >
                   <option value="">
                     + 绑定{availableMcpServers.length === 0 ? "（暂无已配置的服务器）" : " MCP 服务器"}
@@ -556,11 +556,11 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                   {agent.boundSkills.length > 0 && (
                     <span className="flex items-center gap-2 text-[10px] text-g-fg-4">
                       <span className="inline-flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-purple-500" />
+                        <span className="w-1.5 h-1.5 rounded-full bg-g-purple-vivid" />
                         纪律
                       </span>
                       <span className="inline-flex items-center gap-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-teal-500" />
+                        <span className="w-1.5 h-1.5 rounded-full bg-g-green-vivid" />
                         下载
                       </span>
                     </span>

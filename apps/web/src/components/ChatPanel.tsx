@@ -250,7 +250,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         <ChatMotionStyles />
         <div className="text-center hw-msg-in">
           <div
-            className="w-16 h-16 mx-auto mb-4 rounded-2xl flex items-center justify-center shadow-gm-sm border border-g-blue/15"
+            className="w-16 h-16 mx-auto mb-4 rounded-gmLg flex items-center justify-center shadow-gm-sm border border-g-blue/15"
             style={{ background: "linear-gradient(135deg, #eceefb 0%, #e0e3f8 100%)" }}
           >
             <svg className="w-8 h-8 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -285,9 +285,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       ? statusLabels[disposition]
       : agentInfo?.status === "active"
         ? isAgentProcessing
-          ? { text: "实现中", color: "text-emerald-600" }
+          ? { text: "实现中", color: "text-g-green" }
           : liveLabelText
-            ? { text: liveLabelText, color: "text-emerald-600" }
+            ? { text: liveLabelText, color: "text-g-green" }
             : { text: "空闲", color: "text-g-fg-3" }
         : statusInfo;
 
@@ -301,19 +301,19 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
   };
 
   const roleDots: Record<string, string> = {
-    ceo: "bg-amber-400",
-    hr: "bg-rose-400",
-    architect: "bg-purple-400",
-    manager: "bg-blue-400",
-    pm: "bg-blue-400",
-    developer: "bg-green-400",
-    module_dev: "bg-green-400",
-    test_engineer: "bg-yellow-400",
-    code_reviewer: "bg-indigo-400",
-    security_auditor: "bg-red-400",
-    web_perf_auditor: "bg-cyan-400",
-    qa: "bg-yellow-400",
-    devops: "bg-cyan-400",
+    ceo: "bg-g-yellow-vivid",
+    hr: "bg-g-red-vivid",
+    architect: "bg-g-purple-vivid",
+    manager: "bg-g-blue-vivid",
+    pm: "bg-g-blue-vivid",
+    developer: "bg-g-green-vivid",
+    module_dev: "bg-g-green-vivid",
+    test_engineer: "bg-g-yellow-vivid",
+    code_reviewer: "bg-g-blue-vivid",
+    security_auditor: "bg-g-red-vivid",
+    web_perf_auditor: "bg-g-blue-vivid",
+    qa: "bg-g-yellow-vivid",
+    devops: "bg-g-blue-vivid",
   };
 
   const {
@@ -391,7 +391,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       {showMeetingBar && activeMeeting && (
         <div
           data-testid="meeting-status-bar"
-          className="px-4 py-1.5 border-b border-g-border bg-amber-50 text-xs text-amber-800 flex items-center gap-2 shrink-0"
+          className="px-4 py-1.5 border-b border-g-border bg-g-yellow-bg text-xs text-g-yellow flex items-center gap-2 shrink-0"
         >
           <span className="font-semibold shrink-0">开会中</span>
           {activeMeeting.title ? (
@@ -408,13 +408,13 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         <div className="px-4 py-3 border-b border-g-border shrink-0 bg-white">
           <div className="flex items-center gap-3">
             <div
-              className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-sm font-bold text-white shadow-gm-sm ${
+              className={`w-9 h-9 rounded-gm flex items-center justify-center shrink-0 text-sm font-bold text-white shadow-gm-sm ${
                 agentInfo.role === "ceo"
-                  ? "bg-amber-500"
+                  ? "bg-g-yellow-vivid"
                   : agentInfo.role === "hr"
-                    ? "bg-rose-500"
+                    ? "bg-g-red-vivid"
                     : agentInfo.role === "architect"
-                      ? "bg-purple-500"
+                      ? "bg-g-purple-vivid"
                       : agentInfo.role === "manager" || agentInfo.role === "pm"
                         ? "bg-g-blue"
                         : agentInfo.role === "developer" || agentInfo.role === "module_dev"
@@ -430,18 +430,18 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                 <span
                   className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                     isAgentProcessing
-                      ? "bg-emerald-500 hw-status-live"
+                      ? "bg-g-green-vivid hw-status-live"
                       : agentInfo.status === "idle" || agentInfo.status === "inactive"
-                        ? "bg-gray-400"
+                        ? "bg-g-fg-4"
                         : agentInfo.status === "promoted"
-                          ? "bg-blue-400"
+                          ? "bg-g-blue-vivid"
                           : agentInfo.status === "receiving"
-                            ? "bg-amber-400 animate-pulse"
+                            ? "bg-g-yellow-vivid animate-pulse"
                             : agentInfo.status === "merging"
-                              ? "bg-purple-400 animate-pulse"
+                              ? "bg-g-purple-vivid animate-pulse"
                               : agentInfo.status === "dissolving" || agentInfo.status === "archived"
-                                ? "bg-red-500"
-                                : "bg-gray-400"
+                                ? "bg-g-red-vivid"
+                                : "bg-g-fg-4"
                   }`}
                 />
                 <span className={`text-[11px] shrink-0 ${runtimeStatusInfo.color}`}>
@@ -494,10 +494,10 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         ))}
         {pendingApprovalTool && isStreaming && (
           <div className="flex justify-start hw-msg-in">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-yellow-bg border border-g-yellow/70 shadow-gm-sm">
+            <div className="max-w-[80%] rounded-gmLg px-4 py-3 bg-g-yellow-bg border border-g-yellow/70 shadow-gm-sm">
               <div className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0" />
-                <span className="text-sm text-amber-700">
+                <span className="w-2 h-2 rounded-full bg-g-yellow-vivid animate-pulse shrink-0" />
+                <span className="text-sm text-g-yellow">
                   等待审批: {pendingApprovalTool.replace(/^hiveweave__/, "").replace(/_/g, " ")}
                 </span>
               </div>
@@ -506,9 +506,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
         )}
         {retryInfo && isStreaming && (
           <div className="flex justify-start hw-msg-in">
-            <div className="max-w-[80%] rounded-2xl px-4 py-3 bg-g-bg-muted border border-g-border shadow-gm-sm">
+            <div className="max-w-[80%] rounded-gmLg px-4 py-3 bg-g-bg-muted border border-g-border shadow-gm-sm">
               <div className="flex items-center gap-2">
-                <svg className="w-4 h-4 text-orange-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                <svg className="w-4 h-4 text-g-yellow-vivid animate-spin" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path
                     className="opacity-75"
@@ -516,10 +516,10 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                <span className="text-sm text-orange-600">
+                <span className="text-sm text-g-yellow">
                   重试中... {retryInfo.attempt}/{retryInfo.maxRetries}
                 </span>
-                <span className="text-xs text-orange-500/70">{retryInfo.reason}</span>
+                <span className="text-xs text-g-yellow-vivid/70">{retryInfo.reason}</span>
               </div>
             </div>
           </div>
@@ -614,7 +614,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                   const info = fromName;
                   const roleStyle = getRoleStyle(info.role || "");
                   const positionLabel = getPositionLabel(info.position, info.role);
-                  const dotColor = roleDots[info.role || ""] || "bg-gray-400";
+                  const dotColor = roleDots[info.role || ""] || "bg-g-fg-4";
                   const directionTag = isIncoming ? "收到" : "发送";
                   const preview = (msg.content || "").trim() || "（无正文）";
                   const isExpanded = expandedMessageId === msg.id;
@@ -630,7 +630,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                       <div className="flex items-center gap-2 mb-0.5 min-w-0">
                         <span
                           className={
-                            "text-xs font-medium px-1.5 py-0.5 rounded shrink-0 " +
+                            "text-xs font-medium px-1.5 py-0.5 rounded-gm shrink-0 " +
                             (isIncoming ? "bg-g-green-bg text-g-green" : "bg-g-blue-bg text-g-blue")
                           }
                         >
@@ -672,12 +672,12 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
               <div key={i} className="relative group hw-msg-in">
                 <img
                   src={url}
-                  className="h-16 w-16 object-cover rounded-lg border border-g-border shadow-gm-sm"
+                  className="h-16 w-16 object-cover rounded-gm border border-g-border shadow-gm-sm"
                   alt=""
                 />
                 <button
                   onClick={() => removeImage(i)}
-                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-gm-sm hover:scale-110"
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-g-red-vivid text-white rounded-full text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-gm-sm hover:scale-110"
                 >
                   ×
                 </button>
@@ -686,8 +686,8 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           </div>
         )}
         {queuedCount > 0 && (
-          <p className="flex items-center gap-1.5 w-fit text-xs text-amber-700 bg-g-yellow-bg border border-g-yellow/50 rounded-full px-3 py-1 mb-2">
-            <svg className="w-3 h-3 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <p className="flex items-center gap-1.5 w-fit text-xs text-g-yellow bg-g-yellow-bg border border-g-yellow/50 rounded-full px-3 py-1 mb-2">
+            <svg className="w-3 h-3 text-g-yellow-vivid" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l2 2m6-2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
             已排队 {queuedCount} 条消息，将在当前回复完成后自动发送
@@ -749,7 +749,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           <button
             onClick={handleSend}
             disabled={!input.trim() && images.length === 0}
-            className="px-5 py-2.5 bg-g-blue hover:bg-indigo-700 text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
+            className="px-5 py-2.5 bg-g-blue hover:bg-g-blue text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
             发送
           </button>

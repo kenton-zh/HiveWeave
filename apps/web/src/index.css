@@ -64,11 +64,28 @@
     text-shadow: none;
   }
 
-  /* Unified keyboard focus ring */
+  /* Unified keyboard focus ring.
+     P1-2（2026-09-18）：去掉 border-radius:4px —— 它覆盖元素自身圆角，
+     在 rounded-gmLg 卡片上画出 4px 方环；彩色实心底上的环改反色（见下）。 */
   :focus-visible {
     outline: 2px solid rgba(79, 70, 229, 0.5);
     outline-offset: 2px;
-    border-radius: 4px;
+  }
+
+  /* 彩色实心底上的焦点环反色（indigo 环在 indigo 底上不可见） */
+  .bg-g-blue:focus-visible,
+  .bg-g-red:focus-visible,
+  .bg-g-green:focus-visible,
+  .bg-g-purple:focus-visible {
+    outline-color: rgba(255, 255, 255, 0.85);
+  }
+
+  /* P1-1：可点击性手型（Tailwind preflight 中 button 不继承 cursor）。
+     ⚠ 这是兜底统一，不替代逐个审查 —— onClick 用于容器级事件代理的
+     元素不该因此被当成"可点"的视觉承诺。 */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
   }
 
   /* Respect reduced-motion preferences */
@@ -134,11 +151,20 @@
 
   /* Segmented tab control — container + item + active item */
   .hw-segment {
-    @apply flex gap-0.5 bg-g-bg-muted/70 rounded-lg p-0.5 border border-g-border/60;
+    @apply flex gap-0.5 bg-g-bg-muted/70 rounded-gm p-0.5 border border-g-border/60;
   }
   .hw-segment-item {
-    @apply px-3 py-1 text-xs rounded-md text-g-fg-3 transition-all duration-150
+    @apply px-3 py-1 text-xs rounded-gm text-g-fg-3 transition-all duration-150
            hover:text-g-fg active:scale-[0.97] select-none;
+  }
+  /* hover 背景排除活动页签（审计 L-6：@apply 内 hover 会以 (0,2,0) 压过
+     .hw-segment-item-active 的 (0,1,0)，hover 活动页签白底闪成 white/60） */
+  .hw-segment-item:not(.hw-segment-item-active):hover {
+    @apply bg-white/60;
+  }
+  /* P1-3：补缺失的第四态（App.tsx segment 按钮此前无 disabled 反馈） */
+  .hw-segment-item:disabled {
+    @apply opacity-40 cursor-not-allowed;
   }
   .hw-segment-item-active {
     @apply bg-white text-g-fg font-medium shadow-gm-sm border border-g-border/70;

@@ -30,8 +30,8 @@ describe("SettingsPanel 无人值守分区", () => {
     const rows = await screen.findAllByLabelText(/无人值守 /);
     expect(rows.length).toBe(2);
     // p1 已开（settings 里有 unattended_mode:p1=true）→ aria-pressed 语义用类名判断：
-    // 开=bg-emerald-500，关=bg-g-border
-    expect(rows[0].className).toContain("bg-emerald-500");
+    // 开=bg-g-green-vivid，关=bg-g-border
+    expect(rows[0].className).toContain("bg-g-green-vivid");
     expect(rows[1].className).toContain("bg-g-border");
   });
 
@@ -65,7 +65,7 @@ describe("SettingsPanel 无人值守分区", () => {
     const rows = await screen.findAllByLabelText(/无人值守 /);
     fireEvent.click(rows[0]);
     await waitFor(() =>
-      expect(rows[0].className).toContain("bg-emerald-500"),
+      expect(rows[0].className).toContain("bg-g-green-vivid"),
     );
     expect(screen.getByText(/保存失败/)).toBeTruthy();
   });

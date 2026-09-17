@@ -313,7 +313,7 @@ describe("MessageBubble 文件卡片（P1-②：文件类工具 chip 替换 JSON
     fireEvent.click(screen.getByRole("button", { name: "已复制文件路径" }));
   });
 
-  it("失败工具：摘要取 error 首行并标红（text-red-600）", () => {
+  it("失败工具：摘要取 error 首行并标红（text-g-red）", () => {
     const { container } = render(
       <MessageBubble
         msg={mkMsg([
@@ -332,7 +332,7 @@ describe("MessageBubble 文件卡片（P1-②：文件类工具 chip 替换 JSON
     const chip = container.querySelector("[data-file-chip]")!;
     expect(chip.textContent).toContain("FileNotFoundError: nope.txt");
     expect(chip.textContent).toContain("nope.txt");
-    expect(chip.querySelector(".text-red-600")).not.toBeNull();
+    expect(chip.querySelector(".text-g-red")).not.toBeNull();
   });
 
   it("非文件工具保持现状：仍有 JSON <pre> 展开，无文件 chip", () => {

@@ -224,6 +224,19 @@ interface ChatMessage {
 // WS task_event 合并计时器（模块级，避免进 state 引起渲染抖动）
 let _taskEventCoalesceTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** P4-2(b)：逐字段浅比较两条 live 相位（扁平 REST 行），同值 ⇒ 复用旧引用。 */
+function _liveEntryEqual(a: AgentLiveStatus, b: AgentLiveStatus): boolean {
+  const ka = Object.keys(a as unknown as Record<string, unknown>);
+  const kb = Object.keys(b as unknown as Record<string, unknown>);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) {
+    if ((a as unknown as Record<string, unknown>)[k] !== (b as unknown as Record<string, unknown>)[k]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   selectedAgentId: null,
   setSelectedAgent: (id) => set({ selectedAgentId: id }),
@@ -397,9 +410,32 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { agentActiveModel: next };
     }),
-  // Per-agent 实时活动相位（useLiveStatusPoll 每 4s 整表刷新）
+  // Per-agent 实时活动相位（useLiveStatusPoll 事件驱动刷新）
   liveMap: {},
-  setLiveMap: (map) => set({ liveMap: map }),
+  setLiveMap: (map) =>
+    set((st) => {
+      // P4-2(b)（2026-09-18）：**结构复用** —— 单个 agent 相位没变就保留旧
+      // 引用，整表没变就保留旧 liveMap 本身。此前每次轮询整表替换引用 ⇒
+      // 订阅 liveMap 的 OrgTree（1120 行）被无差别全量重渲染。
+      const prev = st.liveMap;
+      const prevKeys = Object.keys(prev);
+      const nextKeys = Object.keys(map);
+      if (prevKeys.length !== nextKeys.length) return { liveMap: map };
+      let identical = true;
+      const next: Record<string, AgentLiveStatus> = {};
+      for (const k of nextKeys) {
+        const old = prev[k];
+        const incoming = map[k];
+        if (old && _liveEntryEqual(old, incoming)) {
+          next[k] = old;
+        } else {
+          identical = false;
+          next[k] = incoming;
+        }
+      }
+      if (identical) return { liveMap: prev };
+      return { liveMap: next };
+    }),
   // Pending initial message
   pendingInitialMessage: null,
   setPendingInitialMessage: (msg) => set({ pendingInitialMessage: msg }),

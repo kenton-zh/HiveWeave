@@ -19,9 +19,9 @@ function fmtTokens(n?: number | null): string {
 function Badge({ text, tone }: { text: string; tone: "gray" | "purple" | "blue" | "amber" | "green" }) {
   const tones: Record<string, string> = {
     gray: "bg-g-bg-muted text-g-fg-3",
-    purple: "bg-purple-50 text-purple-600",
+    purple: "bg-g-purple-bg text-g-purple",
     blue: "bg-g-blue-bg/60 text-g-blue",
-    amber: "bg-amber-50 text-amber-600",
+    amber: "bg-g-yellow-bg text-g-yellow",
     green: "bg-g-green-bg/60 text-g-green",
   };
   return (

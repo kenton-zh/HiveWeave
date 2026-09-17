@@ -39,7 +39,7 @@ export default function TimelineTooltip({
     >
       <p className="text-xs font-medium text-g-fg leading-4">{seg.title}</p>
       <div className="mt-1 flex items-center gap-1.5">
-        <span className={`px-1.5 py-px rounded text-[10px] ${st.chipBg} ${st.chipText}`}>
+        <span className={`px-1.5 py-px rounded-gm text-[10px] ${st.chipBg} ${st.chipText}`}>
           {st.label}
         </span>
         <span className="text-[10px] text-g-fg-4 font-mono">

@@ -12,12 +12,12 @@ interface Props {
 }
 
 const SELECT_BASE =
-  "w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg focus:outline-none transition-shadow";
+  "w-full px-3 py-2 text-sm bg-g-bg border border-g-border rounded-gm text-g-fg transition-shadow";
 
 const SLOT_SELECT_CLS: Record<string, string> = {
   management: `${SELECT_BASE} focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15`,
   executor: `${SELECT_BASE} focus:border-g-green/50 focus:ring-2 focus:ring-g-green/15`,
-  vision: `${SELECT_BASE} focus:border-amber-500/50 focus:ring-2 focus:ring-amber-500/15`,
+  vision: `${SELECT_BASE} focus:border-g-yellow-vivid/50 focus:ring-2 focus:ring-g-yellow-vivid/15`,
 };
 
 function TierCard({
@@ -111,7 +111,7 @@ export default function TierSlotSection({ models, tierConfig, onChange, onSaved 
           {saving ? "保存中..." : "保存配置"}
         </button>
       </div>
-      <p className="text-[13px] text-g-fg-3 mb-4 leading-relaxed">
+      <p className="text-[12px] text-g-fg-3 mb-4 leading-relaxed">
         管理层与执行层各自指定主用与备用。主用故障（429 / 5xx）时切备用。截图会注入主对话，多模态模型自己读图；「帮你看图片」是可选辅助（空则用管理层主用）。生图用下方独立面板。
       </p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -140,8 +140,8 @@ export default function TierSlotSection({ models, tierConfig, onChange, onSaved 
         <TierCard
           title="多模态模型配置"
           subtitle="可选 · 帮你看图片"
-          dotCls="bg-amber-500"
-          cardCls="border-amber-500/25 bg-g-yellow-bg/40"
+          dotCls="bg-g-yellow-vivid"
+          cardCls="border-g-yellow-vivid/25 bg-g-yellow-bg/40"
           selectCls={SLOT_SELECT_CLS.vision}
           models={models}
           primary={tierConfig.visionPrimary}

@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { getQuestions, answerQuestion, type PendingQuestion } from "../api";
 import { useAppStore } from "../store";
+import { getJoinedLobbyChannel } from "../api/ws";
 
 export default function QuestionDialog() {
   const [questions, setQuestions] = useState<PendingQuestion[]>([]);
@@ -32,18 +33,47 @@ export default function QuestionDialog() {
   }, [questionVersion, selectedProjectId]);
 
   // Poll for pending questions
-  // BUG-005 修复：2s → 5s，减少 polling 频率（30→12 req/min）
+  // BUG-005 修复：2s → 5s；P4-1（2026-09-18）：WS `question_asked` 事件
+  // 即时刷新（该事件此前在 ws.ts 有 handler 但 onQuestionAsked 无人消费 ——
+  // 所以不能只删轮询！），轮询降为 15s 兜底（防 WS 断线漏弹，12→4 req/min）。
+  const fetchRef = useRef(async () => {});
+  fetchRef.current = async () => {
+    try {
+      // 只查 pending 状态的问题，避免已答/超时问题反复弹出
+      const qs = await getQuestions({ projectId: selectedProjectId || undefined, status: "pending" });
+      // Filter out locally dismissed questions; always sync (clear when server has none)
+      const visible = qs.filter((q) => !dismissedRef.current.has(q.id));
+      setQuestions(visible);
+    } catch (e) { console.warn("QuestionDialog poll failed:", e); }
+  };
   useEffect(() => {
-    const timer = setInterval(async () => {
-      try {
-        // 只查 pending 状态的问题，避免已答/超时问题反复弹出
-        const qs = await getQuestions({ projectId: selectedProjectId || undefined, status: "pending" });
-        // Filter out locally dismissed questions; always sync (clear when server has none)
-        const visible = qs.filter((q) => !dismissedRef.current.has(q.id));
-        setQuestions(visible);
-      } catch (e) { console.warn("QuestionDialog poll failed:", e); }
-    }, 5000);
-    return () => clearInterval(timer);
+    void fetchRef.current();
+    const timer = setInterval(() => void fetchRef.current(), 15000);
+    // P4 审计 H-1/H-2：必须绑**已 join** 的 lobby channel 单例（自己
+    // channel() 会 new 出未 join 实例，事件被 joinRef 过滤丢弃）；phoenix
+    // on() 返回数字 ref，off(event, ref) 按 ref 解绑。单例未就绪时有限次
+    // 重试。依赖 selectedProjectId：切项目立即拉取（审计 L-7）。
+    let off: (() => void) | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+    const bind = () => {
+      const lobby = getJoinedLobbyChannel();
+      if (!lobby) {
+        if (++attempts <= 20) retryTimer = setTimeout(bind, 500);
+        return;
+      }
+      const refAsked = lobby.on("question_asked", () => void fetchRef.current()) as unknown as number;
+      off = () =>
+        (lobby.off as unknown as (event: string, ref: number) => void)(
+          "question_asked", refAsked
+        );
+    };
+    bind();
+    return () => {
+      clearInterval(timer);
+      if (retryTimer) clearTimeout(retryTimer);
+      off?.();
+    };
   }, [selectedProjectId]);
 
   const [submitting, setSubmitting] = useState(false);
@@ -88,7 +118,7 @@ export default function QuestionDialog() {
           <button
             onClick={() => handleDismiss(q.id, q.agentId)}
             disabled={submitting}
-            className="text-g-fg-4 hover:text-g-fg transition-colors p-1 rounded hover:bg-g-bg-soft disabled:opacity-50"
+            className="text-g-fg-4 hover:text-g-fg transition-colors p-1 rounded-gm hover:bg-g-bg-soft disabled:opacity-50"
             title="暂时忽略"
           >
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -138,7 +168,7 @@ export default function QuestionDialog() {
               if (customAnswers[q.id]?.trim()) handleAnswer(q.id, customAnswers[q.id].trim(), q.agentId);
             }}
             disabled={!customAnswers[q.id]?.trim() || submitting}
-            className="px-4 py-2 rounded-gm bg-g-blue text-white text-sm font-medium shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+            className="px-4 py-2 rounded-gm bg-g-blue text-white text-sm font-medium shadow-gm-sm hover:brightness-110 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
             发送
           </button>

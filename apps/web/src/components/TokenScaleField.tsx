@@ -91,9 +91,9 @@ export default function TokenScaleField({
           onKeyDown={(e) => {
             if (e.key === "Enter") (e.target as HTMLInputElement).blur();
           }}
-          className="flex-1 min-w-0 px-3 py-2 text-sm font-mono bg-g-bg border border-g-border rounded-gm text-g-fg focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15"
+          className="flex-1 min-w-0 px-3 py-2 text-sm font-mono bg-g-bg border border-g-border rounded text-g-fg focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15"
         />
-        <div className="inline-flex shrink-0 rounded-gm border border-g-border overflow-hidden">
+        <div className="inline-flex shrink-0 rounded border border-g-border overflow-hidden">
           {(["K", "M"] as const).map((u) => (
             <button
               key={u}

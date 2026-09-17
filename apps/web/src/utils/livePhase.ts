@@ -16,9 +16,9 @@ export const LIVE_PHASE_LABEL: Record<AgentLivePhase, string> = {
 
 export const LIVE_PHASE_STYLE: Record<AgentLivePhase, string> = {
   tool: "bg-g-yellow-bg text-g-yellow",
-  llm: "bg-emerald-500/15 text-emerald-700",
-  subagent: "bg-purple-100 text-purple-700",
-  working: "bg-gray-100 text-gray-600",
+  llm: "bg-g-green-vivid/15 text-g-green",
+  subagent: "bg-g-purple-bg text-g-purple",
+  working: "bg-g-bg-muted text-g-fg-2",
   waiting: "bg-g-blue-bg text-g-blue",
   idle: "bg-g-fg-4/10 text-g-fg-4",
 };

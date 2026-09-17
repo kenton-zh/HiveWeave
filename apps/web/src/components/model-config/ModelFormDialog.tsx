@@ -465,7 +465,7 @@ export default function ModelFormDialog({ mode, onBack, onSaved, onClose }: Prop
                 <>✗ {testResult.error}</>
               )}
               {(testResult.contextWindowWarning || testResult.maxOutputWarning || testResult.thinkingWarning) && (
-                <div className="mt-1.5 text-amber-600">
+                <div className="mt-1.5 text-g-yellow">
                   {[testResult.contextWindowWarning, testResult.maxOutputWarning, testResult.thinkingWarning]
                     .filter(Boolean)
                     .join("；")}
@@ -481,11 +481,11 @@ export default function ModelFormDialog({ mode, onBack, onSaved, onClose }: Prop
             <button
               onClick={handleDetect}
               disabled={detecting}
-              className="px-3 py-1.5 text-xs font-medium border border-purple-500/40 text-purple-600 rounded-gm hover:bg-purple-500/10 active:scale-[0.97] transition-all disabled:opacity-50 flex items-center gap-1.5"
+              className="px-3 py-1.5 text-xs font-medium border border-g-purple-vivid/40 text-g-purple rounded-gm hover:bg-g-purple-vivid/10 active:scale-[0.97] transition-all disabled:opacity-50 flex items-center gap-1.5"
             >
               {detecting ? (
                 <>
-                  <span className="w-3 h-3 border-2 border-purple-500/40 border-t-purple-600 rounded-full animate-spin" />
+                  <span className="w-3 h-3 border-2 border-g-purple-vivid/40 border-t-purple-600 rounded-full animate-spin" />
                   侦测中...
                 </>
               ) : (

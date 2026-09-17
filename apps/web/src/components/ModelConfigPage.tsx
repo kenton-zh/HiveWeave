@@ -114,7 +114,7 @@ export default function ModelConfigPage({ onClose }: Props) {
         <div className="flex items-center justify-between px-7 py-5 border-b border-g-border shrink-0">
           <div>
             <h2 className="text-xl font-semibold text-g-fg tracking-tight">模型配置</h2>
-            <p className="text-[13px] text-g-fg-3 mt-1">
+            <p className="text-[12px] text-g-fg-3 mt-1">
               知名服务商只填 API Key 即可接入；其他兼容网关走「自定义模型」。层级槽位与生图配置在下方。
             </p>
           </div>

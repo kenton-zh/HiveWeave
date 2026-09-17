@@ -83,7 +83,7 @@ function Skeleton() {
       {[0, 1, 2, 3, 4].map((i) => (
         <div key={i} className="flex gap-2">
           <div
-            className="h-3 w-14 rounded animate-shimmer"
+            className="h-3 w-14 rounded-gm animate-shimmer"
             style={{
               backgroundImage:
                 "linear-gradient(90deg, #eff1f4 25%, #e3e6eb 50%, #eff1f4 75%)",
@@ -91,7 +91,7 @@ function Skeleton() {
             }}
           />
           <div
-            className="h-3 flex-1 rounded animate-shimmer"
+            className="h-3 flex-1 rounded-gm animate-shimmer"
             style={{
               backgroundImage:
                 "linear-gradient(90deg, #eff1f4 25%, #e3e6eb 50%, #eff1f4 75%)",
@@ -201,11 +201,11 @@ function MetaCard({
           <span>结束 {formatDateTime(t.closed_at)}</span>
         )}
         {!!t.is_archived && (
-          <span className="px-1.5 py-0.5 rounded bg-g-bg-muted text-g-fg-3">已归档</span>
+          <span className="px-1.5 py-0.5 rounded-gm bg-g-bg-muted text-g-fg-3">已归档</span>
         )}
       </div>
       {t.blocked_reason && (
-        <p className="mt-1 text-[11px] text-orange-600">阻塞原因：{t.blocked_reason}</p>
+        <p className="mt-1 text-[11px] text-g-yellow">阻塞原因：{t.blocked_reason}</p>
       )}
     </div>
   );
@@ -252,7 +252,7 @@ function EventRow({
       {(chip || who) && (
         <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
           {chip && (
-            <span className={`px-1.5 py-px rounded text-[10px] font-medium ${chip.cls}`}>
+            <span className={`px-1.5 py-px rounded-gm text-[10px] font-medium ${chip.cls}`}>
               {chip.label}
             </span>
           )}
@@ -383,7 +383,7 @@ export default function TaskTimelinePanel() {
         <>
           <MetaCard data={data} anchor={anchor} />
           {data.truncated && (
-            <div className="px-4 py-1.5 text-[11px] text-amber-700 bg-g-yellow-bg border-b border-g-border">
+            <div className="px-4 py-1.5 text-[11px] text-g-yellow bg-g-yellow-bg border-b border-g-border">
               事件超出预算，仅保留最新部分 —— 窗口最早的事件可能缺失
             </div>
           )}

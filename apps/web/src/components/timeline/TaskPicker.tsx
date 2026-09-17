@@ -105,7 +105,7 @@ export default function TaskPicker() {
             if (e.key === "Escape") setOpen(false);
           }}
           placeholder="搜索任务，或粘贴 task_id 直达（含已归档）"
-          className="w-full pl-8 pr-8 py-1.5 text-xs rounded-gm border border-g-border bg-g-bg text-g-fg placeholder:text-g-fg-4 focus:outline-none focus:border-g-border-focus transition-colors"
+          className="w-full pl-8 pr-8 py-1.5 text-xs rounded-gm border border-g-border bg-g-bg text-g-fg placeholder:text-g-fg-4 focus:border-g-border-focus transition-colors"
         />
         {q && (
           <button

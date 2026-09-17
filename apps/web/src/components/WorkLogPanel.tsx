@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import EmptyState from "./EmptyState";
+import { FileText } from "lucide-react";
 import { getWorkLogs } from "../api";
 import { useAppStore } from "../store";
 import type { ActivityEntry } from "../store";
@@ -16,12 +18,12 @@ interface WorkLog {
 }
 
 const typeColors: Record<string, { bg: string; text: string }> = {
-  task: { bg: "bg-blue-100", text: "text-blue-600" },
-  decision: { bg: "bg-purple-100", text: "text-purple-600" },
-  error: { bg: "bg-red-100", text: "text-red-600" },
-  completion: { bg: "bg-green-100", text: "text-green-600" },
-  discussion: { bg: "bg-sky-100", text: "text-sky-600" },
-  delegation: { bg: "bg-amber-100", text: "text-amber-600" },
+  task: { bg: "bg-g-blue-bg", text: "text-g-blue" },
+  decision: { bg: "bg-g-purple-bg", text: "text-g-purple" },
+  error: { bg: "bg-g-red-bg", text: "text-g-red" },
+  completion: { bg: "bg-g-green-bg", text: "text-g-green" },
+  discussion: { bg: "bg-g-blue-bg", text: "text-g-blue" },
+  delegation: { bg: "bg-g-yellow-bg", text: "text-g-yellow" },
 };
 
 /** Friendly Chinese labels for log types */
@@ -127,12 +129,12 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
   const inputPreview = input.length > 80 ? input.slice(0, 80) + "…" : input;
 
   return (
-    <div className="ml-3 border-l border-amber-500/20 pl-2">
+    <div className="ml-3 border-l border-g-yellow-vivid/20 pl-2">
       <div
-        className="flex items-center gap-1.5 cursor-pointer hover:bg-amber-500/5 rounded px-1 -mx-1 transition-colors"
+        className="flex items-center gap-1.5 cursor-pointer hover:bg-g-yellow-vivid/5 rounded-gm px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 shrink-0">工具</span>
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow shrink-0">工具</span>
         <span className="text-[11px] text-g-fg font-mono truncate">{entry.toolName}</span>
         {inputPreview && <span className="text-[10px] text-g-fg-4 truncate flex-1">{inputPreview}</span>}
         <span className="text-[10px] text-g-fg-4/70">{expanded ? "▲" : "▼"}</span>
@@ -140,13 +142,13 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
       {expanded && (
         <div className="mt-1 space-y-1">
           {input && (
-            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-              <span className="text-amber-400/60">input: </span>{input}
+            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded-gm px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+              <span className="text-g-yellow-vivid/60">input: </span>{input}
             </div>
           )}
           {result && (
-            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-              <span className="text-green-400/60">result: </span>{result}
+            <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded-gm px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+              <span className="text-g-green-vivid/60">result: </span>{result}
             </div>
           )}
         </div>
@@ -181,7 +183,7 @@ function ConversationCard({ conv }: { conv: Conversation }) {
       >
         {/* Agent name + status dot */}
         <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
-          <span className={`w-1.5 h-1.5 rounded-full ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
+          <span className={`w-1.5 h-1.5 rounded-full ${conv.isLive ? "bg-g-green-vivid animate-pulse" : hasError ? "bg-g-red-vivid" : "bg-g-fg-3"}`} />
           <span className="text-[11px] font-medium text-g-fg whitespace-nowrap">{conv.agentName}</span>
         </div>
 
@@ -194,10 +196,10 @@ function ConversationCard({ conv }: { conv: Conversation }) {
 
         {/* Badges */}
         <div className="flex items-center gap-1 shrink-0 mt-0.5">
-          {hasThinking && <span className="text-[9px] px-1 py-0.5 rounded bg-purple-500/10 text-purple-600">思考</span>}
-          {toolCount > 0 && <span className="text-[9px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-600">{toolCount}工具</span>}
-          {hasText && <span className="text-[9px] px-1 py-0.5 rounded bg-blue-500/10 text-blue-600">输出</span>}
-          {durationStr && <span className="text-[9px] text-g-fg-4/70">{durationStr}</span>}
+          {hasThinking && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-purple-vivid/10 text-g-purple">思考</span>}
+          {toolCount > 0 && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow">{toolCount}工具</span>}
+          {hasText && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-blue-vivid/10 text-g-blue">输出</span>}
+          {durationStr && <span className="text-[10px] text-g-fg-4/70">{durationStr}</span>}
         </div>
 
         <span className="text-[10px] text-g-fg-4/70 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
@@ -221,9 +223,9 @@ function ConversationCard({ conv }: { conv: Conversation }) {
 
           {/* Text output block */}
           {mergedText && (
-            <div className="ml-3 border-l border-blue-500/20 pl-2">
+            <div className="ml-3 border-l border-g-blue-vivid/20 pl-2">
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 shrink-0">输出</span>
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-gm bg-g-blue-vivid/10 text-g-blue shrink-0">输出</span>
               </div>
               <div className="mt-1 text-[11px] text-g-fg leading-relaxed whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                 {mergedText}
@@ -233,11 +235,11 @@ function ConversationCard({ conv }: { conv: Conversation }) {
 
           {/* Error */}
           {conv.events.filter((e) => e.type === "error").map((e, i) => (
-            <div key={`err-${i}`} className="ml-3 border-l border-red-500/20 pl-2">
+            <div key={`err-${i}`} className="ml-3 border-l border-g-red-vivid/20 pl-2">
               <div className="flex items-center gap-1.5">
-                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-500/10 text-red-600 shrink-0">错误</span>
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-gm bg-g-red-vivid/10 text-g-red shrink-0">错误</span>
               </div>
-              <div className="mt-1 text-[11px] text-red-600 leading-relaxed">
+              <div className="mt-1 text-[11px] text-g-red leading-relaxed">
                 {e.errorMessage}
               </div>
             </div>
@@ -246,8 +248,8 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {/* Done marker */}
           {!conv.isLive && !hasError && (
             <div className="flex items-center gap-1.5 ml-3">
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600">完成</span>
-              <span className="text-[9px] text-g-fg-4/70">{formatTime(conv.endTime)}</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded-gm bg-g-green-vivid/10 text-g-green">完成</span>
+              <span className="text-[10px] text-g-fg-4/70">{formatTime(conv.endTime)}</span>
             </div>
           )}
         </div>
@@ -260,12 +262,12 @@ function ThinkingBlock({ content }: { content: string }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="ml-3 border-l border-purple-500/20 pl-2">
+    <div className="ml-3 border-l border-g-purple-vivid/20 pl-2">
       <div
-        className="flex items-center gap-1.5 cursor-pointer hover:bg-purple-500/5 rounded px-1 -mx-1 transition-colors"
+        className="flex items-center gap-1.5 cursor-pointer hover:bg-g-purple-vivid/5 rounded-gm px-1 -mx-1 transition-colors"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-600 shrink-0">思考</span>
+        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-gm bg-g-purple-vivid/10 text-g-purple shrink-0">思考</span>
         {!expanded && (
           <span className="text-[11px] text-g-fg-3 truncate flex-1">
             {content.slice(0, 120)}{content.length > 120 ? "…" : ""}
@@ -274,7 +276,7 @@ function ThinkingBlock({ content }: { content: string }) {
         <span className="text-[10px] text-g-fg-4/70 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
-        <div className="mt-1 text-[11px] text-g-fg-3 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-g-bg-soft rounded px-2 py-1.5">
+        <div className="mt-1 text-[11px] text-g-fg-3 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-g-bg-soft rounded-gm px-2 py-1.5">
           {content}
         </div>
       )}
@@ -309,7 +311,7 @@ function WorkLogEntry({ log }: { log: WorkLog }) {
         {canExpand && (
           <button
             onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
-            className="ml-auto text-xs text-g-fg-4 hover:text-g-fg transition-colors px-2 py-0.5 rounded hover:bg-g-bg-soft"
+            className="ml-auto text-xs text-g-fg-4 hover:text-g-fg transition-colors px-2 py-0.5 rounded-gm hover:bg-g-bg-soft"
           >
             {expanded ? "收起 ▲" : "详情 ▼"}
           </button>
@@ -321,12 +323,12 @@ function WorkLogEntry({ log }: { log: WorkLog }) {
       {expanded && (
         <div className="mt-2 space-y-2">
           {hasMoreSummary && (
-            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded-gm px-3 py-2 whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
               {log.summary}
             </div>
           )}
           {prettyDetails && (
-            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded px-3 py-2 font-mono whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
+            <div className="text-xs text-g-fg-3 bg-g-bg-soft rounded-gm px-3 py-2 font-mono whitespace-pre-wrap break-all max-h-56 overflow-y-auto">
               {prettyDetails}
             </div>
           )}
@@ -388,13 +390,13 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
         <div className="flex items-center gap-2">
           <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
           {liveCount > 0 && (
-            <span className="flex items-center gap-1.5 text-xs text-emerald-600 px-1.5 py-0.5 bg-emerald-50 border border-emerald-100 rounded-gm">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="flex items-center gap-1.5 text-xs text-g-green px-1.5 py-0.5 bg-g-green-bg border border-g-green rounded-gm">
+              <span className="w-2 h-2 rounded-full bg-g-green-vivid animate-pulse" />
               {liveCount} 运行中
             </span>
           )}
         </div>
-        <button onClick={clearActivity} className="text-xs px-2 py-0.5 rounded-gm text-g-fg-4 hover:text-red-600 hover:bg-red-50 transition-colors">清空</button>
+        <button onClick={clearActivity} className="text-xs px-2 py-0.5 rounded-gm text-g-fg-4 hover:text-g-red hover:bg-g-red-bg transition-colors">清空</button>
       </div>
 
       {/* Agent rows — click to expand */}
@@ -429,13 +431,13 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
         className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-g-bg-soft/70 transition-colors rounded-t-gmLg"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className={`w-2 h-2 rounded-full shrink-0 ${conv.isLive ? "bg-emerald-400 animate-pulse" : hasError ? "bg-red-400" : "bg-gray-500"}`} />
+        <span className={`w-2 h-2 rounded-full shrink-0 ${conv.isLive ? "bg-g-green-vivid animate-pulse" : hasError ? "bg-g-red-vivid" : "bg-g-fg-3"}`} />
         <span className="text-sm font-medium text-g-fg truncate">{conv.agentName}</span>
         {conv.isLive && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 shrink-0">运行中</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded-gm bg-g-green-vivid/15 text-g-green shrink-0">运行中</span>
         )}
         {toolCount > 0 && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 shrink-0">{toolCount} 工具</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow shrink-0">{toolCount} 工具</span>
         )}
         {olderCount > 0 && (
           <span className="text-[10px] text-g-fg-4/70 shrink-0">+{olderCount}</span>
@@ -453,12 +455,12 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
         <div className="px-3 pb-3 pl-7 space-y-1.5">
           {mergedThinking && (
             <details className="group">
-              <summary className="text-[11px] text-purple-600 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[9px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
+              <summary className="text-[11px] text-g-purple cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[10px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
                 <span>思考</span>
-                <span className="text-[9px] text-g-fg-4/70">{mergedThinking.length} 字符</span>
+                <span className="text-[10px] text-g-fg-4/70">{mergedThinking.length} 字符</span>
               </summary>
-              <div className="mt-1 text-[11px] text-g-fg-3 bg-g-bg-soft/90 rounded px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
+              <div className="mt-1 text-[11px] text-g-fg-3 bg-g-bg-soft/90 rounded-gm px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
                 {mergedThinking}
               </div>
             </details>
@@ -470,12 +472,12 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
 
           {mergedText && (
             <details className="group" open={conv.isLive}>
-              <summary className="text-[11px] text-blue-600 cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[9px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
+              <summary className="text-[11px] text-g-blue cursor-pointer list-none flex items-center gap-1.5 select-none">
+                <span className="text-[10px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
                 <span>输出</span>
-                <span className="text-[9px] text-g-fg-4/70">{mergedText.length} 字符</span>
+                <span className="text-[10px] text-g-fg-4/70">{mergedText.length} 字符</span>
               </summary>
-              <div className="mt-1 text-[12px] text-g-fg bg-g-bg-soft/90 rounded px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
+              <div className="mt-1 text-[12px] text-g-fg bg-g-bg-soft/90 rounded-gm px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
                 {mergedText}
               </div>
             </details>
@@ -483,15 +485,15 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
 
           {conv.events.filter((e) => e.type === "error").map((e, i) => (
             <div key={`err-${i}`}>
-              <span className="text-[11px] text-red-600 mb-1 block">错误</span>
-              <div className="text-[11px] text-red-600 bg-red-500/10 rounded px-2.5 py-1.5">
+              <span className="text-[11px] text-g-red mb-1 block">错误</span>
+              <div className="text-[11px] text-g-red bg-g-red-vivid/10 rounded-gm px-2.5 py-1.5">
                 {e.errorMessage}
               </div>
             </div>
           ))}
 
           {!conv.isLive && !hasError && (
-            <div className="text-[10px] text-emerald-400 pt-0.5">完成 · {formatTime(conv.endTime)}</div>
+            <div className="text-[10px] text-g-green-vivid pt-0.5">完成 · {formatTime(conv.endTime)}</div>
           )}
         </div>
       )}
@@ -597,17 +599,17 @@ function WorkLogPanel({ agentId }: { agentId: string | null }) {
           {loading ? (
             <div className="px-6 py-4 flex justify-center">
               <div className="flex gap-1">
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                <span className="w-2 h-2 bg-g-fg-4 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 bg-g-fg-4 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 bg-g-fg-4 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
               </div>
             </div>
           ) : logs.length === 0 ? (
-            <div className="px-6 py-8 flex flex-col items-center justify-center gap-1.5 text-center">
-              <span className="text-2xl">📝</span>
-              <p className="text-sm text-g-fg-4">暂无工作日志</p>
-              <p className="text-[11px] text-g-fg-4/70">Agent 完成任务后会在这里留下记录</p>
-            </div>
+            <EmptyState
+              icon={<FileText />}
+              title="暂无工作日志"
+              description="Agent 完成任务后会在这里留下记录；可切到 Chat 面板查看实时输出"
+            />
           ) : (
             <div className="divide-y divide-g-border/50">
               {logs.map((log) => (

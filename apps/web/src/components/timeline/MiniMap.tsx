@@ -63,7 +63,7 @@ export default function MiniMap({
     <div className="h-10 shrink-0 border-t border-g-border bg-g-bg px-3 py-1.5">
       <div
         ref={trackRef}
-        className="relative h-full rounded bg-g-bg-muted overflow-hidden cursor-pointer"
+        className="relative h-full rounded-gm bg-g-bg-muted overflow-hidden cursor-pointer"
         onPointerDown={(e) => {
           if (!(e.target as HTMLElement).closest("[data-vpframe]")) {
             jumpToClientX(e.clientX, false);

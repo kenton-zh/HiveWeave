@@ -187,7 +187,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             开启后，该项目 agent 的需审批命令不再等待人工（0 等待拒绝并指路替代方案）。测试项目建议开启。
           </p>
           {unattendedUnknown && (
-            <div className="bg-amber-50 border border-amber-200 text-amber-700 px-3 py-1.5 rounded-gm text-xs mb-2">
+            <div className="bg-g-yellow-bg border border-g-yellow text-g-yellow px-3 py-1.5 rounded-gm text-xs mb-2">
               设置读取失败——下方开关状态未知，请刷新后操作。
             </div>
           )}
@@ -209,7 +209,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
                     onClick={() => toggleUnattended(pr.id)}
                     disabled={!!unattendedSaving[pr.id]}
                     className={`relative w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
-                      unattended[pr.id] ? "bg-emerald-500" : "bg-g-border"
+                      unattended[pr.id] ? "bg-g-green-vivid" : "bg-g-border"
                     }`}
                     aria-label={`无人值守 ${pr.name}`}
                   >
@@ -232,9 +232,9 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
         </p>
 
         {error && (
-          <div className="bg-red-50 border border-red-200 text-red-700 px-3 py-1.5 rounded-gm text-xs mb-3">
+          <div className="bg-g-red-bg border border-g-red text-g-red px-3 py-1.5 rounded-gm text-xs mb-3">
             {error}
-            <button onClick={() => setError("")} className="ml-2 text-red-600 hover:text-red-700">×</button>
+            <button onClick={() => setError("")} className="ml-2 text-g-red hover:text-g-red">×</button>
           </div>
         )}
 
@@ -250,20 +250,20 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
                 key={s.id || s.name}
                 className="flex items-center gap-2 px-3 py-2 rounded-gm border border-g-border/60 bg-g-bg-soft"
               >
-                <span className={`w-2 h-2 rounded-full shrink-0 ${s.enabled ? "bg-emerald-400" : "bg-gray-400"}`} />
+                <span className={`w-2 h-2 rounded-full shrink-0 ${s.enabled ? "bg-g-green-vivid" : "bg-g-fg-4"}`} />
                 <div className="min-w-0 flex-1">
                   <div className="text-xs font-medium text-g-fg truncate">{s.name}</div>
                   <div className="text-[10px] text-g-fg-4 truncate">
                     {s.transport} · {s.url || s.command || "（未配置端点）"}
                   </div>
                 </div>
-                <span className={`px-1.5 py-0.5 text-[10px] rounded-gm shrink-0 ${s.enabled ? "bg-emerald-100 text-emerald-700" : "bg-gray-100 text-gray-500"}`}>
+                <span className={`px-1.5 py-0.5 text-[10px] rounded-gm shrink-0 ${s.enabled ? "bg-g-green-bg text-g-green" : "bg-g-bg-muted text-g-fg-3"}`}>
                   {s.enabled ? "启用" : "禁用"}
                 </span>
                 <button
                   onClick={() => setPendingDelete(s.name)}
                   title={`删除 ${s.name}`}
-                  className="text-g-fg-4 hover:text-red-600 transition-colors shrink-0 px-1"
+                  className="text-g-fg-4 hover:text-g-red transition-colors shrink-0 px-1"
                 >
                   ×
                 </button>
@@ -280,12 +280,12 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="名称"
-              className="flex-1 min-w-0 px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:outline-none focus:border-g-blue transition-shadow"
+              className="flex-1 min-w-0 px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue transition-shadow"
             />
             <select
               value={transport}
               onChange={(e) => setTransport(e.target.value as "http" | "stdio")}
-              className="w-24 px-2 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg focus:outline-none focus:border-g-blue"
+              className="w-24 px-2 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg focus:border-g-blue"
             >
               <option value="http">http</option>
               <option value="stdio">stdio</option>
@@ -295,7 +295,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             value={endpoint}
             onChange={(e) => setEndpoint(e.target.value)}
             placeholder={transport === "http" ? "URL（如 http://localhost:8080/mcp）" : "可执行文件（如 npx 或 python）——参数填下方，勿拼整条命令"}
-            className="w-full px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:outline-none focus:border-g-blue transition-shadow"
+            className="w-full px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue transition-shadow"
           />
           {transport === "stdio" && (
             <textarea
@@ -303,7 +303,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
               onChange={(e) => setArgsText(e.target.value)}
               rows={2}
               placeholder={"启动参数，每行一个（如：\n-y\n@some/mcp-server）"}
-              className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:outline-none focus:border-g-blue resize-none transition-shadow"
+              className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue resize-none transition-shadow"
             />
           )}
           <textarea
@@ -311,7 +311,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             onChange={(e) => setEnvJson(e.target.value)}
             rows={2}
             placeholder='env JSON（如 {"API_KEY": "sk-..."}）'
-            className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:outline-none focus:border-g-blue resize-none transition-shadow"
+            className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue resize-none transition-shadow"
           />
           <div className="flex justify-end gap-2">
             <button onClick={onClose} className="px-3 py-1.5 text-xs text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all">
@@ -320,7 +320,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             <button
               onClick={handleAdd}
               disabled={saving}
-              className="px-3 py-1.5 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
+              className="px-3 py-1.5 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-g-blue active:scale-[0.97] transition-all disabled:opacity-50"
             >
               {saving ? "保存中..." : "添加"}
             </button>

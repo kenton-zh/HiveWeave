@@ -96,7 +96,7 @@ export function ImageLightbox({
       <img
         src={image.src}
         alt={image.name ?? ""}
-        className="max-h-[85vh] max-w-[90vw] rounded-lg shadow-2xl select-none"
+        className="max-h-[85vh] max-w-[90vw] rounded-gm shadow-gm-pop select-none"
         onClick={(e) => e.stopPropagation()}
       />
       {/* 左右切换（单图时隐藏） */}

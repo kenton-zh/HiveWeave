@@ -51,8 +51,8 @@ export default function ConfirmDialog({
         {/* Header */}
         <div className="flex items-center gap-3 mb-4">
           {danger && (
-            <div className="w-8 h-8 rounded-full bg-red-50 ring-1 ring-red-100 flex items-center justify-center shrink-0">
-              <svg className="w-5 h-5 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <div className="w-8 h-8 rounded-full bg-g-red-bg ring-1 ring-g-red flex items-center justify-center shrink-0">
+              <svg className="w-5 h-5 text-g-red" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
               </svg>
@@ -74,8 +74,8 @@ export default function ConfirmDialog({
             onClick={onConfirm}
             className={`px-4 py-2 text-sm text-white rounded-gm shadow-gm-sm active:scale-[0.97] transition-all ${
               danger
-                ? "bg-red-600 hover:bg-red-500"
-                : "bg-g-blue text-white hover:bg-blue-600"
+                ? "bg-g-red hover:bg-g-red-vivid"
+                : "bg-g-blue text-white hover:bg-g-blue"
             }`}
           >
             {confirmLabel}

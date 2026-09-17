@@ -47,13 +47,13 @@ export default function ApiKeyDialog({ onClose }: { onClose: () => void }) {
           autoFocus
         />
         <div className="flex justify-end gap-2">
-          <button onClick={handleClear} className="px-3 py-1.5 text-xs text-g-fg-3 hover:text-red-600 rounded-gm hover:bg-red-50 active:scale-[0.97] transition-all">
+          <button onClick={handleClear} className="px-3 py-1.5 text-xs text-g-fg-3 hover:text-g-red rounded-gm hover:bg-g-red-bg active:scale-[0.97] transition-all">
             清除
           </button>
           <button onClick={onClose} className="px-3 py-1.5 text-xs text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all">
             取消
           </button>
-          <button onClick={handleSave} className="px-3 py-1.5 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all">
+          <button onClick={handleSave} className="px-3 py-1.5 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-g-blue active:scale-[0.97] transition-all">
             保存
           </button>
         </div>

@@ -1,4 +1,6 @@
+import { SkeletonList, OfficeSkeleton } from "./components/Skeleton";
 import { useState, useRef, useEffect, Suspense } from "react";
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import OrgTree from "./components/OrgTree";
 import ChatPanel from "./components/ChatPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
@@ -51,6 +53,17 @@ function App() {
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
+  // P3-3 窄屏降级（<1280px）：三栏折回两栏 + tab（Chat 回到右栏）。
+  // EXE 出厂窗 1600×1000 走三栏；1024×700 min_size 触发降级。
+  const [narrowViewport, setNarrowViewport] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 1279px)").matches
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 1279px)");
+    const onChange = () => setNarrowViewport(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
 
   const setProcessingAgents = useAppStore((s) => s.setProcessingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
@@ -468,15 +481,54 @@ function App() {
 
   const leftPanel = resolveLeftPanel(activeView, selectedProjectId);
 
+  // P3：右栏详情面板块（窄屏与宽屏共用同一份 JSX —— 两份清单各列一份 =
+  // 必然漂移）。key=tab：错误不跨 tab sticky（boundary 随 tab 重挂载清 state）。
+  const detailPanels = (
+    <ErrorBoundary key={rightPanelTab} label="右栏面板">
+      <Suspense fallback={<SkeletonList rows={5} />}>
+        {rightPanelTab === "goals" && selectedProjectId && (
+          <div key="panel-goals" className="hw-tab-in h-full">
+            <GoalsPanel projectId={selectedProjectId} />
+          </div>
+        )}
+        {rightPanelTab === "goals" && !selectedProjectId && (
+          <div key="panel-goals-empty" className="hw-tab-in h-full flex items-center justify-center text-g-fg-3 text-sm">
+            请先选择一个项目
+          </div>
+        )}
+        {rightPanelTab === "agent" && selectedAgentId && (
+          <div key="panel-agent" className="hw-tab-in h-full">
+            <AgentDetailPanel agentId={selectedAgentId} />
+          </div>
+        )}
+        {rightPanelTab === "monitor" && selectedAgentId && (
+          <div key="panel-monitor" className="hw-tab-in h-full">
+            <MonitorPanel agentId={selectedAgentId} />
+          </div>
+        )}
+        {rightPanelTab === "debug" && (
+          <div key="panel-debug" className="hw-tab-in h-full">
+            <DebugPanel />
+          </div>
+        )}
+        {rightPanelTab === "logs" && selectedAgentId && (
+          <div key="panel-logs" className="hw-tab-in h-full">
+            <WorkLogPanel agentId={selectedAgentId} />
+          </div>
+        )}
+      </Suspense>
+    </ErrorBoundary>
+  );
+
   return (
     <div className="h-screen flex flex-col bg-g-bg-soft">
       {/* Top Bar */}
       <header className="h-14 border-b border-g-border flex items-center px-5 bg-white shrink-0 relative z-30">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-g-blue to-violet-600 flex items-center justify-center shrink-0 shadow-gm-sm transition-transform duration-200 hover:scale-105">
+          <div className="w-8 h-8 rounded-gm bg-gradient-to-br from-g-blue to-g-purple flex items-center justify-center shrink-0 shadow-gm-sm transition-transform duration-200 hover:scale-105">
             <span className="text-white font-bold text-sm">H</span>
           </div>
-          <h1 className="text-[15px] font-semibold text-g-fg tracking-tight shrink-0 select-none">
+          <h1 className="text-[14px] font-semibold text-g-fg tracking-tight shrink-0 select-none">
             HiveWeave
           </h1>
           <ProjectTimeBadge projectId={selectedProjectId} />
@@ -486,7 +538,7 @@ function App() {
         <div className="ml-6 relative" ref={projectMenuRef}>
           <button
             onClick={() => setShowProjectMenu(!showProjectMenu)}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-[13px] text-g-fg shadow-gm-sm hover:shadow-gm active:scale-[0.98] ${
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-[12px] text-g-fg shadow-gm-sm hover:shadow-gm active:scale-[0.98] ${
               showProjectMenu ? "border-g-blue/50 ring-2 ring-g-blue/15" : "border-g-border hover:border-g-border-strong"
             }`}
           >
@@ -526,7 +578,7 @@ function App() {
                       type="button"
                       disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
                       onClick={(e) => { e.stopPropagation(); handleDeleteProject(p.id); }}
-                      className="ml-2 text-g-fg-4 hover:text-red-600 hover:bg-red-50 rounded-full p-1 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                      className="ml-2 text-g-fg-4 hover:text-g-red hover:bg-g-red-bg rounded-full p-1 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
                       title={deletingProjectId === p.id ? "删除中..." : "删除项目"}
                     >
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -577,7 +629,7 @@ function App() {
                   showToast("Failed to trigger backend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-md p-1.5 transition-all active:scale-90"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-gm p-1.5 transition-all active:scale-90"
               title="Restart Backend"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -594,7 +646,7 @@ function App() {
                   showToast("Failed to trigger frontend restart", "error");
                 }
               }}
-              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-md p-1.5 transition-all active:scale-90"
+              className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-gm p-1.5 transition-all active:scale-90"
               title="Restart Frontend"
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -605,7 +657,7 @@ function App() {
           {/* Model Config page (模型清单 + 层级配置) — 带文字的醒目入口 */}
           <button
             onClick={() => setShowModelConfig(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-[13px] font-medium text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
             title="模型配置"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -658,10 +710,18 @@ function App() {
         </div>
       </header>
 
-      {/* Main Content — floating panels on a gray workbench */}
-      <div className="flex flex-1 overflow-hidden gap-3 p-3">
+      {/* Main Content — floating panels on a gray workbench.
+          P3：宽屏 = 三栏（Org/Office ｜ Chat 独立中栏 ｜ 详情），可拖拽分栏
+          （autoSaveId 持久化栏宽到 localStorage）；窄屏(<1280px) = 两栏 +
+          tab（Chat 回右栏，与旧行为一致）。 */}
+      <PanelGroup
+        direction="horizontal"
+        autoSaveId="hw-main-columns"
+        className="flex-1 overflow-hidden"
+      >
         {/* Left Panel - Org Tree / Office */}
-        <div className="flex-1 flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden">
+        <Panel id="left" defaultSize={narrowViewport ? 60 : 38} minSize={22} className="min-w-0 pt-3 pl-3 pb-3">
+        <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
           <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-3">
             {/* View tabs */}
             <div className="hw-segment">
@@ -707,9 +767,9 @@ function App() {
               >
                 <span className="relative flex w-2 h-2">
                   {currentProject?.isStarted && (
-                    <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 animate-ping-ring" />
+                    <span className="absolute inline-flex h-full w-full rounded-full bg-g-green-vivid animate-ping-ring" />
                   )}
-                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-emerald-500" : "bg-g-fg-4"}`} />
+                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-g-green-vivid" : "bg-g-fg-4"}`} />
                 </span>
                 <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
               </button>
@@ -721,7 +781,7 @@ function App() {
                 <OrgTree />
               ) : leftPanel === "timeline" ? (
                 <ErrorBoundary label="Timeline">
-                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <Suspense fallback={<SkeletonList rows={6} />}>
                     <TimelineView />
                   </Suspense>
                 </ErrorBoundary>
@@ -733,7 +793,7 @@ function App() {
                 </div>
               ) : (
                 <ErrorBoundary label="Office">
-                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                  <Suspense fallback={<OfficeSkeleton />}>
                     <OfficeView />
                   </Suspense>
                 </ErrorBoundary>
@@ -741,9 +801,38 @@ function App() {
             </div>
           </div>
         </div>
+        </Panel>
 
-        {/* Right Panel - Chat / Agent / Logs */}
-        <div className="w-2/5 flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden">
+        {!narrowViewport && (
+          <>
+            <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
+            {/* 中栏：Chat 独立常驻（P3-1/P3-4）—— 与右侧详情同屏 */}
+            <Panel id="chat-middle" defaultSize={31} minSize={24} className="min-w-0 py-3">
+              <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
+                {selectedAgentId ? (
+                  <ChatPanel key="panel-chat-middle" agentId={selectedAgentId} hidden={false} />
+                ) : (
+                  <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
+                    从左侧 Org Tree 选择一个 Agent 开始对话
+                  </div>
+                )}
+              </div>
+            </Panel>
+            <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
+          </>
+        )}
+        {narrowViewport && (
+          <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
+        )}
+
+        {/* Right Panel - 详情面板（宽屏）/ Chat+详情（窄屏） */}
+        <Panel
+          id="details"
+          defaultSize={narrowViewport ? 40 : 31}
+          minSize={22}
+          className="min-w-0 pt-3 pr-3 pb-3"
+        >
+        <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
           {/* Tab bar */}
           <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-1">
             <div className="hw-segment mr-2">
@@ -753,7 +842,7 @@ function App() {
             >
               Goals
             </button>
-            {selectedAgentId && (
+            {narrowViewport && selectedAgentId && (
               <>
                 <button
                   onClick={() => setRightPanelTab("chat")}
@@ -804,7 +893,7 @@ function App() {
           <div className="flex-1 overflow-hidden">
             {rightPanelTab === "task" && selectedTaskId ? (
               <ErrorBoundary label="任务">
-                <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
+                <Suspense fallback={<SkeletonList rows={6} />}>
                   <div key="panel-task" className="hw-tab-in h-full">
                     <TaskTimelinePanel />
                   </div>
@@ -822,49 +911,27 @@ function App() {
                   <p className="text-g-fg-4 text-xs mt-1.5">选择后即可查看对话、目标与日志</p>
                 </div>
               </div>
-            ) : (
+            ) : narrowViewport ? (
               <>
                 <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                {/* key=tab：错误不跨 tab sticky（boundary 随 tab 重挂载清 error state） */}
-                <ErrorBoundary key={rightPanelTab} label="右栏面板">
-                  <Suspense fallback={<div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-pulse-soft">Loading...</div>}>
-                  {rightPanelTab === "goals" && selectedProjectId && (
-                    <div key="panel-goals" className="hw-tab-in h-full">
-                      <GoalsPanel projectId={selectedProjectId} />
-                    </div>
-                  )}
-                  {rightPanelTab === "goals" && !selectedProjectId && (
-                    <div key="panel-goals-empty" className="hw-tab-in h-full flex items-center justify-center text-g-fg-3 text-sm">
-                      请先选择一个项目
-                    </div>
-                  )}
-                  {rightPanelTab === "agent" && (
-                    <div key="panel-agent" className="hw-tab-in h-full">
-                      <AgentDetailPanel agentId={selectedAgentId} />
-                    </div>
-                  )}
-                  {rightPanelTab === "monitor" && (
-                    <div key="panel-monitor" className="hw-tab-in h-full">
-                      <MonitorPanel agentId={selectedAgentId} />
-                    </div>
-                  )}
-                  {rightPanelTab === "debug" && (
-                    <div key="panel-debug" className="hw-tab-in h-full">
-                      <DebugPanel />
-                    </div>
-                  )}
-                  {rightPanelTab === "logs" && (
-                    <div key="panel-logs" className="hw-tab-in h-full">
-                      <WorkLogPanel agentId={selectedAgentId} />
-                    </div>
-                  )}
-                  </Suspense>
-                </ErrorBoundary>
+                {detailPanels}
               </>
+            ) : rightPanelTab === "chat" ? (
+              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in text-center px-6">
+                <div>
+                  <p className="font-medium">Chat 在中间栏</p>
+                  <p className="text-g-fg-4 text-xs mt-1.5">
+                    这里放 Goals / Agent / 日志 / 监控等详情面板，可与对话同屏
+                  </p>
+                </div>
+              </div>
+            ) : (
+              detailPanels
             )}
           </div>
         </div>
-      </div>
+        </Panel>
+      </PanelGroup>
 
       {/* Lazy-loaded dialogs — wrapped in Suspense, fallback=null since they're overlays */}
       <ErrorBoundary label="对话框" fallback={null}>
@@ -907,7 +974,7 @@ function App() {
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 animate-fade-in" onClick={() => setShowProjectSettings(false)}>
             <div className="w-full max-w-md bg-white rounded-gmLg border border-g-border shadow-gm-pop p-5 animate-scale-in" onClick={(e) => e.stopPropagation()}>
               <div className="flex items-center justify-between mb-3">
-                <h3 className="text-[15px] font-semibold text-g-fg">项目设置 — {currentProject?.name}</h3>
+                <h3 className="text-[14px] font-semibold text-g-fg">项目设置 — {currentProject?.name}</h3>
                 <button type="button" onClick={() => setShowProjectSettings(false)} className="text-g-fg-4 hover:text-g-fg rounded-full p-1 transition-colors">
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -922,7 +989,7 @@ function App() {
                 onChange={(e) => setReadDirsDraft(e.target.value)}
                 rows={4}
                 placeholder={"D:\\参考资料\nD:\\共享组件库"}
-                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
+                className="w-full px-3 py-2 text-[12px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
               />
               <label className="block text-xs text-g-fg-2 mb-1 mt-3">
                 附加可写目录（仅 ACL 沙箱 on 时生效；逗号分隔；agent 受限令牌可写，拒绝系统目录/项目 .hiveweave 内）
@@ -932,7 +999,7 @@ function App() {
                 onChange={(e) => setWritableDirsDraft(e.target.value)}
                 rows={4}
                 placeholder={"D:\\素材库\nD:\\共享可写目录"}
-                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
+                className="w-full px-3 py-2 text-[12px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none resize-y"
               />
               <label className="block text-xs text-g-fg-2 mb-1 mt-3">
                 沙箱模式（ACL 沙箱 on 时生效；默认继承环境，危险全开放=信任项目跳过沙箱）
@@ -940,16 +1007,16 @@ function App() {
               <select
                 value={sandboxModeDraft}
                 onChange={(e) => setSandboxModeDraft(e.target.value)}
-                className="w-full px-3 py-2 text-[13px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none"
+                className="w-full px-3 py-2 text-[12px] text-g-fg bg-g-bg-muted border border-g-border rounded-gm focus:border-g-blue focus:ring-1 focus:ring-g-blue/30 outline-none"
               >
                 <option value="">继承环境（默认启用沙箱）</option>
                 <option value="danger-full-access">danger-full-access（逃生门，跳过沙箱）</option>
               </select>
               <div className="flex justify-end gap-2 mt-4">
-                <button type="button" onClick={() => setShowProjectSettings(false)} className="px-3 py-1.5 text-[13px] text-g-fg-2 hover:text-g-fg rounded-gm transition-colors">
+                <button type="button" onClick={() => setShowProjectSettings(false)} className="px-3 py-1.5 text-[12px] text-g-fg-2 hover:text-g-fg rounded-gm transition-colors">
                   取消
                 </button>
-                <button type="button" disabled={savingReadDirs} onClick={saveProjectDirs} className="px-3 py-1.5 text-[13px] text-white bg-g-blue hover:bg-g-blue/90 rounded-gm transition-all disabled:opacity-50">
+                <button type="button" disabled={savingReadDirs} onClick={saveProjectDirs} className="px-3 py-1.5 text-[12px] text-white bg-g-blue hover:bg-g-blue/90 rounded-gm transition-all disabled:opacity-50">
                   {savingReadDirs ? "保存中..." : "保存"}
                 </button>
               </div>

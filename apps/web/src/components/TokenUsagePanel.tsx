@@ -1,3 +1,6 @@
+import EmptyState from "./EmptyState";
+import { Coins } from "lucide-react";
+import ErrorState from "./ErrorState";
 import { Fragment, useState, useEffect, useMemo } from "react";
 import {
   getProjectTokenUsage,
@@ -74,7 +77,7 @@ function NumCell({
   return (
     <td
       className={`font-mono text-right ${
-        strong ? "font-semibold text-violet-600 " : ""
+        strong ? "font-semibold text-g-purple " : ""
       }${dense ? "px-2 py-1.5" : "px-2 py-2"}`}
     >
       {fmt(value)}
@@ -103,7 +106,7 @@ function StatCard({
       <div className="text-[10px] font-medium uppercase tracking-wider text-g-fg-3">{label}</div>
       <div className={`text-xl font-semibold mt-1 font-mono num ${accent}`}>{value}</div>
       {hint ? (
-        <div className="text-[9px] text-g-fg-4 mt-1 leading-snug">{hint}</div>
+        <div className="text-[10px] text-g-fg-4 mt-1 leading-snug">{hint}</div>
       ) : null}
     </div>
   );
@@ -123,10 +126,10 @@ function DailyBarChart({ entries }: { entries: TokenDailyEntry[] }) {
             title={`${e.day}: ${fmtNum(e.total_tokens)} tokens / ${e.llm_calls} calls`}
           >
             <div
-              className="w-full max-w-[36px] rounded-t-[4px] bg-gradient-to-b from-indigo-400 to-g-blue group-hover:from-violet-400 group-hover:to-violet-600 transition-all"
+              className="w-full max-w-[36px] rounded-t-[4px] bg-gradient-to-b from-g-blue-vivid to-g-blue group-hover:from-g-purple-vivid group-hover:to-g-purple transition-all"
               style={{ height: `${h}px` }}
             />
-            <span className="text-[9px] text-g-fg-4 font-mono num truncate w-full text-center">
+            <span className="text-[10px] text-g-fg-4 font-mono num truncate w-full text-center">
               {e.day.slice(5)}
             </span>
           </div>
@@ -261,16 +264,14 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {error && (
-        <div className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-gm px-3 py-2">
-          加载失败：{error}
-        </div>
-      )}
+      {error && <ErrorState title="用量数据加载失败" detail={error} />}
 
       {noData && (
-        <div className="text-sm text-g-fg-3 py-8 text-center">
-          暂无 token 用量数据。Agent 产生对话/压缩后会自动记录。
-        </div>
+        <EmptyState
+          icon={<Coins />}
+          title="暂无 token 用量数据"
+          description="Agent 产生对话/压缩后会自动记录；若持续为空，请到设置里检查模型配置"
+        />
       )}
 
       {!loading && !error && entries.length > 0 && (
@@ -280,7 +281,7 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
             <StatCard
               label="总 Token"
               value={fmtNum(totals.total)}
-              accent="text-violet-600"
+              accent="text-g-purple"
               hint="未命中 + 输出 + 缓存写，不含缓存读"
             />
             <StatCard label="输出" value={fmtNum(totals.output)} accent="text-g-fg" hint="模型生成" />
@@ -393,7 +394,7 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
                                 {g.rows.map((r, i) => (
                                   <tr key={`${r.agent_id}-${r.request_type}-${i}`} className="hover:bg-g-bg-muted/30">
                                     <td className="pl-6 pr-2 py-1 text-left">
-                                      <span className="inline-block text-[10px] text-g-fg-2 bg-g-bg-muted px-1.5 py-0.5 rounded">
+                                      <span className="inline-block text-[10px] text-g-fg-2 bg-g-bg-muted px-1.5 py-0.5 rounded-gm">
                                         {tokenRequestTypeLabel(r.request_type)}
                                       </span>
                                     </td>

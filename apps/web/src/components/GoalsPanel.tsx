@@ -1,3 +1,6 @@
+import EmptyState from "./EmptyState";
+import { Target } from "lucide-react";
+import ErrorState from "./ErrorState";
 import { useState, useEffect, useRef } from "react";
 import { getProjectGoals, updateProjectGoals } from "../api";
 import type { GoalsData } from "../api";
@@ -10,13 +13,13 @@ interface Props {
 const STATUS_ICON = { todo: "○", doing: "◐", done: "●" } as const;
 const STATUS_COLOR = {
   todo: "text-g-fg-4",
-  doing: "text-amber-400",
-  done: "text-emerald-400",
+  doing: "text-g-yellow-vivid",
+  done: "text-g-green-vivid",
 } as const;
 const STATUS_BG = {
-  todo: "bg-gray-500/10",
-  doing: "bg-amber-500/10",
-  done: "bg-emerald-500/10",
+  todo: "bg-g-fg-3/10",
+  doing: "bg-g-yellow-vivid/10",
+  done: "bg-g-green-vivid/10",
 } as const;
 const STATUS_LABEL = { todo: "待办", doing: "进行中", done: "已完成" } as const;
 
@@ -174,15 +177,11 @@ export default function GoalsPanel({ projectId }: Props) {
   // BUG-007 修复：API 失败时显示错误+重试，而非静默空表单
   if (error) {
     return (
-      <div className="h-full flex flex-col items-center justify-center gap-3 text-sm">
-        <div className="text-red-600">{error}</div>
-        <button
-          onClick={fetchGoals}
-          className="px-3 py-1 text-xs bg-g-bg border border-g-border hover:border-g-blue/40 text-g-fg rounded-md transition-colors"
-        >
-          重试
-        </button>
-      </div>
+      <ErrorState
+        title="目标加载失败"
+        detail={error}
+        onRetry={fetchGoals}
+      />
     );
   }
 
@@ -208,7 +207,7 @@ export default function GoalsPanel({ projectId }: Props) {
           <button
             onClick={handleSave}
             disabled={saving}
-            className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] transition-all disabled:opacity-50"
+            className="px-3 py-1 text-xs bg-g-blue text-white rounded-gm shadow-gm-sm hover:brightness-110 active:scale-[0.97] transition-all disabled:opacity-50"
           >
             {saving ? "保存中..." : "保存"}
           </button>
@@ -224,7 +223,7 @@ export default function GoalsPanel({ projectId }: Props) {
           </div>
           <div className="h-2 bg-g-bg-muted rounded-full overflow-hidden">
             <div
-              className="h-full bg-gradient-to-r from-g-blue to-blue-400 rounded-full transition-all duration-500"
+              className="h-full bg-gradient-to-r from-g-blue to-g-blue-vivid rounded-full transition-all duration-500"
               style={{ width: `${pct}%` }}
             />
           </div>
@@ -295,7 +294,7 @@ export default function GoalsPanel({ projectId }: Props) {
                   onKeyDown={(e) => { if (e.key === "Enter") saveEdit(); if (e.key === "Escape") setEditingIdx(null); }}
                   onBlur={saveEdit}
                   autoFocus
-                  className="flex-1 min-w-0 px-2 py-0.5 bg-g-bg border border-g-blue/50 rounded text-sm text-g-fg focus:outline-none"
+                  className="flex-1 min-w-0 px-2 py-0.5 bg-g-bg border border-g-blue/50 rounded-gm text-sm text-g-fg"
                 />
               ) : (
                 <span
@@ -313,7 +312,7 @@ export default function GoalsPanel({ projectId }: Props) {
                 value={kr.owner || ""}
                 onChange={(e) => updateOwner(idx, e.target.value)}
                 placeholder="负责人"
-                className="w-16 px-1.5 py-0.5 bg-transparent border border-transparent hover:border-g-border rounded text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/30 shrink-0 text-right"
+                className="w-16 px-1.5 py-0.5 bg-transparent border border-g-border/40 hover:border-g-border rounded-gm text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:border-g-blue/30 shrink-0 text-right"
               />
 
               {/* Task binding input (批次 G: KR↔任务绑定) */}
@@ -321,12 +320,12 @@ export default function GoalsPanel({ projectId }: Props) {
                 value={kr.taskIds?.join(", ") || ""}
                 onChange={(e) => updateTaskIds(idx, e.target.value)}
                 placeholder="绑任务 ID（逗号分隔）"
-                className="w-32 px-2 py-0.5 bg-g-bg-soft border border-g-border/60 rounded text-[10px] font-mono text-g-fg-3 placeholder-g-fg-4/50 focus:outline-none focus:border-g-blue/40 shrink-0"
+                className="w-32 px-2 py-0.5 bg-g-bg-soft border border-g-border/60 rounded-gm text-[10px] font-mono text-g-fg-3 placeholder-g-fg-4/50 focus:border-g-blue/40 shrink-0"
               />
 
               {/* KR 进度徽章 */}
               {kr.taskIds && kr.taskIds.length > 0 && kr.progress && (
-                <span className="text-[10px] font-mono text-g-fg-4 bg-g-bg-soft px-1.5 py-0.5 rounded shrink-0" title={`绑定 ${kr.progress.bound} 个任务，${kr.progress.approved} 个已批准`}>
+                <span className="text-[10px] font-mono text-g-fg-4 bg-g-bg-soft px-1.5 py-0.5 rounded-gm shrink-0" title={`绑定 ${kr.progress.bound} 个任务，${kr.progress.approved} 个已批准`}>
                   ✓{kr.progress.approved}/{kr.progress.bound}
                 </span>
               )}
@@ -334,7 +333,7 @@ export default function GoalsPanel({ projectId }: Props) {
               {/* Delete */}
               <button
                 onClick={() => removeKR(idx)}
-                className="p-1 rounded-gm text-g-fg-4/70 hover:text-red-600 hover:bg-red-50 transition-colors shrink-0"
+                className="p-1 rounded-gm text-g-fg-4/70 hover:text-g-red hover:bg-g-red-bg transition-colors shrink-0"
                 title="删除"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -344,11 +343,11 @@ export default function GoalsPanel({ projectId }: Props) {
             </div>
           ))}
           {goals.keyResults.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-6 text-center">
-              <span className="text-2xl mb-1.5">🎯</span>
-              <p className="text-xs text-g-fg-4">尚未设定关键结果</p>
-              <p className="text-[10px] text-g-fg-4/70 mt-0.5">在下方输入框添加第一条 KR</p>
-            </div>
+            <EmptyState
+              icon={<Target />}
+              title="尚未设定关键结果"
+              description="在下方输入框添加第一条 KR"
+            />
           )}
         </div>
 

@@ -349,14 +349,14 @@ export default function TeamTimeline() {
           <div className="flex items-center gap-0.5">
             <button
               onClick={() => pan.zoomBy(1.25)}
-              className="w-6 h-6 flex items-center justify-center rounded text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
+              className="w-6 h-6 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
               title="放大"
             >
               +
             </button>
             <button
               onClick={() => pan.zoomBy(0.8)}
-              className="w-6 h-6 flex items-center justify-center rounded text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
+              className="w-6 h-6 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
               title="缩小"
             >
               −
@@ -366,7 +366,7 @@ export default function TeamTimeline() {
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
             placeholder="筛选任务标题…"
-            className="ml-auto w-40 px-2 py-1 text-[11px] rounded-gm border border-g-border bg-g-bg text-g-fg placeholder:text-g-fg-4 focus:outline-none focus:border-g-border-focus transition-colors"
+            className="ml-auto w-40 px-2 py-1 text-[11px] rounded-gm border border-g-border bg-g-bg text-g-fg placeholder:text-g-fg-4 focus:border-g-border-focus transition-colors"
           />
         </div>
         {(presentStatuses.length > 0 || (data?.agents?.length ?? 0) > 0) && (
@@ -459,7 +459,7 @@ export default function TeamTimeline() {
             {/* 顶部时间轴（纵向滚动 sticky） */}
             <div className="sticky top-0 z-20 flex bg-g-bg border-b border-g-border shadow-gm-sm">
               <div
-                className="shrink-0 border-r border-g-border px-2.5 flex items-end pb-1 text-[9px] text-g-fg-4"
+                className="shrink-0 border-r border-g-border px-2.5 flex items-end pb-1 text-[10px] text-g-fg-4"
                 style={{ width: LANE_LABEL_W }}
               >
                 成员 / 时间
@@ -474,7 +474,7 @@ export default function TeamTimeline() {
               {bands.map((b) => (
                 <div
                   key={b.key}
-                  className="absolute inset-y-0 bg-slate-100/60 pointer-events-none"
+                  className="absolute inset-y-0 bg-g-bg-muted/60 pointer-events-none"
                   style={{ left: `${b.left}%`, width: `${b.width}%` }}
                 />
               ))}
@@ -504,7 +504,7 @@ export default function TeamTimeline() {
 
         {/* 截断/更早数据提示（v4：不静默截断） */}
         {!initialLoading && !error && data && (hint.truncated || hint.hasEarlier) && (
-          <div className="absolute top-1.5 left-1/2 -translate-x-1/2 z-30 px-2.5 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-700 text-[10px] shadow-gm-sm pointer-events-none whitespace-nowrap">
+          <div className="absolute top-1.5 left-1/2 -translate-x-1/2 z-30 px-2.5 py-1 rounded-full bg-g-yellow-bg border border-g-yellow text-g-yellow text-[10px] shadow-gm-sm pointer-events-none whitespace-nowrap">
             {hint.truncated
               ? "窗口内事件超限，部分内容未展示——请缩小时间范围"
               : "还有更早的活动数据——放大或左移窗口可查看"}

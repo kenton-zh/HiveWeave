@@ -12,4 +12,4 @@ export const GHOST_BTN_CLS =
   "px-4 py-2 text-sm text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all";
 
 export const SECTION_TITLE_CLS =
-  "text-[13px] font-semibold text-g-fg-2 uppercase tracking-wider flex items-center gap-2";
+  "text-[12px] font-semibold text-g-fg-2 uppercase tracking-wider flex items-center gap-2";

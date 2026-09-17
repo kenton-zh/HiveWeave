@@ -43,7 +43,7 @@ export default function FolderPicker({ initialPath, onSelect, onCancel }: Folder
   if (isElectron) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-        <div className="bg-g-bg border border-g-border rounded-lg px-6 py-4 flex items-center gap-3">
+        <div className="bg-g-bg border border-g-border rounded-gm px-6 py-4 flex items-center gap-3">
           <div className="animate-spin w-4 h-4 border-2 border-g-blue border-t-transparent rounded-full" />
           <span className="text-sm text-g-fg-3">等待选择文件夹...</span>
         </div>
@@ -132,7 +132,7 @@ function WebFolderPicker({
           <button
             disabled={!data?.parentPath || loading}
             onClick={() => data?.parentPath && navigate(data.parentPath)}
-            className="p-1 rounded hover:bg-g-bg-soft disabled:opacity-30 disabled:cursor-not-allowed text-g-fg-3 hover:text-g-fg"
+            className="p-1 rounded-gm hover:bg-g-bg-soft disabled:opacity-30 disabled:cursor-not-allowed text-g-fg-3 hover:text-g-fg"
             title="上级目录"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -150,7 +150,7 @@ function WebFolderPicker({
                 if (e.key === "Escape") { setAddressEditing(false); if (data) setAddressBar(data.currentPath ?? ""); }
               }}
               onBlur={handleAddressSubmit}
-              className="flex-1 px-2 py-1 text-xs bg-g-bg-muted border border-g-blue rounded text-g-fg focus:outline-none font-mono"
+              className="flex-1 px-2 py-1 text-xs bg-g-bg-muted border border-g-blue rounded-gm text-g-fg font-mono"
             />
           ) : (
             <div
@@ -166,7 +166,7 @@ function WebFolderPicker({
                   navigate(pasted);
                 }
               }}
-              className="flex-1 px-2 py-1 text-xs bg-g-bg-muted border border-g-border rounded text-g-fg-3 cursor-text font-mono truncate hover:border-g-border"
+              className="flex-1 px-2 py-1 text-xs bg-g-bg-muted border border-g-border rounded-gm text-g-fg-3 cursor-text font-mono truncate hover:border-g-border"
               title="点击编辑路径，或直接粘贴完整路径"
             >
               {addressBar || "..."}
@@ -210,7 +210,7 @@ function WebFolderPicker({
                   onClick={() => entry.fullPath && navigate(entry.fullPath)}
                   className="flex items-center gap-2 px-3 py-2 rounded-gm text-left group transition-colors hover:bg-g-blue-bg/50 border border-transparent hover:border-g-blue/20"
                 >
-                  <svg className="w-5 h-5 text-yellow-500/80 shrink-0 group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5 text-g-yellow-vivid/80 shrink-0 group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" />
                   </svg>
                   <span className="text-sm text-g-fg group-hover:text-g-fg truncate">{entry.name}</span>
@@ -235,7 +235,7 @@ function WebFolderPicker({
             <button
               onClick={() => data?.currentPath && onSelect(data.currentPath)}
               disabled={!data || loading}
-              className="px-4 py-1.5 text-sm bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-blue-600 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              className="px-4 py-1.5 text-sm bg-g-blue text-white rounded-gm shadow-gm-sm hover:bg-g-blue active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
               选择文件夹
             </button>

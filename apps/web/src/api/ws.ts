@@ -460,6 +460,12 @@ export function subscribeAgentStatus(
 ): { abort: () => void } {
   const socket = getSocket();
   const channel = socket.channel("lobby:status");
+  // P4 审计 C-1（2026-09-18）：暴露**已 join** 的 lobby channel 单例 ——
+  // phoenix `socket.channel()` 每次 new 一个新实例且不自动 join，未 join
+  // 实例的 joinRef 为 null ⇒ 服务器推送被 isMember 丢弃（"dropping
+  // outdated message"），追加监听永远收不到事件。其他模块要听 lobby
+  // 事件必须绑这个单例（getJoinedLobbyChannel），不能自己 channel()。
+  _lobbyChannel = channel;
 
   channel.on("init", (payload: Record<string, unknown>) => {
     if (Array.isArray(payload.agentIds)) {
@@ -551,9 +557,18 @@ export function subscribeAgentStatus(
 
   return {
     abort: () => {
+      _lobbyChannel = null;
       channel.leave();
     },
   };
+}
+
+// 已 join 的 lobby:status channel 单例（P4 审计 C-1）。null = 尚未订阅
+// （App 未挂载/已卸载），消费方应走轮询兜底并在单例就绪后再绑定监听。
+let _lobbyChannel: Channel | null = null;
+
+export function getJoinedLobbyChannel(): Channel | null {
+  return _lobbyChannel;
 }
 
 // Re-export the Channel for advanced usage

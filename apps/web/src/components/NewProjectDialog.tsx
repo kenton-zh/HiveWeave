@@ -155,7 +155,7 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
           <button
             disabled={!customInput.trim()}
             onClick={() => customInput.trim() && handleSend(customInput.trim())}
-            className="px-4 py-2 bg-g-blue text-white hover:bg-blue-600 disabled:opacity-40 text-white rounded-gm text-sm font-medium shadow-gm-sm active:scale-[0.97] transition-all"
+            className="px-4 py-2 bg-g-blue text-white hover:bg-g-blue disabled:opacity-40 text-white rounded-gm text-sm font-medium shadow-gm-sm active:scale-[0.97] transition-all"
           >
             发送
           </button>

@@ -296,12 +296,12 @@ export default function AssistantBall() {
           onPointerDown={onPointerDown}
           onClick={onBallClick}
           title="HiveWeave 助理（可拖动）"
-          className="fixed z-50 flex items-center justify-center rounded-full shadow-gm cursor-grab active:cursor-grabbing select-none touch-none bg-gradient-to-br from-amber-300 to-orange-500 border-2 border-white/70 hover:scale-105 transition-transform"
+          className="fixed z-50 flex items-center justify-center rounded-full shadow-gm cursor-grab active:cursor-grabbing select-none touch-none bg-gradient-to-br from-g-yellow-vivid to-g-yellow border-2 border-white/70 hover:scale-105 transition-transform"
           style={{ left: pos.x, top: pos.y, width: BALL_SIZE, height: BALL_SIZE }}
         >
           <span className="text-2xl pointer-events-none">🐝</span>
           {totalUnread > 0 && (
-            <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[11px] font-semibold flex items-center justify-center pointer-events-none">
+            <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] px-1 rounded-full bg-g-red-vivid text-white text-[11px] font-semibold flex items-center justify-center pointer-events-none">
               {totalUnread > 99 ? "99+" : totalUnread}
             </span>
           )}
@@ -326,7 +326,7 @@ export default function AssistantBall() {
             <button
               onClick={() => setExpanded(false)}
               title="收起"
-              className="w-6 h-6 rounded hover:bg-black/10 text-g-fg-3 text-sm leading-none"
+              className="w-6 h-6 rounded-gm hover:bg-black/10 text-g-fg-3 text-sm leading-none"
             >
               −
             </button>
@@ -335,7 +335,7 @@ export default function AssistantBall() {
                 {targets[0]?.name || "助理"}
               </span>
               {(targets[0]?.unread || 0) > 0 && (
-                <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+                <span className="w-1.5 h-1.5 rounded-full bg-g-red-vivid shrink-0" />
               )}
             </div>
           </div>
@@ -347,7 +347,7 @@ export default function AssistantBall() {
             {messages.map((m) => (
               <div
                 key={m.id}
-                className={`max-w-[85%] px-2.5 py-1.5 rounded-lg text-[13px] whitespace-pre-wrap break-words ${
+                className={`max-w-[85%] px-2.5 py-1.5 rounded-gm text-[12px] whitespace-pre-wrap break-words ${
                   m.role === "user"
                     ? "ml-auto bg-g-blue text-white"
                     : "mr-auto bg-g-bg-soft border border-g-border text-g-fg"
@@ -357,7 +357,7 @@ export default function AssistantBall() {
               </div>
             ))}
             {sendError && (
-              <div className="mx-auto px-2.5 py-1 rounded bg-g-red-bg text-g-red text-[12px] text-center">
+              <div className="mx-auto px-2.5 py-1 rounded-gm bg-g-red-bg text-g-red text-[12px] text-center">
                 发送失败：{sendError}
               </div>
             )}
@@ -374,12 +374,12 @@ export default function AssistantBall() {
                 if (e.key === "Enter") send();
               }}
               placeholder="输入消息…"
-              className="flex-1 min-w-0 px-2.5 py-1.5 text-[13px] rounded border border-g-border focus:outline-none focus:border-g-blue/60 bg-white text-g-fg"
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-[12px] rounded-gm border border-g-border focus:border-g-blue/60 bg-white text-g-fg"
             />
             <button
               onClick={send}
               disabled={sending || !activeId || !input.trim()}
-              className="px-3 py-1.5 text-[13px] rounded bg-g-blue text-white disabled:opacity-40 hover:opacity-90"
+              className="px-3 py-1.5 text-[12px] rounded-gm bg-g-blue text-white disabled:opacity-40 hover:opacity-90"
             >
               发送
             </button>

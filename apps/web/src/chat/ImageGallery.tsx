@@ -66,7 +66,7 @@ export const ImageGallery = memo(function ImageGallery({
           title="查看原图"
           aria-label={`查看图片${image.name ? `：${image.name}` : ""}`}
           onClick={() => setOpenIndex(i)}
-          className={`shrink-0 cursor-zoom-in overflow-hidden rounded-lg p-0 ${
+          className={`shrink-0 cursor-zoom-in overflow-hidden rounded-gm p-0 ${
             isUserSide(align) ? "ring-1 ring-white/30" : "border border-g-border"
           }`}
           style={

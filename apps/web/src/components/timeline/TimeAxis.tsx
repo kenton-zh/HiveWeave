@@ -74,7 +74,7 @@ export default function TimeAxis({
         days.map(({ ts, day }) => (
           <span
             key={`day-${day}`}
-            className="absolute top-0.5 -translate-x-1/2 text-[9px] font-medium text-g-fg-3 whitespace-nowrap"
+            className="absolute top-0.5 -translate-x-1/2 text-[10px] font-medium text-g-fg-3 whitespace-nowrap"
             style={{ left: pct(ts) }}
           >
             Day {day}
@@ -84,7 +84,7 @@ export default function TimeAxis({
       {ticks.map((t) => (
         <span
           key={t}
-          className="absolute bottom-0.5 -translate-x-1/2 text-[9px] text-g-fg-4 font-mono whitespace-nowrap"
+          className="absolute bottom-0.5 -translate-x-1/2 text-[10px] text-g-fg-4 font-mono whitespace-nowrap"
           style={{ left: pct(t) }}
         >
           <span className="block mx-auto mb-px w-px h-1.5 bg-g-border-strong" />
