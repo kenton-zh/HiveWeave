@@ -43,10 +43,28 @@ def is_platform_side(exc: BaseException) -> bool:
     已按此标注的构造点（平台侧，无 api_name）：
       · `token.py` `no logon SID in token groups`
       · `grant.py` / `spawn.py` / `token.py` `pywin32 unavailable`
-      · `service.py` `workspace 根无真实主体写 ACE`
-      · `service.py` `附加可写目录无真实主体写 ACE`
-      · `service.py` `seal read-back failed`（两处：git 引导文件 / 配置载体）
+      · `service.py` `workspace 根无真实主体写 ACE`（**部署前提**，见下）
+      · `service.py` `seal read-back failed`（两处：git 引导文件 / 配置载体
+        —— 平台自己刚 `created`/写过该文件，有信息优势）
       · `integration.py` `pwsh not found`（经 `PwshUnavailableError`）
+
+    ⚠⚠ **标注标准（2026-09-17 第四轮审计 HIGH 定案）** —— 只有构造点对该故障
+    **确有信息优势**时才标，具体是这两种之一：
+
+      (a) 它**自己真的在调** Win32 API（那次的失败就是平台设施故障）；
+      (b) 它在**装配平台自己的目录/设施**（`workspace 根`、git 引导文件 ——
+          这些是平台/部署流程给定的，不在 agent 执行期的自建面内）。
+
+    ⚠ **"观察到某个状态不满足"不足以标注** —— 必须追问"这个状态会不会是
+    agent 自己造出来的"。反例（第四轮审计已摘掉标注的两处）：
+      · `service.py` `附加可写目录 {d} 无真实主体写 ACE` —— 判据是该目录 ACL
+        的**实际状态**，而同段注释明写"**不自动创建**" ⇒ agent 自建目录后
+        触发本分支是**已知可达路径**；
+      · `service.py` `seal read-back failed: {git_dir}`（`.git` **根**）——
+        同上，`.git` 可由 agent `git init` 自建。
+      标了这两处 = **替 agent 卸责**（agent 收到「不是你的 bug」而放弃自查）。
+      它们现在走默认 `False` ⇒ `outcome_unknown`（"这次失败没有归因"，不是
+      "是 agent 的错"，也不是"平台故障"）。
 
     其余一律**不表态**（连 ``SandboxUnavailableError`` 本身都不够 —— 它会
     把真 bug 包进来）。不表态不等于说"不是平台问题"，只是不替上游做它自己

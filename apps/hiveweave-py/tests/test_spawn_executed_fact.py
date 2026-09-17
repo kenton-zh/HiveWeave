@@ -781,7 +781,6 @@ def test_platform_side_flag_survives_wrapping():
         ("token.py", "ACL sandbox requires Windows (pywin32 unavailable)"),
         ("token.py", "no logon SID in token groups"),
         ("service.py", "workspace 根 {root} 无真实主体写 ACE"),
-        ("service.py", "附加可写目录 {d} 无真实主体写 ACE"),
         ("service.py", "seal read-back failed: {path}"),
         ("service.py", "seal read-back failed: {git_dir}"),
     ],
@@ -797,6 +796,11 @@ def test_known_platform_faults_are_annotated(rel_path, needle):
     ⚠ 判据仍走 **AST**（用户 09-14 钦定「永远」）：`needle` 只用于**定位**
     是哪一个构造点（多构造点文件里必须能区分），判定"有没有标注"是 AST
     读关键字参数 —— 换引号/换行/换措辞都不影响。
+
+    ⚠ 2026-09-17 第四轮审计 HIGH：本清单**移除了**两条（判据是"磁盘上 ACL
+    的状态"、而 agent 可自建目录 ⇒ 构造点无信息优势 ⇒ 标了等于替 agent
+    卸责）。见同文件 `test_no_platform_side_on_state_observation_sites`
+    的**反面对照**。
     """
     import ast
 
@@ -846,6 +850,160 @@ def test_known_platform_faults_are_annotated(rel_path, needle):
         )
         return
     pytest.fail(f"{rel_path}:{target_line} 定位到了却没有配对的 raise 节点")
+
+
+@pytest.mark.parametrize(
+    "needle,why",
+    [
+        (
+            "附加可写目录 {d} 无真实主体写 ACE",
+            "agent 可自建附加可写目录（同段注释明写「不自动创建」） ⇒ "
+            "ACL 不满足是 agent 自己的部署动作",
+        ),
+    ],
+)
+def test_no_platform_side_on_state_observation_sites(needle, why):
+    """⭐ **反面对照**（第四轮审计 HIGH）：判据只是"磁盘上某状态不满足"的
+    构造点**不得**标 `platform_side=True`。
+
+    与 `test_known_platform_faults_are_annotated` 是**一对**：那边守住
+    "确有信息优势的平台故障别被漏标"（欠归因），这边守住"观察到状态不等于
+    平台故障，别替 agent 卸责"（过度归因）。缺任一条，另一条都能被"顺手
+    加/删标注"绕过。
+
+    ⚠ 为什么**没有**把 `seal read-back failed: {git_dir}` 也收进来：本仓的
+    定案（第四轮审计）是那个点**保留**标注 —— `.git` 根的封条紧跟在平台自己
+    的 `git init`/`seal_agent_aces_async` 之后，构造点对"刚封完就读回仍泄漏"
+    有信息优势。判据不是"状态是否满足"这一条，还要看"平台有没有亲手造过
+    这个状态"。同理 `seal read-back failed: {path}`（git 引导文件）也保留。
+
+    判据走 AST 按文案锚点定位（同上一节的理由）；锚点漂移时本守卫会
+    `pytest.fail`，不静默失效。
+    """
+    import ast
+
+    path = (
+        pathlib.Path(hiveweave_root())
+        / "services" / "acl_sandbox" / "service.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    located: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+        if fname != "SandboxUnavailableError":
+            continue
+        if needle in ast.unparse(call):
+            located.append(call.lineno)
+    assert len(located) == 1, (
+        f"service.py 里锚点 {needle!r} 应恰好定位 1 个构造点，实测 "
+        f"{len(located)} 个（{located}）—— 锚点漂移时本守卫会静默失效"
+    )
+
+    target_line = located[0]
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        if not isinstance(call.func, ast.Name):
+            continue
+        if call.func.id != "SandboxUnavailableError" or call.lineno != target_line:
+            continue
+        bad = [
+            kw.arg for kw in call.keywords
+            if kw.arg == "platform_side"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value is True
+        ]
+        assert not bad, (
+            f"service.py:{target_line}（{needle}）标了 `platform_side=True` —— "
+            f"判据只是「观察到状态不满足」，构造点对此无信息优势；"
+            f"标了等于替 agent 卸责。理由：{why}。"
+            f"（第四轮审计 HIGH；标注标准见 errors.is_platform_side docstring）"
+        )
+        return
+    pytest.fail(f"service.py:{target_line} 定位到了却没有配对的 raise 节点")
+
+
+def test_api_name_scope_matches_the_call_it_names():
+    """⭐ 第四轮审计 MEDIUM：`api_name="CreateProcessAsUserW"` 的 try 块
+    **只能包 `CreateProcessAsUser` 这一次调用**。
+
+    ⚠⚠ 修复前那个 try 里还有 `_set_inherit` / `AssignProcessToJobObject` /
+    `ResumeThread` —— 后三者抛非 Win32 异常（如 `TypeError`，真代码 bug）也会
+    被贴上 `CreateProcessAsUserW` ⇒ `is_platform_side` 判 True ⇒ 真 bug 被说成
+    平台侧（审计已实测复现）。本守卫按 AST 读"那个 `raise` 所在 try 的 body
+    里到底调了哪些函数"，防止后人把兄弟调用又并回去。
+
+    判据走 AST（不是文案匹配）：只认函数调用名，换注释/换措辞不影响。
+    """
+    import ast
+
+    path = (
+        pathlib.Path(hiveweave_root())
+        / "services" / "acl_sandbox" / "spawn.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    # 1) 定位带 api_name="CreateProcessAsUserW" 的那个构造点，且必须**唯一**
+    targets: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        call = node.exc
+        for kw in call.keywords:
+            if (kw.arg == "api_name"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "CreateProcessAsUserW"):
+                targets.append(node.lineno)
+    assert len(targets) == 1, (
+        f"spawn.py 里 `api_name=\"CreateProcessAsUserW\"` 应恰好 1 处，实测 "
+        f"{len(targets)} 处（{targets}）"
+    )
+
+    # 2) 找到包着它的那个 `Try`，读它 body 里被调的函数名
+    owners: list[ast.Try] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        if any(
+            isinstance(h, ast.ExceptHandler)
+            and any(
+                isinstance(r, ast.Raise)
+                and isinstance(r.exc, ast.Call)
+                and any(
+                    kw.arg == "api_name"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "CreateProcessAsUserW"
+                    for kw in r.exc.keywords
+                )
+                for r in h.body
+            )
+            for h in node.handlers
+        ):
+            owners.append(node)
+    assert len(owners) == 1, f"应恰好 1 个 try 拥有该构造点，实测 {len(owners)}"
+
+    called = sorted({
+        getattr(getattr(c, "func", None), "attr", None)
+        or getattr(getattr(c, "func", None), "id", None)
+        for c in ast.walk(ast.Module(body=owners[0].body, type_ignores=[]))
+        if isinstance(c, ast.Call)
+    } - {None})
+    siblings = [c for c in called if c in (
+        "_set_inherit", "AssignProcessToJobObject", "ResumeThread")]
+    assert not siblings, (
+        f"spawn.py 的 try 块（拥有 api_name=\"CreateProcessAsUserW\"）里还包着 "
+        f"{siblings} —— 它们抛 `TypeError` 之类的真 bug 会被冒领成平台侧故障"
+        f"（第四轮审计 MEDIUM）。请把兄弟调用移出这个 try。"
+        f"（实测该 try 里调用了：{called}）"
+    )
+    assert called == ["CreateProcessAsUser"], (
+        f"该 try 里应只有 `CreateProcessAsUser`，实测 {called}"
+    )
 
 
 def test_no_platform_side_annotation_on_the_catch_all_wrapper():

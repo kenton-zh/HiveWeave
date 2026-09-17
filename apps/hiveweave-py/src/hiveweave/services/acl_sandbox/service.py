@@ -803,6 +803,13 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
     root = policy.boundary_root
     project = policy.project_root
     if not await agrant.has_subject_write_ace_async(root):
+        # ✅ 2026-09-17 第四轮审计 HIGH：**保留** `platform_side=True` —— 与其他
+        # 「无真实主体写 ACE」点**不同族**。理由（信息优势）：`boundary_root` 是
+        # 平台**装配面**（workspace 根由平台/部署流程给定，不是 agent 执行期内
+        # 自建的目录），本点判的是"部署前提未满足"（用户把 workspace 放在
+        # OWNER_RIGHTS-only 目录下）⇒ 构造点确有信息优势。对照下方
+        # `_ensure_standing_grants` 里 additional-dir 那条**已退回不标**：
+        # 那里 agent 可自建目录，判据不再指向平台。
         raise SandboxUnavailableError(
             f"workspace 根 {root} 无真实主体写 ACE（OWNER_RIGHTS-only 或缺失 ACL），"
             f"write-restricted 令牌不可用。请把 workspace 放在用户常规目录下"
@@ -933,10 +940,20 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
                 f"附加可写目录不存在: {d} —— 请先创建该目录（放在用户常规目录下，"
                 f"勿用平台/临时自动创建），再保存项目配置。")
         if not await agrant.has_subject_write_ace_async(d):
+            # ⚠ 2026-09-17 第四轮审计 HIGH：**故意不标** `platform_side`
+            # （与上方 workspace 根那条**不同**，勿顺手补回）。
+            # 判据 `has_subject_write_ace_async(d)` 只是"/该目录 ACL 的实际状态/",
+            # 构造点对这种状态**没有信息优势**：本段注释上一句自己就写了
+            # "**不自动创建**（平台自建目录是 OWNER_RIGHTS-only，对受限令牌不可
+            # 用）" ⇒ agent 在数据根下 `mkdir` 一个附加可写目录、再把它填进
+            # 项目配置，就是**已知可达路径**；此时 ACL 不满足正是 agent 自己的
+            # 部署动作造成的。标成平台侧 = 替 agent 卸责（agent 收到「不是你
+            # 的问题」而放弃自查）。故退回默认 `False` ⇒ `outcome_unknown`。
+            # 标注标准见 `errors.is_platform_side` docstring：只有构造点对该故障
+            # **确有信息优势**（真的在调 Win32 API / 在装配平台自己的目录）才标。
             raise SandboxUnavailableError(
                 f"附加可写目录 {d} 无真实主体写 ACE（OWNER_RIGHTS-only 或缺失 ACL），"
                 f"write-restricted 令牌不可用。请把目录放在用户常规目录下。",
-                platform_side=True,
             )
         await _grant_if_missing(d, extra_sid(d), GRANT_MASK, agrant)
 

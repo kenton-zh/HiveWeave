@@ -86,6 +86,11 @@ def _create_restricted_token(
             restricted = win32security.CreateRestrictedToken(
                 current, TOKEN_FLAGS, [], [], restricting)
         except Exception as e:  # fail-closed
+            # ⚠ 2026-09-17 第四轮审计 MEDIUM（同族）：`api_name` 只在该次调用真
+            # 失败时才带上 —— 构造点确实在调 `CreateRestrictedToken`，故归因成立。
+            # ⚠ 但 `restricting` 是**本函数自己**用 `_to_pysid` 拼的：若传进来的
+            # write_sids 已是不合法形态，`ConvertStringSidToSid` 会抛在**上一行**
+            # （不在本 try 内），本点拿不到 ⇒ 不会被误标。边界已核。
             raise SandboxUnavailableError(
                 f"CreateRestrictedToken failed: {e}",
                 api_name="CreateRestrictedToken")

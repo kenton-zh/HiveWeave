@@ -197,10 +197,25 @@ def _spawn_sync(token, command: str | None = None, cwd: str = ".", env: dict | N
 
         h_proc = h_thread = None
         pid: int | None = None
+        # ⚠ 2026-09-17 第四轮审计 MEDIUM：try 块**只包 `CreateProcessAsUser`**
+        # 这一次调用。修复前它连着 `_set_inherit` / `AssignProcessToJobObject` /
+        # `ResumeThread` 一起包，任何一个抛非 Win32 异常（如 `TypeError` —— 真的
+        # 代码 bug）都会被贴上 `api_name="CreateProcessAsUserW"` ⇒
+        # `is_platform_side` 判 True ⇒ 真 bug 被说成平台侧（审计已实测复现）。
+        # 归因精度：只有 `CreateProcessAsUser` 失败才配叫那个 API 名。
         try:
             h_proc, h_thread, pid, _tid = win32process.CreateProcessAsUser(
                 token, None, command, None, None, 1,
                 CREATE_SUSPENDED, env, cwd, si)
+        except Exception as e:
+            _close_many(in_r, in_w, out_r, out_w, err_r, err_w,
+                        h_thread, h_proc, job)
+            raise SandboxUnavailableError(
+                f"CreateProcessAsUser failed: {e}",
+                api_name="CreateProcessAsUserW")
+        # 以下三步是**兄弟调用**，各自失败有自己的语义 —— 必须移出上面的 try，
+        # 否则归因被上一条的 api_name 冒领。
+        try:
             # §5.4 H3：进程/线程句柄不设 INHERIT —— 否则孙进程继承后，Job
             # 句柄/进程句柄泄漏（B13 失效面）+ 句柄引用被拉长。
             _set_inherit(h_proc, False)
@@ -208,11 +223,22 @@ def _spawn_sync(token, command: str | None = None, cwd: str = ".", env: dict | N
             win32job.AssignProcessToJobObject(job, h_proc)
             win32process.ResumeThread(h_thread)
         except Exception as e:
+            # 进程**已创建**（executed=True 面）但未接进 Job ⇒ 必须杀掉，
+            # 否则无 KILL_ON_CLOSE 的孤儿进程逃逸出 job。
+            try:
+                win32job.TerminateJobObject(job, 1)
+            except Exception:
+                pass
             _close_many(in_r, in_w, out_r, out_w, err_r, err_w,
                         h_thread, h_proc, job)
+            # 归因：Job 装配/恢复线程失败**不一定是平台侧** —— `_set_inherit`
+            # 走的是 `ctypes.windll.kernel32`（`TypeError`/`AttributeError`
+            # 属真代码 bug 的形态），`AssignProcessToJobObject`/`ResumeThread`
+            # 的是 pywin32 调用。构造点无法区分"平台设施坏了"与"我们传错了
+            # 参数"，故**不表态**（默认 False ⇒ outcome_unknown），
+            # 不冒充 `CreateProcessAsUserW`。
             raise SandboxUnavailableError(
-                f"CreateProcessAsUser failed: {e}",
-                api_name="CreateProcessAsUserW")
+                f"job/thread setup after CreateProcessAsUser failed: {e}") from e
         # 父进程侧关闭子进程端（EOF 语义）+ 子进程侧读端
         _close_many(in_r, in_w, out_w, err_w, h_thread)
     return _Spawned(h_proc, pid, job, out_r, err_r)
