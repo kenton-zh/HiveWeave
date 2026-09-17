@@ -120,6 +120,53 @@ def test_prefix_wins_over_legacy_bracket_in_either_order():
     assert parse_issue_severity("x SEVERITY:low y [high]") == "low"
 
 
+# ── F8-②：VERDICT: ISSUES 但列不出任何 issue 行 ⇒ 不确定 ⇒ fail-safe 拦 ──
+
+
+def test_f8_2_issues_with_no_issue_rows_blocks():
+    """F8-② 主判据：宣告 ISSUES 却无 issue 行 ⇒ ``shadow_blocking=True``。
+
+    阳性对照：把 ``shadow_decision`` 的 ``no_evidence`` 分支删掉（恢复
+    ``shadow_blocking = verdict == "ISSUES" and failsafe_high > 0``）⇒
+    本测试转红。旧行为是放行——「宣告有问题但不列证据 ⇒ 放行」。
+    """
+    from hiveweave.services.code_audit import shadow_decision
+
+    dec = shadow_decision("ISSUES", [])
+    assert dec["no_evidence"] is True
+    assert dec["shadow_blocking"] is True
+    assert dec["would_flip"] is True, "legacy 判据同样放行 ⇒ 属新增被拦"
+
+
+def test_f8_2_whitespace_only_issue_rows_still_block():
+    """issue 行全是空白/占位（``_parse_issues`` 会剥成 ``[]``）⇒ 同样拦。"""
+    from hiveweave.services.code_audit import _parse_issues, shadow_decision
+
+    text = "VERDICT: ISSUES\n   \n- \n*  \n"
+    issues = _parse_issues(text)
+    assert issues == [], "空白行不该被当成 issue（前置条件）"
+    dec = shadow_decision("ISSUES", issues)
+    assert dec["no_evidence"] is True and dec["shadow_blocking"] is True
+
+
+def test_f8_2_pass_and_evidenced_issues_keep_old_semantics():
+    """反向回归（「修 A 不能把 B 的闸放宽」）：PASS 与有证据的 ISSUES 不变。"""
+    from hiveweave.services.code_audit import shadow_decision
+
+    # PASS + 无 issue：不拦（空是好消息）
+    dec = shadow_decision("PASS", [])
+    assert dec["no_evidence"] is False and dec["shadow_blocking"] is False
+    # PASS + 全 unparsed issue：既有 fail-safe 语义不变（unparsed ⇒ high）
+    dec = shadow_decision("PASS", ["src/a.py:1 输入未校验"])
+    assert dec["shadow_blocking"] is False, "PASS 不因 unparsed 翻拦"
+    # ISSUES + 有 issue 行（哪怕全 low）：不拦（既有语义，F8-② 不扩围）
+    dec = shadow_decision("ISSUES", ["src/a.py:1 SEVERITY:low 命名建议"])
+    assert dec["no_evidence"] is False and dec["shadow_blocking"] is False
+    # ISSUES + unparsed issue：既有 fail-safe 语义不变
+    dec = shadow_decision("ISSUES", ["src/a.py:1 输入未校验"])
+    assert dec["shadow_blocking"] is True and dec["no_evidence"] is False
+
+
 # ── ③ + shadow：端到端 —— **记录**但**不拦**，且两者不一致要被量出来 ──
 
 

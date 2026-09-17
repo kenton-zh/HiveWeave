@@ -786,17 +786,26 @@ def shadow_decision(verdict: str, issues: list[str]) -> dict[str, Any]:
     验收脚本按同一批键复算，所以两边永远对得上。
 
     ``would_flip`` = 上线 fail-safe 后**新增被拦**的审计数（误拦率的分母）。
+
+    F8-②（2026-09-18）：``verdict == "ISSUES"`` 但 ``issues`` 为空 ⇒ 判定
+    **不确定** ⇒ fail-safe 拦。旧行为是放行 ——「宣告有问题但不列证据 ⇒ 放行」
+    是与「``[high]`` 子串判档」同门的另一处 fail-open（LLM 输出
+    ``VERDICT: ISSUES`` 后不带任何 issue 行、或 issue 行全是空白时，
+    ``failsafe_high=0`` 直接过门）。缓存命中路径
+    （``shadow_decision(verdict_cached, cached_issues)``）走本函数 ⇒ 同步生效。
     """
     counts = count_issue_severities(issues)
     legacy_high = legacy_high_count(issues)
     legacy_blocking = verdict == "ISSUES" and legacy_high > 0
     failsafe_high = counts["high"] + counts["unparsed"]
-    shadow_blocking = verdict == "ISSUES" and failsafe_high > 0
+    no_evidence = verdict == "ISSUES" and not issues
+    shadow_blocking = no_evidence or (verdict == "ISSUES" and failsafe_high > 0)
     return {
         "counts": counts,
         "legacy_high": legacy_high,
         "legacy_blocking": legacy_blocking,
         "failsafe_high": failsafe_high,
+        "no_evidence": no_evidence,
         "shadow_blocking": shadow_blocking,
         "would_flip": shadow_blocking and not legacy_blocking,
     }
