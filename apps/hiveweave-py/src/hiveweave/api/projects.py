@@ -1545,14 +1545,17 @@ async def delete_project(project_id: str) -> dict:
                     # ignore_errors=True: 即使部分文件失败也继续，避免中途退出
                     shutil.rmtree(str(hw_dir), ignore_errors=True)
                     # 再用 rmdir 清理残留的空目录结构
+                    from hiveweave.util.subprocess_decode import (
+                        decode_subprocess_output,
+                    )
                     from hiveweave.util.win_subprocess import hidden_run
 
+                    # P6-c(TEST_DSH_62)：bytes 回传 + 统一解码漏斗。旧写法
+                    # `text=True` 走 locale —— PYTHONUTF8=1 下恒 utf-8，与注释
+                    # 声称的「locale 解码出 GBK」不符，GBK 报错毁成 U+FFFD。
                     result = hidden_run(
                         ["cmd", "/c", "rmdir", "/s", "/q", str(hw_dir)],
-                        capture_output=True, text=True, timeout=30,
-                        # cmd 输出跟随系统 ANSI 代码页（中文机为 GBK），
-                        # 显式 locale 解码 + replace 防 illegal sequence 崩线程
-                        errors="replace",
+                        capture_output=True, timeout=30,
                     )
                     if not hw_dir.exists():
                         _rmtree_ok = True
@@ -1560,7 +1563,8 @@ async def delete_project(project_id: str) -> dict:
                         log.warning("windows_rmdir_fallback_failed",
                                     workspace=workspace,
                                     returncode=result.returncode,
-                                    stderr=result.stderr.strip())
+                                    stderr=decode_subprocess_output(
+                                        result.stderr or b"").strip())
                 except Exception as e:
                     log.warning("windows_rmdir_fallback_error",
                                 workspace=workspace, error=str(e))

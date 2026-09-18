@@ -41,6 +41,7 @@ except ImportError:  # non-Windows
     win32pipe = win32process = win32security = None
 
 from hiveweave.services.acl_sandbox.errors import SandboxUnavailableError
+from hiveweave.util.subprocess_decode import decode_subprocess_output
 
 CREATE_SUSPENDED = win32con.CREATE_SUSPENDED if win32con is not None else 0
 STARTF_USESTDHANDLES = win32con.STARTF_USESTDHANDLES if win32con is not None else 0
@@ -288,8 +289,10 @@ class ConfinedRunner:
             spawned.close()
         return {
             "exit_code": exit_code,
-            "stdout": b"".join(out_buf).decode("utf-8", errors="replace"),
-            "stderr": b"".join(err_buf).decode("utf-8", errors="replace"),
+            # P6-a(TEST_DSH_62)：受限子进程按系统 ANSI 代码页写本地化报错，
+            # utf-8/replace 直解会毁成 U+FFFD —— 统一走 decode_subprocess_output
+            "stdout": decode_subprocess_output(b"".join(out_buf)),
+            "stderr": decode_subprocess_output(b"".join(err_buf)),
             "timed_out": timed_out,
         }
 
@@ -390,10 +393,11 @@ class LongRunningJob:
         self._spawned.close()
 
     def output(self) -> str:
-        return b"".join(self._out).decode("utf-8", errors="replace")
+        # P6-a(TEST_DSH_62)：同 run() —— ANSI 回退解码，保住可读报错
+        return decode_subprocess_output(b"".join(self._out))
 
     def error_output(self) -> str:
-        return b"".join(self._err).decode("utf-8", errors="replace")
+        return decode_subprocess_output(b"".join(self._err))
 
     @property
     def exit_code(self) -> int | None:
