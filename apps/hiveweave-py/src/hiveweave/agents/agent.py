@@ -137,6 +137,9 @@ def _cache_drifts_payload(probe: dict | None) -> str | None:
     迁移，直接放进既有的 `cache_drifts` JSON：`{"drifts": [...],
     "first_mismatch_index": N}`。无漂移时返回 None（保持"未确定"语义，
     不把 NULL 写成 '[]' —— 与既有 test_set_run_fact_skips_none_drifts 一致）。
+    L7-b（TEST_DSH_62 观测批）：`prev_dialog_len` / `dialog_len` / `gap_s`
+    一并序列化 —— 机检判「末位单点 vs 中段改写」与缓存窗口是否过期需要
+    这三个观测位，此前它们只在日志里。
     """
     drifts = (probe or {}).get("drifts") or []
     if not drifts:
@@ -145,6 +148,9 @@ def _cache_drifts_payload(probe: dict | None) -> str | None:
         {
             "drifts": drifts,
             "first_mismatch_index": (probe or {}).get("first_mismatch_index"),
+            "prev_dialog_len": (probe or {}).get("prev_dialog_len"),
+            "dialog_len": (probe or {}).get("dialog_len"),
+            "gap_s": (probe or {}).get("gap_s"),
         },
         ensure_ascii=False,
     )
@@ -1488,18 +1494,21 @@ class Agent:
                         # 混成一个命中率数字会把 provider 缓存窗口过期也算到我们头上。
                         #
                         # TEST_DSH_54 #6（2026-09-12）：同时落**漂移明细**
-                        # （`drifts[]`：到底是 compacted_drift 还是
-                        # history_rewritten）。此前明细只在日志，平台日志文件
-                        # 一停就再也答不出"漂移的是哪一段前缀"。也可能出现
-                        # cold_start（无可读缓存域）—— 与 drift 分开记，
-                        # 免得把"必然零命中"当成"平台改写了前缀"去排查。
+                        # （`drifts[]`：到底是 compacted_drift /
+                        # history_rewritten / tail_hint_drift）。此前明细只在
+                        # 日志，平台日志文件一停就再也答不出"漂移的是哪一段
+                        # 前缀"。也可能出现 cold_start（无可读缓存域）—— 与
+                        # drift 分开记，免得把"必然零命中"当成"平台改写了
+                        # 前缀"去排查。
                         # issue-5 §3.2 ④(b)：把探针新算出的
                         # `first_mismatch_index`（首个不一致下标）一并落库。
                         # 不放新列、不改 schema —— 直接放进既有的 `cache_drifts`
                         # JSON 结构（`agent_runs.cache_drifts` 为 TEXT，无
                         # 类型约束，存量行仍是旧数组形态，新行读得出下标即可）。
-                        # 语义：不一致点 == prev_dialog_len-1 ⇒ 末位单点（本仓
-                        # 已实测的假阳签名）；居中 ⇒ 真·中段改写。
+                        # 语义：末位单点且 history 仍在增长 ⇒ 探针直接报
+                        # tail_hint_drift（本仓已实测的 exit_hint 假阳签名，
+                        # L7-c 起不再与中段改写混报）；居中 ⇒ 真·中段改写
+                        # （history_rewritten）。
                         if _probe and self._current_run_id:
                             await self._run_ledger.set_run_fact(
                                 self.id,

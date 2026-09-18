@@ -15,7 +15,12 @@ run 首请求 ``cache_read=0``，零命中 input 合计 1,742,881 tokens。R3 �
                         ——摘要只在压缩触发时变更；无压缩事件时异常）
 - ``history_rewritten`` 上次 history 不是本次 history 的前缀（中段被改写
                         ——append-only 纪律被破坏，或 prune/compaction
-                        中段替换未伴随摘要变更）
+                        中段替换未伴随摘要变更；末位单点失配见
+                        ``tail_hint_drift``）
+- ``tail_hint_drift``    末位单点失配且 history 仍在增长 —— 本仓实测的
+                        exit_hint 假阳签名（发送版末位 user 带 exit_hint、
+                        落库版不带 ⇒ 不一致点恰在 len(prev)-1），单列分类
+                        避免与真·中段改写混报
 - ``prefix_stable``     前缀全对齐（前缀命中条件全部满足）
 
 最终分类（``final``，report_cache_readout 输出，联合首请求 usage）：
@@ -181,7 +186,6 @@ def compare_and_record(
     if prev_d != cur_d[: len(prev_d)]:
         # 上次首请求的对话主体未原样作为本次前缀重现 —— 中段被改写
         # 或上 run 的对话未正常落库追加。
-        drifts.append("history_rewritten")
         # issue-5 §3.2 ④(b)：算出**首个不一致位置**。本仓库实测的
         # `history_rewritten` 假阳签名是「不一致点恒在末位」
         # （发送版 user 消息带 exit_hint、落库版不带 ⇒ len(prev_d)-1）。
@@ -192,6 +196,19 @@ def compare_and_record(
             if prev_d[i] != cur_d[i]:
                 first_mismatch_index = i
                 break
+        # L7-c（TEST_DSH_62 观测批）：末位单点且 history 仍在增长 ⇒ exit_hint
+        # 假阳签名，改报 tail_hint_drift 与真·中段改写分流。增长判据是签名
+        # 的固有特征：假阳场景下 run2 的 history 必然 ⊇ run1 dialog（追加
+        # 了 assistant 回复与新 user）⇒ len(cur) > len(prev)；对话蒸发 /
+        # 截断（cur 不比 prev 长）即便失配落在末位也是真丢失，仍报
+        # history_rewritten —— 那正是探针要抓的观测价值。
+        if (
+            first_mismatch_index == len(prev_d) - 1
+            and len(cur_d) > len(prev_d)
+        ):
+            drifts.append("tail_hint_drift")
+        else:
+            drifts.append("history_rewritten")
 
     verdict = {
         "verdict": "+".join(drifts) if drifts else "prefix_stable",

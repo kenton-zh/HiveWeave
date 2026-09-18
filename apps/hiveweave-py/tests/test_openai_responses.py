@@ -252,3 +252,44 @@ def test_explicit_responses_rewrites_leftover_chat_url():
     })
     assert cfg.api_format == ApiFormat.OPENAI_RESPONSES
     assert cfg.build_url() == ZEN_RESP
+
+
+# ── L7-a：usage 未知字段一次性采样（TEST_DSH_62 观测批）────────────
+#
+# 目的：验证网关是否上报 cache-write 类字段（cache_creation_input_tokens
+# 等）。已知键集合之外的键 ⇒ 每键只打一条 usage_unknown_field_sampled。
+
+
+def test_extract_usage_samples_unknown_field_once(monkeypatch):
+    from hiveweave.llm import openai_responses as mod
+
+    mod._sampled_usage_keys.clear()
+    calls: list[tuple[str, dict]] = []
+
+    class _Recorder:
+        def info(self, event, **kw):
+            calls.append((event, kw))
+
+    monkeypatch.setattr(mod, "log", _Recorder())
+    h = OpenAIResponsesHandler()
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_creation_input_tokens": 64,
+    }
+    try:
+        out1 = h.extract_usage({"usage": dict(usage)})
+        h.extract_usage({"usage": dict(usage)})  # 第二次不得重复采样
+        assert out1 is not None
+        sampled = [c for c in calls if c[0] == "usage_unknown_field_sampled"]
+        assert len(sampled) == 1, calls
+        assert sampled[0][1]["keys"] == ["cache_creation_input_tokens"]
+        assert sampled[0][1]["value"] == {"cache_creation_input_tokens": 64}
+        # 标准键不触发采样
+        h.extract_usage({"usage": {
+            "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+        }})
+        assert len([c for c in calls
+                    if c[0] == "usage_unknown_field_sampled"]) == 1
+    finally:
+        mod._sampled_usage_keys.clear()

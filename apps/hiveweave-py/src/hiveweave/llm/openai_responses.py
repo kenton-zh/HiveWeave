@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import structlog
+
 from hiveweave.llm.provider import FORMAT_HANDLERS, ApiFormat, FormatHandler, OpenAIHandler
 from hiveweave.llm.thinking import (
     apply_responses_thinking,
@@ -22,8 +24,51 @@ from hiveweave.llm.wire_endpoint import (
     split_wire_endpoint,
 )
 
+log = structlog.get_logger(__name__)
+
 _MAX_OUTPUT_HARD_CAP = 128_000
 _DEFAULT_OUTPUT_CAP = 32_000
+
+# L7-a（TEST_DSH_62 观测批）：usage 未知字段一次性采样。
+# 目的：验证网关是否在 usage 里上报 cache-write 类字段
+# （cache_creation_input_tokens 等）——本提取器只映射已知键，网关若报了
+# 之外的键会静默丢失。对已知集合之外的键**每键只打一次**采样日志
+# （进程级去重；值一并打 —— usage 无敏感信息），风格对齐
+# llm/unknown_error_samples.py 的留样思路（fail-loud 观测，不打断主链路）。
+_KNOWN_USAGE_KEYS = frozenset({
+    # 本提取器显式读取的键
+    "input_tokens", "prompt_tokens",
+    "output_tokens", "completion_tokens",
+    "input_tokens_details", "prompt_tokens_details",
+    "cache_read",
+    # Responses 协议标准存在但本提取器不消费的键（不算未知，防噪音）
+    "total_tokens", "output_tokens_details",
+})
+_sampled_usage_keys: set[str] = set()
+
+
+def _sample_unknown_usage_fields(u: dict) -> None:
+    """usage 顶层出现已知集合之外的键 ⇒ 打一次性采样日志（每键仅一次）。
+
+    ⚠ 本函数**不抛 Exception**：挂在 usage 提取主链路上，观测失败绝不
+    打断计费解析。只扫顶层键 —— *_details 嵌套结构里的标准子键
+    （cached_tokens / reasoning_tokens）已有消费路径，不在此采样。
+    """
+    try:
+        fresh = [
+            k for k in u
+            if k not in _KNOWN_USAGE_KEYS and k not in _sampled_usage_keys
+        ]
+        if not fresh:
+            return
+        _sampled_usage_keys.update(fresh)
+        log.info(
+            "usage_unknown_field_sampled",
+            keys=sorted(fresh),
+            value={k: u.get(k) for k in fresh},
+        )
+    except Exception as e:  # noqa: BLE001 — 观测绝不打断 usage 主链路
+        log.debug("usage_unknown_field_sample_failed", error=str(e)[:200])
 
 
 def rewrite_to_responses_url(base_url: str) -> str:
@@ -190,6 +235,7 @@ class OpenAIResponsesHandler(FormatHandler):
             u = chunk["response"].get("usage")
         if not isinstance(u, dict):
             return None
+        _sample_unknown_usage_fields(u)
         from hiveweave.llm.util import usage_int
 
         out: dict = {}

@@ -462,7 +462,8 @@ def test_agents_are_isolated():
 
 
 def test_first_mismatch_index_is_last_position_on_tail_only_drift():
-    """末位单点（本仓假阳签名）：index 必须恰为 prev_dialog_len-1。"""
+    """末位单点（本仓假阳签名）：index 必须恰为 prev_dialog_len-1，且
+    L7-c 起分类为 tail_hint_drift（不再与中段改写混报）。"""
     h = [
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},
@@ -479,11 +480,32 @@ def test_first_mismatch_index_is_last_position_on_tail_only_drift():
     v = compare_and_record(
         "a1", _build_messages(history=h2, user="next"), model_key=MODEL_KEY
     )
-    assert "history_rewritten" in v["drifts"]
+    assert "tail_hint_drift" in v["drifts"], v
+    assert "history_rewritten" not in v["drifts"], v
     assert v["prev_dialog_len"] == 3
     assert v["first_mismatch_index"] == v["prev_dialog_len"] - 1, (
         "末位单点的下标必须落在 prev_dialog_len-1 —— 这是区分假阳的判据"
     )
+
+
+def test_tail_position_mismatch_without_growth_stays_history_rewritten():
+    """L7-c 增长判据：失配虽落在末位下标，但 cur 没比 prev 长（末位被
+    换 / 丢失而非追加）⇒ 不是 exit_hint 假阳，必须仍报 history_rewritten
+    —— 这正是探针要抓的观测价值（见 test_missing_history_append_
+    detected_as_rewrite 的真实链路版）。"""
+    h = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    # run1 dialog = [q1, a1]；run2 末位被换（a1 → x），长度未增长
+    compare_and_record("a1", _build_messages(history=h[:1], user="a1"),
+                       model_key=MODEL_KEY)
+    v = compare_and_record(
+        "a1", _build_messages(history=h[:1], user="x"), model_key=MODEL_KEY
+    )
+    assert v["first_mismatch_index"] == v["prev_dialog_len"] - 1, v  # 末位下标
+    assert v["dialog_len"] == v["prev_dialog_len"], v  # 且未增长
+    assert v["drifts"] == ["history_rewritten"], v
 
 
 def test_first_mismatch_index_points_to_middle_on_true_rewrite():
@@ -588,6 +610,38 @@ def test_cache_drifts_payload_embeds_first_mismatch_index():
         "first_mismatch_index 不得在下标字段缺失/被丢弃 —— 否则落库后仍答不出"
         "「末位单点 vs 中段改写」"
     )
+
+
+def test_cache_drifts_payload_embeds_l7b_observation_fields():
+    """L7-b：prev_dialog_len / dialog_len / gap_s 必须随明细落库 ——
+    机检「末位单点 vs 中段改写」与缓存窗口是否过期（gap_s）需要这三个
+    观测位，此前它们只在日志里。缺失键机检就得退回人工读日志。"""
+    import json
+
+    from hiveweave.agents.agent import _cache_drifts_payload
+
+    payload = _cache_drifts_payload(
+        {
+            "drifts": ["tail_hint_drift"],
+            "first_mismatch_index": 40,
+            "prev_dialog_len": 41,
+            "dialog_len": 44,
+            "gap_s": 312.5,
+        }
+    )
+    assert payload is not None
+    decoded = json.loads(payload)
+    assert decoded["prev_dialog_len"] == 41
+    assert decoded["dialog_len"] == 44
+    assert decoded["gap_s"] == 312.5
+    # 缺字段的 verdict（旧调用方/构造不全）⇒ 键仍在、值为 None，
+    # 不因 KeyError 炸掉落库路径
+    partial = json.loads(
+        _cache_drifts_payload({"drifts": ["compacted_drift"]}) or "{}"
+    )
+    assert partial["prev_dialog_len"] is None
+    assert partial["dialog_len"] is None
+    assert partial["gap_s"] is None
 
 
 def test_cache_drifts_payload_none_without_drifts():
