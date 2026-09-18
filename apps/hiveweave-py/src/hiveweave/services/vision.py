@@ -575,8 +575,10 @@ def _text_from_message(msg: dict[str, Any]) -> str:
 def extract_nonstream_text(data: dict[str, Any]) -> str:
     """Pull assistant text from a non-streaming chat completion body.
 
-    Supports OpenAI ``choices``, Anthropic ``content`` blocks, and Gemini
-    ``candidates`` — same providers as ``provider_factory``.
+    Supports OpenAI ``choices``, Anthropic ``content`` blocks, Gemini
+    ``candidates``, and the openai-responses non-stream shape
+    (``object=response`` + ``output[]``) — same providers as
+    ``provider_factory``.
     When ``message.content`` is empty (common with thinking models), falls
     back to ``reasoning_content`` / ``thinking``.
     """
@@ -618,6 +620,31 @@ def extract_nonstream_text(data: dict[str, Any]) -> str:
             ]
             return "".join(bits)
 
+    # openai-responses 非流式形态（TEST_DSH_62：muse-spark 实际能看图且
+    # 上游回答完整，但网关回的是 object=response 的 Responses 协议体而非
+    # chat choices，旧解析读成空 → "Vision model returned empty content"）。
+    # 字段路径对齐 llm/openai_responses.py:_chunks_from_complete_response
+    # （SSE 路径的同类解析）：output[] 的 message 条目 → content[] 里
+    # type=="output_text" 的 .text；reasoning / function_call 等条目不含
+    # 可见文本，跳过。status=completed 但无文本则落空返回 ""，交给调用方
+    # 既有报错路径。
+    output = data.get("output")
+    if data.get("object") == "response" or isinstance(output, list):
+        bits = []
+        for item in output or []:
+            if not isinstance(item, dict):
+                continue
+            for part in item.get("content") or []:
+                if (
+                    isinstance(part, dict)
+                    # "text" 与 SSE 路径同口径兜底（部分网关回简写形态）
+                    and part.get("type") in ("output_text", "text")
+                    and isinstance(part.get("text"), str)
+                ):
+                    bits.append(part["text"])
+        if bits:
+            return "".join(bits)
+
     return ""
 
 
@@ -644,12 +671,12 @@ async def analyze_image(
     )
 
     # Vision one-shot wants visible content, not a thinking-only body.
+    # （supports_images 不在此强设：provider_factory.create 只认
+    # is_image_supported() 自动探测，不读 model_config["supports_images"]，
+    # 写了也是死代码，已摘除。）
     cfg = dict(model_config)
     cfg["supports_thinking"] = False
     cfg["default_reasoning_effort"] = None
-    # vision 槽位语义即多模态：强制放行图像注入，防止模型行 supports_images=0
-    # （出厂默认值）把图片静默剥掉，导致 look_at_image 只发文字提示词。
-    cfg["supports_images"] = True
 
     provider = provider_factory.create(cfg)
     body = provider.build_body(

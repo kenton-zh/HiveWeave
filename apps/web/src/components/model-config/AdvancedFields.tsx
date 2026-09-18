@@ -163,6 +163,9 @@ export default function AdvancedFields({ form, setField }: Props) {
               }`}
             />
           </button>
+          <p className="mt-1.5 text-[11px] text-g-fg-4 leading-snug">
+            当前不参与运行时判定：图像能力由平台自动探测（请求失败自动降级）。
+          </p>
         </div>
       </div>
 

@@ -1436,7 +1436,6 @@ class ProviderConfig:
         temperature: float = 0.7,
         top_p: float | None = None,
         top_k: int | None = None,
-        fallback: str | None = None,
         handler: FormatHandler | None = None,
         extra_headers: dict[str, str] | None = None,
         supports_prompt_cache: bool = False,
@@ -1468,7 +1467,6 @@ class ProviderConfig:
         # 可选采样参数：None = 模型配置未设置 → 请求体不带（行为不变）
         self.top_p = top_p
         self.top_k = top_k
-        self.fallback = fallback
         if handler is not None:
             self._handler = handler
         elif api_format == ApiFormat.OPENAI_RESPONSES:
@@ -1663,7 +1661,6 @@ class ProviderFactory:
             temperature=float(model_config.get("temperature") or 0.7),
             top_p=top_p,
             top_k=top_k,
-            fallback=model_config.get("fallback"),
             supports_prompt_cache=supports_cache,
             supports_images=auto_images,
         )
