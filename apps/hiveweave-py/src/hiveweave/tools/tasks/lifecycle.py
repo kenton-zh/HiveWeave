@@ -235,6 +235,40 @@ async def update_task_status_tool(
                     f"it), i.e. a 'dependency' wait, not a person/external "
                     f"wait. Pass one of them."
                 )
+            # TEST_DSH_62 P5/L8（2026-09-18）幂等豁免（工具层，状态机不动）：
+            # 现场取证 blocked→blocked（17:23:04，args 带新 blockedReason +
+            # dependsOnTaskIds，实为元数据刷新需求——blocked 态此前无刷新
+            # 通道）与 running→running（18:28:37，确保态重申）都被服务层
+            # 判 Illegal transition。同态重入在发转移请求前就地消化：
+            # 带元数据 → 走 update_blocked_metadata 刷新（无转移事件）；
+            # 不带 → no-op 成功回执。放在「必须有解封路径」校验之前——
+            # 已 blocked 的任务刷新 reason 不需要重新声明解封出口。
+            cur = await ts.get_task(project_id, params.task_id)
+            if (cur or {}).get("status") == "blocked":
+                has_meta = (
+                    bool((params.blocked_reason or "").strip())
+                    or bool(deps)
+                    or params.wait_kind is not None
+                    or params.wake_at is not None
+                )
+                if has_meta:
+                    await ts.update_blocked_metadata(
+                        project_id,
+                        params.task_id,
+                        reason=(params.blocked_reason or "").strip() or None,
+                        depends_on_task_ids=deps or None,
+                        wait_kind=params.wait_kind,
+                        wake_at=wake_ms,
+                    )
+                    return ToolResult.ok(
+                        f"Task {params.task_id} already blocked — "
+                        f"outcome=metadata_refreshed (blocked metadata "
+                        f"updated in place; no status transition, no new "
+                        f"transition event)."
+                    )
+                return ToolResult.ok(
+                    f"Task {params.task_id} already blocked (no-op)."
+                )
             # 2026-09-17（PLATFORM-ISSUES §11.6）：waitKind=user/external 是
             # **合法且必要**的出口 —— 它表达「等一个 agent 做裁决 / 等外部世界」，
             # 这类等待**没有机器可判的自动解封路径**，由平台的升级兜底负责
@@ -286,6 +320,12 @@ async def update_task_status_tool(
             await ts.unblock_task(project_id, params.task_id)
             return ToolResult.ok(
                 f"Task {params.task_id} unblocked (running)."
+            )
+        if cur_status == "running":
+            # TEST_DSH_62 P5/L8 幂等豁免：running→running 是确保态重申
+            # （现场 18:28:37 实证被判 Illegal transition），非非法转移。
+            return ToolResult.ok(
+                f"Task {params.task_id} already running (no-op)."
             )
         await ts.start_task(project_id, params.task_id)
         return ToolResult.ok(f"Task {params.task_id} started (running).")

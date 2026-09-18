@@ -419,10 +419,13 @@ class MergeMixin:
                 "success": True,
                 "merged": False,
                 "already_up_to_date": True,
+                # TEST_DSH_62 P5/L8：merge 回执文本带稳定 outcome token
+                # （merged / already_merged / nothing_to_merge 三语义），
+                # 模型唯一可见通道是文本——不加结构化字段。
                 "message": (
-                    f"No-op merge: branch {branch} has 0 commits ahead of "
-                    f"{target_branch} — nothing to merge. The worktree is "
-                    f"already up to date with {target_branch}."
+                    f"outcome=nothing_to_merge: branch {branch} has 0 "
+                    f"commits ahead of {target_branch} — nothing to merge. "
+                    f"The worktree is already up to date with {target_branch}."
                     " The merge is COMPLETE — do not call "
                     "git_worktree_merge again; the task auto-closes after "
                     "the grace period."
@@ -751,11 +754,18 @@ class MergeMixin:
             "branch": branch,
             "files": branch_files,
             "short_id": short_id,
+            # outcome token（TEST_DSH_62 P5/L8）：真合并必须可 grep 区分于
+            # already_merged / nothing_to_merge，供 run_steps.result_excerpt。
+            "message": (
+                f"outcome=merged: Branch {branch} merged into {target_branch}"
+                + (f" (merge commit {head})" if ok and head else "")
+                + "."
+            ),
         }
         if already:
             result["already_up_to_date"] = True
             result["message"] = (
-                f"Branch {branch} already on {target_branch} "
+                f"outcome=merged: Branch {branch} already on {target_branch} "
                 f"(no new commits) — treated as merged. "
                 "The merge is COMPLETE — do not call git_worktree_merge "
                 "again; the task auto-closes after the grace period."
@@ -852,10 +862,15 @@ class MergeMixin:
                 "branch": branch,
                 "short_id": short_id,
                 "already_up_to_date": True,
+                # outcome token + 与工具层短路（misc_tools 分支零匹配的
+                # already-merged 回执）同一句文案：两处「已合并」变体收敛，
+                # 仅靠 token/文本一致即可对账。
                 "message": (
-                    f"Branch {branch} was already merged into "
-                    f"{target_branch} in a prior merge — treated as success."
-                    " Nothing to do. (Idempotent re-entry; do not re-merge.)"
+                    f"outcome=already_merged: Branch {branch} was already "
+                    f"merged into {target_branch} by a prior merge — "
+                    "idempotent success. Nothing to do; the worktree branch "
+                    "was cleaned up. Do not call git_worktree_merge again "
+                    "for this branch."
                 ),
             }
 
@@ -1162,11 +1177,18 @@ class MergeMixin:
             "branch": branch,
             "files": branch_files,
             "short_id": short_id,
+            # outcome token（TEST_DSH_62 P5/L8）：真合并必须可 grep 区分于
+            # already_merged / nothing_to_merge，供 run_steps.result_excerpt。
+            "message": (
+                f"outcome=merged: Branch {branch} merged into {target_branch}"
+                + (f" (merge commit {head})" if ok_head and head else "")
+                + "."
+            ),
         }
         if already:
             result["already_up_to_date"] = True
             result["message"] = (
-                f"Branch {branch} already on {target_branch} "
+                f"outcome=merged: Branch {branch} already on {target_branch} "
                 f"(no new commits) — treated as merged. "
                 "The merge is COMPLETE — do not call git_worktree_merge "
                 "again; the task auto-closes after the grace period."

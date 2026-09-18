@@ -666,6 +666,25 @@ async def review_task_tool(
                     "same review_task call; do NOT rework or punish the "
                     "assignee based on this state.\n" + _race_fact_bit(task)
                 )
+            elif current_status == "approved":
+                # TEST_DSH_62 P5/L8：重复 approve 旧文案与 blocked 混用同一
+                # 模板（"must be 'submitted' or 'reviewing'"），模型无从分辨
+                # 「已批过勿重复」与「状态不对」。按状态拆分专属文案。
+                return ToolResult.err(
+                    "Task already 'approved' — approval has already "
+                    "happened; approve side effects (VERIFY spawn / merge "
+                    "gating) must fire exactly once. Do NOT approve again. "
+                    "Wait for the merge, or use decision='rework' if "
+                    "post-approve changes are needed."
+                )
+            elif current_status == "blocked":
+                return ToolResult.err(
+                    "Task is 'blocked' (reason recorded on the task's "
+                    "blockedReason / wait metadata) — clear the blockage "
+                    "first (or let its auto-unblock path / reconcile wake "
+                    "it), then have the assignee resubmit. A blocked task "
+                    "cannot be approved."
+                )
             elif current_status != "reviewing":
                 return ToolResult.err(
                     f"Task must be 'submitted' or 'reviewing' to approve, "

@@ -483,6 +483,104 @@ class LifecycleMixin:
                     error=str(e),
                 )
 
+    async def update_blocked_metadata(
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        reason: str | None = None,
+        depends_on_task_ids: list[str] | None = None,
+        wait_kind: str | None = None,
+        wake_at: int | None = None,
+    ) -> None:
+        """Refresh a blocked task's wait metadata in place — no transition.
+
+        TEST_DSH_62 P5/L8（2026-09-18）：现场 blocked→blocked 的
+        update_task_status 实为元数据刷新需求（args 带了新 blockedReason +
+        dependsOnTaskIds），状态机无自环、走转移必然 Illegal transition。
+        工具层在发转移请求前读当前态，同态 blocked 且带元数据时改走本
+        入口：只更新任务字段，**不写状态转移事件**。窄函数：仅 blocked
+        态可调（其余状态 ValueError），且只动显式传入的字段——未传的
+        字段保持原值，不照搬 block_task 的默认值覆盖语义。
+        """
+        task_id = await self.require_task_id(project_id, task_id)
+        row = await self.get_task(project_id, task_id)
+        if not row:
+            raise ValueError(f"Task not found: {task_id}")
+        if row.get("status") != "blocked":
+            raise ValueError(
+                f"update_blocked_metadata only applies to blocked tasks — "
+                f"task {task_id[:8]} is '{row.get('status')}'. Use "
+                f"block_task for the initial transition."
+            )
+        dep_ids: list[str] = []
+        for d in (depends_on_task_ids or []):
+            dep_ids.append(await self.require_task_id(project_id, d))
+        if any(_same_task_id(d, task_id) for d in dep_ids):
+            raise ValueError(SELF_DEPENDENCY_BLOCK_ERROR)
+        now_ms = int(time.time() * 1000)
+        # wait 三件套只有显式传入任一项才触碰（纯 reason 刷新不得把
+        # wait_kind 意外改写成推断默认值）；kind 推断与 block_task 同源：
+        # deps → dependency，wake_at → timer。
+        touch_wait = (
+            wait_kind is not None or wake_at is not None or bool(dep_ids)
+        )
+        if touch_wait:
+            eff_kind = wait_kind or ("dependency" if dep_ids else "timer")
+            await _execute(
+                project_id,
+                "UPDATE tasks SET "
+                "blocked_reason = COALESCE(?, blocked_reason), "
+                "wait_kind = ?, "
+                "wake_at = CASE WHEN ? IS NOT NULL THEN ? "
+                "WHEN ? = 'timer' THEN wake_at ELSE NULL END, "
+                "updated_at = ? WHERE id = ?",
+                [reason, eff_kind, wake_at, wake_at, eff_kind, now_ms, task_id],
+            )
+        elif reason is not None:
+            await _execute(
+                project_id,
+                "UPDATE tasks SET blocked_reason = ?, updated_at = ? "
+                "WHERE id = ?",
+                [reason, now_ms, task_id],
+            )
+        # Structured dependency refs → merge into depends_on (same as
+        # block_task: additive only, never strips existing deps)
+        if dep_ids:
+            try:
+                rows = await _query(
+                    project_id,
+                    "SELECT depends_on FROM tasks WHERE id = ?",
+                    [task_id],
+                )
+                deps: list = []
+                if rows and rows[0]["depends_on"]:
+                    raw = rows[0]["depends_on"]
+                    try:
+                        deps = json.loads(raw) if isinstance(raw, str) else list(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        deps = []
+                if not isinstance(deps, list):
+                    deps = []
+                added = False
+                for d in dep_ids:
+                    if d not in deps:
+                        deps.append(d)
+                        added = True
+                if added:
+                    await _execute(
+                        project_id,
+                        "UPDATE tasks SET depends_on = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        [json.dumps(deps), now_ms, task_id],
+                    )
+            except Exception as e:
+                log.warning(
+                    "update_blocked_metadata_depends_on_merge_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
+
     async def unblock_task(self, project_id: str, task_id: str) -> None:
         """Unblock a task (blocked → running). Clears blocked_reason.
 

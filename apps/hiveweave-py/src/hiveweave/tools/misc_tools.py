@@ -658,11 +658,15 @@ async def git_worktree_merge_tool(
                     workspace_path,
                 )
             if _already:
+                # TEST_DSH_62 P5/L8：outcome token + 与服务层
+                # merge_by_branch 幂等重入回执（service_merge.py）收敛为
+                # 同一句文案，两处「已合并」变体只留这一份。
                 return ToolResult.ok(
-                    f"Branch {_candidate} was already merged into "
-                    f"{target_branch} by a prior merge — idempotent success. "
-                    "Nothing to do; the worktree branch was cleaned up. "
-                    "Do not re-merge."
+                    f"outcome=already_merged: Branch {_candidate} was "
+                    f"already merged into {target_branch} by a prior "
+                    "merge — idempotent success. Nothing to do; the "
+                    "worktree branch was cleaned up. Do not call "
+                    "git_worktree_merge again for this branch."
                 )
             # T2.1: 分支查找零匹配 ≠ 冲突 —— 对照组（task_name 零匹配路径）
             # 从不拼冲突提示，这里此前却无条件拼 MERGE_CONFLICT_HINT，把
@@ -781,14 +785,22 @@ async def git_worktree_merge_tool(
         issues += report.get("missing", [])
         if report.get("already_up_to_date"):
             msg = (
-                f"dry-run: 分支 {merged_branch} 已合入 {target_branch}，"
-                f"无需 merge。"
+                f"dry-run（信息性预检结果，非错误）：分支 {merged_branch} "
+                f"已合入 {target_branch}，无需 merge。"
             )
         elif not issues:
-            msg = "dry-run: 所有 merge 前置条件已满足，可以执行 merge。"
-        else:
             msg = (
-                "dry-run: 以下前置条件未满足，merge 将被拒绝：\n"
+                "dry-run（信息性预检结果，非错误）：所有 merge 前置条件"
+                "已满足，可以执行 merge。"
+            )
+        else:
+            # TEST_DSH_62 P5/L8：dry-run 是独立形态（不带 outcome token），
+            # 但缺失项清单曾被读成「本次调用失败」——明确这是信息性
+            # 预检结果：当前调用本身成功，未满足项只影响后续真实 merge。
+            msg = (
+                "dry-run（信息性预检结果，非错误）：以下前置条件未满足，"
+                "实际执行 merge 时会被拒绝（本次 dry-run 调用本身成功、"
+                "零改动）：\n"
                 + "\n".join(f"- [{i['code']}] {i['message']}" for i in issues)
             )
         return ToolResult.ok(msg, dry_run=True, missing=issues)
@@ -1284,9 +1296,15 @@ async def git_worktree_status_tool(
                     f"No worktree found for short_id={target_sid} "
                     f"(MAIN inspect failed: {e})"
                 )
-        return ToolResult.err(
-            f"No worktree found for short_id={target_sid}. "
-            f"Expected path under .hiveweave/worktrees/{target_sid}/"
+        # TEST_DSH_62 P5/L8：查**他人**已拆 worktree 查不到是正常答案——
+        # 真合并必拆 worktree（service_merge 清理链），此前按 failed 报
+        # 「No worktree found」会误导重建。对齐服务层 info() 的
+        # success:True/status:None 语义，success + found=false token。
+        return ToolResult.ok(
+            f"found=false — No worktree found for short_id={target_sid} "
+            f"(expected path under .hiveweave/worktrees/{target_sid}/). "
+            "该 worktree 不存在——若此前合并过，合并时会自动拆除"
+            "(cleaned up)，无需重建。"
         )
     branch = info.get("branch") or "?"
     dirty = bool(info.get("has_uncommitted"))
