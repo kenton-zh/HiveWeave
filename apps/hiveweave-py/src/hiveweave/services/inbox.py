@@ -135,10 +135,16 @@ ACK_SPARE_PREFIXES: tuple[str, ...] = (
     "[POST-MERGE VERIFY]",
     "[SHIP READY]",
     "[SUBAGENT DONE]",
+    "[SUBAGENT DONE_TRUNCATED]",
     "[SUBAGENT FAILED]",
     "[BASH DONE]",
     "[BASH FAILED]",
 )
+"""Give-up ACK 不得吞掉这些（BUGFIX: TEST7 429→ACK killed reviews）。
+⚠ `[SUBAGENT DONE_TRUNCATED]`（P0-1）必须与 `[SUBAGENT DONE]` **同列**：
+它读作「干过但没收尾」，在「要不要被 ACK 吞掉」上与 DONE 同族。只把它写进
+文档忘了这张表，会造出「回执被 give-up ACK 静默吞掉、父永不知道子代理被
+切断」的新漏。"""
 PARK_EXEMPT_MESSAGE_TYPES: frozenset[str] = frozenset({"escalation", "ask"})
 # Review / escalation obligations stay wake=1 across 下班. Completion
 # prefixes are ACK-spare (don't swallow on give-up) but MUST park —

@@ -1118,3 +1118,149 @@ def test_platform_reserved_identity() -> None:
     assert not is_platform_reserved_inbox_identity(message_type="system")
     assert not is_platform_reserved_inbox_identity(message_type="normal")
 
+
+# ─────────────────────── P0-1：第三终态 DONE_TRUNCATED ────────────────────
+#
+# TEST_DSH_60 实测：7 条回执里 3 条 `[SUBAGENT DONE]` 正文却带着
+# `Hard turn budget exhausted` —— 子代理被轮次预算切断，交付物可能根本没落盘，
+# 父以为完成、不再验货。修法 = 把 turn_loop 已经给出的结构化
+# ``budget_exhausted`` 事实位穿透到回执前缀。
+#
+# 判据纪律（用户 09-14 钦定）：**不得靠文案子串推断终态**。下面每个断言
+# 都只读「实际前缀」这一个状态事实位，不 assert 正文措辞。
+
+
+@pytest.mark.asyncio
+async def test_budget_exhausted_yields_truncated_prefix_not_done(
+    monkeypatch: pytest.MonkeyPatch, clean_offturn
+) -> None:
+    """子代理回执：`budget_exhausted` ⇒ 前缀是 TRUNCATED，绝不是 DONE。"""
+    inbox, _cleared = _patch_completion(monkeypatch)
+    parent = _FakeParent()
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        lambda _aid: parent,
+    )
+
+    async def fake_run(*_a, **_k):
+        return {
+            "status": "ok",
+            "content": "partial work",
+            "budget_exhausted": True,
+        }
+
+    monkeypatch.setattr("hiveweave.tools.subagent._run_subagent", fake_run)
+
+    result = await spawn_subagent_tool(
+        SpawnSubagentParams(subagent_type="readonly", prompt="scout"),
+        "agent-exec",
+        "/tmp/ws",
+    )
+    assert result.success
+    job_id = result.extra["job_id"]
+    for _ in range(80):
+        if not is_live_job(job_id):
+            break
+        await asyncio.sleep(0.02)
+    assert inbox, "completion receipt must be delivered"
+    head = inbox[0].lstrip()
+    assert head.startswith("[SUBAGENT DONE_TRUNCATED]"), head[:60]
+    # 反向：不得同时被当成 DONE 或 FAILED
+    assert not head.startswith("[SUBAGENT DONE]")
+    assert not head.startswith("[SUBAGENT FAILED]")
+
+
+@pytest.mark.asyncio
+async def test_normal_subagent_still_receives_plain_done(
+    monkeypatch: pytest.MonkeyPatch, clean_offturn
+) -> None:
+    """阴性对照：没被切断时前缀仍是纯 DONE（防守卫恒绿/过度泛化）。"""
+    inbox, _cleared = _patch_completion(monkeypatch)
+    parent = _FakeParent()
+    monkeypatch.setattr(
+        "hiveweave.agents.supervisor.agent_manager.get_agent",
+        lambda _aid: parent,
+    )
+
+    async def fake_run(*_a, **_k):
+        return {"status": "ok", "content": "scout report"}
+
+    monkeypatch.setattr("hiveweave.tools.subagent._run_subagent", fake_run)
+
+    result = await spawn_subagent_tool(
+        SpawnSubagentParams(subagent_type="readonly", prompt="scout"),
+        "agent-exec",
+        "/tmp/ws",
+    )
+    job_id = result.extra["job_id"]
+    for _ in range(80):
+        if not is_live_job(job_id):
+            break
+        await asyncio.sleep(0.02)
+    assert inbox
+    head = inbox[0].lstrip()
+    assert head.startswith("[SUBAGENT DONE]"), head[:60]
+    assert not head.startswith("[SUBAGENT DONE_TRUNCATED]")
+
+
+@pytest.mark.asyncio
+async def test_truncated_receipt_still_satisfies_parent_wait(
+    clean_offturn,
+) -> None:
+    """TRUNCATED **也是回执** ⇒ 父的 kind=agent wait 必须被满足。
+
+    它读作「干过但没收尾」，不是失败。若它不被 is_offturn_completion_text
+    识别，父会留在 wait 上等一个永不再来的唤醒（静默停泊）。
+    """
+    body = "[SUBAGENT DONE_TRUNCATED] job=bg-sub-x\npartial"
+    assert is_offturn_completion_text(body)
+    assert (
+        await wake_source_for_pending(
+            [{"message": body, "message_type": OFFTURN_COMPLETION_MESSAGE_TYPE}]
+        )
+        == "wait_satisfied"
+    )
+
+
+def test_truncated_prefix_park_and_ack_semantics_match_done() -> None:
+    """park / give-up-ACK 语义必须与 DONE **同族**，不得单独造例外。
+
+    inbox 的两张表都不含任何 DONE 类前缀（`[TASK SUBMITTED]` 等才 exempt），
+    目的是不让未完的唤醒被 park 掉。TRUNCATED 与 DONE 同族 ⇒ 两张表里的
+    归属也必须相同，否则会造出「TRUNCATED 被 park 就永久丢」的新不一致。
+    """
+    done = {"message": "[SUBAGENT DONE] job=x", "message_type": "system"}
+    trunc = {"message": "[SUBAGENT DONE_TRUNCATED] job=x", "message_type": "system"}
+    assert should_exempt_from_park(done) == should_exempt_from_park(trunc)
+    assert should_spare_from_give_up_ack(done) == should_spare_from_give_up_ack(
+        trunc
+    )
+    for mt in (None, "system", OFFTURN_COMPLETION_MESSAGE_TYPE):
+        d = {"message": "[SUBAGENT DONE] job=x", "message_type": mt}
+        t = {"message": "[SUBAGENT DONE_TRUNCATED] job=x", "message_type": mt}
+        assert should_exempt_from_park(d) == should_exempt_from_park(t)
+        assert should_spare_from_give_up_ack(
+            d
+        ) == should_spare_from_give_up_ack(t)
+
+
+def test_bash_has_no_truncated_kind() -> None:
+    """bash 无第三值：只有 subagent 会 `ok=False` 地「非失败的未完成」。
+
+    这条守的是「不造死常量」——`PREFIX_BASH_TRUNCATED` 不存在，所以
+    `_TRUNCATED` 里也不会出现它。若将来 bash 也要第三值，本测试会失败，
+    提醒同步改 docs 与提示词，而不是静默漂移。
+    """
+    from hiveweave.services import offturn as _ot
+
+    assert set(_ot._TRUNCATED) == {"subagent"}
+    assert not hasattr(_ot, "PREFIX_BASH_TRUNCATED")
+    # 协议全集必须含 TRUNCATED——否则 is_offturn_completion_text 认不出它
+    assert _ot.PREFIX_SUB_TRUNCATED in _ot._COMPLETION_PREFIXES
+
+
+def test_unrelated_same_named_prefix_is_not_a_receipt() -> None:
+    """防误认：只有**行首**的完整协议前缀才算回执。"""
+    assert not is_offturn_completion_text("[RANDOM] [SUBAGENT DONE_TRUNCATED] x")
+    assert not is_offturn_completion_text("see [SUBAGENT DONE_TRUNCATED] above")
+

@@ -32,20 +32,67 @@ _STOP_REASON = "stopped (project off-duty, dismiss, or shutdown)"
 
 PREFIX_SUB_DONE = "[SUBAGENT DONE]"
 PREFIX_SUB_FAILED = "[SUBAGENT FAILED]"
+# P0-1（TEST_DSH_60）：第三终态——「干过但没收尾（可能没落盘）」。
+# 真实终态本来是三值，过去被压成 `_DONE` / `_FAILED` 二值 ⇒ 7 条回执里
+# 3 条 DONE 其实带着 `Hard turn budget exhausted`，父以为完成、不再验货。
+PREFIX_SUB_TRUNCATED = "[SUBAGENT DONE_TRUNCATED]"
 PREFIX_BASH_DONE = "[BASH DONE]"
 PREFIX_BASH_FAILED = "[BASH FAILED]"
 
 _COMPLETION_PREFIXES = (
     PREFIX_SUB_DONE,
     PREFIX_SUB_FAILED,
+    PREFIX_SUB_TRUNCATED,
     PREFIX_BASH_DONE,
     PREFIX_BASH_FAILED,
 )
+"""回执协议全集（含第三值 TRUNCATED）——`is_offturn_completion_text` 用。
+⚠ 不要和 `inbox._COMPLETION_PREFIXES` 的用法混淆：那份管「give-up ACK 与
+park 是否吞掉」，**不含任何 DONE 类**（语义见 inbox.py 的注释），两者不同源。"""
 
 _DONE = {"subagent": PREFIX_SUB_DONE, "bash": PREFIX_BASH_DONE}
 _FAILED = {"subagent": PREFIX_SUB_FAILED, "bash": PREFIX_BASH_FAILED}
+# 哪些 kind 存在 TRUNCATED 第三值。只有 subagent 会 `ok=False` 地
+# 「非失败的未完成」（`budget_exhausted` 由 tools/subagent.py 穿透而来）；
+# bash 未定义——避免出现一个永远不会被用到的死常量。
+_TRUNCATED = {"subagent": PREFIX_SUB_TRUNCATED}
+# TRUNCATED 的**结构化标记通道**：id(payload) → True。
+#
+# 为什么不留一个「正文里带某个前缀」的道：那会让框架为了知道终态去读一段
+# 自由文本（子代理产物是自由文本，同一条回执既能被读成「完成」也能被读成
+# 「被切断」）。用户 09-14 已钦定禁用文本判据，故终态一律走这里的**对象
+# 身份**：`work()` 返回的就是同一个 str 对象，`id()` 相等即同一份产出。
+# 数量级：同时存在的离轮作业个位数，`clear_truncated_mark` 在投递后回收。
+_TRUNCATED_PAYLOADS: dict[int, bool] = {}
+
+
+def mark_truncated_payload(payload: str) -> None:
+    """把 *payload* 标为「被预算切断的产出」（见 ``_TRUNCATED_PAYLOADS``）。"""
+    _TRUNCATED_PAYLOADS[id(payload)] = True
+
+
+def is_truncated_payload(payload: str) -> bool:
+    """*payload* 是否被 ``mark_truncated_payload`` 标记过。"""
+    return bool(_TRUNCATED_PAYLOADS.get(id(payload)))
+
+
+def clear_truncated_mark(payload: str) -> None:
+    """投递完成后回收标记 —— 不按 job 台账清理，避免长跑泄漏。"""
+    _TRUNCATED_PAYLOADS.pop(id(payload), None)
+# ⚠ 为什么 TRUNCATED 进 `_COMPLETION_PREFIXES`（=> 被认成回执、满足父的
+# kind=agent wait）却**不进** inbox 的 PARK_EXEMPT / ACK_SPARE：
+# 那两张表**不含任何 DONE 类前缀**（语义见 inbox.py 注释），TRUNCATED 与
+# DONE 同族；单独把它塞进去会制造「DONE 被人为 park 就永久丢」的新不一致。
+# ⚠ 前缀是**现象**不是原因：为什么被切断写在正文（tool_loop 的收口说明）。
 
 WorkFn = Callable[[], Awaitable[tuple[bool, str]]]
+"""离轮作业的 work 契约：``(ok, payload)``。
+⚠ 它**无法**表达第三终态。要报 TRUNCATED 的调用方不用 tuple 第三位、也不
+不用正文子串，而是把**同一份** ``payload`` 先注册到 `_TRUNCATED_PAYLOADS`
+（见由 `mark_truncated_payload`），框架按 `id()` 判定 —— **状态判据**。
+用 id 键控而不是 `payload` 对象本身：str 可能不可哈希（子类）且长正文做
+dict 键会把整段输出留驻。对象存活期由调用方保证（`_work()` 的局部变量在
+回执投递完成前不会被回收）。"""
 _T = TypeVar("_T")
 
 
@@ -100,6 +147,24 @@ def is_offturn_completion_text(text: str | None) -> bool:
     """Platform protocol prefixes for native off-turn jobs (not free-text)."""
     t = (text or "").lstrip()
     return any(t.startswith(p) for p in _COMPLETION_PREFIXES)
+
+
+def _strip_completion_prefixes(text: str | None) -> str:
+    """去掉开头的协议前缀（含 TRUNCATED），供**框架侧**剥壳。
+
+    只用于框架自己拼出来的 payload，不用于判断任意消息是不是回执
+    （那件事由 ``is_offturn_completion_text`` 负责）。**不得**用它推断终态
+    ——终态一律由 ``_TRUNCATED_PAYLOADS`` 的对象身份决定。
+    """
+    t = (text or "").lstrip()
+    changed = True
+    while changed:
+        changed = False
+        for p in _COMPLETION_PREFIXES:
+            if t.startswith(p):
+                t = t[len(p):].lstrip()
+                changed = True
+    return t
 
 
 _NO_REAP_CANCEL_REASONS = frozenset({"busy_reset", "reset_processing"})
@@ -248,9 +313,14 @@ def start_offturn_job(
 ) -> str:
     """Register *work* as a background task. Returns the job id immediately.
 
-    *work* must return ``(ok, payload)``. The wrapper adds the protocol
-    prefix, caps the inbox body, and always delivers — including on
-    CancelledError (FAILED + stop reason).
+    The framework-tagged ``(ok, payload)`` contract. The wrapper adds the
+    protocol prefix, caps the inbox body, and always delivers — including on
+    CancelledError (FAILED + stop reason).  (P0-1)
+
+    ``ok=True``  → 该 kind 的 DONE 前缀（干完了）。
+    ``ok=False`` → 该 kind 的 FAILED 前缀；**但**若 ``payload`` 自带
+    ``[SUBAGENT DONE_TRUNCATED]`` 则视为「未落到终态但非失败」的第三值
+    （子代理被预算切断），详见 ``_TRUNCATED``。
     """
     if kind not in _DONE:
         raise ValueError(f"unknown offturn kind: {kind!r}")
@@ -316,12 +386,34 @@ def start_offturn_job(
                     )
                 return
             prefix_s = _DONE[kind] if ok else _FAILED[kind]
+            # P0-1：第三终态由**结构化标记**判定（`id(payload)` 身份），不读
+            # 正文。注意它是在 `ok=True` 这一支上生效的：「干完了」被降级为
+            # 「干过但没收尾」，与「炸了」(`ok=False`) 是两回事，后者的
+            # FAILED 前缀不能被截断态顶替——否则父会去验一个根本没产出的活。
+            _tr = _TRUNCATED.get(kind)
+            if ok and _tr and is_truncated_payload(payload):
+                prefix_s = _tr
+                log.info(
+                    "offturn_job_truncated",
+                    agent_id=agent_id,
+                    job_id=job_id,
+                    kind=kind,
+                )
             body = _format_body(prefix_s, job_id, payload, worktree, agent_id, kind)
             wake = _job_wake_on_complete(job_id)
             try:
                 await await_even_if_cancelled(
                     deliver(
-                        agent_id, job_id, body, ok=ok, wake=wake, kind=kind
+                        agent_id,
+                        job_id,
+                        body,
+                        ok=ok,
+                        # P0-1：TRUNCATED 与 DONE 一样是「干过活了」，父的
+                        # kind=agent wait 照常满足。若这里给 False，父会留在
+                        # wait 上等一个永不再来的唤醒（静默停泊）——「被切断」
+                        # 是完成语义的弱化，不是失败。
+                        wake=wake,
+                        kind=kind,
                     )
                 )
             except Exception as deliver_exc:
@@ -331,6 +423,8 @@ def start_offturn_job(
                     job_id=job_id,
                     error=str(deliver_exc),
                 )
+            finally:
+                clear_truncated_mark(payload)
         finally:
             _JOBS.pop(job_id, None)
 

@@ -255,7 +255,29 @@ async def spawn_subagent_tool(
         )
         if result.get("status") != "ok":
             return False, str(result.get("error") or "unknown error")
-        return True, str(result.get("content") or "(subagent returned no text)")
+        # P0-1：父在等的是「这批活干完没有」。子代理的 LLM 轮次被预算切断时
+        # streamer 返回的是 `status=ok + budget_exhausted=True`（内容仍是
+        # ok，所以落盘与否**未知**）——若在这里折成 `True`，offturn 会照样
+        # 打 `[SUBAGENT DONE]`，父以为完成、不再验货（TEST_DSH_60 实测 7 条
+        # 回执里 3 条如此）。
+        # ⚠ 终态**不走正文前缀**：`text = ...` 是子代理的自由文本，框架据此
+        # 判终态等于用文案推断意图（用户 09-14 钦定禁用）。这里改为把同一份
+        # payload 对象**登记**到结构化通道，由 `register_offturn_job` 按
+        # `id(payload)` 身份判定。
+        # ⚠ 这一条修的是**回执如实**，不是「子代理自己续跑」（子代理多轮
+        # 续跑属新机制，另立 ticket）。
+        text = str(result.get("content") or "(subagent returned no text)")
+        if result.get("budget_exhausted"):
+            from hiveweave.services.offturn import mark_truncated_payload
+
+            text = (
+                f"{text}\n\n"
+                "[SUBAGENT TRUNCATED] The turn budget was exhausted before this "
+                "child finished — the output above may be incomplete and its work "
+                "may not have landed. VERIFY before relying on it."
+            )
+            mark_truncated_payload(text)
+        return True, text
 
     project_id = str(getattr(parent, "project_id", "") or "")
     task_id = await resolve_assignee_task_id(project_id, agent_id)
@@ -272,7 +294,9 @@ async def spawn_subagent_tool(
         "Subagent started off the org turn "
         f"(job={job_id}, type={subagent_type}). "
         f"{next_action_waiting(waiting_on)} "
-        "You will be woken with [SUBAGENT DONE] or [SUBAGENT FAILED]. "
+        "You will be woken with [SUBAGENT DONE], [SUBAGENT FAILED], or "
+        "[SUBAGENT DONE_TRUNCATED] (it hit the turn budget before finishing — "
+        "verify its work before relying on it). "
         "Continue the org turn; do not nest this work in the current LLM call.",
         job_id=job_id,
         waiting_on=waiting_on,
@@ -817,6 +841,17 @@ async def _run_subagent(
     if result.get("status") != "ok":
         return result
     text = (result.get("content") or "").strip()
+    # P0-1（TEST_DSH_60）：预算切断**显式穿透**到 _work() 的终态判定。
+    # 这里只是把 streamer 已给出的结构化事实位原样带上（不新增判据、不看
+    # 文案）——`result["content"]` 里那句 "[TURN BUDGET] Hard turn budget
+    # exhausted" 届时**只是旁证**，机器判定一律走本字段。
+    if result.get("budget_exhausted"):
+        text = (
+            f"{text}\n\n"
+            "[SUBAGENT TRUNCATED] The turn budget was exhausted before this "
+            "child finished — the output above may be incomplete and its work "
+            "may not have landed. VERIFY before relying on it."
+        )
     # 附加 commit 摘要（若有）— 只读本子代理自己的 holder，与其他 spawn 隔离
     for tr in holder.values():
         if tr.get("phase") != "in_progress":

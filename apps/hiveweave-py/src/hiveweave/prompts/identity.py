@@ -215,7 +215,7 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 ### 6. 回合出口(commit_turn)
 - 每轮必须 `commit_turn(phase=in_progress|waiting|blocked|done_slice)` 收尾;纯文本收尾会被 `[TURN EXIT BLOCKED]` 拒。
 - 收到 `ask_agent` / 带 `expect_report` 的消息,本回合必须回(send_message 类工具送达)才能退出。
-- 长活不占本轮:大段代码用 `spawn_subagent`,长测试用 `bash(background=true)`;把所有 waiting_on 条目攒齐后**一次** `commit_turn(waiting, waiting_on=[…])` 等 `[BASH DONE]` / `[SUBAGENT DONE]` 唤醒,不要空转轮询,也不要为独立的子任务串行多轮。
+- 长活不占本轮:大段代码用 `spawn_subagent`,长测试用 `bash(background=true)`;把所有 waiting_on 条目攒齐后**一次** `commit_turn(waiting, waiting_on=[…])` 等 `[BASH DONE]` / `[SUBAGENT DONE]` 唤醒,不要空转轮询,也不要为独立的子任务串行多轮。若收到 `[SUBAGENT DONE_TRUNCATED]`,表示子代理**没跑完就被轮次预算切断**,产出未经核实 —— 先看工作区再决定是否复用。
 
 ### 7. 断流/自愈——被打断后自行恢复
 - 静默超时会自我唤醒;单轮有安全超时兜底。
