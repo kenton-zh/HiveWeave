@@ -486,7 +486,30 @@ async def record_failure_signature(
                 for _k in ("solved_at_ms", "solution_tool", "solution_status"):
                     if _k in (prev_meta or {}):
                         metadata[_k] = prev_meta[_k]
+            # TEST_DSH_62 P7 断链4（2026-09-18）：组织升级梯度状态也必须继承
+            # —— 此前重建只留 solved_* 三键 + hit_count + source_agent_id，
+            # rehit 一次就把 distinct_hitters / 已发档位抹回零（3/5/8 梯度
+            # 失灵，distinct_hitters 永远只剩当前撞到者）。键名与
+            # note_distinct_hitter 写侧同一组常量（单一事实源）。
+            for _k in (
+                _HITTERS_KEY,
+                _HITTERS_OVERFLOW_KEY,
+                _ORG_ESCALATED_AT_KEY,
+                _ORG_ESCALATED_TIERS_KEY,
+            ):
+                if _k in (prev_meta or {}):
+                    metadata[_k] = prev_meta[_k]
             metadata["hit_count"] = int((prev_meta or {}).get("hit_count") or 1) + 1
+            # preexisting 分支同样显式落状态位（与下方 else 新签分支同语义，
+            # P7 断链4：此前该分支可 INSERT 完全缺 solution_status 的新行 ——
+            # 实测 19 条 missing 的来源）。携带了解法行 ⇒ verified（机检不变
+            # 式：有解法行与状态位不许分叉）；未携带 ⇒ none。
+            metadata.setdefault(
+                "solution_status",
+                SOLUTION_STATUS_VERIFIED
+                if carried_solution_line
+                else SOLUTION_STATUS_NONE,
+            )
         else:
             # #16-② 状态位显式落 ``none``：机检口径是
             # ``content LIKE '%已验证解法:%' AND solution_status != 'verified'``
@@ -549,6 +572,8 @@ async def known_signature_hint(
     """同项目共享空间里是否已有该失败签名 —— 供工具调用前置检查注入。
 
     Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用/自指）。
+    命中且条目带「已验证解法:」行时，解法文本**直接拼进提示**（P7 断链1：
+    签名池对 Agent 不可达，指路去"读共享空间"是发不出去的指令）。
 
     **自指抑制（2026-09-01，s3-clone_06）**：F10 的 hook 是「先写签名、后取提
     示」——同一次失败写入的条目会被自己立刻命中，而该条目内容只有错误原文 +
@@ -585,9 +610,25 @@ async def known_signature_hint(
                         sig=sig[:60],
                     )
                     return None
+                # TEST_DSH_62 P7 断链1（2026-09-18）：签名池对 Agent 不可达
+                # （read_memory 只读 agent 域），旧文案「先读它」是 Agent 无法
+                # 执行的指令，且固定文案永不携带解法内容 —— hint 命中也拿
+                # 不到解法。改为把「已验证解法:」行的解法文本拼进提示，命中
+                # 即得解法本身；无解法行（仅有实质根因，_signature_has_solution
+                # 的②支放行）时给中性提示，不再指路去读一个读不到的地方。
+                for _ln in content.splitlines():
+                    if not _ln.startswith(_SOLUTION_LINE_PREFIX):
+                        continue
+                    _sol = _ln.split(":", 1)[1].strip()
+                    if _sol:
+                        return (
+                            "[shared fix] 团队已有该失败签名的已验证解法: "
+                            f"{_sol}\n"
+                            "（同写法原样重试无效，按上行解法换路执行。）"
+                        )
                 return (
-                    "[shared fix] 团队共享空间已有该失败签名条目 —— 先读它，"
-                    "别重复撞同一个坑。"
+                    "[shared fix] 团队共享空间已有该失败签名条目（该坑已被撞过"
+                    "并有根因记录）—— 同一写法原样重试无效，别重复撞同一个坑。"
                 )
         # 0-4（审计 M2）：未命中此前**完全静默** —— 而"算法变更导致老条目不可达"
         # 与"这个失败确实是新的"在日志上长得一样，无从分辨。

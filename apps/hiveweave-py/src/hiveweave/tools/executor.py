@@ -1428,9 +1428,13 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "abort — rework the executor to rebase main in their worktree. "
             "Does not auto-spawn VERIFY. After a milestone is on MAIN, "
             "coordinators dispatch one QA task with milestoneVerify=true. "
-            "already_up_to_date=true means the merge is COMPLETE — do NOT "
-            "call this tool again; the task auto-closes after the grace "
-            "period."
+            "Judge completion ONLY by the stable token in the receipt TEXT: "
+            "outcome=merged | outcome=already_merged | "
+            "outcome=nothing_to_merge. already_merged / nothing_to_merge "
+            "mean the merge is COMPLETE — do NOT call this tool again; the "
+            "task auto-closes after the grace period. (Structured fields "
+            "like already_up_to_date are stripped from what you see — "
+            "never wait for them.)"
         ),
         "properties": {
             "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
@@ -1468,8 +1472,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "git_worktree_sync": {
         "description": (
             "Sync MAIN's new commits into your worktree (MAIN → worktree). "
-            "No-op when already up to date (merged=false, "
-            "reason=up_to_date). Untracked files MAIN would overwrite are "
+            "No-op (nothing merged, still a success) when the receipt TEXT "
+            "says 'already up to date' — judge by that text, not by "
+            "structured fields (merged/reason are stripped from what you "
+            "see). Untracked files MAIN would overwrite are "
             "auto-moved to .hiveweave/merge-quarantine (recoverable — "
             "listed in the receipt and an inbox notice; the merge still "
             "completes). "
@@ -2801,10 +2807,13 @@ async def _f10_pending_success_backfill(
 # 共享空间（供其他 Agent 前置检索）；命中已知签名的错误回执附 shared-fix 提示
 # （让「先查共享空间」从文案变成行为）。
 #
-# TEST_DSH_47 #6（run 内同签名即时去重）：首撞者按 39 P1-3 设计被抑制提示
+# TEST_DSH_47 #6（同签名即时去重）：首撞者按 39 P1-3 设计被抑制提示
 # （正确 —— 条目是自己 2 秒前的错误原文），但 105s 后重撞同一堵墙时连
 # 「自己刚撞过」都不说。进程内记 (agent_id, sig) → 上次时间戳/次数，
-# 短窗内同签名复撞即附即时去重提示（「你 X 秒前刚问过」）。
+# 短窗内同签名复撞即附即时去重提示（「你 X 秒前刚撞过」）。
+# TEST_DSH_62 P7 断链2（2026-09-18）：键**不含 run_id** —— shell 每次调用
+# 都是独立 run，含 run_id 会让跨 run 复撞（同一 Agent 2h13m 撞 11 次 head）
+# 每次都算首撞、零提示。误标由 600s 时间窗兜底（窗外视为新一轮，不提示）。
 _LAST_SEEN_SIG: dict[str, dict[str, Any]] = {}
 _LAST_SEEN_SIG_LOCK = threading.Lock()
 #: 同签名复撞提示窗口 —— 窗内复撞视为"刚撞过"，窗外视为新一轮尝试。
@@ -2815,22 +2824,17 @@ _LAST_SEEN_SIG_MAX_KEYS = 2000
 def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str:
     """登记一次失败签名；短窗内同 agent 同签名复撞返回去重提示，否则 ""。
 
-    键 = (agent_id, run_id, sig)：签名含上下文（工具/路径），天然按"同一堵墙"
-    计数；agent_id + run id 并键防跨 agent / 跨 run 误标（105s 后同 run 复撞
-    即时去重；run_id 不可得时退回旧键结构）。纯内存 best-effort（复撞发生在
-    分钟级窗口，重启丢失无碍），容量有界。
+    键 = (agent_id, sig)：签名含上下文（工具/路径），天然按"同一堵墙"
+    计数；agent_id 并键防跨 agent 误标。**不含 run_id**（TEST_DSH_62 P7
+    断链2）：shell 每次调用是独立 run，TEST_DSH_47 #6 当初并上 run_id 是
+    防"跨 run 误标"，但复撞判定本就有 600s 时间窗兜底 —— 窗外视为新一轮
+    尝试、不提示，去掉 run_id 不会把久远 run 误标成"刚撞过"，却能让**窗口
+    内**的跨 run 复撞（每次调用一个 run 的常态）真正触发「X 分钟前已撞过」。
+    纯内存 best-effort（复撞发生在分钟级窗口，重启丢失无碍），容量有界。
     """
     if not sig:
         return ""
-    run_id: str | None = None
-    try:
-        from hiveweave.agents.supervisor import agent_manager
-
-        agent = agent_manager.get_agent(agent_id)
-        run_id = getattr(agent, "_current_run_id", None)
-    except Exception:  # noqa: BLE001 — run id 不可得退回旧键结构
-        run_id = None
-    key = f"{agent_id}|{run_id or 'norun'}|{sig}"
+    key = f"{agent_id}|{sig}"
     now = time.time()
     with _LAST_SEEN_SIG_LOCK:
         if len(_LAST_SEEN_SIG) >= _LAST_SEEN_SIG_MAX_KEYS:
@@ -2970,24 +2974,28 @@ async def _f10_result_hooks(
         # agent_id 传入供自指抑制留日志；条目无解法信息时不广播（镜子提示）
         # 39 审计 P1-3：首撞者不发自指提示——"先读它"只指向**别人**的条目
         # （首撞者刚写完条目，内容是自己 2 秒前的错误原文，读了零信息量）。
+        # TEST_DSH_62 P7 断链3（2026-09-18）：删掉 `pre_source != agent_id`
+        # 的按人自指门 —— 它与 hint 内部的**内容量门**
+        # （_signature_has_solution：条目须带已验证解法行或实质根因）叠成
+        # 真空：本人复撞自己首撞的条目、哪怕解法已被回填也拿不到任何提示。
+        # 镜子条目（占位根因、无解法行）在 hint 侧就被拦下，按人门控不再
+        # 需要；hint 现在自带解法原文，自指命中 = 直接拿到解法，不再是
+        # "读自己 2 秒前写的镜子"。
         preexisting = bool(isinstance(rec, dict) and rec.get("preexisting"))
-        pre_source = (
-            (rec or {}).get("preexisting_source") if isinstance(rec, dict) else None
-        )
         # ── 提示改走独立通道（批次 4 附项，2026-09-11）────────────
         # 此前两类提示都 `result["error"] +=` —— 工具回执于是对"工具返回了
         # 什么"撒谎（DSH 设计笔记 2026-07-08-repeat-tool-guard.md:58 明确
         # 否决），且与真错误同格 ⇒ 被习得性跳读（R7 恶化项的机制）。
         # 现在合并成 **一条** platform_notice 投递；`error` 字段只保留真错误。
         _notice_parts: list[str] = []
-        if preexisting and pre_source != agent_id:
+        if preexisting:
             hint = await known_signature_hint(project_id, error, agent_id=agent_id)
             if hint:
                 _notice_parts.append(hint)
-        # TEST_DSH_47 #6：run 内同签名即时去重 —— 首撞者被抑制 shared-fix
+        # TEST_DSH_47 #6：同签名即时去重 —— 首撞者被抑制 shared-fix
         # 提示是正确的，但复撞时至少要告诉它"自己刚撞过"。
         # （sig 同样复用写侧带回的那份 —— 本去重是进程内自比，换签名来源
-        # 会自我不一致。）
+        # 会自我不一致。键不含 run_id（P7 断链2），跨 run 复撞同样命中。）
         _self_note = _note_self_repeat_hit(
             agent_id, tool_name, rec.get("sig") if isinstance(rec, dict) else None
         )

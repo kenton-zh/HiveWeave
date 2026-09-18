@@ -148,12 +148,18 @@ async def test_fail_then_success_backfills_solution_and_restores_hint(
 
 @pytest.mark.asyncio
 async def test_preexisting_hint_goes_to_other_agent_not_self(space):
-    """preexisting 既有语义回归：带解法条目 → hint 给别人，首撞者自指抑制。
+    """preexisting 既有语义回归：带解法条目 → hint 给别人；自指按**内容量**门控。
 
     ⚠️ **行为变更（批次 4 附项，2026-09-11，有意）**：hint 不再拼进
     `result["error"]`，改走独立 platform_notice 通道 —— `error` 字段只保留
     工具的真错误（此前拼接会让回执对"工具返回了什么"撒谎，并与真错误同格
     导致被跳读）。所以本用例断言的是**通道去向**，不是 error 文本。
+
+    ⚠️ **行为变更（TEST_DSH_62 P7 断链3，2026-09-18，有意）**：删掉
+    executor 侧 `pre_source != agent_id` 的按人自指门 —— 本人复撞自己首撞、
+    但条目已带已验证解法时**同样收到 hint**（hint 自带解法原文，自指命中 =
+    直接拿到解法，不再是"读自己 2 秒前写的镜子"）。镜子条目（占位根因、
+    无解法行）仍被 hint 内部的 _signature_has_solution 内容量门拦下。
     """
     sig = fs.signature_of(_ERROR)
     space.rows.append(
@@ -179,18 +185,20 @@ async def test_preexisting_hint_goes_to_other_agent_not_self(space):
     ), patch(
         "hiveweave.db.meta.get_agent_project_id", AsyncMock(return_value="proj")
     ):
-        # 别人（agent-B）撞坑 → 收到 [shared fix]（走独立通道）
+        # 别人（agent-B）撞坑 → 收到 [shared fix]，且 hint 携带解法原文
         result_b = {"success": False, "output": "", "error": _ERROR}
         await exec_mod._f10_result_hooks(result_b, "bash", {}, "agent-B")
         assert result_b["error"] == _ERROR  # 回执只含真错误，未被污染
         assert any("[shared fix]" in t for _, t, _ in delivered), delivered
+        assert any("改用 pwsh 写法重试" in t for _, t, _ in delivered), delivered
 
         delivered.clear()
-        # 首撞者（agent-A）自己再撞 → 自指抑制，无 hint
+        # 首撞者（agent-A）自己再撞 → 条目已带解法 ⇒ 同样收到 hint
+        # （P7 断链3：按人门控收窄为按内容门控）
         result_a = {"success": False, "output": "", "error": _ERROR}
         await exec_mod._f10_result_hooks(result_a, "bash", {}, "agent-A")
         assert result_a["error"] == _ERROR
-        assert not any("[shared fix]" in t for _, t, _ in delivered), delivered
+        assert any("[shared fix]" in t for _, t, _ in delivered), delivered
 
 
 # ── 占位 / 无实质解法不回填 ──
@@ -801,3 +809,229 @@ async def test_solution_status_never_diverges_from_solution_line(space):
         assert status == fs.SOLUTION_STATUS_VERIFIED, (
             f"解法行与状态位分叉：{r['id']} status={status!r}"
         )
+
+
+# ── TEST_DSH_62 P7 断链1：hint 携带解法原文 ──────────────
+
+
+@pytest.mark.asyncio
+async def test_hint_carries_solution_line_text(space):
+    """hint 命中带「已验证解法:」行的条目 ⇒ 解法文本直接拼进提示文案。
+
+    断链1：签名池对 Agent 不可达（read_memory 只读 agent 域），旧固定文案
+    「先读它」是发不出去的指令 —— 命中即得解法本身才是闭环。
+    """
+    sig = fs.signature_of(_ERROR)
+    space.rows.append(
+        {
+            "id": "mem-1",
+            "agent_id": fs._SIGNATURE_WRITER,
+            "scope": "project",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
+            "type": "failure_signature",
+            "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh -Command ls 重试",
+            "source_agent_id": "agent-A",
+            "metadata": {"source_agent_id": "agent-A"},
+        }
+    )
+    hint = await fs.known_signature_hint("proj", _ERROR, agent_id="agent-B")
+    assert hint and hint.startswith("[shared fix]")
+    assert "已验证解法:" in hint
+    assert "改用 pwsh -Command ls 重试" in hint  # 解法原文逐字在场
+    assert "先读它" not in hint
+
+
+@pytest.mark.asyncio
+async def test_hint_without_solution_line_drops_unreachable_instruction(space):
+    """无解法行（仅实质根因，_signature_has_solution 的②支）⇒ 中性提示。
+
+    原则：不给 Agent 发无法执行的指令 ——「先读它」指向一个 read_memory
+    读不到的地方（签名池在 project 域），必须从文案里消失。
+    """
+    sig = fs.signature_of(_ERROR)
+    content = (
+        f"[失败签名] tool=bash | {sig}\n"
+        "根因提示: runner_failed: shell 方言不兼容 —— 命令从未执行\n"
+        f"原文尾: {sig[-40:]}\n"
+        "首个撞到的 Agent: agent-A"
+    )
+    space.rows.append(
+        {
+            "id": "mem-1",
+            "agent_id": fs._SIGNATURE_WRITER,
+            "scope": "project",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
+            "type": "failure_signature",
+            "content": content,
+            "source_agent_id": "agent-A",
+            "metadata": {"source_agent_id": "agent-A"},
+        }
+    )
+    hint = await fs.known_signature_hint("proj", _ERROR, agent_id="agent-B")
+    assert hint and "[shared fix]" in hint
+    assert "先读它" not in hint
+
+
+# ── TEST_DSH_62 P7 断链2：self-repeat 键不含 run_id ──────
+
+
+def test_self_repeat_fires_across_run_boundary(monkeypatch):
+    """同 agent 跨 run（shell 每次调用一个 run）复撞同一签名 ⇒ 第二次必提示。
+
+    回归钉：若有人把 run_id 并回键（TEST_DSH_47 #6 旧形态），本用例变红
+    —— 旧键下两次调用分属不同 run_id，各自算首撞、零提示（实测同一 Agent
+    2h13m 撞 11 次 head 全程无通知的机制）。误标由 600s 时间窗兜底，不测。
+    """
+    exec_mod.reset_self_repeat_hits_for_tests()
+    try:
+        sig = fs.signature_of(_ERROR)
+        assert sig
+
+        class _FakeAgent:
+            def __init__(self, run_id: str) -> None:
+                self._current_run_id = run_id
+
+        class _FakeManager:
+            """两次 get_agent 返回**不同** run_id 的 agent（模拟跨 run）。"""
+
+            def __init__(self) -> None:
+                self._seq = iter(["run-1", "run-2"])
+
+            def get_agent(self, agent_id):
+                return _FakeAgent(next(self._seq))
+
+        import hiveweave.agents.supervisor as supervisor
+
+        monkeypatch.setattr(supervisor, "agent_manager", _FakeManager())
+
+        first = exec_mod._note_self_repeat_hit("agent-A", "bash", sig)
+        second = exec_mod._note_self_repeat_hit("agent-A", "bash", sig)
+        assert first == ""  # 首撞不提示
+        assert "SELF REPEAT" in second  # 跨 run 复撞必须提示
+        assert "#2" in second
+    finally:
+        exec_mod.reset_self_repeat_hits_for_tests()
+
+
+def test_self_repeat_does_not_leak_across_agents():
+    """键含 agent_id：别人的复撞记忆不得让我"被提示刚撞过"。"""
+    exec_mod.reset_self_repeat_hits_for_tests()
+    try:
+        sig = fs.signature_of(_ERROR)
+        assert exec_mod._note_self_repeat_hit("agent-A", "bash", sig) == ""
+        assert exec_mod._note_self_repeat_hit("agent-B", "bash", sig) == ""
+        assert "SELF REPEAT" in exec_mod._note_self_repeat_hit(
+            "agent-A", "bash", sig
+        )
+    finally:
+        exec_mod.reset_self_repeat_hits_for_tests()
+
+
+# ── TEST_DSH_62 P7 断链4：rehit 继承梯度状态 + 补状态位 ──
+
+
+@pytest.mark.asyncio
+async def test_rehit_preserves_org_gradient_state(space):
+    """rehit 重建 metadata 不得抹掉 distinct_hitters / 已发档位。
+
+    旧实现只继承 solved_* 三键 + hit_count + source_agent_id ⇒ rehit 一次
+    把梯度状态抹回零，3/5/8 组织升级档位失灵。
+    """
+    sig = fs.signature_of(_ERROR)
+    space.rows.append(
+        {
+            "id": "mem-1",
+            "agent_id": fs._SIGNATURE_WRITER,
+            "scope": "project",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
+            "type": "failure_signature",
+            "content": _entry_content(sig),
+            "source_agent_id": "agent-A",
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "hit_count": 3,
+                fs._HITTERS_KEY: ["agent-A", "agent-B"],
+                fs._HITTERS_OVERFLOW_KEY: 0,
+                fs._ORG_ESCALATED_AT_KEY: 123456,
+                fs._ORG_ESCALATED_TIERS_KEY: [0],
+            },
+        }
+    )
+    rec = await fs.record_failure_signature(
+        project_id="proj",
+        agent_id="agent-C",
+        tool_name="bash",
+        error=_ERROR,
+        attribution="",
+    )
+    assert rec["preexisting"] is True
+    meta = space.rows[0]["metadata"]
+    assert meta[fs._HITTERS_KEY] == ["agent-A", "agent-B"]  # 不被抹掉
+    assert meta[fs._HITTERS_OVERFLOW_KEY] == 0
+    assert meta[fs._ORG_ESCALATED_TIERS_KEY] == [0]
+    assert meta[fs._ORG_ESCALATED_AT_KEY] == 123456
+    assert meta["hit_count"] == 4  # 计数照常累加（不受继承影响）
+
+
+@pytest.mark.asyncio
+async def test_rehit_inserts_solution_status_none_when_missing(space):
+    """preexisting 分支重建必须显式落状态位（19 条 missing 的来源修复）。
+
+    与 else 新签分支同语义：字段存在且语义明确，不靠"缺失"推断。
+    """
+    sig = fs.signature_of(_ERROR)
+    space.rows.append(
+        {
+            "id": "mem-1",
+            "agent_id": fs._SIGNATURE_WRITER,
+            "scope": "project",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
+            "type": "failure_signature",
+            "content": _entry_content(sig),  # 无解法行
+            "source_agent_id": "agent-A",
+            "metadata": {"source_agent_id": "agent-A", "hit_count": 1},
+        }
+    )
+    await fs.record_failure_signature(
+        project_id="proj",
+        agent_id="agent-B",
+        tool_name="bash",
+        error=_ERROR,
+        attribution="",
+    )
+    meta = space.rows[0]["metadata"]
+    assert meta["solution_status"] == fs.SOLUTION_STATUS_NONE
+    assert meta["hit_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rehit_carried_solution_line_backfills_verified_status(space):
+    """解法行被携带（同 tool rehit）而旧 meta 缺状态位 ⇒ 补 verified。
+
+    机检不变式：有解法行与状态位不许分叉 —— setdefault 的默认值必须随
+    「是否携带解法行」走，而不是一律 none。
+    """
+    sig = fs.signature_of(_ERROR)
+    space.rows.append(
+        {
+            "id": "mem-1",
+            "agent_id": fs._SIGNATURE_WRITER,
+            "scope": "project",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
+            "type": "failure_signature",
+            "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh 写法",
+            "source_agent_id": "agent-A",
+            "metadata": {"source_agent_id": "agent-A", "hit_count": 1},
+        }
+    )
+    await fs.record_failure_signature(
+        project_id="proj",
+        agent_id="agent-B",
+        tool_name="bash",
+        error=_ERROR,
+        attribution="",
+    )
+    meta = space.rows[0]["metadata"]
+    assert meta["solution_status"] == fs.SOLUTION_STATUS_VERIFIED
+    # 解法行也原样保留（携带语义不回退）
+    assert "改用 pwsh 写法" in space.rows[0]["content"]
