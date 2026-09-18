@@ -69,7 +69,8 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 # Description style (DSH contract, not a lecture): what it does; invariants;
 # failure markers; output shape; next action on the long path; what not to do.
 # Cross-call workflow lives in role prompts. Hive wakes via
-# [BASH|SUBAGENT DONE/FAILED] — do not document job_output.
+# [BASH|SUBAGENT DONE/FAILED] (+ [SUBAGENT DONE_TRUNCATED] = child cut off by
+# the turn budget, output unverified) — do not document job_output.
 
 TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "bash": {

@@ -1245,18 +1245,110 @@ def test_truncated_prefix_park_and_ack_semantics_match_done() -> None:
 
 
 def test_bash_has_no_truncated_kind() -> None:
-    """bash 无第三值：只有 subagent 会 `ok=False` 地「非失败的未完成」。
+    """bash 无第三值：只有 subagent 会报「非失败的未完成」。
 
-    这条守的是「不造死常量」——`PREFIX_BASH_TRUNCATED` 不存在，所以
-    `_TRUNCATED` 里也不会出现它。若将来 bash 也要第三值，本测试会失败，
-    提醒同步改 docs 与提示词，而不是静默漂移。
+    这条守的是「不造死成员」——`OFFTURN_STATE` 里没有 BASH_TRUNCATED，
+    所以 `_STATES_BY_KIND["bash"]` 也不该有 `truncated` 槽位。若将来 bash
+    也要第三值，本测试会失败，提醒同步改 docs 与提示词，而不是静默漂移。
     """
     from hiveweave.services import offturn as _ot
 
-    assert set(_ot._TRUNCATED) == {"subagent"}
-    assert not hasattr(_ot, "PREFIX_BASH_TRUNCATED")
-    # 协议全集必须含 TRUNCATED——否则 is_offturn_completion_text 认不出它
-    assert _ot.PREFIX_SUB_TRUNCATED in _ot._COMPLETION_PREFIXES
+    assert "truncated" not in _ot._STATES_BY_KIND["bash"]
+    assert "truncated" in _ot._STATES_BY_KIND["subagent"]
+    assert not hasattr(_ot.OFFTURN_STATE, "BASH_TRUNCATED")
+    # 协议全集必须含 TRUNCATED——否则 is_offturn_completion_text 认不出它，
+    # 父的 kind=agent wait 会永远等不到唤醒（静默停泊）
+    assert _ot.OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED.prefix in (
+        _ot._COMPLETION_PREFIXES
+    )
+
+
+def test_terminal_state_rejects_illegal_combinations() -> None:
+    """非法/矛盾终态必须**抛**，不许静默兜底成 DONE 或 FAILED。
+
+    这是「回执如实」的边界守卫：如果一个 kind 不允许的 state 被静默接受，
+    父代理会拿到一个语义错误的前缀——比崩溃更难查。
+    """
+    from hiveweave.services.offturn import (
+        OFFTURN_STATE,
+        _terminal_state,
+    )
+
+    # 合法：二值默认 + 显式第三值
+    assert (
+        _terminal_state("subagent", True, None)
+        is OFFTURN_STATE.SUBAGENT_DONE
+    )
+    assert (
+        _terminal_state("subagent", False, None)
+        is OFFTURN_STATE.SUBAGENT_FAILED
+    )
+    assert (
+        _terminal_state("subagent", True, OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED)
+        is OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED
+    )
+    # 矛盾：ok=True 却声明 FAILED；ok=False 却声明 TRUNCATED
+    for kind, ok, state in (
+        ("subagent", True, OFFTURN_STATE.SUBAGENT_FAILED),
+        ("subagent", False, OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED),
+        ("subagent", True, OFFTURN_STATE.BASH_DONE),  # 跨 kind 也不许
+        ("bash", True, OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED),  # bash 无第三值
+    ):
+        with pytest.raises(ValueError):
+            _terminal_state(kind, ok, state)
+
+
+@pytest.mark.asyncio
+async def test_work_declaring_state_drives_the_prefix(
+    monkeypatch: pytest.MonkeyPatch, clean_offturn
+) -> None:
+    """端到端：`work()` 显式返回的 state 决定前缀，与 payload 文本无关。
+
+    ⚠ 反过来也要成立：payload 里**写着** `[SUBAGENT DONE_TRUNCATED]` 但
+    `work()` 声明 DONE 时，前缀必须是 DONE —— 证明框架**不读**正文
+    （用户 09-14 钦定：禁用文本判据）。
+    """
+    from hiveweave.services.offturn import OFFTURN_STATE
+
+    inbox, _cleared = _patch_completion(monkeypatch)
+
+    async def work_declared() -> tuple:
+        return True, "partial", OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED
+
+    job = start_offturn_job(
+        kind="subagent",
+        agent_id="agent-exec",
+        project_id="proj-1",
+        work=work_declared,
+    )
+    for _ in range(80):
+        if not is_live_job(job):
+            break
+        await asyncio.sleep(0.02)
+    assert inbox and inbox[0].lstrip().startswith("[SUBAGENT DONE_TRUNCATED]")
+
+    inbox.clear()
+
+    async def work_text_only() -> tuple:
+        # 正文里**模仿**截断态文案，但终态声明是 DONE
+        return (
+            True,
+            "[SUBAGENT TRUNCATED] text looks truncated but state says done",
+        )
+
+    job2 = start_offturn_job(
+        kind="subagent",
+        agent_id="agent-exec",
+        project_id="proj-1",
+        work=work_text_only,
+    )
+    for _ in range(80):
+        if not is_live_job(job2):
+            break
+        await asyncio.sleep(0.02)
+    assert inbox, "second receipt must be delivered"
+    assert inbox[0].lstrip().startswith("[SUBAGENT DONE]")
+    assert not inbox[0].lstrip().startswith("[SUBAGENT DONE_TRUNCATED]")
 
 
 def test_unrelated_same_named_prefix_is_not_a_receipt() -> None:

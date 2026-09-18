@@ -11,6 +11,7 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TypeVar
 
@@ -30,69 +31,121 @@ _REAP_JOIN_S = 2.0
 _REAP_DEAD_S = 15.0
 _STOP_REASON = "stopped (project off-duty, dismiss, or shutdown)"
 
-PREFIX_SUB_DONE = "[SUBAGENT DONE]"
-PREFIX_SUB_FAILED = "[SUBAGENT FAILED]"
-# P0-1（TEST_DSH_60）：第三终态——「干过但没收尾（可能没落盘）」。
-# 真实终态本来是三值，过去被压成 `_DONE` / `_FAILED` 二值 ⇒ 7 条回执里
-# 3 条 DONE 其实带着 `Hard turn budget exhausted`，父以为完成、不再验货。
-PREFIX_SUB_TRUNCATED = "[SUBAGENT DONE_TRUNCATED]"
-PREFIX_BASH_DONE = "[BASH DONE]"
-PREFIX_BASH_FAILED = "[BASH FAILED]"
 
-_COMPLETION_PREFIXES = (
-    PREFIX_SUB_DONE,
-    PREFIX_SUB_FAILED,
-    PREFIX_SUB_TRUNCATED,
-    PREFIX_BASH_DONE,
-    PREFIX_BASH_FAILED,
-)
-"""回执协议全集（含第三值 TRUNCATED）——`is_offturn_completion_text` 用。
-⚠ 不要和 `inbox._COMPLETION_PREFIXES` 的用法混淆：那份管「give-up ACK 与
-park 是否吞掉」，**不含任何 DONE 类**（语义见 inbox.py 的注释），两者不同源。"""
-
-_DONE = {"subagent": PREFIX_SUB_DONE, "bash": PREFIX_BASH_DONE}
-_FAILED = {"subagent": PREFIX_SUB_FAILED, "bash": PREFIX_BASH_FAILED}
-# 哪些 kind 存在 TRUNCATED 第三值。只有 subagent 会 `ok=False` 地
-# 「非失败的未完成」（`budget_exhausted` 由 tools/subagent.py 穿透而来）；
-# bash 未定义——避免出现一个永远不会被用到的死常量。
-_TRUNCATED = {"subagent": PREFIX_SUB_TRUNCATED}
-# TRUNCATED 的**结构化标记通道**：id(payload) → True。
+# ─────────────────────── 终态：结构化状态 → 协议前缀 ───────────────────────
 #
-# 为什么不留一个「正文里带某个前缀」的道：那会让框架为了知道终态去读一段
-# 自由文本（子代理产物是自由文本，同一条回执既能被读成「完成」也能被读成
-# 「被切断」）。用户 09-14 已钦定禁用文本判据，故终态一律走这里的**对象
-# 身份**：`work()` 返回的就是同一个 str 对象，`id()` 相等即同一份产出。
-# 数量级：同时存在的离轮作业个位数，`clear_truncated_mark` 在投递后回收。
-_TRUNCATED_PAYLOADS: dict[int, bool] = {}
+# 一条协议前缀串承载**两个**事实：哪个 phase（``[SUBAGENT …]`` / ``[BASH …]``）
+# 与哪个终态（``DONE`` / ``DONE_TRUNCATED`` / ``FAILED``）。把**已渲染**的前缀
+# 反解析回终态 = 文本判据 —— 禁用（用户 2026-09-14 钦定；且任何这种解析器都能
+# 靠「换一种写法」绕过）。
+# ⇒ 机制是**单向**的：`OFFTURN_STATE`（结构化）→ `.prefix`（渲染）。每个成员
+# 以它渲染出的字符串命名，框架只用这一个方向，**绝不**从渲染结果反推终态。
+#
+# ⚠ 曾经试过两条错路，都别回去：
+# ① 「payload 里带某个前缀」——还是读自由文本；
+# ② 「按 `id(payload)` 登记标记」——`id()` 是**裸地址**：CPython 同 size-class
+#    字符串在对象回收后立刻复用地址，一个**正常完成**的产出可能继承某个已死
+#    作业的 id 而被误报 TRUNCATED（已实测复现）。终态是 `work()` 的**返回值**，
+#    本来就该显式返回，不必也不准绕到对象身份上去猜。
 
 
-def mark_truncated_payload(payload: str) -> None:
-    """把 *payload* 标为「被预算切断的产出」（见 ``_TRUNCATED_PAYLOADS``）。"""
-    _TRUNCATED_PAYLOADS[id(payload)] = True
+class OFFTURN_STATE(StrEnum):
+    """离轮作业终态（结构化，与渲染后的前缀字符串**一一对应**）。
+
+    三值不是「OK / FAIL / 未知」而是「干完了 / 干过但没收尾 / 炸了」：
+    第二值是本仓新增的第三态（P0-1），对应子代理 `budget_exhausted`
+    ——产出**可能没落盘**，父代理必须验货而不是当完成。
+    """
+
+    SUBAGENT_DONE = "SUBAGENT_DONE"
+    SUBAGENT_DONE_TRUNCATED = "SUBAGENT_DONE_TRUNCATED"
+    SUBAGENT_FAILED = "SUBAGENT_FAILED"
+    BASH_DONE = "BASH_DONE"
+    BASH_FAILED = "BASH_FAILED"
+
+    @property
+    def prefix(self) -> str:
+        """渲染成协议前缀串（**唯一**方向：状态 → 文本）。"""
+        return _PREFIX_BY_STATE[self]
 
 
-def is_truncated_payload(payload: str) -> bool:
-    """*payload* 是否被 ``mark_truncated_payload`` 标记过。"""
-    return bool(_TRUNCATED_PAYLOADS.get(id(payload)))
+_PREFIX_BY_STATE: dict[OFFTURN_STATE, str] = {
+    OFFTURN_STATE.SUBAGENT_DONE: "[SUBAGENT DONE]",
+    # P0-1（TEST_DSH_60）：第三终态——「干过但没收尾（可能没落盘）」。
+    # 真实终态本来是三值，过去被压成 DONE / FAILED 二值 ⇒ 7 条回执里 3 条
+    # DONE 其实带着 `Hard turn budget exhausted`，父以为完成、不再验货。
+    OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED: "[SUBAGENT DONE_TRUNCATED]",
+    OFFTURN_STATE.SUBAGENT_FAILED: "[SUBAGENT FAILED]",
+    OFFTURN_STATE.BASH_DONE: "[BASH DONE]",
+    OFFTURN_STATE.BASH_FAILED: "[BASH FAILED]",
+}
+PREFIX_SUB_DONE = OFFTURN_STATE.SUBAGENT_DONE.prefix
+PREFIX_SUB_FAILED = OFFTURN_STATE.SUBAGENT_FAILED.prefix
+PREFIX_SUB_TRUNCATED = OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED.prefix
+PREFIX_BASH_DONE = OFFTURN_STATE.BASH_DONE.prefix
+PREFIX_BASH_FAILED = OFFTURN_STATE.BASH_FAILED.prefix
 
+_COMPLETION_PREFIXES = tuple(s.prefix for s in OFFTURN_STATE)
+"""回执协议全集（含第三值 TRUNCATED）——`is_offturn_completion_text` 用。
+⚠ 不要和 `inbox` 的两张前缀表混淆：那两张管「give-up ACK / park 是否吞掉」，
+**不含任何 DONE 类**（语义见 inbox.py 注释），不同源，**不要合并**。"""
 
-def clear_truncated_mark(payload: str) -> None:
-    """投递完成后回收标记 —— 不按 job 台账清理，避免长跑泄漏。"""
-    _TRUNCATED_PAYLOADS.pop(id(payload), None)
+#: 哪些终态属于哪个 kind（bash 无 TRUNCATED，见模块 docstring）。
+_STATES_BY_KIND: dict[str, dict[str, OFFTURN_STATE]] = {
+    "subagent": {
+        "ok": OFFTURN_STATE.SUBAGENT_DONE,
+        "truncated": OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED,
+        "failed": OFFTURN_STATE.SUBAGENT_FAILED,
+    },
+    "bash": {
+        "ok": OFFTURN_STATE.BASH_DONE,
+        "failed": OFFTURN_STATE.BASH_FAILED,
+    },
+}
+
+#: 可被 `work()` 用 `(False, payload, state)` 报出的非 ok 终态。
+#: `DONE_TRUNCATED` 是**完成语义的弱化**，不是失败：它必须与 `DONE` 同族
+#: （进 `_COMPLETION_PREFIXES` ⇒ 父的 kind=agent wait 照常满足；进
+#: `inbox.ACK_SPARE_PREFIXES` ⇒ 不被 give-up ACK 吞掉），否则父会留在 wait
+#: 上等一个永不再来的唤醒（静默停泊），或回执被静默吞掉。
+_TRUNCATED_STATES = frozenset(
+    s for s in OFFTURN_STATE if s is OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED
+)
 # ⚠ 为什么 TRUNCATED 进 `_COMPLETION_PREFIXES`（=> 被认成回执、满足父的
 # kind=agent wait）却**不进** inbox 的 PARK_EXEMPT / ACK_SPARE：
 # 那两张表**不含任何 DONE 类前缀**（语义见 inbox.py 注释），TRUNCATED 与
 # DONE 同族；单独把它塞进去会制造「DONE 被人为 park 就永久丢」的新不一致。
 # ⚠ 前缀是**现象**不是原因：为什么被切断写在正文（tool_loop 的收口说明）。
 
-WorkFn = Callable[[], Awaitable[tuple[bool, str]]]
-"""离轮作业的 work 契约：``(ok, payload)``。
-⚠ 它**无法**表达第三终态。要报 TRUNCATED 的调用方不用 tuple 第三位、也不
-不用正文子串，而是把**同一份** ``payload`` 先注册到 `_TRUNCATED_PAYLOADS`
-（见由 `mark_truncated_payload`），框架按 `id()` 判定 —— **状态判据**。
-用 id 键控而不是 `payload` 对象本身：str 可能不可哈希（子类）且长正文做
-dict 键会把整段输出留驻。对象存活期由调用方保证（`_work()` 的局部变量在
-回执投递完成前不会被回收）。"""
+#: 离轮作业的 work 契约：``(ok, payload[, state])``。
+#:
+#: - ``ok=True``  → 该 kind 的 DONE。
+#: - ``ok=False`` → 该 kind 的 FAILED（父应重派）。
+#: - 第三位可选：显式声明非 ok 的**具体**终态，用于 `DONE_TRUNCATED`
+#:   （完成语义的弱化，不是失败——见 `_TRUNCATED_STATES`）。
+#:   终态是 `work()` 的返回值，**必须显式返回**，不许靠 payload 文本或对象
+#:   身份反推（理由见上文三条）。
+WorkFn = Callable[..., Awaitable[tuple]]
+
+
+def _terminal_state(kind: str, ok: bool, state: OFFTURN_STATE | None) -> OFFTURN_STATE:
+    """(kind, ok, 显式 state) → 终态。非法组合直接抛，绝不静默兜底。"""
+    states = _STATES_BY_KIND[kind]
+    if state is None:
+        # 未显式声明：按 ok 走二值默认（旧调用方无需改动）
+        return states["ok"] if ok else states["failed"]
+    if state not in states.values():
+        raise ValueError(
+            f"terminal state {state} is not valid for offturn kind {kind!r} "
+            f"(allowed: {sorted(s.value for s in states.values())})"
+        )
+    # 一致性：显式声明不得与 ok 矛盾
+    is_failed = state is states["failed"]
+    if ok == is_failed:
+        raise ValueError(
+            f"offturn kind {kind!r}: ok={ok} contradicts state={state.value}"
+        )
+    return state
 _T = TypeVar("_T")
 
 
@@ -313,16 +366,16 @@ def start_offturn_job(
 ) -> str:
     """Register *work* as a background task. Returns the job id immediately.
 
-    The framework-tagged ``(ok, payload)`` contract. The wrapper adds the
-    protocol prefix, caps the inbox body, and always delivers — including on
-    CancelledError (FAILED + stop reason).  (P0-1)
+    The wrapper renders the protocol prefix from the terminal state, caps the
+    inbox body, and always delivers — including on CancelledError (FAILED +
+    stop reason).  (P0-1)
 
-    ``ok=True``  → 该 kind 的 DONE 前缀（干完了）。
-    ``ok=False`` → 该 kind 的 FAILED 前缀；**但**若 ``payload`` 自带
-    ``[SUBAGENT DONE_TRUNCATED]`` 则视为「未落到终态但非失败」的第三值
-    （子代理被预算切断），详见 ``_TRUNCATED``。
+    ``work()`` 返回 ``(ok, payload)`` 或 ``(ok, payload, OFFTURN_STATE)``：
+    ``ok=True`` → DONE；``ok=False`` → FAILED；第三位显式声明第三终态
+    （目前只有 ``SUBAGENT_DONE_TRUNCATED`` = 「干过但没收尾，产出可能没落
+    盘」）。非法/矛盾组合抛 ``ValueError``，不静默兜底。
     """
-    if kind not in _DONE:
+    if kind not in _STATES_BY_KIND:
         raise ValueError(f"unknown offturn kind: {kind!r}")
     prefix = "bg-sub" if kind == "subagent" else "bg-bash"
     job_id = f"{prefix}-{uuid.uuid4().hex[:12]}"
@@ -331,10 +384,11 @@ def start_offturn_job(
     ready = asyncio.Event()
 
     async def _run() -> None:
+        _failed_p = _STATES_BY_KIND[kind]["failed"].prefix
         await ready.wait()
         try:
             try:
-                ok, payload = await work()
+                returned = await work()
             except asyncio.CancelledError:
                 log.info(
                     "offturn_job_cancelled",
@@ -342,7 +396,7 @@ def start_offturn_job(
                     job_id=job_id,
                     kind=kind,
                 )
-                body = f"{_FAILED[kind]} job={job_id}\n{_STOP_REASON}"
+                body = f"{_failed_p} job={job_id}\n{_STOP_REASON}"
                 wake = _job_wake_on_complete(job_id)
                 try:
                     await await_even_if_cancelled(
@@ -367,7 +421,7 @@ def start_offturn_job(
                     error=str(exc),
                 )
                 body = (
-                    f"{_FAILED[kind]} job={job_id}\n"
+                    f"{_failed_p} job={job_id}\n"
                     f"{type(exc).__name__}: {_redact(str(exc))}"
                 )
                 wake = _job_wake_on_complete(job_id)
@@ -385,21 +439,21 @@ def start_offturn_job(
                         error=str(deliver_exc),
                     )
                 return
-            prefix_s = _DONE[kind] if ok else _FAILED[kind]
-            # P0-1：第三终态由**结构化标记**判定（`id(payload)` 身份），不读
-            # 正文。注意它是在 `ok=True` 这一支上生效的：「干完了」被降级为
-            # 「干过但没收尾」，与「炸了」(`ok=False`) 是两回事，后者的
-            # FAILED 前缀不能被截断态顶替——否则父会去验一个根本没产出的活。
-            _tr = _TRUNCATED.get(kind)
-            if ok and _tr and is_truncated_payload(payload):
-                prefix_s = _tr
+            # P0-1：终态**由 work() 显式返回**，不读正文、不猜对象身份。
+            ok = bool(returned[0])
+            payload = str(returned[1])
+            declared = returned[2] if len(returned) > 2 else None
+            state = _terminal_state(kind, ok, declared)
+            if state in _TRUNCATED_STATES:
                 log.info(
                     "offturn_job_truncated",
                     agent_id=agent_id,
                     job_id=job_id,
                     kind=kind,
                 )
-            body = _format_body(prefix_s, job_id, payload, worktree, agent_id, kind)
+            body = _format_body(
+                state.prefix, job_id, payload, worktree, agent_id, kind
+            )
             wake = _job_wake_on_complete(job_id)
             try:
                 await await_even_if_cancelled(
@@ -407,11 +461,11 @@ def start_offturn_job(
                         agent_id,
                         job_id,
                         body,
+                        # P0-1：TRUNCATED 与 DONE 同属「干过活了」⇒ ok=True，
+                        # 父的 kind=agent wait 照常满足。若给 False，父会留在
+                        # wait 上等一个永不再来的唤醒（静默停泊）——「被预算
+                        # 切断」是完成语义的弱化，不是失败。
                         ok=ok,
-                        # P0-1：TRUNCATED 与 DONE 一样是「干过活了」，父的
-                        # kind=agent wait 照常满足。若这里给 False，父会留在
-                        # wait 上等一个永不再来的唤醒（静默停泊）——「被切断」
-                        # 是完成语义的弱化，不是失败。
                         wake=wake,
                         kind=kind,
                     )
@@ -423,8 +477,6 @@ def start_offturn_job(
                     job_id=job_id,
                     error=str(deliver_exc),
                 )
-            finally:
-                clear_truncated_mark(payload)
         finally:
             _JOBS.pop(job_id, None)
 

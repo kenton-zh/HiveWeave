@@ -10,7 +10,9 @@
   返回 end_turn=True 结束子代理工具循环。
 - 默认无墙钟。可选 ``timeout_s`` 才套在子代理
   自己的 Streamer 上；**不**顺延父 safety timer / 不嵌进 streamer HARD 570。
-- 本工具立即返回 waiting_on；完成后 inbox ``[SUBAGENT DONE|FAILED]`` 叫醒父。
+- 本工具立即返回 waiting_on；完成后 inbox 三类回执叫醒父：
+  ``[SUBAGENT DONE]``（跑完了）/ ``[SUBAGENT DONE_TRUNCATED]``（**轮次预算
+  切断，没跑完、产出可能没落盘 ⇒ 父须先验货**）/ ``[SUBAGENT FAILED]``。
 - 只记结果：子代理过程不落库。
 """
 
@@ -163,7 +165,10 @@ class SpawnSubagentParams(BaseModel):
     "(it does not see this conversation). Each spawn returns its own "
     "waiting_on entry — batch ALL pending entries (spawns + background bash) "
     "into ONE commit_turn(phase=waiting, waiting_on=[...]). Woken with "
-    "[SUBAGENT DONE] / [SUBAGENT FAILED]. The subagent works in YOUR worktree "
+    "[SUBAGENT DONE], [SUBAGENT FAILED], or [SUBAGENT DONE_TRUNCATED]. "
+    "DONE_TRUNCATED means the child hit the turn budget before finishing — "
+    "its output is UNVERIFIED (the work may not have landed): check the "
+    "worktree before relying on it. The subagent works in YOUR worktree "
     "with YOUR permissions, returns its result not intermediate steps, and "
     "must commit_turn before finishing. Give a complete standalone prompt. "
     "subagent_type is REQUIRED: 'readonly' (read-only scout), 'audit' (run "
@@ -181,6 +186,7 @@ async def spawn_subagent_tool(
     """Start a subagent off-turn and return waiting_on immediately."""
     from hiveweave.agents.supervisor import agent_manager
     from hiveweave.services.offturn import (
+        OFFTURN_STATE,
         build_waiting_on,
         next_action_waiting,
         resolve_assignee_task_id,
@@ -242,7 +248,7 @@ async def spawn_subagent_tool(
     snap_run_id = getattr(parent, "_current_run_id", None)
     snap_counter = getattr(parent, "_run_step_counter", 0)
 
-    async def _work() -> tuple[bool, str]:
+    async def _work() -> tuple:
         result = await _run_subagent(
             parent,
             prompt,
@@ -260,23 +266,19 @@ async def spawn_subagent_tool(
         # ok，所以落盘与否**未知**）——若在这里折成 `True`，offturn 会照样
         # 打 `[SUBAGENT DONE]`，父以为完成、不再验货（TEST_DSH_60 实测 7 条
         # 回执里 3 条如此）。
-        # ⚠ 终态**不走正文前缀**：`text = ...` 是子代理的自由文本，框架据此
-        # 判终态等于用文案推断意图（用户 09-14 钦定禁用）。这里改为把同一份
-        # payload 对象**登记**到结构化通道，由 `register_offturn_job` 按
-        # `id(payload)` 身份判定。
-        # ⚠ 这一条修的是**回执如实**，不是「子代理自己续跑」（子代理多轮
-        # 续跑属新机制，另立 ticket）。
+        # ⚠ 终态必须**显式返回**：既不许读 `text` 里的前缀（那是子代理的自由
+        # 文本，据此判终态 = 用文案推断意图，用户 09-14 钦定禁用），也不许
+        # 绕到 payload 的 `id()` 上去猜（裸地址，会被复用而误判）。
         text = str(result.get("content") or "(subagent returned no text)")
         if result.get("budget_exhausted"):
-            from hiveweave.services.offturn import mark_truncated_payload
-
-            text = (
+            return (
+                True,
                 f"{text}\n\n"
                 "[SUBAGENT TRUNCATED] The turn budget was exhausted before this "
                 "child finished — the output above may be incomplete and its work "
-                "may not have landed. VERIFY before relying on it."
+                "may not have landed. VERIFY before relying on it.",
+                OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED,
             )
-            mark_truncated_payload(text)
         return True, text
 
     project_id = str(getattr(parent, "project_id", "") or "")
