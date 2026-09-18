@@ -32,6 +32,42 @@ DELIVERY_DELIVERED = "delivered"
 
 UTTERANCE_ROLES = frozenset({"speech", "direction", "topic_result", "abstain"})
 
+# ── abstain 的结构化原因（2026-09-18）──────────────────────────────
+# 为什么存在：``abstain`` 本身是**合法终态**（空发言不得被当成正式表态）。
+# 但「**主动**弃权」与「**被掐断**而未完成」在库里长得一模一样 ⇒ 主持人会
+# 拿「没来得及说话」当「没有意见」推进决策（PLATFORM-ISSUES §8.5 形态①
+# 同族：用正常状态掩盖异常状态）。
+# ⇒ 落成 ``meeting_utterances.abstain_reason`` 列，消费者按**状态列**分流，
+#   **不得**读 ``content`` 文案推断（文案自由、换语言即失效）。
+# 放在 service 是因为 prompts（渲染简报）与 runner（产生终局）都要引用它，
+# 而两者之间没有依赖边 —— 常量落在共同依赖上可避免循环导入。
+ABSTAIN_NO_SPEECH = "no_speech"          # 模型没调 speak_in_meeting（真弃权）
+ABSTAIN_BUDGET_EXHAUSTED = "budget_exhausted"  # 轮次预算切断（未跑完）
+ABSTAIN_TIMEOUT = "timeout"              # 180s 墙钟超时
+ABSTAIN_ERROR = "error"                  # LLM/工具异常
+#: 平台**代写**的弃权行 —— 当事人从未获得发言机会（缺席/被移出/泵重启）。
+#: ⚠ 与 ``NO_SPEECH``（本人听了、没意见）**必须分开**：把它算作「无异议」
+#: 就是本修复要根除的错。「代写」类不计入 `INCOMPLETE_REASONS`，因为它们
+#: **不是**「跑了但没跑完」——加轮并不能让缺席者发言，提示主席再加一轮是误导。
+ABSTAIN_DISMISSED = "dismissed"          # 会中被 dismiss（平台代写，非本人表态）
+ABSTAIN_RECOVERED = "recovered"          # 泵重启补写，本人从未表态
+ABSTAIN_UNAVAILABLE = "agent_unavailable"  # 无活体 agent 实例（进程内缺实例）
+
+#: 「未完成」类原因 —— 这些人**表达过但要被切断**，加一轮可能救回来。
+ABSTAIN_INCOMPLETE_REASONS = frozenset({
+    ABSTAIN_BUDGET_EXHAUSTED,
+    ABSTAIN_TIMEOUT,
+    ABSTAIN_ERROR,
+})
+
+#: 「平台代写」类原因 —— 这些人**从未表态**，且加轮也救不回来（人不在场）。
+#: 渲染时同样不得与真弃权混同，但**不应**提示主席加轮。
+ABSTAIN_WRITTEN_BY_PLATFORM = frozenset({
+    ABSTAIN_DISMISSED,
+    ABSTAIN_RECOVERED,
+    ABSTAIN_UNAVAILABLE,
+})
+
 
 class MeetingError(Exception):
     """会议状态/权限类拒绝（工具层转为可操作错误文本）。"""
@@ -403,9 +439,14 @@ class MeetingService:
         agent_id: str,
         role: str,
         content: str,
+        abstain_reason: str = "",
         _force: bool = False,
     ) -> str:
         """写一条 meeting_utterances（平台侧记录，不是 agent 记忆）。
+
+        ``abstain_reason`` 是**结构化事实位**（2026-09-18）：它把「主动弃权」
+        与「被轮次预算掐断/超时/异常」分开。消费者按该列分流，**不得**去读
+        ``content`` 文案推断原因（文案自由、随语言变）。
 
         守卫（``_force`` 供 direction/topic_result 内部写绕开 collecting 检查）：
         - speech 只能在 collecting 阶段、且议题/轮次与行状态一致；
@@ -445,8 +486,9 @@ class MeetingService:
         await project_db.execute_by_project(
             project_id,
             "INSERT INTO meeting_utterances (id, meeting_id, project_id, "
-            "topic_index, round_index, agent_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "topic_index, round_index, agent_id, role, content, created_at, "
+            "abstain_reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 utterance_id,
                 meeting_id,
@@ -457,6 +499,7 @@ class MeetingService:
                 role,
                 content or "",
                 _now_ms(),
+                abstain_reason or "",
             ],
         )
         return utterance_id
@@ -472,7 +515,7 @@ class MeetingService:
     ) -> list[dict[str, Any]]:
         sql = (
             "SELECT id, meeting_id, topic_index, round_index, agent_id, role, "
-            "content, created_at FROM meeting_utterances "
+            "content, created_at, abstain_reason FROM meeting_utterances "
             "WHERE meeting_id = ?"
         )
         params: list[Any] = [meeting_id]

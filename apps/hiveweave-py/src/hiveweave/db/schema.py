@@ -886,9 +886,14 @@ PROJECT_DB_TABLES = [
         agent_id TEXT NOT NULL,
         role TEXT NOT NULL,
         content TEXT,
-        created_at INTEGER
+        created_at INTEGER,
+        -- 结构化弃权原因（2026-09-18）：区分「主动弃权」与「被掐断而未完成」。
+        -- 空串 = 非 abstain 或无此信息（旧行）。
+        abstain_reason TEXT NOT NULL DEFAULT ''
     )
     """,
+    # 迁移：旧库补列（ALTER 失败 = 列已存在，被 ensure_project_db 吞掉）
+    """ALTER TABLE meeting_utterances ADD COLUMN abstain_reason TEXT NOT NULL DEFAULT ''""",
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
@@ -909,6 +914,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
         # 「宣告了沙箱却没跑」再次静默退化成 NULL（本仓 TEST_DSH_37 P0-1 形态）。
         "executed",
     },
+    # meeting_utterances.abstain_reason（2026-09-18）：区分「主动弃权」与
+    # 「被轮次预算掐断/超时/异常」。登记进自检 ⇒ 迁移断裂会在启动时 fail-loud，
+    # 而不是让主持人把「没来得及说话」静默读成「没有意见」。
+    "meeting_utterances": {"abstain_reason"},
 }
 
 # ── Meta DB 索引 ────────────────────────────────────────────

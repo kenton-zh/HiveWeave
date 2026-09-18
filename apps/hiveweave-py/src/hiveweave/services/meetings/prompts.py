@@ -14,6 +14,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from hiveweave.services.meetings.service import (
+    ABSTAIN_INCOMPLETE_REASONS,
+    ABSTAIN_WRITTEN_BY_PLATFORM,
+)
+
 # 盲评金丝雀标记：speech 行的平台内部分类标记，绝不进简报 / RESULT。
 SPEECH_MARKER = "role=speech"
 
@@ -126,14 +131,63 @@ def chair_briefing(
             lines.append(f"- 议题「{title}」结论：{result}")
     lines.append("")
     lines.append(f"### 本轮发言（{len(speeches)} 人，含弃权）")
+    incomplete = 0
+    platform_written = 0
     for s in speeches:
         name = str(s.get("agent_name") or s.get("agent_id") or "?")
         role = str(s.get("role") or "speech")
         content = str(s.get("content") or "").strip()
+        reason = str(s.get("abstain_reason") or "").strip()
         if role == "abstain" or not content:
-            lines.append(f"- {name}：（弃权/未发言）{content}")
+            # ⭐ 2026-09-18：三分「主动弃权」/「未完成」/「平台代写」。
+            # 判据取结构化列 `abstain_reason`，**不读 content 文案**。
+            #   - 未完成（预算切断/超时/异常）：跑过但被切断 ⇒ 加轮可救；
+            #   - 平台代写（dismiss/泵恢复/无实例）：从未表态 **且人不在场**
+            #     ⇒ 加轮救不回，**不得**提示主席加轮（那会误导它空转）；
+            #   - 其余 → 真弃权（听了、没意见），可安全视为无异议。
+            if reason in ABSTAIN_INCOMPLETE_REASONS:
+                incomplete += 1
+                lines.append(
+                    f"- {name}：⚠ 未完成（{reason}）—— **未表态**，"
+                    "其意见不在本轮发言中，请勿当作弃权或无异议"
+                )
+            elif reason in ABSTAIN_WRITTEN_BY_PLATFORM:
+                platform_written += 1
+                lines.append(
+                    f"- {name}：⚠ 未参会（{reason}）—— **未表态**，"
+                    "本条为平台代写，请勿当作弃权或无异议"
+                )
+            else:
+                lines.append(f"- {name}：（弃权/未发言）{content}")
         else:
             lines.append(f"- {name}：{_clip(content, _MAX_RESULT_CHARS)}")
+    # ⚠ 只在**还能加轮**时提加轮建议（2026-09-18 审计 P1-2）。
+    # 第 3 轮 `allow_continue=False`：`tools_for_profile` 已把
+    # `continue_meeting_round` 从主席白名单剔除（`runner.py:71`）⇒ 这时
+    # 建议加轮是**死指令**（模型物理上调不到），还会与下方「必须收口、
+    # continue 已不可用」自相矛盾。只报事实，不给做不到的建议。
+    if incomplete and allow_continue:
+        lines.append("")
+        lines.append(
+            f"⚠ 本轮有 {incomplete} 人未完成发言（预算切断/超时/异常）——"
+            "他们的意见**没有进入本轮**。若该议题依赖他们的判断，"
+            "考虑用 continue_meeting_round 再给一轮，而不是直接收口。"
+        )
+    elif incomplete:
+        lines.append("")
+        lines.append(
+            f"⚠ 本轮有 {incomplete} 人未完成发言（预算切断/超时/异常）——"
+            "他们的意见**没有进入本轮**。本轮已是最后一轮、无法再加轮，"
+            "收口时请把这一点写进结论（例如注明某方意见缺失），"
+            "不要当作他们已表态。"
+        )
+    if platform_written:
+        lines.append("")
+        lines.append(
+            f"⚠ 另有 {platform_written} 人未参会（平台代写弃权）——"
+            "他们**从未表态**，且加轮无法让他们发言。"
+            "收口时请基于到场者的意见，不要假设他们同意。"
+        )
     lines.append("")
     if allow_continue:
         lines.append(

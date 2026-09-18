@@ -26,6 +26,10 @@ from hiveweave.services.meetings.runner import (
     run_meeting_turn,
 )
 from hiveweave.services.meetings.service import (
+    ABSTAIN_DISMISSED,
+    ABSTAIN_ERROR,
+    ABSTAIN_RECOVERED,
+    ABSTAIN_UNAVAILABLE,
     ACTIVE_STATUSES,
     MAX_ROUNDS,
     MeetingConflict,
@@ -311,6 +315,7 @@ async def _run_round(
                 await _record_abstain_if_missing(
                     project_id, meeting, aid, topic_index, round_index,
                     f"turn error: {res}",
+                    abstain_reason=ABSTAIN_ERROR,
                 )
 
 
@@ -342,6 +347,7 @@ async def _record_abstain_if_missing(
     topic_index: int,
     round_index: int,
     reason: str,
+    abstain_reason: str = "",
 ) -> None:
     try:
         if await svc.has_utterance(
@@ -361,6 +367,7 @@ async def _record_abstain_if_missing(
             agent_id=agent_id,
             role="abstain",
             content=reason,
+            abstain_reason=abstain_reason,
             _force=True,
         )
         await emit_meeting_event(project_id, meeting)
@@ -381,9 +388,12 @@ async def _participant_turn(
 ) -> None:
     if recovering:
         # 泵恢复：collecting 中途重启 → 未发言者直接补弃权（规格 §泵）
+        # ⚠ 结构化原因：本人**从未表态**（不是「听了没意见」），且加轮救不回
+        # —— 渲染时必须与真弃权分开，见 ABSTAIN_WRITTEN_BY_PLATFORM。
         await _record_abstain_if_missing(
             project_id, meeting, agent_id, topic_index, round_index,
             "recovered after restart — recorded as abstain",
+            abstain_reason=ABSTAIN_RECOVERED,
         )
         return
     if await svc.has_utterance(
@@ -403,6 +413,7 @@ async def _participant_turn(
         await _record_abstain_if_missing(
             project_id, meeting, agent_id, topic_index, round_index,
             "no live agent instance",
+            abstain_reason=ABSTAIN_UNAVAILABLE,
         )
         return
     briefing = prompts.participant_briefing(
@@ -445,6 +456,9 @@ async def _participant_turn(
     await _record_abstain_if_missing(
         project_id, meeting, agent_id, topic_index, round_index,
         str(outcome.get("content") or "abstain"),
+        # ⭐ 结构化原因：runner 判定的「预算切断/超时/异常/真弃权」经此落库。
+        # 主持人简报据此把「未完成」与「弃权」分开渲染（不再一样）。
+        abstain_reason=str(outcome.get("abstain_reason") or ""),
     )
 
 
@@ -723,6 +737,9 @@ async def handle_agent_dismissed(project_id: str, agent_id: str) -> None:
                     agent_id=agent_id,
                     role="abstain",
                     content="dismissed during meeting",
+                    # ⚠ 结构化原因：本人**从未表态**（被移出名册），不是「听了
+                    # 没意见」。空串会把它渲染成真弃权 —— 正是本修复根除的错。
+                    abstain_reason=ABSTAIN_DISMISSED,
                     _force=True,
                 )
             except MeetingError:

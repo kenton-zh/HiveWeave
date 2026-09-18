@@ -12,6 +12,7 @@ from hiveweave.services.inbox import (
     should_spare_from_give_up_ack,
 )
 from hiveweave.services.offturn import (
+    OFFTURN_STATE,
     agent_has_live_job_for_task,
     build_waiting_on,
     is_live_job,
@@ -1355,4 +1356,40 @@ def test_unrelated_same_named_prefix_is_not_a_receipt() -> None:
     """防误认：只有**行首**的完整协议前缀才算回执。"""
     assert not is_offturn_completion_text("[RANDOM] [SUBAGENT DONE_TRUNCATED] x")
     assert not is_offturn_completion_text("see [SUBAGENT DONE_TRUNCATED] above")
+
+
+async def test_truncated_wake_needs_both_type_gate_and_prefix_start() -> None:
+    """TRUNCATED 唤醒父代理需**两个条件同时**成立（缺一即静默停泊）。
+
+    `wake_source_for_pending` 的 docstring 明说 `message_type` 是 trust gate、
+    前缀是 body contract，**不是互相替代**。既有测试只验了单条完整消息，
+    没验「两个条件各自失效时是否真的降级」——本测试补这一半（阴性对照）。
+
+    阳性对照实测（2026-09-18，手工）：把 `DONE_TRUNCATED` 移出
+    `_COMPLETION_PREFIXES` 后，本测试的第 3 例**转红**且其余 5 例不变红
+    ⇒ 探针精确命中、无假阳。
+    """
+    trunc = OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED.prefix
+
+    def m(text: str, mt: str | None) -> dict:
+        return {"message": text, "message_type": mt, "from_agent_id": "sys"}
+
+    # 阳性：类型对 + 前缀在行首 ⇒ 满足 wait
+    assert (
+        await wake_source_for_pending([m(f"{trunc} job=x", OFFTURN_COMPLETION_MESSAGE_TYPE)])
+        == "wait_satisfied"
+    )
+    # 阴性①：前缀对但类型**不是** offturn_completion ⇒ 不得满足
+    # （类型闸失效 ⇒ 任何人伪造一段带前缀的文本都能唤醒父代理）
+    assert await wake_source_for_pending([m(trunc, "normal")]) == "trigger"
+    # 阴性②：类型对但前缀不在行首 ⇒ 不得满足
+    assert (
+        await wake_source_for_pending([m(f"先说一句话\n{trunc} job=x", OFFTURN_COMPLETION_MESSAGE_TYPE)])
+        == "trigger"
+    )
+    # 阴性③：两条件都缺 ⇒ 不得满足
+    assert await wake_source_for_pending([m("子代理跑完了", None)]) == "trigger"
+    # 阴性④：空 / 非 dict 输入不得抛异常也不得误判为满足
+    assert await wake_source_for_pending([]) == "trigger"
+    assert await wake_source_for_pending([None, "not-a-dict"]) == "trigger"  # type: ignore[list-item]
 

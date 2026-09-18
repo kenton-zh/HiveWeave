@@ -29,12 +29,22 @@ from typing import Any, Awaitable, Callable
 import structlog
 
 from hiveweave.llm.streamer import Streamer
-from hiveweave.services.meetings.service import MAX_ROUNDS
+from hiveweave.services.meetings.service import (
+    ABSTAIN_BUDGET_EXHAUSTED,
+    ABSTAIN_ERROR,
+    ABSTAIN_NO_SPEECH,
+    ABSTAIN_TIMEOUT,
+    MAX_ROUNDS,
+)
 
 log = structlog.get_logger(__name__)
 
 MEETING_SPEECH_TIMEOUT_S = 180
 MEETING_MAX_TOOL_ROUNDS = 8
+
+# abstain 原因枚举的**唯一定义处**在 services/meetings/service.py（prompts 也要
+# 引用它，放这里会造 prompts→runner 的新依赖边）。此处只是转出，勿另立一份。
+# 参见 service.py 的同名常量块：那里解释了为什么必须是**结构化列**而不是文案。
 
 # 只读集（参会者 + 主持共用）——白名单是唯一权威：未列入不出现。
 _MEETING_READONLY_TOOLS = frozenset({
@@ -346,28 +356,59 @@ async def run_meeting_turn(
 def _timeout_outcome(tool_profile: str) -> dict[str, Any]:
     if tool_profile == "chair":
         return {"action": "none", "content": "chair turn timed out"}
-    return {"action": "abstain", "content": "speech timed out (180s)"}
+    return {
+        "action": "abstain",
+        "content": "speech timed out (180s)",
+        "abstain_reason": ABSTAIN_TIMEOUT,
+    }
 
 
 def _fail_outcome(tool_profile: str, error: str) -> dict[str, Any]:
     if tool_profile == "chair":
         return {"action": "none", "content": f"chair turn failed: {error}"}
-    return {"action": "abstain", "content": f"turn failed: {error}"}
+    return {
+        "action": "abstain",
+        "content": f"turn failed: {error}",
+        "abstain_reason": ABSTAIN_ERROR,
+    }
 
 
 def _outcome_from(
     tool_profile: str, holder: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
+    """从 holder / streamer 结果合成终局。
+
+    ⚠ ``budget_exhausted`` 必须在这里被判（与 ``tools/subagent.py`` 的 P0-1
+    同源）：8 轮被掐断时若混进普通 ``abstain``，主持人会把「**没来得及说话**」
+    读成「**没有意见**」，据此推进决策 —— 这是「用正常状态掩盖异常状态」的
+    又一实例（同族见 PLATFORM-ISSUES §8.5）。
+    """
     decision = holder.get("decision")
     if decision:
         return decision
+    # 被轮次预算切断 ⇒ 独立的 abstain 原因。为什么排在 speech **之前**：
+    # 预算闸口都在「开新一轮之前」触发，且成功调工具的一轮必带
+    # ``end_turn``（见 ``tool_loop.py`` 的 ``if end_turn:`` 早返回，
+    # 那条路径**不带** ``budget_exhausted``）⇒ 二者互斥。若真出现共存，
+    # 说明轮次被用完而非发言成功，按「未完成」记更保守（宁可让主席知道
+    # 有人没跑完，也不要把可疑内容当正式表态）。
+    if result.get("budget_exhausted"):
+        return {
+            "action": "abstain",
+            "content": "budget exhausted before the turn finished",
+            "abstain_reason": ABSTAIN_BUDGET_EXHAUSTED,
+        }
     speech = holder.get("speech")
     if speech:
         return {"action": "speak", "content": speech}
     # 空发言 / 不调工具 → abstain / none（不把 assistant 散文当发言）
     if tool_profile == "chair":
         return {"action": "none", "content": "no continue/conclude decision"}
-    return {"action": "abstain", "content": "no speak_in_meeting call"}
+    return {
+        "action": "abstain",
+        "content": "no speak_in_meeting call",
+        "abstain_reason": ABSTAIN_NO_SPEECH,
+    }
 
 
 def _finish(

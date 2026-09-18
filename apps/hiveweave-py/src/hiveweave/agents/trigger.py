@@ -404,8 +404,13 @@ async def wake_source_for_pending(
 
     ``message_type=offturn_completion`` is the trust gate for
     ``wait_satisfied``. Protocol prefixes
-    ``[SUBAGENT DONE|FAILED]`` / ``[BASH DONE|FAILED]`` are the body
-    contract, not a substitute for type. ``from=system`` plus prefix
+    ``[SUBAGENT DONE|DONE_TRUNCATED|FAILED]`` / ``[BASH DONE|FAILED]`` are the
+    body contract, **not** a substitute for type — both conditions must hold
+    (type gate **and** prefix at line start); either one missing degrades to
+    ``trigger``. ``DONE_TRUNCATED`` counts as a receipt here: it reads as
+    "worked but did not finish", so the parent's ``kind=agent`` wait must be
+    satisfied or the parent parks forever on a wake that never comes.
+    ``from=system`` plus prefix
     with type=system/normal is a normal ``trigger`` (or ``task`` if
     ``task_id`` is set). Peer + prefix without that type stays
     ``trigger``.
