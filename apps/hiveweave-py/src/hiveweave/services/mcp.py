@@ -36,6 +36,10 @@ log = structlog.get_logger(__name__)
 MCP_CALL_TIMEOUT = 30.0
 # stdio 子进程关闭超时
 _STDIO_CLOSE_TIMEOUT = 5.0
+# stdio stdout 的 StreamReader 缓冲上限。asyncio 默认 64KiB，JSON-RPC 大响应
+# 单行会超；MCP 没有 Python 兜底，缓冲给足 16MiB（高水位 2×limit，最坏
+# ~32MiB 驻留可接受）。超限路径见 _StdioTransport.call 的 ValueError 分支。
+_STDIO_STREAM_LIMIT = 16 * 1024 * 1024
 
 # mcp_servers 的 DDL 已归位到 `db/schema.py::MCP_SERVERS_DDL`，与 Meta 建表
 # 清单（META_DB_TABLES）**共用同一份**，避免两处漂移。
@@ -173,6 +177,7 @@ class _StdioTransport:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_STDIO_STREAM_LIMIT,
             env=env,
             cwd=self.cwd or None,
         )
@@ -199,9 +204,26 @@ class _StdioTransport:
             proc.stdin.write(line.encode())
             await proc.stdin.drain()
             assert proc.stdout is not None
-            raw = await asyncio.wait_for(
-                proc.stdout.readline(), timeout=MCP_CALL_TIMEOUT
-            )
+            try:
+                raw = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=MCP_CALL_TIMEOUT
+                )
+            except ValueError as exc:
+                # 响应单行超过 StreamReader limit：readline 超限时已把缓冲
+                # 清掉，stdio 流就此**错位** —— 长行的剩余部分会被下一次
+                # call 当成新行读成半截 JSON，毒化整条连接。不能只抛错了事：
+                # 终止子进程复位连接，下次 _ensure_proc 干净重启。
+                log.warning(
+                    "mcp_stdio_line_limit_exceeded",
+                    command=self.command,
+                    limit=_STDIO_STREAM_LIMIT,
+                )
+                await self.close()
+                raise RuntimeError(
+                    f"MCP stdio: 响应单行超过缓冲上限"
+                    f"（{_STDIO_STREAM_LIMIT} bytes），stdio 流已错位，"
+                    f"该 server 连接需要重建（子进程已终止: {self.command}）"
+                ) from exc
             if not raw:
                 raise RuntimeError(
                     "MCP stdio: empty response (process may have exited)"

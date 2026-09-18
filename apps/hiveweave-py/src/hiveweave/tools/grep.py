@@ -18,6 +18,7 @@ from typing import Any
 import structlog
 
 from hiveweave.tools.security import is_sensitive_path
+from hiveweave.util.subprocess_decode import decode_subprocess_output
 
 log = structlog.get_logger(__name__)
 
@@ -27,6 +28,12 @@ MAX_RESULTS = 500
 """默认结果上限（R4）。大目录搜索结果封顶，防止海量匹配导致输出过大。"""
 MAX_CHARS_PER_LINE = 500
 MAX_FILE_SIZE = 1_048_576  # 1MB — skip larger files
+
+# rg 输出管道的 StreamReader 缓冲上限。asyncio 默认 64KiB，>64KiB 单行
+# （压缩/混淆产物常态）会让 readline 抛 ValueError。1MiB 足够容纳
+# --max-columns 截断后的行；刻意不用 8MiB —— StreamReader 高水位是
+# 2×limit，stdout/stderr 双管道最坏 ~32MiB 驻留。
+_RG_STREAM_LIMIT = 1 * 1024 * 1024
 
 # Directories to skip during fallback scan
 IGNORED_DIRS = frozenset({
@@ -74,6 +81,10 @@ async def _try_ripgrep(
     避免大目录扫描全量输出载入内存。
     """
     args = ["rg", "--line-number", "--no-heading", "--color=never"]
+    # 源头限长：>2000 列的匹配行只输出预览（只截显示，不减少匹配数——
+    # 匹配发生在完整行上）。防止兆级单行把输出管道撑到 StreamReader 上限；
+    # 本侧 content 本来就截到 MAX_CHARS_PER_LINE，行为自洽。
+    args.extend(["--max-columns=2000", "--max-columns-preview"])
     if include_ignored:
         # 审查 worktree 等被 gitignore/隐藏规则屏蔽的目录
         args.extend(["--no-ignore-vcs", "--hidden"])
@@ -92,6 +103,7 @@ async def _try_ripgrep(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_RG_STREAM_LIMIT,
         )
     except FileNotFoundError:
         return None
@@ -111,7 +123,9 @@ async def _try_ripgrep(
                 break
             if not raw_line:
                 break
-            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            # 共享解码漏斗：strict utf-8 → 系统 ANSI（Windows mbcs）→ replace，
+            # 避免本机代码页输出（GBK 文件内容/报错）被硬解成 U+FFFD 垃圾
+            line = decode_subprocess_output(raw_line).rstrip("\r\n")
             if not line:
                 continue
             # Format: <file>:<line>:<content>
@@ -129,6 +143,14 @@ async def _try_ripgrep(
             # Normalize path separators
             file = file.replace("\\", "/")
             matches.append({"file": file, "line": line_num, "content": content})
+    except ValueError:
+        # 单行超过 StreamReader limit：readline 超限时先清缓冲再抛
+        # ValueError('Separator is not found, and chunk exceed the limit')，
+        # 曾穿出整个 rg 路径、把本可工作的 _scan_python 兜底也跳过。
+        # 与 rg 不可见（FileNotFoundError/OSError）同构：丢弃本批已读匹配，
+        # 降级 Python 扫描（finally 仍保证 return 前杀进程清资源）。
+        log.info("grep_rg_line_limit_exceeded", falling_back="python_scan")
+        return None
     finally:
         # 达到上限或读取完毕后，若 rg 仍在运行则终止，释放资源
         if proc.returncode is None:
