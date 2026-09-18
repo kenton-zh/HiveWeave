@@ -72,7 +72,9 @@ export function useLiveStatusPoll(projectId: string | null | undefined) {
       const refActivity = lobby.on("activity", kick) as unknown as number;
       // .d.ts 只声明了 off(event, callback) 重载；运行时按 ref 过滤
       // （审计 H-2），经窄化类型调用 ref 形态。
-      const offByRef = lobby.off as unknown as (
+      // 必须 bind(lobby)：裸提取方法会把 this 剥成 undefined，phoenix off
+      // 内部读 this.bindings 即 TypeError（09-18 实测＝切项目白屏根因）。
+      const offByRef = lobby.off.bind(lobby) as unknown as (
         event: string, ref: number
       ) => void;
       off = () => {

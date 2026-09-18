@@ -63,10 +63,11 @@ export default function QuestionDialog() {
         return;
       }
       const refAsked = lobby.on("question_asked", () => void fetchRef.current()) as unknown as number;
-      off = () =>
-        (lobby.off as unknown as (event: string, ref: number) => void)(
-          "question_asked", refAsked
-        );
+      // bind(lobby) 同 useLiveStatusPoll：裸调用剥 this ⇒ 读 this.bindings 即 TypeError
+      const offByRef = lobby.off.bind(lobby) as unknown as (
+        event: string, ref: number
+      ) => void;
+      off = () => offByRef("question_asked", refAsked);
     };
     bind();
     return () => {
