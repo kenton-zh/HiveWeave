@@ -59,7 +59,7 @@ _INSPECTOR_ALIASES: frozenset[str] = frozenset({
 # 不要把这条改动当成「提示词一致性有保障了」。
 _SHELL_DIALECT_SECTION = f"""## Shell 方言（Windows 宿主：pwsh — 先看这段再写命令）
 命令执行走 **PowerShell (pwsh)**，不是 bash。unix 惯用语**多数**会被**前置拒绝**（`unix-only command(s) not available`），报错里附 pwsh 等价写法——照着改，不要换 flag 重试。
-⚠ **例外（会被自动转译，直接用即可）**：`| head -N` / `| tail -N` / `| wc -l` 这类**管道尾**，以及**整条**就是 `head -N 文件` / `tail -N 文件` / `wc -l 文件` 的写法 —— 平台会先改写成 pwsh 等价物再执行。**其余 unix 写法不在例外内。**
+⚠ **例外（会被自动转译，直接用即可）**：`| head -N` / `| tail -N` / `| wc -l` 这类**管道尾**——位于整条命令末尾**或复合命令某一段的末尾**（`;` / `&&` / `||` 分段，如 `git status | head -n 20; echo done`）都会被逐段改写，另加**整条**就是 `head -N 文件` / `tail -N 文件` / `wc -l 文件` 的直接写法 —— 平台会先改写成 pwsh 等价物再执行。**其余 unix 写法不在例外内**；同一条命令里还带别的 unix-only 命令（如 sed）时不会部分翻译，仍整条拒绝并附等价写法。
 
 **以下命令会被平台前置拒绝（`unix-only command(s) not available`）——别用（上一条的例外形态除外）**：
 {_rejected_commands_inline()}

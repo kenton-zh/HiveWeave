@@ -37,6 +37,7 @@ from typing import Any
 import structlog
 
 from hiveweave.util import path_guard
+from hiveweave.util.subprocess_decode import decode_subprocess_output
 from hiveweave.util.tree_label import cwd_display
 from hiveweave.tools.fact_positions import classify_error_text
 from hiveweave.tools.result import finalize_fact_dict
@@ -1596,9 +1597,18 @@ _SHELL_KEYWORDS = frozenset({
 })
 
 
-def _split_command_segments(command: str) -> list[str]:
-    """按未被引号包裹的 ; | || && & 换行 切分命令段（`&` 的 fd 重定向不切）。"""
-    segments: list[str] = []
+def _split_command_segments_with_seps(
+    command: str,
+) -> list[tuple[str, str | None]]:
+    """同一切分逻辑，但保留分隔符：返回 ``(段, 其后分隔符)`` 序列。
+
+    分隔符本身不进段内；末段分隔符为 ``None``。``&&`` / ``||`` 记双字符，
+    ``&`` 的 fd 重定向形态（``2>&1`` / ``&>``）不是分隔符（照旧并入段内）。
+    P2（TEST_DSH_62 分段翻译）：改写器需要**按原分隔符重组**整条命令，
+    只返回段的旧签名会丢分隔符 —— 故切分核心挪到这里，
+    :func:`_split_command_segments` 成为它的投影（语义逐字符不变）。
+    """
+    pairs: list[tuple[str, str | None]] = []
     buf: list[str] = []
     quote: str | None = None
     i = 0
@@ -1616,12 +1626,10 @@ def _split_command_segments(command: str) -> list[str]:
             buf.append(ch)
             i += 1
             continue
+        sep: str | None = None
         if command.startswith("&&", i) or command.startswith("||", i):
-            segments.append("".join(buf))
-            buf = []
-            i += 2
-            continue
-        if ch in (";", "|", "\n", "&"):
+            sep = command[i : i + 2]
+        elif ch in (";", "|", "\n", "&"):
             # `&` 只在**不是** fd 重定向（2>&1 / &> out）时才是段分隔符
             if ch == "&":
                 prev = command[i - 1] if i > 0 else ""
@@ -1630,14 +1638,42 @@ def _split_command_segments(command: str) -> list[str]:
                     buf.append(ch)
                     i += 1
                     continue
-            segments.append("".join(buf))
+            sep = ch
+        if sep is not None:
+            pairs.append(("".join(buf), sep))
             buf = []
-            i += 1
+            i += len(sep)
             continue
         buf.append(ch)
         i += 1
-    segments.append("".join(buf))
-    return segments
+    pairs.append(("".join(buf), None))
+    return pairs
+
+
+def _split_command_segments(command: str) -> list[str]:
+    """按未被引号包裹的 ; | || && & 换行 切分命令段（`&` 的 fd 重定向不切）。"""
+    return [seg for seg, _sep in _split_command_segments_with_seps(command)]
+
+
+def _split_statements(command: str) -> list[tuple[str, str | None]]:
+    """把 (段,分隔符) 序列聚成**语句级** ``(语句, 其后分隔符)``。
+
+    语句边界 = ``;`` / ``&&`` / ``||`` / ``&`` / 换行；管道 ``|`` **不是**
+    语句边界 —— ``git log | head -3`` 是**一条语句**，``head -3`` 是这条语句
+    的管道尾。这正是 :func:`try_closed_pipe_translation` 分段改写的作用单元：
+    旧实现把封闭集正则的 ``$`` 锚在整条命令串尾，复合命令**中段**的管道尾
+    （``git status | head -n 20; echo done`` 的第一段）永远够不着翻译。
+    """
+    statements: list[tuple[str, str | None]] = []
+    stmt = ""
+    for piece, sep in _split_command_segments_with_seps(command):
+        stmt += piece
+        if sep == "|":
+            stmt += sep      # 管道并回同一语句
+            continue
+        statements.append((stmt, sep))   # 语句级分隔符或末段（None）
+        stmt = ""
+    return statements
 
 
 def _cmd_substitution_bodies(segment: str) -> list[str]:
@@ -1834,31 +1870,130 @@ _CLOSED_PIPE_TAIL_RE = re.compile(
 )
 
 
-def try_closed_pipe_translation(command: str) -> tuple[str, str] | None:
-    """管道尾 head/tail/wc → Select-Object/Measure-Object 封闭翻译。
+class _TranslatedCommand(tuple):
+    """``(改写命令, 原命令)`` 二元组 + ``rewritten_segments`` 附加属性。
 
-    Returns:
-        (改写命令, 原命令)——可安全改写；None——不属封闭集/前段仍有
-        unix-only/无管道尾（维持 gate 拒绝教学）。
+    仍是二元组：既有调用点的两元解包、测试的索引/相等断言全部兼容。
+    额外携带"本次改写了几段"供 ``bash.dialect_auto_translated`` 日志观测
+    （P2 分段改写后单条命令可改写多段）。默认 1（直接形态翻译器不改它）。
     """
-    stripped = command.rstrip()
-    m = _CLOSED_PIPE_TAIL_RE.search(stripped)
-    if not m:
-        return None
+
+    def __new__(cls, new: str, original: str, rewritten_segments: int = 1):
+        obj = super().__new__(cls, (new, original))
+        obj.rewritten_segments = rewritten_segments  # type: ignore[attr-defined]
+        return obj
+
+
+def _statement_has_unclosed_cmd_subst(statement: str) -> bool:
+    """语句内是否有**未闭合**的 ``$(`` / 反引号（best-effort 平衡扫描）。
+
+    与 :func:`_cmd_substitution_bodies` 同一套平衡规则（反斜杠跳过、嵌套
+    计深）。为什么只需要查**未闭合**：闭合的 ``$( … )`` 必以 ``)`` 收口，
+    语句尾（封闭集正则的 ``$`` 锚点）不可能落在它体内；只有未闭合时，
+    匹配到的"管道尾"才可能其实身在命令替换体内 —— 此时语句在 bash/pwsh
+    都是语法错，语义无从谈起 ⇒ 调用方整条不译（fail-safe）。
+    """
+    i = 0
+    n = len(statement)
+    while i < n:
+        ch = statement[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if statement.startswith("$(", i):
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                c = statement[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if statement.startswith("$(", j):
+                    depth += 1
+                    j += 2
+                    continue
+                if c == ")":
+                    depth -= 1
+                j += 1
+            if depth:      # 扫到结尾仍未配平
+                return True
+            i = j
+            continue
+        if ch == "`":
+            j = statement.find("`", i + 1)
+            if j == -1:
+                return True
+            i = j + 1
+            continue
+        i += 1
+    return False
+
+
+def _closed_pipe_tail_ps(m: re.Match) -> str:
+    """封闭集管道尾匹配 → pwsh 等价物（映射与正则收录的形态一一对应）。"""
     tail = m.group("tail").strip()
     n = (m.group("n") or "").strip()
     if tail.startswith("| wc"):
-        ps_tail = "| Measure-Object -Line"
-    elif tail.startswith("| head"):
-        ps_tail = f"| Select-Object -First {n}"
-    else:
-        ps_tail = f"| Select-Object -Last {n}"
-    head_part = stripped[: m.start("tail")].rstrip()
-    if not head_part:
+        return "| Measure-Object -Line"
+    if tail.startswith("| head"):
+        return f"| Select-Object -First {n}"
+    return f"| Select-Object -Last {n}"
+
+
+def try_closed_pipe_translation(command: str) -> tuple[str, str] | None:
+    """管道尾 head/tail/wc → Select-Object/Measure-Object 封闭翻译（分段版）。
+
+    P2（TEST_DSH_62）：旧实现把 `_CLOSED_PIPE_TAIL_RE` 的 ``$`` 锚在**整条
+    命令串尾**，复合命令**中段**的管道尾（``git status | head -n 20; echo
+    done`` 的第一段）永远够不着翻译，随后被方言门整条拒绝 —— 14 次方言
+    拒绝里 8 次卡这。现按 :func:`_split_statements` 切语句（``;`` / ``&&`` /
+    ``||`` / ``&`` / 换行为界，管道属语句内部），**逐语句**套同一封闭集
+    正则，改写后按原分隔符重组。
+
+    安全判据（不可破，与旧版一致）：
+    - 封闭集正则**原样不动**（``head -c`` / ``wc -c`` / ``wc -w`` / 负数 /
+      尾注释 / heredoc 都不命中或被下方 detect 拦下）；
+    - 任一语句命中管道尾但拿不准（前段还有 unix-only / 前段为空 / 命令替换
+      未闭合）⇒ **整体** ``return None``，fail-safe 到现状（方言门整条拒 +
+      处方）—— 绝不做半吊子改写；
+    - 重组后全量复查 :func:`detect_untranslated_unix`：其余语句残留 unix-only
+      时同样 ``None``（例：``sed -i s/a/b/ f; git log | head -3`` 不译，
+      交给 gate 按 sed 给处方）。
+
+    Returns:
+        (改写命令, 原命令)——可安全改写（附加 ``rewritten_segments`` 属性）；
+        None——不属封闭集/前段仍有 unix-only/无管道尾（维持 gate 拒绝教学）。
+    """
+    pieces: list[str] = []
+    rewritten = 0
+    for stmt, sep in _split_statements(command):
+        stripped = stmt.rstrip()
+        m = _CLOSED_PIPE_TAIL_RE.search(stripped)
+        if m is None:
+            pieces.append(stmt if sep is None else stmt + sep)
+            continue
+        # 命中封闭集管道尾 ⇒ 本语句必须能被**完整**改写，任何拿不准都整体放弃
+        if _statement_has_unclosed_cmd_subst(stmt):
+            return None
+        head_part = stripped[: m.start("tail")].rstrip()
+        if not head_part or detect_untranslated_unix(head_part):
+            return None
+        rewritten += 1
+        new_stmt = head_part + " " + _closed_pipe_tail_ps(m)
+        if sep is None:
+            pieces.append(new_stmt)
+        else:
+            # 保留被 rstrip 吃掉的段尾空白再接分隔符：`head -3 &` 的 `&`
+            # 前空格在 pwsh 有构词意义（`-First 3&` 会被并进同一 token）。
+            # 末段（sep None）不带分隔符，维持旧行为丢弃尾空白。
+            pieces.append(new_stmt + stmt[len(stripped):] + sep)
+    if not rewritten:
         return None
-    if detect_untranslated_unix(head_part):
+    new_command = "".join(pieces)
+    # 全量复核：其余语句残留 unix-only（sed/grep…）⇒ 半改比不改糟，整条放弃
+    if detect_untranslated_unix(new_command):
         return None
-    return (head_part + " " + ps_tail, command)
+    return _TranslatedCommand(new_command, command, rewritten)
 
 
 #: 「只读限流词**直接形态**」的封闭集：`head -N f` / `tail -N f`（含 `-n N` 变体）。
@@ -1985,25 +2120,16 @@ def _normalize_for_pwsh(command: str) -> str:
 
 
 def _decode_output(raw: bytes) -> str:
-    """P2 fix(TEST10): 解码子进程输出。
+    """P2 fix(TEST10) / P6-b(TEST_DSH_62)：解码子进程输出。
 
-    优先 UTF-8（env 已设 PYTHONIOENCODING=utf-8），失败时回退到系统
-    locale 编码（中文 Windows 为 GBK/CP936）。避免 cmd.exe 原生命令
-    （dir/type/findstr）输出乱码。
+    统一走 :func:`hiveweave.util.subprocess_decode.decode_subprocess_output`
+    （strict utf-8 → Windows mbcs/ANSI 回退 → replace）。旧实现在 strict
+    utf-8 失败后回退 ``locale.getpreferredencoding`` —— 本机
+    ``PYTHONUTF8=1``（及 PEP 686 之后所有 Python）下它恒返回 utf-8，
+    回退等于没回退，中文 Windows 上 cmd.exe 原生命令（dir/type/findstr）
+    的 GBK 输出全部毁成 U+FFFD；``mbcs`` 不受 UTF-8 模式影响。
     """
-    if not raw:
-        return ""
-    try:
-        return raw.decode("utf-8")
-    except (UnicodeDecodeError, ValueError):
-        pass
-    # Fallback: system locale (GBK on zh-CN Windows)
-    try:
-        import locale
-        enc = locale.getpreferredencoding(False) or "gbk"
-        return raw.decode(enc, errors="replace")
-    except Exception:
-        return raw.decode("utf-8", errors="replace")
+    return decode_subprocess_output(raw)
 
 
 async def _kill_subprocess(proc) -> None:
@@ -2433,6 +2559,9 @@ async def execute_bash(
             log.info(
                 "bash.dialect_auto_translated",
                 translated_preview=command[:180],
+                # P2 分段改写：一条复合命令可改写多段（观测用，默认 1）
+                rewritten_segments=getattr(
+                    translated_pair, "rewritten_segments", 1),
             )
 
     dialect_err = _pwsh_dialect_gate(command, confined=spawn_decision.confined)
@@ -2650,6 +2779,9 @@ async def execute_run_command(
             log.info(
                 "run_command.dialect_auto_translated",
                 translated_preview=command[:180],
+                # P2 分段改写：一条复合命令可改写多段（观测用，默认 1）
+                rewritten_segments=getattr(
+                    translated_pair_rc, "rewritten_segments", 1),
             )
 
     run_dialect_err = _pwsh_dialect_gate(command, confined=spawn_decision.confined)
