@@ -202,24 +202,6 @@ def is_offturn_completion_text(text: str | None) -> bool:
     return any(t.startswith(p) for p in _COMPLETION_PREFIXES)
 
 
-def _strip_completion_prefixes(text: str | None) -> str:
-    """去掉开头的协议前缀（含 TRUNCATED），供**框架侧**剥壳。
-
-    只用于框架自己拼出来的 payload，不用于判断任意消息是不是回执
-    （那件事由 ``is_offturn_completion_text`` 负责）。**不得**用它推断终态
-    ——终态一律由 ``_TRUNCATED_PAYLOADS`` 的对象身份决定。
-    """
-    t = (text or "").lstrip()
-    changed = True
-    while changed:
-        changed = False
-        for p in _COMPLETION_PREFIXES:
-            if t.startswith(p):
-                t = t[len(p):].lstrip()
-                changed = True
-    return t
-
-
 _NO_REAP_CANCEL_REASONS = frozenset({"busy_reset", "reset_processing"})
 
 
