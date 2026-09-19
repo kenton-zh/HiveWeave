@@ -1776,6 +1776,19 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "to fill (non-code / emergency hotfix). Never omit silently."
                 ),
             },
+            "acceptanceCoverage": {
+                "type": "object",
+                "aliases": ["acceptance_coverage"],
+                "description": (
+                    "VERIFY 验收清单覆盖声明。最小格式："
+                    '{"<条目id>": {"attestation_ids": ["<凭证id>"]}}；'
+                    "确不适条目改 "
+                    '{"<条目id>": {"not_applicable_reason": "<理由>"}}'
+                    "（还须平台 waiver）。条目 id 见平台拒绝回执清单"
+                    "（条目N: … 的 N 就是 id）；不要照搬 policy kind 名——"
+                    "凭证须属本任务要求的类型、未过期且成功（平台机器核验）。"
+                ),
+            },
         },
         "required": ["summary", "testsPassed"],
     },

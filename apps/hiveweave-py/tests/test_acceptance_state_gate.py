@@ -402,7 +402,8 @@ def test_sync_form_fails_closed_without_verification():
 
 def test_error_message_names_ids_and_prescribes_state_path():
     msg = format_acceptance_coverage_error(["条目c1: 导出 CSV 功能可用"])
-    assert "acceptance_coverage" in msg
+    # 2026-09-19 接线修复：处方指向 submit_task 的 acceptanceCoverage 参数
+    assert "acceptanceCoverage" in msg
     assert "test_run" in msg
     assert "waive_attestation" in msg
     assert "N/A" in msg  # 说明裸 N/A 不再放行（处方仍点名它）

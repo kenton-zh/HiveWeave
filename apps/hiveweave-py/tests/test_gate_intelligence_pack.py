@@ -644,9 +644,10 @@ def test_uncovered_items_state_judgment():
         verified_ids={"a1"},
     )
     assert len(partial) == 1 and "条目2" in partial[0], partial
-    # 拒绝文案带处方（指结构化的覆盖声明）
+    # 拒绝文案带处方（指结构化的覆盖声明；2026-09-19 起处方指向
+    # submit_task 的 acceptanceCoverage 参数，不再说 evidence 键名）
     msg = format_acceptance_coverage_error(partial)
-    assert "acceptance_coverage" in msg and "test_run" in msg and "N/A" in msg
+    assert "acceptanceCoverage" in msg and "test_run" in msg and "N/A" in msg
 
 
 @pytest.mark.asyncio
@@ -698,7 +699,7 @@ async def test_service_submit_na_and_index_text_rejected(env):
                 "summary": "条目1 通过；条目2 N/A: 本环境无边界数据集，已人工抽查",
             },
         )
-    assert "acceptance_coverage" in str(ei.value)
+    assert "acceptanceCoverage" in str(ei.value)
     assert (await svc.get_task(pid, vid))["status"] == "running"
 
     # 无 acceptance_criteria 的 VERIFY 不受门影响

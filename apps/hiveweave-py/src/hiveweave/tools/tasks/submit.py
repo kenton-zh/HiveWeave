@@ -161,6 +161,20 @@ class SubmitTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["contractWaived", "contract_waived"]},
     )
+    acceptance_coverage: dict[str, Any] | None = Field(
+        default=None,
+        alias="acceptanceCoverage",
+        description=(
+            "VERIFY 验收清单覆盖声明（仅 VERIFY 任务需要）。格式："
+            '{"<条目id>": {"attestation_ids": ["<凭证id>"]}}；确不适的条目 '
+            '{"<条目id>": {"not_applicable_reason": "<理由>"}}（还须平台 '
+            "waiver）。凭证须属本任务要求的类型、未过期且成功（平台机器"
+            "核验）。条目 id 以平台拒绝回执清单为准。"
+        ),
+        json_schema_extra={
+            "aliases": ["acceptanceCoverage", "acceptance_coverage"]
+        },
+    )
     dry_run: bool = Field(
         default=False,
         alias="dryRun",
@@ -183,6 +197,61 @@ class SubmitTaskParams(BaseModel):
     @classmethod
     def _coerce_attestation_ids(cls, v: Any) -> Any:
         return _coerce_to_list(v)
+
+
+def _build_evidence(
+    params: SubmitTaskParams,
+    policy_id: str,
+    attest_ids: list[str],
+) -> dict[str, Any]:
+    """submit 参数 → verdict evidence 骨架（**纯函数**，无 IO / 无门禁判定）。
+
+    从 _submit_preflight 原地抽出（TEST_DSH_63 接线修复）：只负责把参数
+    逐键透传进 evidence；audit_soft 落章等需要任务上下文的步骤仍留在
+    调用方。除新增 acceptance_coverage 透传外，行为与抽取前一致。
+    """
+    evidence: dict[str, Any] = {
+        "summary": params.summary,
+        "tests_passed": True,
+        "policy_id": policy_id,
+        "attestation_ids": attest_ids,
+    }
+    if getattr(params, "commit", None) or getattr(params, "commit_hash", None):
+        evidence["commit"] = (
+            getattr(params, "commit", None) or getattr(params, "commit_hash", None)
+        )
+    if getattr(params, "core_interaction_executed", None):
+        evidence["core_interaction_executed"] = True
+    if getattr(params, "failures_acknowledged", None):
+        evidence["failures_acknowledged"] = params.failures_acknowledged
+    # E1 通道：VERIFY 任务的 verdict / blockingIssues 透传进 evidence
+    # （service 层硬校验依赖这两个字段；缺失时由 E1 硬拒并给出明确文案）。
+    from hiveweave.services.tasks.verify import normalize_verdict
+
+    if getattr(params, "verdict", None):
+        nv = normalize_verdict(params.verdict)
+        evidence["verdict"] = nv if nv else str(params.verdict).strip()
+    if getattr(params, "blocking_issues", None):
+        evidence["blocking_issues"] = list(params.blocking_issues)
+    if getattr(params, "env_snapshot", None):
+        evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
+    _delivery_contract = getattr(params, "delivery_contract", None)
+    if _delivery_contract:
+        evidence["delivery_contract"] = _delivery_contract
+    if getattr(params, "contract_waived", False):
+        evidence["contract_waived"] = True
+    # 验收清单覆盖声明 → evidence（acceptance.py 覆盖门的结构化判据）。
+    # 此前该门经 submit_task 结构上不可满足：参数无入口，模型硬传也被
+    # pydantic extra=ignore 静默吞掉（TEST_DSH_63：82 次调用 0 次带参）。
+    if params.acceptance_coverage:
+        evidence["acceptance_coverage"] = params.acceptance_coverage
+    if params.files_changed:
+        from hiveweave.services.worktree_review import normalize_files_changed
+
+        evidence["files_changed"] = normalize_files_changed(params.files_changed)
+    if params.test_output:
+        evidence["test_output"] = params.test_output[:4000]
+    return evidence
 
 
 async def _submit_preflight(
@@ -524,42 +593,7 @@ async def _submit_preflight(
             ),
         })
 
-    evidence: dict[str, Any] = {
-        "summary": params.summary,
-        "tests_passed": True,
-        "policy_id": policy_id,
-        "attestation_ids": attest_ids,
-    }
-    if getattr(params, "commit", None) or getattr(params, "commit_hash", None):
-        evidence["commit"] = (
-            getattr(params, "commit", None) or getattr(params, "commit_hash", None)
-        )
-    if getattr(params, "core_interaction_executed", None):
-        evidence["core_interaction_executed"] = True
-    if getattr(params, "failures_acknowledged", None):
-        evidence["failures_acknowledged"] = params.failures_acknowledged
-    # E1 通道：VERIFY 任务的 verdict / blockingIssues 透传进 evidence
-    # （service 层硬校验依赖这两个字段；缺失时由 E1 硬拒并给出明确文案）。
-    from hiveweave.services.tasks.verify import normalize_verdict
-
-    if getattr(params, "verdict", None):
-        nv = normalize_verdict(params.verdict)
-        evidence["verdict"] = nv if nv else str(params.verdict).strip()
-    if getattr(params, "blocking_issues", None):
-        evidence["blocking_issues"] = list(params.blocking_issues)
-    if getattr(params, "env_snapshot", None):
-        evidence["env_snapshot"] = str(params.env_snapshot)[:4000]
-    _delivery_contract = getattr(params, "delivery_contract", None)
-    if _delivery_contract:
-        evidence["delivery_contract"] = _delivery_contract
-    if getattr(params, "contract_waived", False):
-        evidence["contract_waived"] = True
-    if params.files_changed:
-        from hiveweave.services.worktree_review import normalize_files_changed
-
-        evidence["files_changed"] = normalize_files_changed(params.files_changed)
-    if params.test_output:
-        evidence["test_output"] = params.test_output[:4000]
+    evidence = _build_evidence(params, policy_id, attest_ids)
     # ── F1：软失败「平台判定」点 ────────────────────────────────────────────
     # 触发条件是 ``audit_soft`` = ``code_audit_soft_fail_pending(needed, agent_id,
     # task_id)``，即 **平台**根据 policy 必需清单 + 进程内审计尝试记录

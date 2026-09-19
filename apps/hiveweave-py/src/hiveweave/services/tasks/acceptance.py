@@ -486,7 +486,8 @@ def format_acceptance_coverage_error(
         "acceptance_criteria，verdict evidence 未体现对以下 "
         f"{len(missing)} 条的覆盖：\n- "
         + "\n- ".join(missing)
-        + f"\n处方：在 verdict evidence 加 `acceptance_coverage`，逐条按 id 声明覆盖"
+        + f"\n处方：submit_task 传 **`acceptanceCoverage` 参数**（不是 verdict "
+        "文本、不是文件），逐条按 id 声明覆盖"
         "（条目N → id 见上方清单），形如 " + _example
         + "——凭证由平台核验"
         f"（**必须属于本任务要求的凭证类型**{_multi}、"
