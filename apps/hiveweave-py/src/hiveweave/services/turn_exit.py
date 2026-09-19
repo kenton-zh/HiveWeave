@@ -946,6 +946,15 @@ async def agent_worktree_has_uncommitted(
 # commit_turn 同步拒绝时拼进提示。覆写式更新，仅 advisory。
 _ceo_project_pending_details: dict[str, list[str]] = {}
 
+# L8 窄豁免放行留痕（agent_id → note）：「待命叶子未派活」因无活可派被
+# 豁免时写入，commit_turn 成功回执取用（advisory，见 pop_idle_leaf_exempt_note）。
+_idle_leaf_exempt_notes: dict[str, str] = {}
+
+
+def pop_idle_leaf_exempt_note(agent_id: str) -> str:
+    """Pop the idle-leaf exemption note for *agent_id* (advisory)."""
+    return _idle_leaf_exempt_notes.pop(agent_id, "")
+
 # UNCOMMITTED_WORKTREE hint extras (files / path / git_status_error).
 _worktree_hint_details: dict[str, dict] = {}
 
@@ -1047,6 +1056,14 @@ async def ceo_project_pending_obligations(
     非 CEO 一律返回 []（仅一次角色查询，零任务 SQL）。任一子查询失败
     fail-open（跳过该项），绝不阻塞收工。返回人可读条目列表；
     空列表 = 项目层面可以收工。
+
+    L8 窄豁免（TEST_DSH_63 ×7 复撞，2026-09-19）：blocker 集只剩「待命
+    叶子未派活」且项目当前不存在可派任务（无 status='created' 且未认领的
+    开放任务——其余任务全部 closed/cancelled、被 verify 串行锁（verifying）、
+    blocked 或已被承办人/评审链占用）时，「dispatch_task 派活待命叶子」
+    物理不可能完成——派活需要一张存在的未派任务，CEO 不能凭空造活。
+    此时该子条款不成立（其余子条款 submitted/verifying/FAIL 照旧阻断，
+    不整体拆门）；放行留痕见 ``_idle_leaf_exempt_notes``。
     """
     try:
         from hiveweave.services.org import OrgService
@@ -1154,6 +1171,37 @@ async def ceo_project_pending_obligations(
             )
     except Exception as e:
         log.debug("ceo_project_pending_open_fail_failed", error=str(e))
+
+    # L8 窄豁免：当且仅当 blocker 集只剩「待命叶子未派活」且不存在可派
+    # 任务时剔除该子条款。可派任务 = status='created' 且未认领的开放任务；
+    # 其余状态（claimed/running/rework 被承办人占用、submitted/reviewing/
+    # approved 在评审链、verifying 被 verify 串行锁、blocked 挂起、
+    # closed/cancelled 终态）都不存在「派给待命叶子」的对象。查询失败
+    # → 不豁免（保守，宁可让 CEO 走 waiting 出口也不误放）。
+    if pending and all("待命叶子未派活" in p for p in pending):
+        dispatchable: int | None = None
+        try:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS c FROM tasks "
+                "WHERE is_archived = 0 AND status = 'created' "
+                "AND (assignee_id IS NULL OR assignee_id = '')"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            dispatchable = int(row["c"] or 0) if row else 0
+        except Exception as e:
+            log.debug("ceo_project_pending_dispatchable_failed", error=str(e))
+        if dispatchable == 0:
+            _idle_leaf_exempt_notes[agent_id] = (
+                "无活可派，叶子待命不计义务 (pending_idle_leaf_exempted)"
+            )
+            log.info(
+                "pending_idle_leaf_exempted",
+                project_id=project_id,
+                agent_id=agent_id,
+                blockers=list(pending),
+            )
+            return []
 
     return pending
 

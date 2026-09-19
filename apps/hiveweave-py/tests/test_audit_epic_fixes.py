@@ -1292,12 +1292,15 @@ async def test_resequence_receipt_wording():
     assert "第 1 次" in text
 
 
-# ── P2-①：幂等拒绝措辞按 kind 分流 ───────────────────────────────
+# ── P2-①：幂等措辞按 kind 分流（L8 批2 更新：同 kind 重复 waive 已从
+#    拒绝改为 no-op 成功回执 outcome=already_waived；kind 分流的拒绝措辞
+#    保留在「kind 不同」分支——tool_failure↔quality 改变审批权归属）──
 
 
 @pytest.mark.asyncio
 async def test_idempotent_reject_wording_tool_failure(env):
-    """tool_failure 幂等拒绝：不再硬编码「quality-class cannot approve」。"""
+    """tool_failure 同 kind 重复 waive → no-op 成功回执（不再判非法）。"""
+    from hiveweave.services.attestation import count_waivers
     from hiveweave.tools.task_tools import (
         WaiveAttestationParams,
         waive_attestation_tool,
@@ -1342,16 +1345,21 @@ async def test_idempotent_reject_wording_tool_failure(env):
             agent_id="coord-1",
             workspace=env["workspace_path"],
         )
-    assert second.success is False
+    # L8 批2：同 kind 重入是确保态重申 → no-op 成功回执，不再卡死善后通道
+    assert second.success is True
     text = (second.output or "") + (second.error or "")
+    assert "outcome=already_waived" in text
+    assert "already waived (no-op)" in text
     assert "kind=tool_failure" in text
-    assert "does NOT take away your approval right" in text
+    assert "无需重复豁免" in text
     assert "quality-class waived_by cannot approve" not in text
+    # no-op 不新增 waiver 行（终身配额不被重试消耗）
+    assert await count_waivers(PROJECT_ID, "t-idem-tf") == 1
 
 
 @pytest.mark.asyncio
 async def test_idempotent_reject_wording_quality(env):
-    """quality 幂等拒绝：维持第三方隔离措辞。"""
+    """quality 既有 waiver + 换 kind 重入 → 维持拒绝，第三方隔离措辞保留。"""
     from hiveweave.tools.task_tools import (
         WaiveAttestationParams,
         waive_attestation_tool,
@@ -1393,6 +1401,7 @@ async def test_idempotent_reject_wording_quality(env):
             WaiveAttestationParams(
                 taskId="t-idem-q",
                 reason="CLI 任务无 UI 可 browse，以 bash 验证日志替代验证",
+                reasonKind="tool_failure",
             ),
             agent_id="coord-1",
             workspace=env["workspace_path"],

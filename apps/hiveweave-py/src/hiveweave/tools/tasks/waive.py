@@ -108,6 +108,20 @@ class WaiveAttestationParams(BaseModel):
     )
 
 
+def _format_waiver_expiry(expires_at: Any) -> str:
+    """人可读的 waiver 有效期描述（幂等 no-op 回执用）。"""
+    try:
+        exp = int(expires_at) if expires_at is not None else None
+    except (TypeError, ValueError):
+        exp = None
+    if not exp:
+        return "无过期时间"
+    remaining = exp - int(time.time() * 1000)
+    if remaining <= 0:
+        return "已过期"
+    return f"剩 {remaining // 3_600_000}h{(remaining % 3_600_000) // 60_000:02d}m"
+
+
 async def _agent_has_open_verify(project_id: str, agent_id: str) -> bool:
     """名下有未闭环 VERIFY 验收义务（E5 收口纪律判定用）。"""
     try:
@@ -163,7 +177,8 @@ async def waive_attestation_tool(
         attestation_service,
         count_waivers,
         create_waiver,
-        has_valid_waiver,
+        get_valid_waiver,
+        normalize_waiver_kind,
     )
     from hiveweave.services.org import OrgService
     from hiveweave.services.policy import infer_role_family
@@ -238,30 +253,28 @@ async def waive_attestation_tool(
             "标志），完成验收后再提交；② 或显式升级 coordinator/CEO 处理。"
         )
 
-    # Lifetime cap — escape hatch must stay narrower than the front door
-    prior = await count_waivers(project_id, params.task_id)
-    if prior >= MAX_WAIVERS_PER_TASK:
-        return ToolResult.err(
-            f"waive_attestation rejected: task {params.task_id} already has "
-            f"{prior} waiver(s) (max {MAX_WAIVERS_PER_TASK}). "
-            "Obtain real attestation evidence instead."
-        )
-    if await has_valid_waiver(project_id, params.task_id):
-        waived_by = agent_id
-        existing_kind = "quality"
-        try:
-            from hiveweave.services.attestation import (
-                get_valid_waiver,
-                normalize_waiver_kind,
-            )
+    # 审计 epic P0-3：waiver 按原因分流（quality 默认 | tool_failure）。
+    # 请求 kind 先归一——幂等判定与下方 create_waiver 共用同一口径。
+    waiver_kind = normalize_waiver_kind(params.reason_kind)
 
-            wr = await get_valid_waiver(project_id, params.task_id)
-            if wr and wr.get("agent_id"):
-                waived_by = str(wr["agent_id"])
-            if wr:
-                existing_kind = normalize_waiver_kind(wr.get("waiver_kind"))
-        except Exception:
-            pass
+    # 已有未过期 waiver → 幂等重入（L8 家族第 4 例，TEST_DSH_63）：同任务
+    # 同 kind 重复 waive 与 update_task_status running→running（TEST_DSH_62）
+    # 同病——重复请求是「确保态重申」，不是新的非法豁免。旧实现对 CEO 已
+    # 落 waiver 后的每一次重入都回 reject，把发起人的善后通道（自批/路由）
+    # 卡死。现在同 kind → ToolResult.ok 回执（outcome=already_waived）+
+    # 既有 waiver 的 kind/有效期/「无需重复豁免」；kind 不同 = 实质语义变化
+    # （tool_failure ↔ quality 改变审批权归属），维持拒绝，等过期或自批。
+    # 该检查置于 lifetime cap 之前：no-op 不新增 waiver 行，重复重试不应
+    # 消耗 2 次终身配额；cap 对「真正新豁免」的口径不变。
+    try:
+        existing_waiver = await get_valid_waiver(project_id, params.task_id)
+    except Exception:
+        existing_waiver = None
+    if existing_waiver is not None:
+        waived_by = str(existing_waiver.get("agent_id") or agent_id)
+        existing_kind = normalize_waiver_kind(
+            existing_waiver.get("waiver_kind")
+        )
         tip = await _format_post_waive_approve_tip(
             project_id,
             waived_by=waived_by,
@@ -269,6 +282,15 @@ async def waive_attestation_tool(
             caller_id=agent_id,
             kind=existing_kind,
         )
+        if existing_kind == waiver_kind:
+            wid = str(existing_waiver.get("id") or "")[:8]
+            return ToolResult.ok(
+                f"outcome=already_waived: task {params.task_id} already "
+                f"waived (no-op). 既有 waiver {wid} (kind={existing_kind}, "
+                f"{_format_waiver_expiry(existing_waiver.get('expires_at'))}) "
+                "仍有效——无需重复豁免，请直接走下方 NEXT ACTION。"
+                + tip
+            )
         # 审计 P2 修复：措辞按既有 waiver 的 kind 分流——旧实现硬编码
         # "quality-class waived_by cannot approve"，对 tool_failure 豁免
         # 误导发起人「自己不能批」。
@@ -287,6 +309,15 @@ async def waive_attestation_tool(
             f"waive_attestation rejected: task {params.task_id} already has "
             f"an unexpired waiver (kind={existing_kind}). {reject_detail}"
             + tip
+        )
+
+    # Lifetime cap — escape hatch must stay narrower than the front door
+    prior = await count_waivers(project_id, params.task_id)
+    if prior >= MAX_WAIVERS_PER_TASK:
+        return ToolResult.err(
+            f"waive_attestation rejected: task {params.task_id} already has "
+            f"{prior} waiver(s) (max {MAX_WAIVERS_PER_TASK}). "
+            "Obtain real attestation evidence instead."
         )
 
     # Evidence attestation must be a real execution kind (not another waiver).
@@ -382,10 +413,7 @@ async def waive_attestation_tool(
         if evidence_id
         else f"[ceo_look] {reason}"
     )
-    # 审计 epic P0-3：waiver 按原因分流（quality 默认 | tool_failure）。
-    from hiveweave.services.attestation import normalize_waiver_kind
-
-    waiver_kind = normalize_waiver_kind(params.reason_kind)
+    # waiver_kind 已在幂等检查前归一（审计 epic P0-3：quality | tool_failure）。
     try:
         waiver_id = await create_waiver(
             project_id,

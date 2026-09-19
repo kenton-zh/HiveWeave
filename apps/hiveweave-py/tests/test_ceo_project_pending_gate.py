@@ -260,11 +260,19 @@ async def test_ceo_verifying_task_pending(env):
 
 @pytest.mark.asyncio
 async def test_ceo_idle_leaf_pending(env):
-    """active 叶子超过宽限期且名下零任务 → 待派活。"""
+    """active 叶子超过宽限期且名下零任务 → 待派活。
+
+    L8 窄豁免（TEST_DSH_63）后，仅当**无活可派**（无 created 未认领任务）
+    时该子条款才被豁免——此处放一张 created 未认领任务，所以待命叶子
+    照旧成立。零任务即豁免的形态归 tests/test_waive_idempotent_and_turn_gate.py。
+    """
     old = int(time.time() * 1000) - 20 * 60 * 1000
     await _insert_agent(
         env["workspace_path"], LEAF_ID, short_id="A102", name="乙希",
         created_at=old,
+    )
+    await _insert_task(
+        env["workspace_path"], "t-created", status="created"
     )
     with patch(
         "hiveweave.services.org.OrgService.get_agent",
@@ -403,6 +411,9 @@ async def test_ceo_idle_leaf_not_missed_behind_many_coordinators(env):
         env["workspace_path"], LEAF_ID, short_id="A105", name="戊当",
         created_at=old,
     )
+    # L8 窄豁免后零任务会被豁免——本测试验证的是叶子在 LIMIT 50 内不被
+    # coordinator 挤没，补一张 created 未认领任务保持「有活可派」前提。
+    await _insert_task(env["workspace_path"], "t-n1", status="created")
     with patch(
         "hiveweave.services.org.OrgService.get_agent",
         new=AsyncMock(return_value=_ceo_row()),

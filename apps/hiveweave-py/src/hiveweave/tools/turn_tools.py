@@ -440,11 +440,20 @@ async def commit_turn_tool(
             gates=[],
         )
 
+    # L8 窄豁免留痕（TEST_DSH_63）：预检把「待命叶子未派活」因无活可派
+    # 豁免时，成功回执注明（稳定 token pending_idle_leaf_exempted），
+    # 让「门为何放行」对 CEO 与回归测试可见。
+    from hiveweave.services.turn_exit import pop_idle_leaf_exempt_note
+
+    exempt_note = pop_idle_leaf_exempt_note(agent_id)
+    exempt_suffix = f" {exempt_note}" if exempt_note else ""
+
     return ToolResult.ok(
         f"STOP: TurnResult committed (phase={tr.phase}). "
         f"Do NOT call any more tools this turn. gates: []. "
         f"Platform evaluates exit next; if blocked you will be told "
-        f"exactly which gates remain — do not guess.",
+        f"exactly which gates remain — do not guess."
+        + exempt_suffix,
         turn_result=payload,
         end_turn=True,
         gates=[],
