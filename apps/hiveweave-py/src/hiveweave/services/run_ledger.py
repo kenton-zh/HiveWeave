@@ -98,6 +98,29 @@ def _summary_from_reason(result_summary: str, error_reason: str) -> str:
     return (error_reason or "")[:200]
 
 
+_UPSTREAM_DEATH_TEXT_NEEDLES = (
+    "regionerror",
+    "region error",
+    "not available in your country",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "gateway time-out",
+    "internal server error",
+)
+
+
+def _looks_upstream_death_text(error_text: str) -> bool:
+    """错误文案是否像上游/区域类死亡（占位行标注用；窄 needle，非判定权威）。
+
+    权威判定是 ``llm/retry.is_upstream_death``（组3，吃异常对象）；这里只有
+    error_reason 文本可用，仅用于给占位行打 ``:upstream`` 标签 —— 打错标签
+    不影响占位行的补账语义。
+    """
+    t = (error_text or "").lower()
+    return any(n in t for n in _UPSTREAM_DEATH_TEXT_NEEDLES)
+
+
 class RunLedger:
     """Per-project run ledger service.
 
@@ -637,6 +660,19 @@ class RunLedger:
         TEST_DSH_47 #2: error runs previously left ``result_summary`` NULL,
         making idle/400-class deaths invisible to token/wall-clock tax
         accounting. Always land a one-line summary alongside the reason.
+
+        R11 占位行（TEST_DSH_63 批3 组4，2026-09-19）：run 实际死亡、
+        ``actual_llm_calls > 0`` 且 ``llm_usage`` 无任何行时插入一条全 0 占位
+        usage 行 —— 「declared > 0 必须有账」恢复 0 断口（DSH_63 实测：其一
+        run actual_llm_calls=1 却零账）。占位行可机检：
+        - 行侧：``request_type IS NULL`` + ``provider IS NULL`` + 全 0 token
+          + ``duration_ms = 0``（真实请求行 request_type/provider 均非空）；
+        - run 侧：``result_summary`` **前置** ``[llm_usage_placeholder]`` 标记
+          （上游死亡时为 ``[llm_usage_placeholder:upstream]``）—— 前置而非
+          追加，因为 summary 截 500 字符，追加式标记可能被截掉丢机检位。
+          回归判据用 run↔usage 行 join 即可区分「真 0 账（丢账）」与
+          「占位（上游死亡，token 未回传）」。
+        best-effort：占位失败不改变 error 标记本身。
         """
         now = _now_ms()
         summary = _summary_from_reason(result_summary, error_reason)
@@ -649,6 +685,92 @@ class RunLedger:
             )
         except Exception as e:
             log.warning("run_ledger.error_run_failed", error=str(e))
+        try:
+            await self._insert_placeholder_usage_for_dead_run(
+                agent_id, run_id, error_reason, now
+            )
+        except Exception as e:  # noqa: BLE001 — 占位是补账，绝不拦主流程
+            log.warning("run_ledger.placeholder_usage_failed", error=str(e))
+
+    async def _insert_placeholder_usage_for_dead_run(
+        self,
+        agent_id: str,
+        run_id: str,
+        error_reason: str,
+        died_at_ms: int,
+    ) -> None:
+        """零账死亡 run 的 R11 占位 usage 行（判据见 :meth:`error_run`）。"""
+        if not run_id:
+            return
+        rows = await project_db.query(
+            agent_id,
+            "SELECT actual_llm_calls, result_summary FROM agent_runs "
+            "WHERE id = ?",
+            [run_id],
+        )
+        if not rows:
+            return
+        if int(rows[0]["actual_llm_calls"] or 0) <= 0:
+            return  # declared=0 ⇒ 无账可补（R11 判据不涉及）
+        cur = await project_db.query(
+            agent_id,
+            "SELECT COUNT(*) AS c FROM llm_usage WHERE run_id = ?",
+            [run_id],
+        )
+        if cur and int(cur[0]["c"] or 0) > 0:
+            return  # 已有账 —— 占位只补「零账」断口
+        model_id = None
+        try:
+            mrows = await project_db.query(
+                agent_id,
+                "SELECT model_id FROM agents WHERE id = ?",
+                [agent_id],
+            )
+            if mrows:
+                model_id = mrows[0]["model_id"]
+        except Exception as e:  # noqa: BLE001 — model 拿不到就 NULL
+            log.debug("run_ledger.placeholder_model_lookup_failed", error=str(e))
+        project_id = None
+        try:
+            from hiveweave.db import meta as meta_db
+
+            project_id = await meta_db.get_agent_project_id(agent_id)
+        except Exception:  # noqa: BLE001
+            project_id = None
+        upstream = _looks_upstream_death_text(error_reason)
+        marker = (
+            "[llm_usage_placeholder:upstream]"
+            if upstream
+            else "[llm_usage_placeholder]"
+        )
+        prev_summary = str(rows[0]["result_summary"] or "")
+        if marker not in prev_summary:
+            # 标记放最前：result_summary 截 500 字符，追加式标记可能被
+            # 截掉而丢机检位；前置标记永不丢（正文被截断可接受）。
+            new_summary = (
+                f"{marker} | {prev_summary}" if prev_summary else marker
+            )
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET result_summary = ? WHERE id = ?",
+                [new_summary[:500], run_id],
+            )
+        await project_db.execute(
+            agent_id,
+            "INSERT INTO llm_usage (id, agent_id, project_id, run_id, task_id, "
+            "model_id, request_type, provider, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_creation_tokens, total_tokens, "
+            "duration_ms, cold_start, creation_unreported, created_at) "
+            "VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, ?)",
+            [str(uuid.uuid4()), agent_id, project_id, run_id, model_id, died_at_ms],
+        )
+        log.warning(
+            "run_ledger.placeholder_usage_inserted",
+            agent_id=(agent_id or "")[:12],
+            run_id=(run_id or "")[:8],
+            model_id=str(model_id or "")[:40],
+            upstream=upstream,
+        )
 
     async def find_interrupted_run(self, agent_id: str) -> dict | None:
         """Find the most recent interrupted run for an agent."""

@@ -221,6 +221,40 @@ class ObligationsMixin:
             )
             return True  # fail-closed
 
+    async def has_pending_upstream_recovery(
+        self, project_id: str, agent_id: str
+    ) -> bool:
+        """上游死亡 durable 重醒未到期 → True（dwell/义务时钟应暂停）。
+
+        TEST_DSH_63 批3 组4：agent 死于上游错误后、自动重醒到期前，它不是
+        「僵死」而是「平台已排定的合法等待」——dwell 不累计、auto-submit /
+        VERIFY 改派不触发；唤醒触发后等待行被 clear_expired 清掉，本谓词
+        自然回到 False（时钟恢复，无需任何解除动作）。
+
+        ⚠ 跳过判据的**真正消费点**不在本文件：dwell 时钟住在
+        ``game_time._nudge_stale_ledger``，其 ``live_wait_agents``（来自
+        ``wait_contract_service.list_all_active``）已把任何 active wait 的
+        agent 排除出 stall 计数 / auto-submit / VERIFY 改派 —— upstream
+        recovery 等待行因此**天然**被覆盖，无需改 game_time。本谓词是该
+        子集的具名读法（wait_contract.has_active_upstream_recovery 的转发），
+        供观测、定向豁免点与测试复用；fail-open False（查询失败按无重醒，
+        不改变任何既有跳过语义）。
+        """
+        try:
+            from hiveweave.services.wait_contract import (
+                has_active_upstream_recovery,
+            )
+
+            return await has_active_upstream_recovery(project_id, agent_id)
+        except Exception as e:  # noqa: BLE001 — fail-open：不影响既有判定
+            log.debug(
+                "has_pending_upstream_recovery_failed",
+                project_id=project_id,
+                agent_id=agent_id,
+                error=str(e),
+            )
+            return False
+
     async def can_idle(self, project_id: str, agent_id: str) -> bool:
         """F6 本体：**「许可收尾 / 许可不唤醒」的唯一判定源**。
 

@@ -749,25 +749,27 @@ class WaitContractService:
             except Exception:  # noqa: BLE001 — 退避是优化，查不到退基础 TTL
                 timer_timeout_rounds = {}
         for item in deduped_items:
+            # wkind/wref/wnote:加前缀避免与上方 _item_kind_ref 解包的 kind/ref
+            # 遮蔽(mypy no-redef)。
             if isinstance(item, WaitingOnItem):
-                kind: str = item.kind
-                ref = item.ref
-                note = item.note
+                wkind: str = item.kind
+                wref = item.ref
+                wnote = item.note
             else:
-                kind = str(item.get("kind") or "external")
-                ref = str(item.get("ref") or "")
-                note = item.get("note")
-            if not ref:
+                wkind = str(item.get("kind") or "external")
+                wref = str(item.get("ref") or "")
+                wnote = item.get("note")
+            if not wref:
                 continue
-            wake_on = list(DEFAULT_WAKE_ON.get(kind, ["timeout"]))
+            wake_on = list(DEFAULT_WAKE_ON.get(wkind, ["timeout"]))
             if isinstance(item, dict) and item.get("wake_on"):
                 wake_on = list(item["wake_on"])
             wid = str(uuid.uuid4())
             exp = expires_at
             if isinstance(item, dict) and item.get("expires_at") is not None:
                 exp = int(item["expires_at"])
-            unbounded = looks_unbounded_external(kind, ref) or (
-                str(kind).lower() == "task" and batch_unbounded
+            unbounded = looks_unbounded_external(wkind, wref) or (
+                str(wkind).lower() == "task" and batch_unbounded
             )
             if unbounded:
                 exp = None
@@ -777,14 +779,14 @@ class WaitContractService:
                 if not wake_on:
                     wake_on = (
                         ["external"]
-                        if str(kind).lower() == "external"
+                        if str(wkind).lower() == "external"
                         else ["task_transition"]
                     )
             elif exp is None:
-                ttl_ms = default_ttl_ms(kind, agent_id)
+                ttl_ms = default_ttl_ms(wkind, agent_id)
                 target_ms = None
-                if str(kind).lower() == "timer":
-                    candidate = parse_timer_target_ms(ref, note)
+                if str(wkind).lower() == "timer":
+                    candidate = parse_timer_target_ms(wref, wnote)
                     # P2-1（审计）：目标必须晚于本条 wait 的创建时刻才采信。
                     # parse 对纯数字按 epoch —— ref 解析失败后回退 note 时，
                     # note="30" 会解析成 1970（已过时刻）→ 立即假唤醒还标
@@ -804,13 +806,13 @@ class WaitContractService:
                     # **timer 专有**语义 —— 越界会污染非 timer 票的 note 与参数
                     # 类型（test_locked_writers_part2 用不可绑定 note 构造中途失败
                     # 时抓到的正是这一点）。
-                    if str(kind).lower() == "timer":
+                    if str(wkind).lower() == "timer":
                         eff_ttl = timer_backoff_ttl_ms(
                             ttl_ms,
-                            timer_timeout_rounds.get(_timer_rounds_key(ref), 0),
+                            timer_timeout_rounds.get(_timer_rounds_key(wref), 0),
                         )
                         exp = now + eff_ttl
-                        note = _mark_wait_note(note, "ttl_expire", None)
+                        wnote = _mark_wait_note(wnote, "ttl_expire", None)
                     else:
                         exp = now + ttl_ms
                 else:
@@ -821,14 +823,14 @@ class WaitContractService:
                     # （15min→1h→6h→24h）。退避窗够到目标即转按目标排队，
                     # 故只会少醒、不会漏醒。
                     eff_ttl = timer_backoff_ttl_ms(
-                        ttl_ms, timer_timeout_rounds.get(_timer_rounds_key(ref), 0)
+                        ttl_ms, timer_timeout_rounds.get(_timer_rounds_key(wref), 0)
                     )
                     if target_ms <= now + eff_ttl:
                         exp = target_ms
-                        note = _mark_wait_note(note, "target_reached", target_ms)
+                        wnote = _mark_wait_note(wnote, "target_reached", target_ms)
                     else:
                         exp = now + eff_ttl
-                        note = _mark_wait_note(note, "ttl_cap", target_ms)
+                        wnote = _mark_wait_note(wnote, "ttl_cap", target_ms)
             statements.append(
                 (
                     "INSERT INTO agent_waits "
@@ -839,13 +841,13 @@ class WaitContractService:
                         wid,
                         agent_id,
                         project_id,
-                        kind,
-                        ref,
+                        wkind,
+                        wref,
                         json.dumps(wake_on),
                         exp,
                         ver,
                         phase,
-                        note,
+                        wnote,
                         now,
                     ],
                 )
@@ -855,13 +857,13 @@ class WaitContractService:
                     "id": wid,
                     "agentId": agent_id,
                     "projectId": project_id,
-                    "kind": kind,
-                    "ref": ref,
+                    "kind": wkind,
+                    "ref": wref,
                     "wakeOn": wake_on,
                     "expiresAt": exp,
                     "obligationVersion": ver,
                     "phase": phase,
-                    "note": note,
+                    "note": wnote,
                     "createdAt": now,
                     "clearedAt": None,
                 }
@@ -1334,6 +1336,184 @@ class WaitContractService:
                 error=str(e),
             )
         return out
+
+
+# ── 上游死亡 durable 重醒（TEST_DSH_63 批3 组4，2026-09-19）─────────────
+# 病：一次 30 秒上游抖动窗（403 RegionError / 503 重试耗尽）可连杀多个 run；
+# run 死后 agent 永久停摆 —— 无自动重醒、无通知。DSH 参照哲学：死亡可接受，
+# 恢复靠 **durable 触发**，任务保持 claimed（不做 parked/断点续跑，整轮重放，
+# 前缀缓存友好）。
+# 药：复用**既有** agent_waits 机制——插一条 kind=timer 的等待行，到期由
+# game_time tick 的 clear_expired → [WAIT_TIMEOUT] + watchdog trigger 唤醒
+# （后端重启后 activate 路径的对账同样覆盖，天然 durable）。
+# 副产品（正是任务 2 的 dwell 暂停）：_nudge_stale_ledger 的 live_wait_agents
+# 把任何 active wait 的 agent 视为「合法等待」，stall 计数 / auto-submit /
+# VERIFY 改派全部跳过；唤醒行被清后自然恢复。obligations.has_open_work 的
+# wait 负项同样生效。⇒ 不需要任何 game_time / 义务时钟侧的新代码。
+# 次数持久化：attempt 序号写进 note 的 [wakeup_reason=upstream_recovery
+# attempt=N] 标记 + 行的 phase='upstream_recovery'；窗口期内的行（含已清除）
+# 计数取档，不新造调度器、不加表、不加列。
+
+UPSTREAM_RECOVERY_KIND = "timer"
+"""重醒等待行的 kind —— 复用 timer 语义（wake_on 含 timeout）。"""
+
+UPSTREAM_RECOVERY_PHASE = "upstream_recovery"
+"""重醒等待行的 phase 标记（agent_waits.phase），DB 级可机检。"""
+
+UPSTREAM_RECOVERY_ATTEMPTS = 3
+"""自动重醒封顶次数；耗尽后停止重醒，交人工（ORG_ESCALATION）。"""
+
+UPSTREAM_RECOVERY_DELAYS_MS = (60_000, 180_000, 600_000)
+"""退避阶梯（第 1/2/3 次死亡的重醒延迟）。"""
+
+UPSTREAM_RECOVERY_WINDOW_MS = 30 * 60 * 1000
+"""attempt 计数窗：窗口内的重醒行（含已清除）计入退避档位，窗外归零。"""
+
+UPSTREAM_RECOVERY_NOTE_TAG = "[wakeup_reason=upstream_recovery"
+"""note 标记前缀 —— game_time._process_wait_contracts 解析出
+wakeup_reason=upstream_recovery 放进 [WAIT_TIMEOUT] 的 details；
+trigger.wake_source_for_pending 靠正文里的同一标记识别重醒唤醒。"""
+
+_UPSTREAM_RECOVERY_WAKE_TEXT = "上游抖动后自动恢复,任务与上下文不变"
+"""唤醒 reason 文案（钦定）。放进 ref —— [WAIT_TIMEOUT] 正文含
+`Your wait (timer:<ref>) expired`，文案因此随唤醒信可达 agent。"""
+
+
+def _upstream_recovery_note(attempt: int, run_id: str, target_ms: int) -> str:
+    base = _UPSTREAM_RECOVERY_WAKE_TEXT
+    tag = (
+        f"{_WAKEUP_REASON_TAG}upstream_recovery attempt={attempt} "
+        f"run={(run_id or '')[:8]} target={_iso_utc(target_ms)}]"
+    )
+    return f"{base} | {tag}"
+
+
+async def _upstream_recovery_rows(
+    project_id: str, agent_id: str, *, active_only: bool
+) -> list[dict]:
+    await _ensure_schema(project_id)
+    conn = await _conn(project_id)
+    if conn is None:
+        return []
+    sql = (
+        "SELECT * FROM agent_waits "
+        "WHERE agent_id = ? AND kind = ? AND phase = ? "
+        + ("AND cleared_at IS NULL " if active_only else "")
+        + "ORDER BY created_at ASC"
+    )
+    try:
+        cur = await conn.execute(
+            sql, [agent_id, UPSTREAM_RECOVERY_KIND, UPSTREAM_RECOVERY_PHASE]
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    except Exception as e:  # noqa: BLE001 — fail-open：查询失败按无行处理
+        log.debug("upstream_recovery_scan_failed", error=str(e))
+        return []
+    return [_row_to_dict(r) for r in rows]
+
+
+async def has_active_upstream_recovery(
+    project_id: str, agent_id: str
+) -> bool:
+    """该 agent 是否有**未到期**的上游重醒等待（dwell/义务时钟暂停判据）。
+
+    消费点：obligations.has_pending_upstream_recovery（具名读法）；
+    真正的跳过发生在 game_time._nudge_stale_ledger 的 live_wait_agents
+    （任何 active wait 即跳过 stall/改派/自动提交）——本谓词是其
+    upstream_recovery 子集，供定向观测与未来豁免点复用。
+    """
+    rows = await _upstream_recovery_rows(project_id, agent_id, active_only=True)
+    now = int(time.time() * 1000)
+    return any(
+        (w.get("expiresAt") is None or int(w.get("expiresAt") or 0) > now)
+        for w in rows
+    )
+
+
+async def schedule_upstream_recovery_wait(
+    project_id: str,
+    agent_id: str,
+    *,
+    run_id: str = "",
+    now_ms: int | None = None,
+) -> dict:
+    """给死于上游错误的 agent 排一次 durable 自动唤醒（幂等、封顶 3 次）。
+
+    返回 dict：
+    - ``{"scheduled": True, "attempt": n, "delay_ms": d, "wake_at": ts,
+      "wait_id": id}`` —— 已插入等待行；
+    - ``{"scheduled": False, "reason": "pending_exists"}`` —— 已有未触发
+      的重醒等待（不叠排，保留最早一次）；
+    - ``{"scheduled": False, "exhausted": True, "attempt": n}`` —— 窗口内
+      已耗尽 3 次，调用方应升级人工（不再排）。
+
+    只 INSERT 单行，**不清**该 agent 既有等待（与 replace_waits 的全清
+    语义刻意不同——死亡不该抹掉它上一轮的合法停泊）。
+    """
+    if not project_id or not agent_id:
+        return {"scheduled": False, "reason": "missing_ids"}
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    active = await _upstream_recovery_rows(
+        project_id, agent_id, active_only=True
+    )
+    if active:
+        return {"scheduled": False, "reason": "pending_exists"}
+    recent = await _upstream_recovery_rows(
+        project_id, agent_id, active_only=False
+    )
+    recent = [
+        r for r in recent
+        if int(r.get("createdAt") or 0) >= now - UPSTREAM_RECOVERY_WINDOW_MS
+    ]
+    attempt = len(recent) + 1
+    if attempt > UPSTREAM_RECOVERY_ATTEMPTS:
+        return {
+            "scheduled": False,
+            "exhausted": True,
+            "attempt": len(recent),
+        }
+    delay_ms = UPSTREAM_RECOVERY_DELAYS_MS[
+        min(attempt - 1, len(UPSTREAM_RECOVERY_DELAYS_MS) - 1)
+    ]
+    exp = now + delay_ms
+    wid = str(uuid.uuid4())
+    await _ensure_schema(project_id)
+    await execute_by_project(
+        project_id,
+        "INSERT INTO agent_waits "
+        "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+        "obligation_version, phase, note, created_at, cleared_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)",
+        [
+            wid,
+            agent_id,
+            project_id,
+            UPSTREAM_RECOVERY_KIND,
+            f"{_UPSTREAM_RECOVERY_WAKE_TEXT}(attempt={attempt}"
+            f"/{UPSTREAM_RECOVERY_ATTEMPTS})",
+            json.dumps(DEFAULT_WAKE_ON.get(UPSTREAM_RECOVERY_KIND, ["timeout"])),
+            exp,
+            UPSTREAM_RECOVERY_PHASE,
+            _upstream_recovery_note(attempt, run_id, exp),
+            now,
+        ],
+    )
+    log.warning(
+        "upstream_recovery_wake_scheduled",
+        agent_id=agent_id,
+        project_id=project_id,
+        run_id=(run_id or "")[:8],
+        attempt=f"{attempt}/{UPSTREAM_RECOVERY_ATTEMPTS}",
+        delay_s=delay_ms // 1000,
+    )
+    return {
+        "scheduled": True,
+        "attempt": attempt,
+        "delay_ms": delay_ms,
+        "wake_at": exp,
+        "wait_id": wid,
+    }
 
 
 def _norm_token(value: str | None) -> str:

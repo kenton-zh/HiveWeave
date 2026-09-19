@@ -423,6 +423,7 @@ async def wake_source_for_pending(
 
     wait_ok = False
     task = False
+    upstream_recovery = False
     for msg in pending or []:
         if not isinstance(msg, dict):
             continue
@@ -434,8 +435,18 @@ async def wake_source_for_pending(
             text
         ):
             wait_ok = True
+        # 上游死亡 durable 重醒（组4）：game_time 对到期的
+        # phase=upstream_recovery 等待行发 [WAIT_TIMEOUT]，正文 details 里带
+        # wakeup_reason='upstream_recovery'（note 标记解析而来）。识别成专属
+        # source → try_clear_resume_suppressed 放行 —— 否则 3 连败置位的
+        # give-up latch 会在最后一米吞掉重醒触发（信已投递、trigger 蒸发）。
+        body = str(text or "")
+        if mt == "system" and "[WAIT_TIMEOUT]" in body and "upstream_recovery" in body:
+            upstream_recovery = True
     if wait_ok:
         return "wait_satisfied"
+    if upstream_recovery:
+        return "upstream_recovery"
     pid = (project_id or "").strip() or None
     waiter = (waiter_agent_id or "").strip() or None
     if pid and waiter:

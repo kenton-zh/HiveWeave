@@ -42,6 +42,34 @@ from hiveweave.llm.retry import (
     parse_retry_after_ms,
     should_retry_exception,
 )
+# ── 跨组契约（组3）：上游死亡判定 ────────────────────────────────────
+# 契约：is_upstream_death(err) 覆盖 PermanentError(status=403) / 含
+# "RegionError" / 含 UPSTREAM_BREAKER_MARKER / 5xx 重试耗尽（TEST_DSH_63
+# 批3 组4 的 durable 重醒以此判定）。组3 落地前走开发期桩 —— 到达
+# _handle_error 的 5xx 必然已在 llm/retry HTTP 层重试耗尽，故桩把 5xx 一并
+# 认死；429 不认（rate-limit 有专属治理路径，重试未必必败）。组3 集成后
+# import 成功即自动切换真实现，桩成为死代码（测试 monkeypatch 模块级名字
+# `hiveweave.agents.agent.is_upstream_death` 对两态同样有效）。
+try:  # 组3 正式实现
+    from hiveweave.llm.retry import (  # type: ignore[attr-defined]
+        UPSTREAM_BREAKER_MARKER,
+        is_upstream_death,
+    )
+except ImportError:  # 开发期桩（组3 落地前）
+    UPSTREAM_BREAKER_MARKER = "__UPSTREAM_BREAKER__"  # type: ignore[assignment]
+
+    def is_upstream_death(err: BaseException | None) -> bool:  # type: ignore[misc]
+        status = getattr(err, "status", None)
+        try:
+            status_i = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status_i = None
+        if status_i == 403 or (status_i is not None and 500 <= status_i <= 599):
+            return True
+        text = str(err or "")
+        return "RegionError" in text or UPSTREAM_BREAKER_MARKER in text
+
+
 from hiveweave.llm.streamer import Streamer
 from hiveweave.prompts.context import build_context_prompt
 from hiveweave.prompts.identity import build_identity_prompt, resolve_prompt_role_type
@@ -621,6 +649,10 @@ class Agent:
                 "inbox_task",
                 "verify",
                 "wait_satisfied",
+                # 上游死亡 durable 重醒（组4）：平台自己的定时唤醒信必须
+                # 穿透 give-up latch —— 否则 3 连败置位的闩会把重醒触发
+                # 吞掉（唤醒行到期、信已投递、trigger 却在最后一米蒸发）。
+                "upstream_recovery",
             )
             or bool(opts.get("task_id"))
             or opts.get("message_type") == "task"
@@ -1645,18 +1677,21 @@ class Agent:
                     ):
                         from hiveweave.llm.retry import RetryableError
 
-                        await self._handle_error(
-                            RetryableError(
-                                error_msg,
-                                status=err_status if isinstance(err_status, int) else 429,
-                                headers=err_headers if isinstance(err_headers, dict) else {},
-                            )
+                        _err = RetryableError(
+                            error_msg,
+                            status=err_status if isinstance(err_status, int) else 429,
+                            headers=err_headers if isinstance(err_headers, dict) else {},
                         )
+                        # 5xx 重试耗尽会以 RetryableError 形态到达这里
+                        # （429/限流有专属治理路径，is_upstream_death 不认 429）。
+                        await self._maybe_schedule_upstream_recovery(_err)
+                        await self._handle_error(_err)
                     else:
-                        await self._handle_error(
-                            _PermanentError(error_msg, status=_err_status_int),
-                            partial_result=result,
+                        _err = _PermanentError(
+                            error_msg, status=_err_status_int
                         )
+                        await self._maybe_schedule_upstream_recovery(_err)
+                        await self._handle_error(_err, partial_result=result)
 
                 break
 
@@ -1676,6 +1711,7 @@ class Agent:
                 error=str(e),
                 exc_info=True,
             )
+            await self._maybe_schedule_upstream_recovery(e)
             await self._handle_error(e)
 
         finally:
@@ -2528,6 +2564,79 @@ class Agent:
         丢失已完成产出（参考 DSH 事件溯源）。
         """
         return await _agent_recovery.handle_error(self, error, partial_result)
+
+    async def _maybe_schedule_upstream_recovery(self, error: Exception) -> None:
+        """上游死亡（403 RegionError / 5xx 重试耗尽等）→ durable 自动重醒。
+
+        TEST_DSH_63 批3 组4：run 永久死亡后 agent 此前无任何自动恢复 ——
+        6 个 run 死于同一 30 秒抖动窗、全员停摆到人工介入。现按 DSH 参照
+        哲学：死亡可接受、恢复靠 durable 触发 —— 判定真时给**同一 agent**
+        排一次自动唤醒（60s/180s/600s 退避、封顶 3 次、次数持久化在
+        agent_waits 行上，机制与口径见
+        :func:`hiveweave.services.wait_contract.schedule_upstream_recovery_wait`）；
+        3 次耗尽仍死 → 停止重醒，交人工（ORG_ESCALATION，独立去重）。
+
+        位置契约：必须在 ``_handle_error`` **之前**调用 —— handle_error 会
+        置位 give-up latch / resume cooldown，但排队本身走 DB 等待行，不受
+        两者影响；唤醒 trigger 侧由 ``upstream_recovery`` source 穿透闩。
+
+        best-effort：判定/排队/通知任何一步失败都只记日志，绝不改变既有
+        错误治理控制流。
+        """
+        try:
+            if not is_upstream_death(error):
+                return
+        except Exception as e:  # noqa: BLE001 — 判定故障不拦错误治理
+            log.debug(
+                "upstream_death_check_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+            return
+        run_id = str(getattr(self, "_current_run_id", None) or "")
+        project_id = str(getattr(self, "project_id", None) or "")
+        try:
+            from hiveweave.services.wait_contract import (
+                schedule_upstream_recovery_wait,
+            )
+
+            outcome = await schedule_upstream_recovery_wait(
+                project_id, self.id, run_id=run_id
+            )
+        except Exception as e:  # noqa: BLE001 — 排队失败退化为旧行为
+            outcome = None
+            log.warning(
+                "upstream_recovery_schedule_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
+        if outcome and outcome.get("exhausted"):
+            try:
+                from hiveweave.services import health_notice
+
+                await health_notice.notify_upstream_recovery_exhausted(
+                    project_id, self.id, int(outcome.get("attempt") or 3)
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "upstream_recovery_exhausted_notice_failed",
+                    agent_id=self.id,
+                    error=str(e),
+                )
+        # 观测面：死亡进通知去重窗（≥2 次/300s 才汇总给 CEO，见
+        # health_notice.notify_upstream_deaths）。耗尽升级单独发，不经此窗。
+        try:
+            from hiveweave.services import health_notice
+
+            await health_notice.notify_upstream_deaths(
+                project_id, self.id, run_id
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "upstream_death_notice_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
 
     async def _park_after_quota_exhausted(
         self,

@@ -49,6 +49,9 @@ inbox 消息是**已落库、有 id、可从 DB 重放**的实体；往上下文
 
 from __future__ import annotations
 
+import time
+from collections import deque
+
 import structlog
 
 log = structlog.get_logger(__name__)
@@ -60,6 +63,14 @@ KIND_ORG_ESCALATION = "ORG_ESCALATION"
 
 #: 单条提示长度上限（inbox 正文不该被提示撑爆；超出截断并留痕）。
 _MAX_BODY_CHARS = 2000
+
+
+# ── 上游死亡通知去重（TEST_DSH_63 批3 组4，2026-09-19）────────────────
+# 病：一次 30 秒上游抖动窗连杀 6+ run，零通知 —— 但反过来「每次死亡都
+# 告诉 CEO」也会在抖动窗里刷屏。药：进程内滑动窗（300s）内第 1 次死亡只
+# 记数，≥2 次 → 给 CEO 发**一条**汇总；窗口内只发一条。
+# 与 wait_contract 的 durable 重醒不同，这里是**观测面**：进程内即忘
+# （重启清零可接受——通知不是恢复机制，重醒才是）。
 
 
 async def deliver_notice(
@@ -124,3 +135,156 @@ def combine_pending_text(*parts: str | None) -> str:
     kept = [(p or "").strip() for p in parts]
     kept = [p for p in kept if p]
     return "\n\n".join(kept)
+
+
+# ── 上游死亡窗口去重 + 重醒耗尽升级（组4）────────────────────────────
+
+UPSTREAM_DEATH_WINDOW_S = 300
+"""死亡滑动窗：窗内第 1 次只记数，≥2 次 → 一条汇总；窗口发过即不再发。"""
+
+_UPSTREAM_EXHAUSTED_DEDUP_S = 30 * 60
+"""重醒耗尽升级的进程内去重（每 agent 30min 至多一条；不受死亡窗限制）。"""
+
+# project_id → [(monotonic, agent_id, run_id), ...]
+_upstream_death_events: dict[str, deque[tuple[float, str, str]]] = {}
+# project_id → 上次窗内汇总发送时刻（monotonic）
+_upstream_death_notice_sent: dict[str, float] = {}
+# "project_id:agent_id" → 上次耗尽升级发送时刻（monotonic）
+_upstream_exhausted_notice_sent: dict[str, float] = {}
+
+
+def reset_upstream_notice_state_for_tests() -> None:
+    """清空进程内去重状态（仅供测试）。"""
+    _upstream_death_events.clear()
+    _upstream_death_notice_sent.clear()
+    _upstream_exhausted_notice_sent.clear()
+
+
+async def _project_ceo_id(project_id: str | None) -> str | None:
+    """项目 CEO（root）agent id。role='ceo' 优先，无父者兜底；fail-open None。"""
+    if not project_id:
+        return None
+    try:
+        from hiveweave.services.org import OrgService
+
+        agents = await OrgService().list_agents(project_id) or []
+    except Exception as e:  # noqa: BLE001 — 通知 best-effort
+        log.debug("health_notice.ceo_lookup_failed", error=str(e))
+        return None
+    for a in agents:
+        if str(a.get("role") or "").lower() == "ceo" and a.get("id"):
+            return str(a["id"])
+    for a in agents:
+        if not a.get("parent_id") and a.get("id"):
+            return str(a["id"])
+    return None
+
+
+async def notify_upstream_deaths(
+    project_id: str | None,
+    agent_id: str,
+    run_id: str = "",
+) -> bool:
+    """上游死亡进滑动窗；窗内 ≥2 次且未发过 → 给 CEO 发**一条**汇总。
+
+    返回是否实际发送（调用方不应因 False 改变行为）。第 1 次死亡只记数，
+    不打扰任何人 —— 单次抖动自愈是常态（durable 重醒在 wait_contract 侧
+    负责），刷屏只会训练 CEO 跳读。
+    """
+    key = project_id or "?"
+    now = time.monotonic()
+    dq = _upstream_death_events.setdefault(key, deque())
+    dq.append((now, str(agent_id or ""), str(run_id or "")[:8]))
+    while dq and now - dq[0][0] > UPSTREAM_DEATH_WINDOW_S:
+        dq.popleft()
+    if len(dq) < 2:
+        return False
+    if now - _upstream_death_notice_sent.get(key, 0.0) < UPSTREAM_DEATH_WINDOW_S:
+        return False  # 本窗口已发过一条 —— 只记数
+    seen: set[str] = set()
+    agents: list[str] = []
+    for _ts, aid, _rid in dq:
+        if aid and aid not in seen:
+            seen.add(aid)
+            agents.append(aid)
+    ceo = await _project_ceo_id(project_id)
+    if not ceo:
+        log.warning(
+            "health_notice.upstream_death_no_ceo",
+            project_id=project_id,
+            deaths=len(dq),
+        )
+        return False
+    text = (
+        f"上游抖动窗内检测到 {len(dq)} 次 run 死亡"
+        f"（agent：{', '.join(a[:12] for a in agents) or '未知'}）。"
+        "各 agent 已按退避（60s/180s/600s，封顶 3 次）排定 durable 自动重醒，"
+        "任务与上下文不变；本窗口内只汇总此一条。"
+        f"最近 run：{(run_id or '')[:8] or 'n/a'}。"
+    )
+    # 先占窗再投递：并发死亡（DSH_63 正是 30s 窗连杀多个 run）在 deliver
+    # await 期间再进本口时，必须看到「已发」而不是把汇总再发一遍；
+    # 投递失败则回滚占位，让窗口内的下一次死亡重试。
+    _upstream_death_notice_sent[key] = now
+    sent = await deliver_notice(
+        ceo, text, kind=KIND_ORG_ESCALATION, project_id=project_id, wake=True
+    )
+    if sent:
+        dq.clear()  # 本窗收口 —— 下一次抖动从新窗起算
+        log.warning(
+            "health_notice.upstream_deaths_summarized",
+            project_id=project_id,
+            deaths_in_window=len(agents),
+            agents=[a[:12] for a in agents],
+        )
+    else:
+        _upstream_death_notice_sent.pop(key, None)
+    return sent
+
+
+async def notify_upstream_recovery_exhausted(
+    project_id: str | None,
+    agent_id: str,
+    attempts: int = 3,
+) -> bool:
+    """自动重醒耗尽仍死 → 停止重醒，交人工（**不受**死亡窗限制，单独发）。
+
+    进程内每 (project, agent) 30min 至多一条 —— 耗尽后的每一次死亡都会
+    重进本口，不去重会给 CEO 刷近重复消息。
+    """
+    key = f"{project_id or '?'}:{agent_id or '?'}"
+    now = time.monotonic()
+    if now - _upstream_exhausted_notice_sent.get(key, 0.0) < (
+        _UPSTREAM_EXHAUSTED_DEDUP_S
+    ):
+        return False
+    ceo = await _project_ceo_id(project_id)
+    if not ceo:
+        log.warning(
+            "health_notice.upstream_exhausted_no_ceo",
+            project_id=project_id,
+            agent_id=(agent_id or "")[:12],
+        )
+        return False
+    text = (
+        f"agent {str(agent_id or '')[:12]} 的上游死亡自动重醒已达上限"
+        f"（{attempts} 次：60s/180s/600s 均未能恢复），已停止自动重醒。"
+        "任务仍 claimed、上下文完整，需人工介入：检查模型区域可用性 / "
+        "更换模型或密钥后手动唤醒该 agent。"
+    )
+    # 先占去重位再投递（同 notify_upstream_deaths 的并发占位理由）；
+    # 失败回滚，让下一次耗尽重试。
+    _upstream_exhausted_notice_sent[key] = now
+    sent = await deliver_notice(
+        ceo, text, kind=KIND_ORG_ESCALATION, project_id=project_id, wake=True
+    )
+    if sent:
+        log.warning(
+            "health_notice.upstream_recovery_exhausted",
+            project_id=project_id,
+            agent_id=(agent_id or "")[:12],
+            attempts=attempts,
+        )
+    else:
+        _upstream_exhausted_notice_sent.pop(key, None)
+    return sent
