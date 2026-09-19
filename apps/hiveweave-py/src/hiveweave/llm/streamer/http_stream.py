@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 import httpx
 import structlog
 
+from hiveweave.llm.circuit_breaker import UPSTREAM_BREAKER_COOLDOWN_S
 from hiveweave.llm.provider import (
     ProviderConfig,
     _IMAGES_OMITTED_NOTE,
@@ -22,6 +23,7 @@ from hiveweave.llm.retry import (
     RetryableError,
     classify_http_error,
     is_region_unavailable_error,
+    is_upstream_death,
 )
 from hiveweave.llm.unknown_error_samples import (
     flush_unknown_samples,
@@ -82,6 +84,34 @@ class HttpStreamMixin:
         _fire_delta: Any
         _retry_handler: Any
         _circuit_breaker: Any
+
+    async def _open_breaker_if_upstream_death(
+        self,
+        provider_name: str,
+        agent_id: str,
+        round_num: int,
+        exc: BaseException,
+    ) -> bool:
+        """上游死亡类永久错误（403/RegionError）→ 立即熔断（B+ 快熔）。
+
+        判据 = 跨组契约唯一判据 ``retry.is_upstream_death``；命中即
+        ``CircuitBreaker.open_for``（不等 FAIL_THRESHOLD 阈值累计），
+        ``upstream_breaker_opened`` 日志（provider/cooldown_s 契约字段）
+        只在此一处维护。返回是否命中（供测试/调用方分支）。
+        AUTH/参数类（401/400/402）返回 False，维持「不喂熔断」旁路。
+        """
+        if not is_upstream_death(exc):
+            return False
+        await self._circuit_breaker.open_for(provider_name)
+        log.warning(
+            "upstream_breaker_opened",
+            provider=provider_name,
+            cooldown_s=UPSTREAM_BREAKER_COOLDOWN_S,
+            agent_id=agent_id,
+            round=round_num,
+            error=str(exc)[:200],
+        )
+        return True
 
     async def _stream_with_empty_retry(
         self,
@@ -333,6 +363,14 @@ class HttpStreamMixin:
                 "error_code": getattr(e, "error_code", None),
             }
         except PermanentError as e:
+            # B+（TEST_DSH_63）：403 RegionError 等确定性上游死亡**不再走**
+            # 「不喂 breaker」旁路 —— REGION/5xx 类失败都要推动熔断（原则：
+            # AUTH/参数类 401/400 仍不喂）。首次命中即 open_for，开启期并行
+            # 请求在 stream() 入口 check() 秒败（带 UPSTREAM_BREAKER_MARKER），
+            # 冷却过后 half_open 探针自动恢复。
+            await self._open_breaker_if_upstream_death(
+                provider_name, agent_id, round_num, e
+            )
             # fixplan #13：本方法作用域内的样本（典型是下面的图像能力短语表失配）
             # **不在** `_do_streaming_request` 的 flush 覆盖内 —— 那是**另一个方法**，
             # 且只在抛异常时才 flush。不在这里补一次的话，该样本要等本 agent
@@ -413,6 +451,10 @@ class HttpStreamMixin:
                     }
                 except PermanentError as se:
                     # 剥图后仍失败（非图像类 400/401 等）→ 归一化返回，不再剥图递归。
+                    # 同主路径 B+ 原则：上游死亡类（403/RegionError）也要喂熔断。
+                    await self._open_breaker_if_upstream_death(
+                        provider_name, agent_id, round_num, se
+                    )
                     return {
                         "status": "error",
                         "text": "",

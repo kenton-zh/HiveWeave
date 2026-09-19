@@ -47,6 +47,15 @@ PROBE_TIMEOUT_MS = 60_000
 下次 check 自动转回 open 重新冷却。
 """
 
+UPSTREAM_BREAKER_COOLDOWN_S = 60
+"""确定性上游死亡快熔（``open_for``）的默认冷却秒数（TEST_DSH_63 方案 B+）。
+
+63 实测：30 秒上游抖动窗内 4 个在跑流被打断 + 2 个新 run 即刻撞墙，
+各自烧满 300s 才死。403 RegionError 首次命中即 open_for（不等 FAIL_THRESHOLD
+次累计），开启期并行请求在 check() 处秒败（错误带 ``UPSTREAM_BREAKER_MARKER``）。
+60s = 抖动窗（30s）的两倍余量；冷却过后 half_open 探针自动放行恢复。
+"""
+
 
 class CircuitState(str, Enum):
     """熔断器三态。"""
@@ -78,7 +87,8 @@ class _BreakerState:
     """单个 provider 的熔断器状态（内部类，非线程安全，由 CircuitBreaker 的锁保护）。"""
 
     __slots__ = ("provider", "state", "fail_count", "opened_at",
-                 "probe_deadline", "fallback", "last_error_code")
+                 "probe_deadline", "fallback", "last_error_code",
+                 "open_cooldown_ms")
 
     def __init__(self, provider: str, fallback: str | None = None) -> None:
         self.provider = provider
@@ -91,6 +101,10 @@ class _BreakerState:
         # RetryableError.error_code）—— 熔断器的第一个结构化消费方：
         # 「为什么熔断」从只读日志变成状态可查（snapshot 暴露）。
         self.last_error_code: str | None = None
+        # 本次 open 的单次冷却覆盖（毫秒）；None = 用管理器级 cooldown_ms。
+        # 只由 open_for（确定性快熔，60s）设置；阈值触发的常规 open 沿用
+        # 管理器默认 30s。reset() 清除。
+        self.open_cooldown_ms: int | None = None
 
     def reset(self) -> None:
         """回到 closed 状态，重置所有计数。"""
@@ -99,12 +113,25 @@ class _BreakerState:
         self.opened_at = None
         self.probe_deadline = None
         self.last_error_code = None
+        self.open_cooldown_ms = None
 
-    def open(self) -> None:
-        """进入 open 状态，开始冷却计时。"""
+    def open(self, cooldown_ms: int | None = None) -> None:
+        """进入 open 状态，开始冷却计时。
+
+        ``cooldown_ms``：本次 open 的冷却覆盖（None = 管理器默认）。
+        open_for 的确定性快熔传 UPSTREAM_BREAKER_COOLDOWN_S*1000；
+        阈值触发/探针超时路径不传，沿用管理器级 COOLDOWN_MS。
+        """
         self.state = CircuitState.OPEN
         self.opened_at = time.monotonic()
         self.probe_deadline = None
+        self.open_cooldown_ms = cooldown_ms
+
+    def effective_cooldown_ms(self, default_ms: int) -> int:
+        """本次 open 生效的冷却毫秒（单次覆盖 > 管理器默认）。"""
+        if self.open_cooldown_ms is not None:
+            return self.open_cooldown_ms
+        return default_ms
 
 
 class CircuitBreaker:
@@ -170,6 +197,38 @@ class CircuitBreaker:
 
     # ── 检查 ────────────────────────────────────────────────
 
+    async def open_for(
+        self,
+        name: str,
+        cooldown_s: float = UPSTREAM_BREAKER_COOLDOWN_S,
+    ) -> None:
+        """立即熔断指定 provider（确定性上游死亡快熔，TEST_DSH_63 方案 B+）。
+
+        403 RegionError 等确定性不可恢复错误**不走** FAIL_THRESHOLD 阈值
+        累计 —— 首次命中即 open，开启期并行/后续请求在 check() 处秒败
+        （错误文案带 ``UPSTREAM_BREAKER_MARKER``，见 core._breaker_open_error），
+        不再各自烧满重试预算。冷却用本调用给定的单次覆盖
+        （默认 UPSTREAM_BREAKER_COOLDOWN_S = 60s，可长于管理器级
+        COOLDOWN_MS）；冷却过后 check() 正常转 half_open 放行探针，
+        探针成功经 report_success 自动恢复 —— 无需手动复位。
+
+        fail_count 保持现状：快熔是确定性判定，不依赖连续计数。
+        未注册的 provider 自动建账（与 register 等效，避免调用序敏感）。
+        判据统一走 ``hiveweave.llm.retry.is_upstream_death``（跨组契约），
+        本方法只负责状态变更。
+        """
+        async with self._lock:
+            b = self._breakers.get(name)
+            if b is None:
+                b = _BreakerState(name)
+                self._breakers[name] = b
+            b.open(cooldown_ms=int(cooldown_s * 1000))
+            log.warning(
+                "circuit_force_opened",
+                provider=name,
+                cooldown_s=cooldown_s,
+            )
+
     async def check(self, name: str) -> CheckResult:
         """检查 provider 是否放行。
 
@@ -190,8 +249,11 @@ class CircuitBreaker:
                 return CheckResult.ok()
 
             if b.state is CircuitState.OPEN:
-                # 检查冷却是否已过
-                if b.opened_at is not None and (now - b.opened_at) * 1000 >= self.cooldown_ms:
+                # 检查冷却是否已过（open_for 快熔的单次覆盖优先于管理器默认）
+                if b.opened_at is not None and (
+                    (now - b.opened_at) * 1000
+                    >= b.effective_cooldown_ms(self.cooldown_ms)
+                ):
                     # 冷却过后 → half_open，当前调用者成为探针
                     b.state = CircuitState.HALF_OPEN
                     b.probe_deadline = now + self.probe_timeout_ms / 1000.0
@@ -295,6 +357,21 @@ class CircuitBreaker:
             b = self._breakers.get(name)
             return b.fail_count if b else 0
 
+    def cooldown_left_s(self, name: str) -> int:
+        """provider 剩余冷却秒数（open 状态）；未注册/非 open 返回 0。
+
+        与 ``snapshot()`` 同为**无锁同步读** —— 只用于错误文案展示/诊断
+        （_breaker_open_error 带 "还剩几秒"），不用于任何放行判定；
+        放行判定一律走 async check()。
+        """
+        b = self._breakers.get(name)
+        if b is None or b.state is not CircuitState.OPEN or b.opened_at is None:
+            return 0
+        left = b.effective_cooldown_ms(self.cooldown_ms) / 1000 - (
+            time.monotonic() - b.opened_at
+        )
+        return max(0, int(left))
+
     async def reset(self, name: str | None = None) -> None:
         """重置熔断器（调试/测试用）。
 
@@ -322,7 +399,11 @@ class CircuitBreaker:
             cooldown_left = 0
             if b.state == CircuitState.OPEN and b.opened_at is not None:
                 cooldown_left = max(
-                    0, int((self.cooldown_ms / 1000) - (now - b.opened_at))
+                    0,
+                    int(
+                        b.effective_cooldown_ms(self.cooldown_ms) / 1000
+                        - (now - b.opened_at)
+                    ),
                 )
             out.append({
                 "provider": name,

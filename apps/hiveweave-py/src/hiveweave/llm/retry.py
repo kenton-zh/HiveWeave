@@ -255,6 +255,69 @@ def is_region_unavailable_error(message: str) -> bool:
     return any(p.search(message) for p in _COMPILED_REGION_PATTERNS)
 
 
+# ── 上游死亡跨组契约（TEST_DSH_63，方案 B+）────────────────────
+# 63 的 6 个 run 死于同一个 30 秒上游抖动窗（4 个在跑流被打断 + 2 个新 run
+# 即刻撞墙），各自烧满 300s 才死。B+ 方案：403 RegionError 首次命中即把
+# 熔断器 open（不再等 5 次阈值），开启期并行请求在 check() 处秒败，
+# 冷却（UPSTREAM_BREAKER_COOLDOWN_S，定义在 circuit_breaker.py）过后
+# half_open 探针自动放行恢复。本模块持有跨组契约的**单一事实源**：
+# 标记常量 + 判定函数。run 级恢复（组4）与 llm 层熔断（组3）都只 import 这里。
+
+UPSTREAM_BREAKER_MARKER = "upstream_breaker_open"
+"""上游熔断开启期快败标记（跨组契约 token）。
+
+熔断开启期的请求被 check() 拒绝时，错误文案**必须**包含本标记 +
+provider 名 + 剩余冷却秒数（见 ``Streamer._breaker_open_error``）。
+组4 的 run 级恢复、日志回归、外部消费方都靠这个 token 区分
+「熔断快败」与「真实上游错误」——改值 = 同时改两处消费方，禁止
+只改常量。
+"""
+
+
+def is_upstream_death(err: BaseException | str | None) -> bool:
+    """判定是否「上游确定性死亡」（跨组契约的**唯一判据**）。
+
+    ⚠ 本函数是 run 级恢复（组4：自动重醒/通知/占位账）与 llm 层熔断
+    （组3：403 → ``CircuitBreaker.open_for``）共享的唯一判据 —— 两边
+    **不许**各自另写匹配规则；判据变更只改这里（本 docstring 即契约）。
+
+    True 当（宁窄勿宽）：
+      1. ``PermanentError`` 且 ``status == 403``（classify_http_error 的
+         地域 fast-fail 主形态）；
+      2. 文本（str(err) / err.args / 异常类型名）命中地域不可用族
+         （``is_region_unavailable_error``，含 "RegionError" 字面与
+         "not available in your country/region" 等 —— 覆盖 http_stream
+         transport_raw 无状态码 ``PermanentError(err_text)`` 形态）；
+      3. 文本含 ``UPSTREAM_BREAKER_MARKER``（熔断快败结果再入判定的场景）；
+      4. ``RetryableError`` 且 ``status`` 为 5xx —— 重试耗尽后的最终错误
+         （classify_http_error 的 message 形态即 "HTTP 5xx: ..."）。判据用
+         结构化 ``status`` 字段而非解析消息文案，避免文案误命中真实业务数字。
+
+    一律 False：AUTH 401 / 参数 400 / 余额 402 等客户端类 PermanentError、
+    429 限流、超时与连接错误（status None，瞬态会自愈）、普通未知错误。
+    """
+    if err is None:
+        return False
+    if isinstance(err, PermanentError):
+        if getattr(err, "status", None) == 403:
+            return True
+    if isinstance(err, RetryableError):
+        status = getattr(err, "status", None)
+        if isinstance(status, int) and 500 <= status < 600:
+            return True
+    texts = [str(err), type(err).__name__]
+    for arg in getattr(err, "args", ()):  # 多参异常的原始消息形态
+        texts.append(str(arg))
+    for text in texts:
+        if not text:
+            continue
+        if UPSTREAM_BREAKER_MARKER in text:
+            return True
+        if is_region_unavailable_error(text):
+            return True
+    return False
+
+
 def classify_http_error(
     status: int | None,
     body: str,

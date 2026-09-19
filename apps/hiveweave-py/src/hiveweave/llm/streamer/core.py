@@ -10,7 +10,7 @@ import structlog
 
 from hiveweave.llm.circuit_breaker import CircuitBreaker, circuit_breaker
 from hiveweave.llm.provider import ProviderFactory, provider_factory
-from hiveweave.llm.retry import RetryHandler
+from hiveweave.llm.retry import UPSTREAM_BREAKER_MARKER, RetryHandler
 
 from .constants import (
     DEFAULT_PLACEHOLDER,
@@ -164,7 +164,14 @@ class Streamer(
         # park / 容量治理接手。
         cb_result = await self._circuit_breaker.check(provider_name)
         if not cb_result.allowed:
-            return self._breaker_open_error(provider_name, start_time, tried)
+            # B+（TEST_DSH_63）：快败文案必须带 UPSTREAM_BREAKER_MARKER +
+            # provider 名 + 剩余冷却秒 —— 组4 run 级恢复与日志回归靠这个
+            # token 识别「熔断快败」。MagicMock breaker 下该调用返回 Mock，
+            # 仅进文案不作数值消费，不影响既有 mock 契约测试。
+            cooldown_left_s = self._circuit_breaker.cooldown_left_s(provider_name)
+            return self._breaker_open_error(
+                provider_name, start_time, tried, cooldown_left_s
+            )
 
         # 广播 start 事件
         await self._fire_delta(on_delta, {"type": "start"})
@@ -277,16 +284,24 @@ class Streamer(
 
     @staticmethod
     def _breaker_open_error(
-        provider_name: str, start_time: float, tried: set[str]
+        provider_name: str,
+        start_time: float,
+        tried: set[str],
+        cooldown_left_s: int = 0,
     ) -> dict:
         """E6: 熔断打开且无有效 fallback → 503 error result（不进重试裸抛）。
 
         让 agent 层的 is_retryable 判定（429+5xx）接住，走既有同 tier
         failover；failover 无解 → 正常 handle_error → 配额风暴交 E7。
+
+        B+（TEST_DSH_63）：文案必须含 ``UPSTREAM_BREAKER_MARKER`` + provider
+        名 + 剩余冷却秒数 —— 这是开启期快败的识别 token（跨组契约，组4
+        run 级恢复与日志回归都匹配它），不许改措辞时顺手删掉。
         """
         msg = (
             f"Circuit breaker open for provider '{provider_name}' "
-            f"and no fallback available (tried={sorted(tried)})"
+            f"and no fallback available (tried={sorted(tried)}) "
+            f"[{UPSTREAM_BREAKER_MARKER} cooldown_left_s={cooldown_left_s}]"
         )
         return Streamer._error_result(
             msg, start_time, error_status=503, error_headers={}
