@@ -318,6 +318,75 @@ def is_upstream_death(err: BaseException | str | None) -> bool:
     return False
 
 
+# ── 流空转跨组契约（TEST_DSH_64 #3）────────────────────────────
+# 64 现场：首 chunk 后流空转原抛 PermanentError（status=None）⇒ 既不进
+# with_retry 重试，也不被重醒门认出（is_upstream_death 判 False）——两条
+# 死 run 全靠「恰好有未读 inbox」的 30s 冷却运气。终版修法：idle 改判
+# RetryableError（同请求专属重试 1 次）→ 耗尽升级 PermanentError，由
+# run 级 durable 重醒接管（schedule_upstream_recovery_wait 60/180/600s）。
+# ⚠ 本组常量/谓词是**跨组契约**：组2 在 tools/subagent.py 的分类器按
+# ``STREAM_IDLE_ERROR_CODE`` 字面量对齐 —— 改名 = 同时改 http_stream 抛出点、
+# 本模块谓词、subagent 分类器，禁止只改一处。
+# ⚠ 判据收窄红线：**不许**把 idle 纳入 is_upstream_death —— 该谓词与 60s
+# 快熔共判据（_open_breaker_if_upstream_death），扩它 = 慢流对全项目关闸。
+STREAM_IDLE_ERROR_CODE = "stream_idle"
+"""首 chunk 后流空转（RetryableError 形态）的稳定错误码（跨组契约）。"""
+
+STREAM_IDLE_EXHAUSTED_ERROR_CODE = "stream_idle_exhausted"
+"""流空转同请求重试耗尽后的 PermanentError 稳定错误码（跨组契约）。"""
+
+STREAM_IDLE_MAX_RETRIES = 1
+"""流空转在单次 ``with_retry`` 内的专属重试上限。
+
+不经通用 ``MAX_RETRIES``=5 次退避表：idle 每次判定已烧满 150s 空转窗，
+逐次退避重试只会把一条死流拖成十几分钟的僵尸；1 次重试后仍空转即判死，
+交给 run 级 durable 重醒（60/180/600s 退避）接管。64 实测 idle 全为真死，
+非退避可救。
+"""
+
+_STREAM_IDLE_EXHAUSTED_TEXT_NEEDLES: tuple[str, ...] = (
+    "流空转重试已耗尽",
+    "idle retries exhausted",
+)
+
+
+def is_stream_idle_exhausted(err: BaseException | str | None) -> bool:
+    """判定是否「流空转重试已耗尽」终态（PermanentError 形态，窄谓词）。
+
+    判据：``error_code == STREAM_IDLE_EXHAUSTED_ERROR_CODE``（结构化优先，
+    agent.py 重建异常时不丢码即必中），否则文案 needle 兜底（覆盖错误经
+    result dict 只剩 ``str(e)`` 的形态）。供 agent 重醒门
+    ``_maybe_schedule_upstream_recovery`` 使用 —— **不**参与熔断判定。
+    """
+    if err is None:
+        return False
+    if getattr(err, "error_code", None) == STREAM_IDLE_EXHAUSTED_ERROR_CODE:
+        return True
+    text = str(err)
+    return any(n in text for n in _STREAM_IDLE_EXHAUSTED_TEXT_NEEDLES)
+
+
+def is_stream_idle_error(err: BaseException | str | None) -> bool:
+    """判定是否「首 chunk 后流空转」类错误（可重试形态）。
+
+    判据：``error_code == STREAM_IDLE_ERROR_CODE``，或文本含 "stream idle"
+    （兜底重建/历史形态）。与 :func:`is_stream_idle_exhausted` **互斥**：
+    耗尽态是终态（PermanentError），不再算可重试的空转类。
+
+    用途：① ``RetryHandler.with_retry`` 的专属重试闸；② http_stream
+    RetryableError 耗尽出口跳过 report_failure（暗坑③：idle 原是
+    PermanentError 从不喂熔断，改判 Retryable 后若照喂，会经 FAIL_THRESHOLD
+    「5 次累计」后门把 provider 全项目熔断）。不参与 is_upstream_death。
+    """
+    if err is None:
+        return False
+    if is_stream_idle_exhausted(err):
+        return False
+    if getattr(err, "error_code", None) == STREAM_IDLE_ERROR_CODE:
+        return True
+    return "stream idle" in str(err).lower()
+
+
 def classify_http_error(
     status: int | None,
     body: str,
@@ -680,13 +749,21 @@ class RetryHandler:
         - 指数退避 + jitter，Retry-After header 优先。
         - PermanentError 立即抛出，不重试。
         - 非可重试异常也不重试（直接抛出）。
+        - 流空转（``is_stream_idle_error``，TEST_DSH_64 #3）：**专属**预算
+          ``STREAM_IDLE_MAX_RETRIES``（1 次），不经通用 max_retries 退避表、
+          不 sleep（idle 判定本身已等满 150s）；重试仍空转 ⇒ 升级为
+          ``PermanentError(error_code=stream_idle_exhausted)``，交 run 级
+          durable 重醒接管。attempt 计数器手动推进（while 结构）：idle 重试
+          **不占**通用 attempt 名额，两条预算完全独立。
         - ``persist``：可选持久化回调 ``(attempt, delay_ms, exc, exhausted)``
           —— 每次决定重试（exhausted=False）与重试耗尽（exhausted=True）时
           调用，供调用方把重试事件落库（参考 DSH 把 retry 写入持久事件流，
           重启后仍可查/可审计）。
         """
         last_exc: BaseException | None = None
-        for attempt in range(self.max_retries + 1):  # 0..max_retries
+        idle_retries = 0
+        attempt = 0  # 通用重试序号（0-based；idle 专属重试不推进它）
+        while True:
             try:
                 return await fn()
             except PermanentError:
@@ -703,6 +780,42 @@ class RetryHandler:
                         error=str(e)[:200],
                     )
                     raise
+                # 流空转（TEST_DSH_64 #3）：专属 1 次重试，不经通用退避表。
+                # 每次空转判定已烧满 idle 窗口（150s），再指数退避纯属加时；
+                # 耗尽即升级 PermanentError（重醒门认 stream_idle_exhausted）。
+                if is_stream_idle_error(e):
+                    if idle_retries >= STREAM_IDLE_MAX_RETRIES:
+                        log.warning(
+                            "stream_idle_retry_exhausted",
+                            attempt=attempt,
+                            idle_retries=idle_retries,
+                            error=str(e),
+                        )
+                        if persist is not None:
+                            await self._safe_persist(
+                                persist, attempt + 1, 0, e, True
+                            )
+                        raise PermanentError(
+                            f"{e} — 流空转重试已耗尽"
+                            f"（{STREAM_IDLE_MAX_RETRIES} retry）",
+                            status=getattr(e, "status", None),
+                            error_code=STREAM_IDLE_EXHAUSTED_ERROR_CODE,
+                        ) from e
+                    idle_retries += 1
+                    last_exc = e
+                    log.info(
+                        "stream_idle_retry",
+                        attempt=attempt + 1,
+                        error=str(e),
+                    )
+                    if persist is not None:
+                        await self._safe_persist(
+                            persist, attempt + 1, 0, e, False
+                        )
+                    await self._fire_retry(attempt + 1, 0, e)
+                    # 立即重试：上游已静默满 idle 窗，退避不改变结局；
+                    # attempt 不推进 —— 通用预算不被 idle 侵占
+                    continue
                 last_exc = e
                 if attempt >= self.max_retries:
                     log.warning(
@@ -727,6 +840,7 @@ class RetryHandler:
                         persist, attempt + 1, delay, e, False
                     )
                 await self._fire_retry(attempt + 1, delay, e)
+                attempt += 1
                 await asyncio.sleep(delay / 1000.0)
             except Exception as e:
                 # 其他异常 — 检查是否为可重试的网络错误
@@ -751,6 +865,7 @@ class RetryHandler:
                             persist, attempt + 1, delay, e, False
                         )
                     await self._fire_retry(attempt + 1, delay, e)
+                    attempt += 1
                     await asyncio.sleep(delay / 1000.0)
                 else:
                     raise

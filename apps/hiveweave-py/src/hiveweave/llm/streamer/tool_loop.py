@@ -691,6 +691,10 @@ class ToolLoopMixin:
                     "error": round_result.get("error"),
                     "error_status": round_result.get("error_status"),
                     "error_headers": round_result.get("error_headers"),
+                    # TEST_DSH_64 暗坑①：组 error result 时透传稳定错误码 ——
+                    # stream_idle_exhausted（流空转重试耗尽）此前在这里被丢，
+                    # agent 层重醒门只剩文案可判。
+                    "error_code": round_result.get("error_code"),
                 }
 
             new_text = round_result["text"] or ""

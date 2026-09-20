@@ -39,6 +39,7 @@ from hiveweave.llm.retry import (
     UPSTREAM_STREAM_ERROR_KEYWORDS as _UPSTREAM_KEYWORDS_FROM_RETRY,
     classify_http_error,
     compute_backoff,
+    is_stream_idle_exhausted,
     parse_retry_after_ms,
     should_retry_exception,
 )
@@ -504,6 +505,13 @@ class Agent:
         # （TEST11 H4），DB 侧无法可靠判活，故用内存信号（PROCESSING 保护
         # 集合 list_processing() 同为内存态，语义一致）。
         self._last_stream_activity_at: float = 0.0
+        # TEST_DSH_64 #7 empty_stream 判据：本 run 是否真的收到过 chunk。
+        # recovery._flush_pending_usage 只有在 False 时才允许标
+        # empty_stream=1 —— 此前「sink 已在别处落账后清空」的中断也被标
+        # （64 实测 5/5 带账 run 全污染），R11 回归判据受累。置位点：
+        # _on_delta 的 text/thinking delta + 主循环 usage 快照非空；run
+        # 创建时复位。
+        self._run_saw_stream_chunk: bool = False
         # 执行中的工具：{tool_call_id: (tool_name, start_ms)}——僵尸判定按
         # 当前工具超时 + 余量放宽（question 200s 不冤杀长工具）。
         self._active_tools: dict[str, tuple[str, float]] = {}
@@ -1376,6 +1384,8 @@ class Agent:
             except Exception as e:
                 log.debug("run_ledger.create_run_failed", error=str(e))
             self._run_step_counter = 0
+            # empty_stream 判据随 run 复位（TEST_DSH_64 #7，见 __init__ 注）
+            self._run_saw_stream_chunk = False
 
             # 创建 Streamer（统一 max_tool_rounds = 600）
             max_rounds = self._get_max_tool_rounds()
@@ -1478,6 +1488,11 @@ class Agent:
                             error=str(_te),
                         )
                 _rounds_this_attempt = list(self._pending_usage)
+                if _rounds_this_attempt:
+                    # 有 usage 轮 = 有真实 chunk 到达（empty_stream 判据，
+                    # TEST_DSH_64 #7）。置于 record_rounds/clear 之前：
+                    # 清空后这个事实只剩这里能作证。
+                    self._run_saw_stream_chunk = True
                 await token_meter.record_rounds(
                     agent_id=self.id,
                     project_id=self.project_id,
@@ -1687,11 +1702,18 @@ class Agent:
                         await self._maybe_schedule_upstream_recovery(_err)
                         await self._handle_error(_err)
                     else:
-                        _err = _PermanentError(
-                            error_msg, status=_err_status_int
+                        # TEST_DSH_64 暗坑②：重建 PermanentError 时必须保留
+                        # result 里的稳定错误码 —— stream_idle_exhausted
+                        # （流空转重试耗尽）的码若在这里丢掉，重醒门窄谓词
+                        # 只剩文案 needle 可判。_perr 异名：与 if 支的
+                        # RetryableError 区分（mypy 同名变量跨支异型）。
+                        _perr = _PermanentError(
+                            error_msg,
+                            status=_err_status_int,
+                            error_code=result.get("error_code"),
                         )
-                        await self._maybe_schedule_upstream_recovery(_err)
-                        await self._handle_error(_err, partial_result=result)
+                        await self._maybe_schedule_upstream_recovery(_perr)
+                        await self._handle_error(_perr, partial_result=result)
 
                 break
 
@@ -2566,7 +2588,7 @@ class Agent:
         return await _agent_recovery.handle_error(self, error, partial_result)
 
     async def _maybe_schedule_upstream_recovery(self, error: Exception) -> None:
-        """上游死亡（403 RegionError / 5xx 重试耗尽等）→ durable 自动重醒。
+        """上游死亡（403 RegionError / 5xx 重试耗尽 / 流空转重试耗尽等）→ durable 自动重醒。
 
         TEST_DSH_63 批3 组4：run 永久死亡后 agent 此前无任何自动恢复 ——
         6 个 run 死于同一 30 秒抖动窗、全员停摆到人工介入。现按 DSH 参照
@@ -2576,6 +2598,10 @@ class Agent:
         :func:`hiveweave.services.wait_contract.schedule_upstream_recovery_wait`）；
         3 次耗尽仍死 → 停止重醒，交人工（ORG_ESCALATION，独立去重）。
 
+        TEST_DSH_64 #6：判定扩为 ``is_upstream_death(error) or
+        is_stream_idle_exhausted(error)`` —— 后者是流空转（首 chunk 后
+        150s 静默）同请求重试 1 次仍空转的**耗尽终态**，此前不接重醒。
+
         位置契约：必须在 ``_handle_error`` **之前**调用 —— handle_error 会
         置位 give-up latch / resume cooldown，但排队本身走 DB 等待行，不受
         两者影响；唤醒 trigger 侧由 ``upstream_recovery`` source 穿透闩。
@@ -2584,7 +2610,14 @@ class Agent:
         错误治理控制流。
         """
         try:
-            if not is_upstream_death(error):
+            # TEST_DSH_64 #6：流空转重试耗尽（stream_idle_exhausted）也接
+            # durable 重醒 —— idle 原 PermanentError(status=None) 无 region
+            # 文案无 marker，is_upstream_death 判 False，64 现场重醒排队 0 条。
+            # ⚠ 只接**耗尽终态**窄谓词；不许把 is_upstream_death 本身扩到
+            # idle（它与 60s 快熔共判据，扩它 = 慢流对全项目关闸），也不碰熔断。
+            if not (
+                is_upstream_death(error) or is_stream_idle_exhausted(error)
+            ):
                 return
         except Exception as e:  # noqa: BLE001 — 判定故障不拦错误治理
             log.debug(
@@ -3633,6 +3666,12 @@ class Agent:
         FIX(text-acc): 收到 round_start 时重置累积器并清空 streaming 占位正文。
         前端 stream draft 必须同步丢掉上一轮 text/thinking 段。
         """
+        # TEST_DSH_64 #7：内容 delta（text/thinking）= 真 chunk 到达的证据，
+        # 供 recovery._flush_pending_usage 的 empty_stream 判据用。
+        # 排除 llm_queue（信号量排队 ping，请求还没发）与 round_start
+        # （每轮 HTTP 请求**之前**就发，零 chunk 死亡的 run 也会有）。
+        if event.get("type") in ("text_delta", "thinking_delta"):
+            self._run_saw_stream_chunk = True
         return await _agent_streaming.on_delta(self, event)
 
     async def _on_tool_call(

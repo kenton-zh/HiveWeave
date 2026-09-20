@@ -1316,8 +1316,16 @@ async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> No
         # 标成"未排除"（漏报），或放宽判据把 window 内的行都算成"记了账"
         # （错报：v5 就是这么错的，压缩调用的账被算到了对话 run 头上）。
         # `set_run_fact` 自带 best-effort 兜底，不阻塞恢复流程。
+        #
+        # TEST_DSH_64 #7（2026-09-19）：**只有真零 chunk 才标**。sink 空有两
+        # 种成因：① 真·零 chunk（首包前就被掐）；② 账已在别处落库后被
+        # `clear()`（agent 主循环 record_rounds 后无条件清空）—— ② 的 chunk
+        # 早就到过，标 empty_stream=1 是污染（64 实测 5/5 带账 run 全标 1）。
+        # 证据位 `agent._run_saw_stream_chunk`（__init__ 注释列了全部置位点：
+        # text/thinking delta + usage 快照非空；run 创建时复位）为 True 即
+        # ②，跳过标记。存量行不回填。
         _rid = getattr(agent, "_current_run_id", None)
-        if _rid:
+        if _rid and not getattr(agent, "_run_saw_stream_chunk", False):
             await agent._run_ledger.set_run_fact(agent.id, _rid, empty_stream=1)
         return
     try:

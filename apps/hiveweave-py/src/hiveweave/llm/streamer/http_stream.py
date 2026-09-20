@@ -19,10 +19,12 @@ from hiveweave.llm.provider import (
     mark_image_unsupported,
 )
 from hiveweave.llm.retry import (
+    STREAM_IDLE_ERROR_CODE,
     PermanentError,
     RetryableError,
     classify_http_error,
     is_region_unavailable_error,
+    is_stream_idle_error,
     is_upstream_death,
 )
 from hiveweave.llm.unknown_error_samples import (
@@ -344,9 +346,15 @@ class HttpStreamMixin:
             return result
         except RetryableError as e:
             # 可重试错误耗尽 → 报告熔断器失败（C10: 让熔断器感知 HTTP 429/503/504/529 + 网络错误）
-            await self._circuit_breaker.report_failure(
-                provider_name, error_code=getattr(e, "error_code", None)
-            )
+            # ⚠ TEST_DSH_64 暗坑③：流空转类 RetryableError **跳过**
+            # report_failure —— idle 原是 PermanentError（从不喂熔断），改判
+            # Retryable 后若照喂，会经 FAIL_THRESHOLD=5「5 次累计」后门把
+            # provider 全项目熔断（慢流关闸面扩大）。空转的恢复钥匙是
+            # with_retry 专属重试 + run 级 durable 重醒，不是熔断。
+            if not is_stream_idle_error(e):
+                await self._circuit_breaker.report_failure(
+                    provider_name, error_code=getattr(e, "error_code", None)
+                )
             return {
                 "status": "error",
                 "text": "",
@@ -434,9 +442,13 @@ class HttpStreamMixin:
                 except RetryableError as se:
                     # 剥图重试本身遇到瞬态错误 → 归一化返回（保 error_status/headers），
                     # 不泄漏裸异常（主路径同款契约，TEST19 教训：402 需区分）。
-                    await self._circuit_breaker.report_failure(
-                        provider_name, error_code=getattr(se, "error_code", None)
-                    )
+                    # ⚠ TEST_DSH_64 暗坑③（第二处，OCR 复查补）：stream_idle 系
+                    # 同样跳过 report_failure —— 与主出口同一条「5 次累计」
+                    # 后门熔断红线。
+                    if not is_stream_idle_error(se):
+                        await self._circuit_breaker.report_failure(
+                            provider_name, error_code=getattr(se, "error_code", None)
+                        )
                     return {
                         "status": "error",
                         "text": "",
@@ -464,6 +476,9 @@ class HttpStreamMixin:
                         "error": str(se),
                         "error_status": se.status,
                         "partial_usage": getattr(se, "partial_usage", None),
+                        # TEST_DSH_64：stream_idle_exhausted 码随行（暗坑②：
+                        # agent 层重建异常才有码可保，重醒门窄谓词靠它）
+                        "error_code": getattr(se, "error_code", None),
                     }
             return {
                 "status": "error",
@@ -474,6 +489,9 @@ class HttpStreamMixin:
                 "error": str(e),
                 "error_status": e.status,
                 "partial_usage": getattr(e, "partial_usage", None),
+                # TEST_DSH_64：PermanentError 出口此前不透 error_code ——
+                # stream_idle_exhausted 耗尽码会在这里凭空消失。
+                "error_code": getattr(e, "error_code", None),
             }
 
     # ── 实际流式 HTTP 请求（线程池 + 同步 httpx）────────────────
@@ -641,8 +659,17 @@ class HttpStreamMixin:
                         raise RetryableError(
                             f"First chunk timeout ({FIRST_CHUNK_TIMEOUT_S}s)"
                         )
-                    raise PermanentError(
-                        f"Stream idle timeout ({IDLE_TIMEOUT_S}s)"
+                    # TEST_DSH_64 #3：首 chunk 后空转原抛 PermanentError ⇒
+                    # 不进 with_retry 重试、重醒门也不认（is_upstream_death
+                    # 判 False），死 run 全靠 30s 冷却运气。改判 RetryableError
+                    # （error_code=stream_idle，跨组契约）⇒ with_retry 专属
+                    # 重试 1 次，耗尽升级 PermanentError(stream_idle_exhausted)
+                    # 交 run 级 durable 重醒。150s 数值不动（64 实测全为真死，
+                    # 非误杀）；⚠ 不许把 idle 纳入 is_upstream_death（与 60s
+                    # 快熔共判据，扩它 = 慢流对全项目关闸）。
+                    raise RetryableError(
+                        f"Stream idle timeout ({IDLE_TIMEOUT_S}s)",
+                        error_code=STREAM_IDLE_ERROR_CODE,
                     )
 
                 if kind is _DONE:
