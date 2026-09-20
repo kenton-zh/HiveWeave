@@ -199,7 +199,7 @@ async def notify_upstream_deaths(
         dq.popleft()
     if len(dq) < 2:
         return False
-    if now - _upstream_death_notice_sent.get(key, 0.0) < UPSTREAM_DEATH_WINDOW_S:
+    if now - _upstream_death_notice_sent.get(key, float("-inf")) < UPSTREAM_DEATH_WINDOW_S:
         return False  # 本窗口已发过一条 —— 只记数
     seen: set[str] = set()
     agents: list[str] = []
@@ -254,7 +254,7 @@ async def notify_upstream_recovery_exhausted(
     """
     key = f"{project_id or '?'}:{agent_id or '?'}"
     now = time.monotonic()
-    if now - _upstream_exhausted_notice_sent.get(key, 0.0) < (
+    if now - _upstream_exhausted_notice_sent.get(key, float("-inf")) < (
         _UPSTREAM_EXHAUSTED_DEDUP_S
     ):
         return False
