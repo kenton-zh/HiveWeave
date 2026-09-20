@@ -118,6 +118,10 @@ async def test_fail_then_success_backfills_solution_and_restores_hint(
             "agent-A", "bash", {"command": "ls --unix-only"}
         )
         assert _key in exec_mod._PENDING_SOLUTIONS
+        # TEST_DSH_64 #2：pending 携带本次条目 module_id（回填直定位用）
+        assert exec_mod._PENDING_SOLUTIONS[_key]["module_id"] == (
+            fs.make_module_id("proj", sig, "bash")
+        )
         assert (  # 旧两元键形态已退役 —— 它让"同工具"冒充"同问题"
             "agent-A",
             "bash",
@@ -133,17 +137,29 @@ async def test_fail_then_success_backfills_solution_and_restores_hint(
         assert _key not in exec_mod._PENDING_SOLUTIONS  # pending 已消费
 
     content = space.rows[0]["content"]
-    assert "已验证解法:" in content
+    # TEST_DSH_64 #2-3（2026-09-19）回声语义降级：同参成功是构造性事实，
+    # 写「同参重试:」回声行 + status=retried_ok，不再冒充「已验证解法」。
+    assert "同参重试:" in content
+    assert "已验证解法:" not in content
+    assert "完全相同参数" in content
     assert "ls --unix-only" in content
-    assert fs._signature_has_solution(content)
+    assert space.rows[0]["metadata"]["solution_status"] == (
+        fs.SOLUTION_STATUS_RETRIED_OK
+    )
+    assert not fs._has_verified_solution_line(content)
     # 解法行插在根因行之后
     lines = content.splitlines()
     assert lines[1].startswith("根因提示:")
-    assert lines[2].startswith("已验证解法:")
+    assert lines[2].startswith("同参重试:")
 
-    # 3) hint 恢复广播：别人撞同一签名能拿到 [shared fix]
-    hint = await fs.known_signature_hint("proj", _ERROR, agent_id="agent-B")
+    # 3) hint 恢复广播：别人撞同一签名能拿到 [shared fix]（回声=中性提示，
+    #    不是「已验证解法」携带）
+    hint = await fs.known_signature_hint(
+        "proj", _ERROR, agent_id="agent-B", tool_name="bash"
+    )
     assert hint and "[shared fix]" in hint
+    assert "同参重试曾成功" in hint
+    assert "已验证解法:" not in hint
 
 
 @pytest.mark.asyncio
@@ -171,7 +187,14 @@ async def test_preexisting_hint_goes_to_other_agent_not_self(space):
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh 写法重试",
             "source_agent_id": "agent-A",
-            "metadata": {"source_agent_id": "agent-A"},
+            # TEST_DSH_64 #2：桩条目按写侧真实形态补齐 (signature, tool_name)
+            # 元组与状态位 —— hint 定位与解法携带都按 metadata 门控。
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "signature": sig,
+                "tool_name": "bash",
+                "solution_status": fs.SOLUTION_STATUS_VERIFIED,
+            },
         }
     )
     delivered: list[tuple[str, str, dict]] = []
@@ -304,7 +327,7 @@ async def test_sensitive_args_redacted_before_backfill(space, clear_pending):
             "agent-A",
         )
     content = space.rows[0]["content"]
-    assert "已验证解法:" in content  # 回填本身成功
+    assert "同参重试:" in content  # 回填本身成功（回声行，TEST_DSH_64 #2-3）
     # 键名命中的值 → 已隐藏占位（env 整个 dict、headers.Authorization 值）
     assert "已隐藏" in content
     # 敏感值原文绝不出现
@@ -353,7 +376,7 @@ async def test_empty_args_success_does_not_backfill(space, clear_pending):
         await exec_mod._f10_pending_success_backfill(
             {"success": True, "output": "ok", "error": None}, "bash", {}, "agent-A"
         )
-    assert space.rows and "已验证解法:" not in space.rows[0]["content"]
+    assert space.rows and "同参重试:" not in space.rows[0]["content"]
     assert not fs._signature_has_solution(space.rows[0]["content"])
     # #11-(d)：空参数成功**不许消费**真 pending（占位身份 `tool::{}`
     # 是共享的，拿它 pop 会吃掉别人的真 pending）。
@@ -383,7 +406,7 @@ async def test_all_empty_values_do_not_backfill(space, clear_pending):
             {"note": "", "flag": None},
             "agent-A",
         )
-    assert space.rows and "已验证解法:" not in space.rows[0]["content"]
+    assert space.rows and "同参重试:" not in space.rows[0]["content"]
 
 
 # ── P1-3 的边界：**部分**为空的参数仍算有实质内容 ──
@@ -410,7 +433,7 @@ async def test_partial_empty_values_still_backfill(space, clear_pending):
         await exec_mod._f10_pending_success_backfill(
             {"success": True, "output": "ok", "error": None}, "bash", _args, "agent-A"
         )
-    assert "已验证解法:" in space.rows[0]["content"]
+    assert "同参重试:" in space.rows[0]["content"]
     assert "ls -la" in space.rows[0]["content"]
 
 
@@ -512,7 +535,7 @@ async def test_same_args_reordered_still_matches(space, clear_pending):
             "agent-A",
         )
 
-    assert "已验证解法:" in space.rows[0]["content"]
+    assert "同参重试:" in space.rows[0]["content"]
     assert not exec_mod._PENDING_SOLUTIONS
 
 
@@ -573,7 +596,14 @@ def test_first_line_matches_tool_parses_marker():
 
 @pytest.mark.asyncio
 async def test_backfill_skips_entry_whose_tool_differs(space):
-    """同签名、异工具的两条条目 ⇒ 解法必须落到**同工具**那条。"""
+    """同签名、异工具的两条条目 ⇒ 解法必须落到**同工具**那条。
+
+    ⚠️ **机制更新（TEST_DSH_64 #2，2026-09-19，有意）**：backfill 定位从
+    「首行前缀扫描 + ``tool=`` 首行二次门」改为 **module_id 精确等值**
+    （携带键或按 (project, tool, sig) 重算 —— 同一函数，非两份判据）。
+    旧机制在前缀塌缩（两条不同错误共享 sig[:48]）时会把解法「落错行」；
+    意图不变：解法必须落到与本次成功调用同工具的条目上。
+    """
     sig = fs.signature_of(_ERROR)
     wrong = _entry_content(sig).replace("tool=bash", "tool=read_file")
     right = _entry_content(sig)
@@ -582,11 +612,14 @@ async def test_backfill_skips_entry_whose_tool_differs(space):
             "id": "mem-wrong",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": "mod-wrong",
+            "module_id": fs.make_module_id("proj", sig, "read_file"),
             "type": "failure_signature",
             "content": wrong,
             "source_agent_id": "agent-B",
-            "metadata": {},
+            "metadata": {
+                "signature": sig,
+                "tool_name": "read_file",
+            },
         }
     )
     space.rows.append(
@@ -594,11 +627,14 @@ async def test_backfill_skips_entry_whose_tool_differs(space):
             "id": "mem-right",
             "agent_id": fs._SIGNATURE_WRITER,
             "scope": "project",
-            "module_id": "mod-right",
+            "module_id": fs.make_module_id("proj", sig, "bash"),
             "type": "failure_signature",
             "content": right,
             "source_agent_id": "agent-A",
-            "metadata": {},
+            "metadata": {
+                "signature": sig,
+                "tool_name": "bash",
+            },
         }
     )
     ok = await fs.backfill_solution(sig, "bash", "改用 pwsh 写法", project_id="proj")
@@ -606,6 +642,17 @@ async def test_backfill_skips_entry_whose_tool_differs(space):
     by_id = {r["id"]: r["content"] for r in space.rows}
     assert "已验证解法:" in by_id["mem-right"]
     assert "已验证解法:" not in by_id["mem-wrong"]  # 错条目不污染
+    # 显式传 module_id（pending 携带形态）同样只落目标行
+    ok2 = await fs.backfill_solution(
+        sig,
+        "bash",
+        "另一条解法也不该落到 read_file 行",
+        project_id="proj",
+        module_id=fs.make_module_id("proj", sig, "bash"),
+    )
+    assert ok2 is True
+    by_id = {r["id"]: r["content"] for r in space.rows}
+    assert "另一条解法也不该落到 read_file 行" not in by_id["mem-wrong"]
 
 
 # ── #16-②：solution_status 状态位不许与解法行分叉 ──────────
@@ -752,6 +799,8 @@ async def test_rehit_preserves_solution_status(space):
             "source_agent_id": "agent-A",
             "metadata": {
                 "source_agent_id": "agent-A",
+                "signature": sig,  # TEST_DSH_64 #2：rehit 定位按元组等值
+                "tool_name": "bash",
                 "solution_status": fs.SOLUTION_STATUS_VERIFIED,
                 "solution_tool": "bash",
                 "solved_at_ms": 123,
@@ -778,7 +827,11 @@ async def test_rehit_preserves_solution_status(space):
 
 @pytest.mark.asyncio
 async def test_solution_status_never_diverges_from_solution_line(space):
-    """机检口径本身：不许出现「有解法行但状态位 != verified」。"""
+    """机检口径本身：行与状态位不许分叉（TEST_DSH_64 #2-3 新口径）。
+
+    ① 有「已验证解法:」行 ⇒ status == verified；② 只有「同参重试:」回声行
+    ⇒ status == retried_ok（回声不冒充已验证解法，也不许与状态位分叉）。
+    """
     _args = {"command": "ls -la"}
     with patch(
         "hiveweave.db.meta.get_agent_project_id", AsyncMock(return_value="proj")
@@ -804,10 +857,12 @@ async def test_solution_status_never_diverges_from_solution_line(space):
         )
     for r in space.rows:
         has_line = fs._has_verified_solution_line(r["content"])
+        has_echo = fs._has_retry_echo_line(r["content"])
         status = (r.get("metadata") or {}).get("solution_status")
-        assert has_line, "本例应当已回填出解法行（否则下面的断言无意义）"
-        assert status == fs.SOLUTION_STATUS_VERIFIED, (
-            f"解法行与状态位分叉：{r['id']} status={status!r}"
+        assert has_echo, "本例应当已回填出回声行（否则下面的断言无意义）"
+        assert not has_line, "同参成功是回声不是已验证解法，不许写「已验证解法:」行"
+        assert status == fs.SOLUTION_STATUS_RETRIED_OK, (
+            f"回声行与状态位分叉：{r['id']} status={status!r}"
         )
 
 
@@ -820,6 +875,10 @@ async def test_hint_carries_solution_line_text(space):
 
     断链1：签名池对 Agent 不可达（read_memory 只读 agent 域），旧固定文案
     「先读它」是发不出去的指令 —— 命中即得解法本身才是闭环。
+
+    ⚠️ TEST_DSH_64 #2（2026-09-19）：携带门改按 ``solution_status ==
+    "verified"``（有行无位的脏条目不广播），hint 定位按
+    ``(signature, tool_name)`` 元组等值并要求调用方给 tool_name。
     """
     sig = fs.signature_of(_ERROR)
     space.rows.append(
@@ -831,22 +890,41 @@ async def test_hint_carries_solution_line_text(space):
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh -Command ls 重试",
             "source_agent_id": "agent-A",
-            "metadata": {"source_agent_id": "agent-A"},
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "signature": sig,
+                "tool_name": "bash",
+                "solution_status": fs.SOLUTION_STATUS_VERIFIED,
+            },
         }
     )
-    hint = await fs.known_signature_hint("proj", _ERROR, agent_id="agent-B")
+    hint = await fs.known_signature_hint(
+        "proj", _ERROR, agent_id="agent-B", tool_name="bash"
+    )
     assert hint and hint.startswith("[shared fix]")
     assert "已验证解法:" in hint
     assert "改用 pwsh -Command ls 重试" in hint  # 解法原文逐字在场
     assert "先读它" not in hint
 
+    # verified 行+位齐全才携带：缺状态位的脏条目（历史遗留）不给解法
+    dirty = dict(space.rows[0])
+    dirty = {**dirty, "metadata": {**dirty["metadata"]}}
+    del dirty["metadata"]["solution_status"]
+    space.rows[0] = dirty
+    hint_dirty = await fs.known_signature_hint(
+        "proj", _ERROR, agent_id="agent-B", tool_name="bash"
+    )
+    assert hint_dirty and "已验证解法:" not in hint_dirty
+    assert "暂无已验证解法" in hint_dirty
+
 
 @pytest.mark.asyncio
 async def test_hint_without_solution_line_drops_unreachable_instruction(space):
-    """无解法行（仅实质根因，_signature_has_solution 的②支）⇒ 中性提示。
+    """无解法行（仅实质根因）⇒ 显式空态，不发「先读它」这类不可执行指令。
 
-    原则：不给 Agent 发无法执行的指令 ——「先读它」指向一个 read_memory
-    读不到的地方（签名池在 project 域），必须从文案里消失。
+    ⚠️ **行为变更（TEST_DSH_64 #2-4，2026-09-19，有意）**：旧实现走
+    _signature_has_solution 的②支给中性提示、镜子条目返回 None；新实现
+    统一为显式空态「该签名暂无已验证解法」（不再 None、不再指路读池子）。
     """
     sig = fs.signature_of(_ERROR)
     content = (
@@ -864,12 +942,19 @@ async def test_hint_without_solution_line_drops_unreachable_instruction(space):
             "type": "failure_signature",
             "content": content,
             "source_agent_id": "agent-A",
-            "metadata": {"source_agent_id": "agent-A"},
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "signature": sig,
+                "tool_name": "bash",
+            },
         }
     )
-    hint = await fs.known_signature_hint("proj", _ERROR, agent_id="agent-B")
+    hint = await fs.known_signature_hint(
+        "proj", _ERROR, agent_id="agent-B", tool_name="bash"
+    )
     assert hint and "[shared fix]" in hint
     assert "先读它" not in hint
+    assert "暂无已验证解法" in hint
 
 
 # ── TEST_DSH_62 P7 断链2：self-repeat 键不含 run_id ──────
@@ -949,6 +1034,8 @@ async def test_rehit_preserves_org_gradient_state(space):
             "source_agent_id": "agent-A",
             "metadata": {
                 "source_agent_id": "agent-A",
+                "signature": sig,  # TEST_DSH_64 #2：rehit 定位按元组等值
+                "tool_name": "bash",
                 "hit_count": 3,
                 fs._HITTERS_KEY: ["agent-A", "agent-B"],
                 fs._HITTERS_OVERFLOW_KEY: 0,
@@ -989,7 +1076,12 @@ async def test_rehit_inserts_solution_status_none_when_missing(space):
             "type": "failure_signature",
             "content": _entry_content(sig),  # 无解法行
             "source_agent_id": "agent-A",
-            "metadata": {"source_agent_id": "agent-A", "hit_count": 1},
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "signature": sig,  # TEST_DSH_64 #2：rehit 定位按元组等值
+                "tool_name": "bash",
+                "hit_count": 1,
+            },
         }
     )
     await fs.record_failure_signature(
@@ -1021,7 +1113,12 @@ async def test_rehit_carried_solution_line_backfills_verified_status(space):
             "type": "failure_signature",
             "content": _entry_content(sig) + "\n已验证解法: 改用 pwsh 写法",
             "source_agent_id": "agent-A",
-            "metadata": {"source_agent_id": "agent-A", "hit_count": 1},
+            "metadata": {
+                "source_agent_id": "agent-A",
+                "signature": sig,  # TEST_DSH_64 #2：rehit 定位按元组等值
+                "tool_name": "bash",
+                "hit_count": 1,
+            },
         }
     )
     await fs.record_failure_signature(

@@ -692,10 +692,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "type": "string",
                 "enum": ["readonly", "audit", "write"],
                 "aliases": ["type", "kind"],
+                # TEST_DSH_64 #5：description 首行给字面示例 —— 真实缺参案例
+                # 连 prompt 一起缺，体内精修文案（pydantic 拦截后的 err 文案）
+                # 对缺参是死代码，只有 schema 描述先到位才救得回。⚠ 本字段与
+                # tools/subagent.py SpawnSubagentParams.subagent_type 是双份，
+                # 改一处必须同步另一处（两份不许漂移）。有意不加默认值：缺参
+                # 案例同样缺 prompt，default 救不了；体内必填校验保留。
                 "description": (
-                    "REQUIRED. readonly = read-only scout; audit = run "
-                    "tests/browse + submit (no attestation); write = edit "
-                    "code + git_worktree (parent must have SOURCE_WRITE)."
+                    "必填: subagent_type='write'(实现类) | 'readonly'(侦察) | "
+                    "'audit'(审计) —— 例如 {\"subagent_type\": \"write\", "
+                    "\"prompt\": \"...\"}。readonly = read-only scout; "
+                    "audit = run tests/browse + submit task (no attestation); "
+                    "write = edit code + git_worktree (parent must have "
+                    "SOURCE_WRITE). Missing or invalid value returns an "
+                    "error without changing the parent's turn."
                 ),
             },
             "prompt": {
@@ -2756,7 +2766,7 @@ async def _f10_pending_success_backfill(
     """同 agent **同调用身份**失败后的首次成功 → 把成功参数摘要回填进条目。
 
     42 轮实测 18/18 hint 无效的根因：条目只有错误原文没有解法，且常由
-    失败者自己刚写。解法 = 本次成功调用的参数摘要（≤200 字符，纯机械
+    失败者自己刚写。回填 = 本次成功调用的参数摘要（≤200 字符，纯机械
     回填，无 LLM 总结；先按键名脱敏，见 _redact_for_shared_solution）。
     命中即清 pending；无 pending 的成功只花一次 dict 查询。
 
@@ -2775,6 +2785,14 @@ async def _f10_pending_success_backfill(
     P1-3（审计）：空参数（{} / 全空值）不回填 ——「已验证解法: {}」会让
     _signature_has_solution 恢复对全员广播「先读它」，正是自指抑制闸要防
     的镜子条目换马甲；无实质参数即消费 pending 后直接弃。
+
+    **回声语义降级（TEST_DSH_64 #2-3，2026-09-19）**：能走到回填的 success
+    **参数恒等于失败参数**（同调用身份才 pop 得到 pending）——这是构造性
+    事实：「同参重试成功」只说明环境/代码变了，不是「有人验证过这组参数
+    是解法」（范畴错误）。故 status 标 ``retried_ok``、写「同参重试:」回声行
+    （不复用「已验证解法:」前缀，机检不变式不破），文案改述事实；hint 的
+    「已验证解法」携带门只认 verified，回声条目只拿中性提示。
+
     best-effort，绝不影响工具回执。
     """
     if not result or not result.get("success"):
@@ -2803,14 +2821,26 @@ async def _f10_pending_success_backfill(
         normalized = summary.strip()[:200]
         if normalized in ("{}", "[]", "null", '""', ""):
             return
-        solution = f"同工具失败后一次成功执行的参数: {normalized}"
-        from hiveweave.services.failure_signature import backfill_solution
+        # 回声文案（TEST_DSH_64 #2-3）：改述构造性事实，不冒充「已验证解法」。
+        solution = (
+            "此前有 Agent 以完全相同参数重试成功（说明环境/代码已变化，"
+            "非参数问题；同参原样重试可先再试一次）: "
+            f"{normalized}"
+        )
+        from hiveweave.services.failure_signature import (
+            SOLUTION_STATUS_RETRIED_OK,
+            backfill_solution,
+        )
 
         await backfill_solution(
             pending.get("sig") or "",
             tool_name,
             solution,
             project_id=pending.get("project_id"),
+            # module_id 直定位（TEST_DSH_64 #2 修法第 2 步）：pending 存有
+            # record_failure_signature 回传的本次条目键，回填按它精确落行。
+            module_id=pending.get("module_id") or None,
+            status=SOLUTION_STATUS_RETRIED_OK,
         )
     except Exception as e:  # noqa: BLE001
         log.debug("f10_pending_backfill_failed", error=str(e))
@@ -2871,8 +2901,8 @@ def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str
         ago = f"{elapsed / 60:.1f} 分钟前"
     return (
         f"[SELF REPEAT #{count} via {tool_name}] 你 {ago}刚撞过同一失败"
-        f"（{sig[:80]}）—— 同一写法原样重试无效，先读团队共享空间条目"
-        f"解法或换路执行，勿再撞同一堵墙。"
+        f"（{sig[:80]}）—— 同一写法原样重试无效，直接换路执行；共享池该签名"
+        f"未必已有已验证解法，别等现成答案。"
     )
 
 
@@ -2982,6 +3012,10 @@ async def _f10_result_hooks(
                     _PENDING_SOLUTIONS[_pending_key] = {
                         "project_id": project_id,
                         "sig": _sig_for_pending,
+                        # TEST_DSH_64 #2 修法第 2 步：pending 带上本次条目的
+                        # module_id（record_failure_signature 回传值），回填
+                        # 靠它直接定位条目，取代 sig[:48] 前缀扫描落行。
+                        "module_id": rec.get("module_id"),
                         "ts": _now_s,
                     }
         # agent_id 传入供自指抑制留日志；条目无解法信息时不广播（镜子提示）
@@ -3002,7 +3036,12 @@ async def _f10_result_hooks(
         # 现在合并成 **一条** platform_notice 投递；`error` 字段只保留真错误。
         _notice_parts: list[str] = []
         if preexisting:
-            hint = await known_signature_hint(project_id, error, agent_id=agent_id)
+            # tool_name 传参（TEST_DSH_64 #2-5 二元组门）：hint 的条目定位 =
+            # (signature, tool_name) 元组精确等值 —— 没有工具名它宁可不广播，
+            # 也不按签名子串乱串。
+            hint = await known_signature_hint(
+                project_id, error, agent_id=agent_id, tool_name=tool_name
+            )
             if hint:
                 _notice_parts.append(hint)
         # TEST_DSH_47 #6：同签名即时去重 —— 首撞者被抑制 shared-fix

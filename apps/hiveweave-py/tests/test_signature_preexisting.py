@@ -25,7 +25,14 @@ def _mem(sig: str, source: str | None, tail: str = "") -> dict:
     return {
         "type": "failure_signature",
         "content": content,
-        "metadata": {"source_agent_id": source, "signature": sig},
+        # TEST_DSH_64 #2（2026-09-19）：record 预存扫描定位判据改为
+        # metadata (signature, tool_name) 元组精确等值 —— 桩条目按写侧真实
+        # 形态补齐两键（旧行缺字段=不匹配，是拍板接受的搁浅语义）。
+        "metadata": {
+            "source_agent_id": source,
+            "signature": sig,
+            "tool_name": "pwsh",
+        },
     }
 
 

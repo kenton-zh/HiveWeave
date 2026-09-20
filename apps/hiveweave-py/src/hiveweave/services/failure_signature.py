@@ -385,13 +385,14 @@ async def record_failure_signature(
     """把新失败签名写入项目共享空间（R7 → 0 的可机检支撑）。
 
     Returns ``{"written": bool, "preexisting": bool, "preexisting_source":
-    str|None, "sig": str|None}``：``preexisting``=该签名在本次失败**之前**
-    已存在（39 审计 P1-3：首撞者不该收"先读它"自指提示——executor 据此
-    门控 hint）；``preexisting_source``=首撞者；``sig``=**写侧实际使用的
-    规范化签名**（带 root 归一）。executor 侧的 pending/自指去重/组织升级
-    必须**复用这个 sig**，不得自己再调 ``signature_of(error)`` —— 那会算出
-    不带 root 的另一份签名，与写侧记忆行失配（同一事实两处判）。
-    best-effort。
+    str|None, "sig": str|None, "module_id": str|None}``：``preexisting``=该
+    签名条目在本次失败**之前**已存在（39 审计 P1-3：首撞者不该收"先读它"
+    自指提示——executor 据此门控 hint）；``preexisting_source``=首撞者；
+    ``sig``=**写侧实际使用的规范化签名**（带 root 归一）；``module_id``=
+    本次条目的记忆键（TEST_DSH_64 #2：executor 存进 pending，backfill 靠它
+    直接定位条目）。executor 侧的 pending/自指去重/组织升级必须**复用这个
+    sig**，不得自己再调 ``signature_of(error)`` —— 那会算出不带 root 的
+    另一份签名，与写侧记忆行失配（同一事实两处判）。best-effort。
     """
     if not project_id:
         return {
@@ -399,6 +400,7 @@ async def record_failure_signature(
             "preexisting": False,
             "preexisting_source": None,
             "sig": None,
+            "module_id": None,
         }
     sig = signature_of(error, root=await _project_root_of(project_id))
     if sig is None:
@@ -407,6 +409,7 @@ async def record_failure_signature(
             "preexisting": False,
             "preexisting_source": None,
             "sig": None,
+            "module_id": None,
         }
     try:
         from hiveweave.services.memory import MemoryService
@@ -419,16 +422,25 @@ async def record_failure_signature(
         preexisting_source: str | None = None
         # 件1（回填处置 2026-09-05）：rehit 时旧条目若已回填「已验证解法:」行，
         # 原样携带到新内容 —— 否则本次覆写会把刚回填的解法冲掉（回填白做，
-        # hint 恢复也随之失效）。
+        # hint 恢复也随之失效）。TEST_DSH_64 #2-3：「同参重试:」回声行同样
+        # 携带（它是条目的事实记录，覆写冲掉 = 同参重试曾成功的信息丢失）。
         carried_solution_line: str | None = None
+        carried_retry_line: str | None = None
         prev_meta: dict = {}
         try:
             for m in (await memory_service.get_project_memories(project_id)) or []:
                 if m.get("type") != "failure_signature":
                     continue
                 fl = (m.get("content") or "").split("\n", 1)[0]
-                if fl.startswith("[失败签名]") and (
-                    f"| {sig}" in fl or sig[:48] in fl
+                # TEST_DSH_64 #2 修法第 1/5 步（2026-09-19）：定位判据从
+                # ``sig[:48]`` 前缀子串探测改为 metadata ``(signature,
+                # tool_name)`` 元组精确等值 —— 前缀塌缩（两条不同错误共享
+                # 前 48 字符）会把别条当成 rehit；携带门 ``_first_line_
+                # matches_tool`` 改施于**条目首行 fl**（此前错施在解法行上，
+                # 解法行无 ``tool=`` 段 ⇒ 恒放行，等于没门）。工具门在此
+                # 已由元组等值承载，fl 门是防御纵深。
+                if _entry_matches(sig, tool_name, m.get("metadata")) and (
+                    _first_line_matches_tool(fl, tool_name)
                 ):
                     preexisting = True
                     preexisting_source = (
@@ -441,14 +453,24 @@ async def record_failure_signature(
                     # 签名时不再覆盖 A 的行，但如果把 A 的「已验证解法」原样
                     # 携带进 B 的新行，B 自己后续的真实解法回填会因
                     # _has_verified_solution_line 被幂等跳过 —— 等于从写入侧
-                    # 把「错解」种进 B 的行。preexisting/hit_count 保持签名级
-                    # （撞到同签名文本就是 rehit，不改 P1-3 自指门语义）。
+                    # 把「错解」种进 B 的行。
+                    # ⚠ 2026-09-19 订正（TEST_DSH_64 #2）：元组精确等值取代
+                    # 签名级前缀匹配后，preexisting/hit_count 也随之**按行**
+                    # （即按 (sig, tool) 条目）——「同签名文本但异工具」不再算
+                    # rehit（那是另一条目，批 C 设计如此），P1-3 自指门语义
+                    # 不变（门只看 preexisting 布尔）。行内解法必属同工具 ——
+                    # 携带不再逐行门控（原逐行门施在解法行上恒放行，是死代码）。
                     for _line in (m.get("content") or "").splitlines():
-                        if _line.startswith(_SOLUTION_LINE_PREFIX) and _first_line_matches_tool(
-                            _line, tool_name
+                        if (
+                            carried_solution_line is None
+                            and _line.startswith(_SOLUTION_LINE_PREFIX)
                         ):
                             carried_solution_line = _line
-                            break
+                        elif (
+                            carried_retry_line is None
+                            and _line.startswith(_RETRY_ECHO_LINE_PREFIX)
+                        ):
+                            carried_retry_line = _line
                     break
         except Exception:  # noqa: BLE001 — 前查失败按"新签名"处理
             pass
@@ -459,7 +481,7 @@ async def record_failure_signature(
             f"首个撞到的 Agent: {agent_id}"
             f"（撞到该签名后请先检索本项目共享空间是否已有解法）"
         )
-        if carried_solution_line:
+        if carried_solution_line or carried_retry_line:
             _lines = content.split("\n")
             _at = len(_lines)  # 兜底：找不到根因行则追加末尾（绝不插首行前，
             # 否则破坏 [失败签名] 首行匹配）
@@ -467,23 +489,33 @@ async def record_failure_signature(
                 if _ln.startswith("根因提示:"):
                     _at = _i + 1
                     break
-            _lines.insert(_at, carried_solution_line)
+            # 插入顺序：已验证解法在前、同参重试回声在后（解法权威性更高）。
+            # 同一下标依次 insert 会让后插者排前面，故按下标偏移追加。
+            for _offset, _carried in enumerate(
+                filter(None, (carried_solution_line, carried_retry_line))
+            ):
+                _lines.insert(_at + _offset, _carried)
             content = "\n".join(_lines)
         now_ms = int(time.time() * 1000)
         module_id = make_module_id(project_id, sig, tool_name)
         metadata = {
             "kind": "failure_signature",
             "signature": sig,
-            "tool_name": tool_name or "",
+            "tool_name": (tool_name or "").strip(),
             "first_hit_at_ms": now_ms,
         }
         if preexisting:
             # 回填溯源字段随 rehit 保留（solved_at/solution_tool + 状态位）——
-            # 批 C 审计 MEDIUM：**仅当解法行被携带**（tool 门控通过）时才继
-            # 承状态位 —— 否则 B 的行会「状态位=verified 但无解法行」，同样
-            # 违反下方的机检不变式（只是反方向）。
-            if carried_solution_line:
-                for _k in ("solved_at_ms", "solution_tool", "solution_status"):
+            # 批 C 审计 MEDIUM：**仅当有行被携带**（解法行或回声行）时才继
+            # 承状态位 —— 否则会出现「状态位=verified/retried_ok 但对应行
+            # 没了」的分叉，违反下方的机检不变式（只是反方向）。
+            if carried_solution_line or carried_retry_line:
+                for _k in (
+                    "solved_at_ms",
+                    "retried_at_ms",
+                    "solution_tool",
+                    "solution_status",
+                ):
                     if _k in (prev_meta or {}):
                         metadata[_k] = prev_meta[_k]
             # TEST_DSH_62 P7 断链4（2026-09-18）：组织升级梯度状态也必须继承
@@ -502,13 +534,18 @@ async def record_failure_signature(
             metadata["hit_count"] = int((prev_meta or {}).get("hit_count") or 1) + 1
             # preexisting 分支同样显式落状态位（与下方 else 新签分支同语义，
             # P7 断链4：此前该分支可 INSERT 完全缺 solution_status 的新行 ——
-            # 实测 19 条 missing 的来源）。携带了解法行 ⇒ verified（机检不变
-            # 式：有解法行与状态位不许分叉）；未携带 ⇒ none。
+            # 实测 19 条 missing 的来源）。携带了什么行 ⇒ 什么状态（机检不变
+            # 式：行与状态位不许分叉；TEST_DSH_64 #2-3 增补回声行支）；
+            # 未携带 ⇒ none。
             metadata.setdefault(
                 "solution_status",
                 SOLUTION_STATUS_VERIFIED
                 if carried_solution_line
-                else SOLUTION_STATUS_NONE,
+                else (
+                    SOLUTION_STATUS_RETRIED_OK
+                    if carried_retry_line
+                    else SOLUTION_STATUS_NONE
+                ),
             )
         else:
             # #16-② 状态位显式落 ``none``：机检口径是
@@ -555,6 +592,10 @@ async def record_failure_signature(
             "preexisting": preexisting,
             "preexisting_source": preexisting_source,
             "sig": sig,
+            # TEST_DSH_64 #2 修法第 2 步：回传本次条目的 module_id ——
+            # executor 的 pending 存它，backfill 靠它直接定位条目
+            # （取代 sig[:48] 前缀扫描定位）。早退分支同形状返回 None。
+            "module_id": module_id,
         }
     except Exception as e:
         log.warning("failure_signature.broadcast_failed", error=str(e))
@@ -563,31 +604,52 @@ async def record_failure_signature(
             "preexisting": False,
             "preexisting_source": None,
             "sig": None,
+            "module_id": None,
         }
 
 
 async def known_signature_hint(
-    project_id: str | None, error: str | None, agent_id: str | None = None
+    project_id: str | None,
+    error: str | None,
+    agent_id: str | None = None,
+    tool_name: str | None = None,
 ) -> str | None:
     """同项目共享空间里是否已有该失败签名 —— 供工具调用前置检查注入。
 
-    Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用/自指）。
-    命中且条目带「已验证解法:」行时，解法文本**直接拼进提示**（P7 断链1：
-    签名池对 Agent 不可达，指路去"读共享空间"是发不出去的指令）。
+    Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用/缺工具名）。
+    命中且条目 ``solution_status == "verified"`` 时，「已验证解法:」行的解法
+    文本**直接拼进提示**（P7 断链1：签名池对 Agent 不可达，指路去"读共享
+    空间"是发不出去的指令）。
 
-    **自指抑制（2026-09-01，s3-clone_06）**：F10 的 hook 是「先写签名、后取提
-    示」——同一次失败写入的条目会被自己立刻命中，而该条目内容只有错误原文 +
-    占位根因（``见错误原文``）。提示它去「先读它」等于指它读自己刚写的一面镜子，
-    零信息量，且因为看起来在工作而极难被发现（TEST_DSH_38 实测 18/18 失败步
-    全部收到该提示，dev server 同一堵墙连撞 3 次）。
+    **定位判据（TEST_DSH_64 #2，2026-09-19）**：metadata ``(signature,
+    tool_name)`` 元组精确等值（``_entry_matches``）—— 取代 ``sig[:48]``
+    前缀子串探测。前缀塌缩（两条不同错误共享前 48 字符）会把 A 工具条目的
+    解法串投给 B 工具的撞坑者（hint 此前**无工具门**，是串投的最后一环）。
+    ``tool_name`` 缺失时**直接不广播**（无法构成条目身份，宁可沉默也不按
+    子串乱串；54 轮已定位的倒车形态，禁）。
 
-    因此：命中的签名条目**必须携带超出错误原文的信息**（根因提示非占位）才广播。
+    **自指抑制（2026-09-01，s3-clone_06）→ 显式空态（#2-4）**：F10 的 hook
+    是「先写签名、后取提示」——命中的条目可能是自己刚写的镜子。旧实现对此
+    返回 None；现改为：verified ⇒ 带解法；retried_ok ⇒ 中性提示「同参重试
+    曾成功」（回声不冒充已验证解法）；其余（含镜子条目）⇒ 显式空态
+    「该签名暂无已验证解法」—— 不再 None、不再指路读一个读不到的池子。
     只读、best-effort —— 查询失败仅返回 None，绝不阻断工具执行。
     """
     if not project_id:
         return None
     sig = signature_of(error, root=await _project_root_of(project_id))
     if sig is None:
+        return None
+    tool = (tool_name or "").strip()
+    if not tool:
+        # 二元组门（#2-5）：没有工具名就无法构成 (signature, tool_name) 条目
+        # 身份 —— 宁可不广播，也不退回「按签名子串匹配」（54 轮已定位的
+        # 串投缺陷形态）。
+        log.debug(
+            "failure_signature.hint_missing_tool_name",
+            agent_id=(agent_id or "")[:12],
+            sig=sig[:60],
+        )
         return None
     try:
         from hiveweave.services.memory import MemoryService
@@ -597,25 +659,17 @@ async def known_signature_hint(
         for m in mems or []:
             if m.get("type") != "failure_signature":
                 continue
-            content = m.get("content") or ""
-            first_line = content.split("\n", 1)[0] if content else ""
-            if not first_line.startswith("[失败签名]"):
+            if not _entry_matches(sig, tool, m.get("metadata")):
                 continue
-            # 签名行格式：`[失败签名] tool=xxx | <sig>`
-            if f"| {sig}" in first_line or sig[:48] in first_line:
-                if not _signature_has_solution(content):
-                    log.debug(
-                        "failure_signature.hint_suppressed_self_reference",
-                        agent_id=(agent_id or "")[:12],
-                        sig=sig[:60],
-                    )
-                    return None
-                # TEST_DSH_62 P7 断链1（2026-09-18）：签名池对 Agent 不可达
-                # （read_memory 只读 agent 域），旧文案「先读它」是 Agent 无法
-                # 执行的指令，且固定文案永不携带解法内容 —— hint 命中也拿
-                # 不到解法。改为把「已验证解法:」行的解法文本拼进提示，命中
-                # 即得解法本身；无解法行（仅有实质根因，_signature_has_solution
-                # 的②支放行）时给中性提示，不再指路去读一个读不到的地方。
+            content = m.get("content") or ""
+            # TEST_DSH_62 P7 断链1（2026-09-18）+ TEST_DSH_64 #2-3/#2-4
+            # （2026-09-19）：解法携带按 metadata.solution_status 门控 ——
+            # 只对 ``verified`` 生效；``retried_ok``（同参重试回声）不冒充
+            # 已验证解法，给中性提示；其余给显式空态（不再 None、不再指路
+            # 读池子 ——「先读它」是对 Agent 不可达的指令）。
+            status = str((m.get("metadata") or {}).get("solution_status")
+                         or SOLUTION_STATUS_NONE)
+            if status == SOLUTION_STATUS_VERIFIED:
                 for _ln in content.splitlines():
                     if not _ln.startswith(_SOLUTION_LINE_PREFIX):
                         continue
@@ -626,10 +680,23 @@ async def known_signature_hint(
                             f"{_sol}\n"
                             "（同写法原样重试无效，按上行解法换路执行。）"
                         )
+                # verified 但解法行缺失/为空（分叉脏数据）→ 落到空态，不广播。
+            elif status == SOLUTION_STATUS_RETRIED_OK:
                 return (
-                    "[shared fix] 团队共享空间已有该失败签名条目（该坑已被撞过"
-                    "并有根因记录）—— 同一写法原样重试无效，别重复撞同一个坑。"
+                    "[shared fix] 同参重试曾成功：此前有 Agent 以完全相同参数"
+                    "重试成功（说明环境/代码已变化，非参数问题）—— 可先原样"
+                    "重试一次；若再失败请换路执行。"
                 )
+            log.debug(
+                "failure_signature.hint_no_verified_solution",
+                agent_id=(agent_id or "")[:12],
+                sig=sig[:60],
+                solution_status=status,
+            )
+            return (
+                "[shared fix] 该失败签名已有共享条目，但暂无已验证解法 —— "
+                "同一写法原样重试无效，请换路执行。"
+            )
         # 0-4（审计 M2）：未命中此前**完全静默** —— 而"算法变更导致老条目不可达"
         # 与"这个失败确实是新的"在日志上长得一样，无从分辨。
         # 这里只在**项目里确实存在签名条目**时留痕，并降到 debug：
@@ -706,6 +773,12 @@ def _signature_has_solution(content: str) -> bool:
     判定看两处：①「已验证解法:」行（backfill_solution 回填，非空即有解，
     hint 恢复广播）；②「根因提示:」行：缺失 / 空 / 等于占位值 → 无信息量。
     未来若新增结构化解法字段，应在此一并纳入判定。
+
+    ⚠ TEST_DSH_64 #2-3（2026-09-19）同步调整：「同参重试:」回声行
+    （``_RETRY_ECHO_LINE_PREFIX``）**不**算解法 —— 同参重试成功是构造性
+    事实（环境/代码变了），不是被验证的解法；独立前缀使其天然落在本函数
+    判定之外（回声条目不该恢复「有解」广播）。hint 的解法携带自本次收口
+    起改按 ``metadata.solution_status == "verified"`` 门控，不再走本函数。
     """
     has_root_cause = False
     for line in (content or "").splitlines():
@@ -728,6 +801,14 @@ def _signature_has_solution(content: str) -> bool:
 #: 已验证解法行前缀 —— backfill_solution 追加、_signature_has_solution 认可。
 _SOLUTION_LINE_PREFIX = "已验证解法:"
 
+#: 同参重试回声行前缀（TEST_DSH_64 #2-3，2026-09-19）——
+#: ``_f10_pending_success_backfill`` 的回声**专用**前缀。⚠ **不**复用
+#: 「已验证解法:」：机检不变式是「有『已验证解法:』行 ⇒ status 必须
+#: verified」，回声行的 status 是 ``retried_ok``，沿用旧前缀会直接击穿它；
+#: 且 ``_signature_has_solution`` / hint 携带门只认「已验证解法:」，
+#: 独立前缀让回声行天然被排除在「已验证解法」广播之外。
+_RETRY_ECHO_LINE_PREFIX = "同参重试:"
+
 #: 解法状态位（#16-②）—— 条目 metadata 上的唯一权威判定：
 #: ``none`` = 无已验证解法（占位根因，镜子条目）；``verified`` = 已被
 #: backfill_solution 回填并经身份校验。机检口径：
@@ -735,7 +816,17 @@ _SOLUTION_LINE_PREFIX = "已验证解法:"
 #: —— 即「有解法行」与「状态位」不允许分叉。
 SOLUTION_STATUS_NONE = "none"
 SOLUTION_STATUS_VERIFIED = "verified"
-_SOLUTION_STATUSES = frozenset({SOLUTION_STATUS_NONE, SOLUTION_STATUS_VERIFIED})
+# TEST_DSH_64 #2-3（2026-09-19）回声语义降级：**同参重试成功**是构造性事实
+# （success args ≡ 失败 args ⇒ 只是环境/代码变了，不是「参数问题的解法」），
+# 不许标 ``verified`` —— 旧实现把它当「已验证解法」广播给全员，是范畴错误
+# （环境变了 ≠ 有人验证过这个参数序列能解这个问题）。``retried_ok`` 条目
+# 在 hint 里只给中性提示（同参重试曾成功），不进「已验证解法」广播。
+SOLUTION_STATUS_RETRIED_OK = "retried_ok"
+_SOLUTION_STATUSES = frozenset({
+    SOLUTION_STATUS_NONE,
+    SOLUTION_STATUS_VERIFIED,
+    SOLUTION_STATUS_RETRIED_OK,
+})
 
 #: 解法文本长度下限 —— 低于此阈值视为无实质内容，不回填（防噪音）。
 _MIN_SOLUTION_LEN = 8
@@ -761,6 +852,14 @@ def _has_verified_solution_line(content: str) -> bool:
     return False
 
 
+def _has_retry_echo_line(content: str) -> bool:
+    """条目是否已含「同参重试:」回声行（回声幂等判定，TEST_DSH_64 #2-3）。"""
+    for line in (content or "").splitlines():
+        if line.startswith(_RETRY_ECHO_LINE_PREFIX):
+            return True
+    return False
+
+
 def _first_line_matches_tool(first_line: str, tool_name: str) -> bool:
     """首行 ``[失败签名] tool=<name> | <sig>`` 是否属于该工具（#11-(c)）。
 
@@ -770,6 +869,13 @@ def _first_line_matches_tool(first_line: str, tool_name: str) -> bool:
     广播「先读它」）。``tool_name`` 为空时**不做二次筛选**（调用方没给出
     可供筛选的身份，此时按签名定位是唯一可选行为；不假装做了校验）。
     解析失败（首行没有 ``tool=`` 段）同样放行 —— 历史条目可能早于该格式。
+
+    ⚠ TEST_DSH_64 #2（2026-09-19）定位收口后本函数**只剩防御纵深职责**：
+    record/hint/backfill 的主定位判据已改为 metadata 元组/module_id 精确
+    等值（见 ``_entry_matches``），它不再承担「同签名跨工具行会串投」的
+    主防线 —— 但 record 携带门仍要求它施于**条目首行 fl**（此前错施在
+    「已验证解法:」解法行上，解法行没有 ``tool=`` 段 ⇒ ``idx < 0`` 恒放行，
+    等于没门）。
     """
     name = (tool_name or "").strip()
     if not name:
@@ -781,6 +887,39 @@ def _first_line_matches_tool(first_line: str, tool_name: str) -> bool:
         return True
     got = head[idx + len(marker):].strip()
     return got == name
+
+
+# ── TEST_DSH_64 #2（2026-09-19）：条目身份 = metadata 元组精确等值 ──────────
+#
+# ``sig[:48]`` 前缀子串探测曾在**四个**位点使用：record 预存扫描、hint 命中、
+# backfill 定位、hitter 计数。前缀是「同族墙」语义，只该给组织升级计数
+# （``note_distinct_hitter``，**保留前缀不动** —— 深挖定谳防 R7 倒退）；
+# 定位与广播必须走**全签名 + 工具名**的精确等值 —— 两条不同错误共享前缀时
+# （截断 + 归一完全可能造出这种塌缩），前缀匹配会把 A 的解法广播给 B、把
+# 回填落进别条（「错解比无解更贵」）。旧行缺 metadata 字段即视为不匹配
+# （批 C 已拍板接受搁浅，不做兼容双判据 —— 那会变成两份判据）。
+#
+# 为什么元组等值 ⇔ module_id 等值：``make_module_id(project, tool, sig)`` 是
+# (project, tool, sig) 的确定性哈希 —— 同一项目内，``(signature, tool_name)``
+# 元组唯一决定 module_id（写侧同一函数产出），故 backfill 按 module_id 直接
+# 定位与元组精确等值是同一判据的两种形态，不是两份判据。
+
+def _entry_signature_key(meta: dict | None) -> tuple[str, str]:
+    """条目身份键：``(metadata.signature, metadata.tool_name)``（缺字段 = 空串）。"""
+    m = meta or {}
+    return (
+        str(m.get("signature") or ""),
+        str(m.get("tool_name") or "").strip(),
+    )
+
+
+def _entry_matches(sig: str, tool_name: str, meta: dict | None) -> bool:
+    """条目 metadata 是否**精确等于** ``(sig, tool_name)`` —— 缺字段 = 不匹配。
+
+    这是 record 预存扫描与 hint 命中的唯一定位判据（TEST_DSH_64 #2 修法
+    第 1 步：结构化精确匹配取代 ``sig[:48]`` 前缀子串探测）。
+    """
+    return _entry_signature_key(meta) == (sig or "", (tool_name or "").strip())
 
 
 async def repair_solution_status(project_id: str) -> int:
@@ -840,8 +979,10 @@ async def backfill_solution(
     solution: str,
     *,
     project_id: str | None = None,
+    module_id: str | None = None,
+    status: str = SOLUTION_STATUS_VERIFIED,
 ) -> bool:
-    """问题解决后把解法回填进既有失败签名条目（R7 恶化项处置）。
+    """问题解决后把解法/回声回填进既有失败签名条目（R7 恶化项处置）。
 
     ``signature_key`` = 规范化失败签名（``signature_of`` 的返回值；executor
     在失败时存入 pending，同 agent **同调用身份**随后一次成功后原样带回
@@ -849,19 +990,25 @@ async def backfill_solution(
     ``project_id`` 定位 per-project DB（executor 在失败/成功两侧都拿得到，
     随 pending 传递；keyword-only 以保持三参位置调用契约）。
 
-    定位 = 同 project、scope='project'、type='failure_signature'、首行
-    **同时**含该签名与 ``tool=<tool_name>``（#11-(c) 写入侧补校验：签名相撞
-    时必须指向正确条目，不许把解法填进别条；与 ``known_signature_hint``
-    同一签名匹配语义）。回填 = 在「根因提示:」行后插入「已验证解法:
-    <solution>」行（UPDATE 整条 content，不加行数，50 行裁剪逻辑不受影响）；
-    经 MemoryService.save_memory 的固定写入方 upsert 落库，写锁与缓存失效
-    沿用既有路径。**同时**把 ``metadata.solution_status`` 置 ``verified``
-    （#16-② 解法必填校验：有解法行 ⇒ 状态位必须为 verified，机检见
-    ``SOLUTION_STATUS_VERIFIED`` 注释）。
+    **定位 = module_id 精确等值（TEST_DSH_64 #2 修法第 2 步，2026-09-19）**：
+    优先用 ``module_id``（pending 随 ``record_failure_signature`` 回传值携带
+    的本次条目键）；缺省按 ``(project_id, tool_name, sig)`` 三元组**重算**
+    （``make_module_id``，与写侧同一函数 —— 元组等值的哈希形态，非两份判据）。
+    ⚠ 旧的 ``sig[:48]`` 前缀扫描 + 最老行优先定位路径**已删除**：两条不同
+    错误共享前缀时它会「落错行」，把回填写进别条（错解比无解更贵）。
+    旧行 module_id 缺失 / 不含 tool（批 C 前形态）即不匹配 —— 搁浅已拍板
+    接受，不做兼容双判据。
 
-    只接受实质解法（``_is_substantive_solution``）；条目已有解法行时幂等
-    跳过（并补写状态位，修占位期的不一致）。best-effort：任何失败只记日志
-    返回 False，绝不影响工具执行。
+    ``status``（#2-3 回声语义降级）：``verified``（默认，人验证过的解法）⇒
+    写「已验证解法:」行 + ``solution_status=verified``；``retried_ok``（同参
+    重试成功的构造性事实）⇒ 写「同参重试:」回声行 + ``solution_status=
+    retried_ok`` —— **不**冒充已验证解法（hint 的携带门只认 verified）。
+
+    只接受实质解法（``_is_substantive_solution``）。幂等：已有「已验证解法:」
+    行 ⇒ 跳过（verified 回填补写状态位；retried_ok 回声不动 —— 真解法权威
+    性高于回声）；已有「同参重试:」行时 verified 回声可升级写入、retried_ok
+    回声跳过不重复。best-effort：任何失败只记日志返回 False，绝不影响工具
+    执行。
     """
     sig = (signature_key or "").strip()
     if not sig or not project_id:
@@ -873,23 +1020,26 @@ async def backfill_solution(
             sig=sig[:60],
         )
         return False
+    if status not in (SOLUTION_STATUS_VERIFIED, SOLUTION_STATUS_RETRIED_OK):
+        # 防御：未知状态按 verified 处理会让脏状态进机检口径，直接拒绝。
+        log.warning(
+            "failure_signature.backfill_bad_status",
+            status=str(status),
+        )
+        return False
     try:
         from hiveweave.services.memory import MemoryService
 
         memory_service = MemoryService()
+        # TEST_DSH_64 #2：module_id 直接定位（取代前缀扫描）。携带键与重算键
+        # 同源（make_module_id(project, tool, sig)），等值 ⇔ (sig, tool) 元组
+        # 等值 —— 单一判据。
+        expected_mid = module_id or make_module_id(project_id, sig, tool_name)
         target = None
         for m in (await memory_service.get_project_memories(project_id)) or []:
             if m.get("type") != "failure_signature":
                 continue
-            fl = (m.get("content") or "").split("\n", 1)[0]
-            if fl.startswith("[失败签名]") and (
-                f"| {sig}" in fl or sig[:48] in fl
-            ):
-                # #11-(c)：签名相撞时按首行 tool= 二次定位 —— 解法必须落到
-                # 与本次成功调用**同工具**的条目上（否则是"错解"，比没有
-                # 解更贵：_signature_has_solution 会认它并对全员广播）。
-                if not _first_line_matches_tool(fl, tool_name):
-                    continue
+            if (m.get("module_id") or "") == expected_mid:
                 target = m
                 break
         if target is None:
@@ -897,6 +1047,7 @@ async def backfill_solution(
                 "failure_signature.backfill_no_entry",
                 sig=sig[:60],
                 tool=tool_name,
+                by_module_id=True,
             )
             return False
         if not target.get("module_id"):
@@ -906,9 +1057,12 @@ async def backfill_solution(
         content = target.get("content") or ""
         metadata = dict(target.get("metadata") or {})
         if _has_verified_solution_line(content):
-            # 幂等跳过，不重复追加；但补齐状态位（历史条目可能只有解法行
-            # 没有 solution_status —— 机检口径要求两者不许分叉）。
-            if metadata.get("solution_status") != SOLUTION_STATUS_VERIFIED:
+            # 已有真解法行：幂等跳过，不重复追加、不被回声降级；verified
+            # 回补状态位（历史条目可能只有解法行没有 solution_status ——
+            # 机检口径要求两者不许分叉）。
+            if status == SOLUTION_STATUS_VERIFIED and (
+                metadata.get("solution_status") != SOLUTION_STATUS_VERIFIED
+            ):
                 metadata["solution_status"] = SOLUTION_STATUS_VERIFIED
                 await memory_service.save_memory(
                     agent_id=_SIGNATURE_WRITER,
@@ -921,8 +1075,20 @@ async def backfill_solution(
                     metadata=metadata,
                 )
             return True
+        if status == SOLUTION_STATUS_RETRIED_OK and _has_retry_echo_line(content):
+            # 回声幂等：同参重试事实已在条目上，不重复追加。
+            return True
         lines = content.splitlines()
-        solution_line = f"{_SOLUTION_LINE_PREFIX} {solution.strip()}"
+        if status == SOLUTION_STATUS_RETRIED_OK:
+            solution_line = f"{_RETRY_ECHO_LINE_PREFIX} {solution.strip()}"
+            metadata["retried_at_ms"] = int(time.time() * 1000)
+            metadata["solution_tool"] = tool_name or ""
+            metadata["solution_status"] = SOLUTION_STATUS_RETRIED_OK
+        else:
+            solution_line = f"{_SOLUTION_LINE_PREFIX} {solution.strip()}"
+            metadata["solved_at_ms"] = int(time.time() * 1000)
+            metadata["solution_tool"] = tool_name or ""
+            metadata["solution_status"] = SOLUTION_STATUS_VERIFIED
         insert_at = None
         for i, line in enumerate(lines):
             if line.startswith("根因提示:"):
@@ -932,9 +1098,6 @@ async def backfill_solution(
             lines.append(solution_line)
         else:
             lines.insert(insert_at, solution_line)
-        metadata["solved_at_ms"] = int(time.time() * 1000)
-        metadata["solution_tool"] = tool_name or ""
-        metadata["solution_status"] = SOLUTION_STATUS_VERIFIED
         await memory_service.save_memory(
             agent_id=_SIGNATURE_WRITER,
             project_id=project_id,
@@ -950,6 +1113,7 @@ async def backfill_solution(
             project_id=project_id,
             tool=tool_name,
             sig=sig[:60],
+            solution_status=status,
         )
         return True
     except Exception as e:

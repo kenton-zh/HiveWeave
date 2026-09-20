@@ -115,6 +115,29 @@ _SUBAGENT_TYPE_TOOLS: dict[str, frozenset[str]] = {
 
 _VALID_SUBAGENT_TYPES = frozenset(_SUBAGENT_TYPE_TOOLS.keys())
 
+#: DONE_TRUNCATED 横幅（TEST_DSH_64 #9，2026-09-19）—— 单一事实源，
+#: ``_run_subagent`` 与 ``_work`` 两处追加点共用（历史上各写一份已漂移过）。
+#: 三事实位分工：① 「预算切断、产出未验」由本横幅声明；② 正文是否完整 /
+#: spill 路径由 offturn 落信封时判定（``_format_body`` / ``_spill_large``，
+#: 只有它知道最终正文长度）；③ 验货指路（git_worktree_status + read_file）
+#: 固定在本横幅与 offturn 的两处落点上。追加前必须查重
+#: （``_append_truncated_banner``）：正文已含标记就不再加 —— 双追加会出
+#: 「横幅双份」的回执。
+_SUBAGENT_TRUNCATED_MARKER = "[SUBAGENT TRUNCATED]"
+_SUBAGENT_TRUNCATED_BANNER = (
+    f"{_SUBAGENT_TRUNCATED_MARKER} The turn budget was exhausted before this "
+    "child finished — the output above may be incomplete and its work "
+    "may not have landed. VERIFY before relying on it: check "
+    "git_worktree_status and read_file for what actually landed."
+)
+
+
+def _append_truncated_banner(text: str) -> str:
+    """给正文追加 DONE_TRUNCATED 横幅；已含标记则原样返回（查重防双份）。"""
+    if _SUBAGENT_TRUNCATED_MARKER in (text or ""):
+        return text
+    return f"{text}\n\n{_SUBAGENT_TRUNCATED_BANNER}"
+
 
 class SpawnSubagentParams(BaseModel):
     """Parameters for spawn_subagent tool."""
@@ -122,12 +145,21 @@ class SpawnSubagentParams(BaseModel):
     model_config = {"populate_by_name": True}
 
     subagent_type: str = Field(
+        # TEST_DSH_64 #5：description 首行给字面示例 —— 真实缺参案例连 prompt
+        # 一起缺，体内校验文案（pydantic 拦截后才可见）对缺参是死代码；示例
+        # 必须在 schema 描述层先到位。⚠ 本字段与 executor.py
+        # TOOL_PARAM_SCHEMAS["spawn_subagent"].properties.subagent_type 是
+        # 双份，改一处必须同步另一处（两份不许漂移）。有意不加默认值（必填
+        # 校验保留）：缺参案例同样缺 prompt，default 救不了，反而让空串流进
+        # 体内再走 err 分支。
         description=(
-            "REQUIRED (no default). One of: 'readonly' | 'write' | 'audit'. "
-            "readonly = read-only scout; audit = run tests/browse + submit "
-            "task (no attestation); write = edit code + git_worktree (parent "
-            "must have SOURCE_WRITE). Missing or invalid value returns an "
-            "error without changing the parent's turn."
+            "必填: subagent_type='write'(实现类) | 'readonly'(侦察) | "
+            "'audit'(审计) —— 例如 {\"subagent_type\": \"write\", "
+            "\"prompt\": \"...\"}。readonly = read-only scout; audit = run "
+            "tests/browse + submit task (no attestation); write = edit code "
+            "+ git_worktree (parent must have SOURCE_WRITE). Missing or "
+            "invalid value returns an error without changing the parent's "
+            "turn."
         ),
         json_schema_extra={"aliases": ["type", "kind"]},
     )
@@ -271,12 +303,12 @@ async def spawn_subagent_tool(
         # 绕到 payload 的 `id()` 上去猜（裸地址，会被复用而误判）。
         text = str(result.get("content") or "(subagent returned no text)")
         if result.get("budget_exhausted"):
+            # TEST_DSH_64 #9：查重后追加 —— _run_subagent 已在 content 尾部
+            # 加过横幅，此处原样双追加会出「横幅双份」回执。
+            text = _append_truncated_banner(text)
             return (
                 True,
-                f"{text}\n\n"
-                "[SUBAGENT TRUNCATED] The turn budget was exhausted before this "
-                "child finished — the output above may be incomplete and its work "
-                "may not have landed. VERIFY before relying on it.",
+                text,
                 OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED,
             )
         return True, text
@@ -482,14 +514,21 @@ _LOGIC_ERROR_STATUS = {400, 401, 402, 403, 404, 409, 422}
 
 
 def _subagent_failure_class(
-    reason: str | None, error_status: int | None = None
+    reason: str | None,
+    error_status: int | None = None,
+    error_code: str | None = None,
 ) -> str:
     """子代理失败分类事实位：upstream（环境瞬断）vs logic（子侧问题）。
 
     42 轮实证（dsh42 青岩×2/方糖、s3c09 潮汐）：错误恒为「subagent
     failed」，父无法区分「上游瞬断可原样重试」与「子逻辑错误需改 prompt」。
-    本判定只读既有事实（子 run 的 error_status + reason 关键字），
+    本判定只读既有事实（子 run 的 error_status + reason 关键字 + error_code），
     证据不足返回 unknown，不臆断。
+
+    跨组契约（TEST_DSH_64，2026-09-19）：错误文本/error_code 含
+    ``stream_idle`` ⇒ upstream —— 断流是上游瞬断，可原样重试。字面量与
+    ``llm/retry.py`` 的 ``STREAM_IDLE_ERROR_CODE = "stream_idle"``（组3 新增）
+    同步；常量就位后可改为 import（现为避免跨组时序耦合用字面量）。
     """
     if error_status is not None:
         try:
@@ -502,8 +541,13 @@ def _subagent_failure_class(
             if es in _LOGIC_ERROR_STATUS:
                 return "logic"
     text = (reason or "").strip().lower()
-    if not text:
+    code = (error_code or "").strip().lower()
+    if not text and not code:
         return "unknown"
+    # stream_idle 判据在通用关键词表之前：表里是 "stream idle"（空格形），
+    # 咬不到下划线形的稳定错误码。
+    if "stream_idle" in text or "stream_idle" in code:
+        return "upstream"
     if any(k in text for k in _UPSTREAM_FAILURE_KEYWORDS):
         return "upstream"
     return "logic"
@@ -517,6 +561,7 @@ async def _record_subagent_step(
     counter: int | None = None,
     reason: str | None = None,
     error_status: int | None = None,
+    error_code: str | None = None,
     child_status: str | None = None,
 ) -> None:
     """P1-6/P2-5：子代理在父 run 的 run_steps 留一条步骤。
@@ -565,11 +610,13 @@ async def _record_subagent_step(
             error = None
             if status != "completed":
                 reason_text = (reason or "unknown reason").strip()
-                # 分类用原始 reason（_subagent_failure_class None-safe）：
-                # 兜底文案「unknown reason」只做展示、不参与分类 —— 否则
-                # 「证据不足」被臆断成 logic，误导父代理改 prompt 而非重试
-                # （审计 P1：docstring 承诺 unknown 不臆断）。
-                failure_class = _subagent_failure_class(reason, error_status)
+                # 分类用原始 reason/error_code（_subagent_failure_class
+                # None-safe）：兜底文案「unknown reason」只做展示、不参与
+                # 分类 —— 否则「证据不足」被臆断成 logic，误导父代理改 prompt
+                # 而非重试（审计 P1：docstring 承诺 unknown 不臆断）。
+                failure_class = _subagent_failure_class(
+                    reason, error_status, error_code
+                )
                 error = (
                     f"subagent failed (status={child_status or status}, "
                     f"class={failure_class}, reason={reason_text[:200]})"
@@ -729,7 +776,9 @@ async def _run_subagent(
                 not timeout_retried
                 and stream_retries < _SUBAGENT_STREAM_RETRIES
                 and _subagent_failure_class(
-                    err_text, result.get("error_status")
+                    err_text,
+                    result.get("error_status"),
+                    result.get("error_code"),
                 )
                 == "upstream"
             )
@@ -837,6 +886,9 @@ async def _run_subagent(
             else str(result["error"])
         ),
         error_status=None if child_ok else result.get("error_status"),
+        # stream_idle 分类判据读稳定错误码（TEST_DSH_64 跨组契约）；
+        # streamer 现未产出该键时为 None，判据自动落回文本层。
+        error_code=None if child_ok else result.get("error_code"),
         child_status=None if child_ok else str(result.get("status") or "error"),
     )
 
@@ -848,12 +900,13 @@ async def _run_subagent(
     # 文案）——`result["content"]` 里那句 "[TURN BUDGET] Hard turn budget
     # exhausted" 届时**只是旁证**，机器判定一律走本字段。
     if result.get("budget_exhausted"):
-        text = (
-            f"{text}\n\n"
-            "[SUBAGENT TRUNCATED] The turn budget was exhausted before this "
-            "child finished — the output above may be incomplete and its work "
-            "may not have landed. VERIFY before relying on it."
-        )
+        # P0-1（TEST_DSH_60）：预算切断**显式穿透**到 _work() 的终态判定。
+        # 这里只是把 streamer 已给出的结构化事实位原样带上（不新增判据、不看
+        # 文案）——`result["content"]` 里那句 "[TURN BUDGET] Hard turn budget
+        # exhausted" 届时**只是旁证**，机器判定一律走本字段。
+        # TEST_DSH_64 #9：横幅统一走 _append_truncated_banner（查重 + 验货
+        # 指路），与 _work() 共用单一事实源。
+        text = _append_truncated_banner(text)
     # 附加 commit 摘要（若有）— 只读本子代理自己的 holder，与其他 spawn 隔离
     for tr in holder.values():
         if tr.get("phase") != "in_progress":

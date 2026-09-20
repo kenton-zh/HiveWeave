@@ -502,7 +502,20 @@ def _format_body(
     kind: str,
 ) -> str:
     text = _redact((payload or "").strip() or "(no output)")
+    fits = len(text) <= _INBOX_CHARS
     spilled = _spill_large(text, agent_id, kind, worktree)
+    # TEST_DSH_64 #9（2026-09-19）DONE_TRUNCATED 三事实位 · 信封侧：
+    # 正文未被收件箱截断时，显式声明「以上正文即子代理完整输出」—— 父不必
+    # 猜 [TRUNCATED] 横幅之下还有没有隐藏下文（旧回执缺这一位，父无从区分
+    # 「正文就是全部」与「正文只是头部」）。判据是本函数自己渲染的前缀常量
+    # （状态→文本单向，不解析自由文本）；溢出分支的事实位由 _spill_large 附
+    # （spill 路径 + 验货指路）。
+    if fits and prefix == OFFTURN_STATE.SUBAGENT_DONE_TRUNCATED.prefix:
+        spilled = (
+            f"{spilled}\n"
+            "(以上正文即该子代理的完整输出，未经收件箱截断；仍需验货 —— "
+            "git_worktree_status + read_file 确认实际落盘。)"
+        )
     return f"{prefix} job={job_id}\n{spilled}"
 
 
@@ -519,15 +532,23 @@ def _spill_large(text: str, agent_id: str, kind: str, worktree: str) -> str:
         )
     except Exception as exc:
         log.debug("offturn_spill_failed", error=str(exc))
+    # TEST_DSH_64 #9：溢出分支同口径补验货指路（子代理用 git_worktree_status
+    # + read_file；bash 产出无 worktree 语义，指路 read_file 即可）。
+    verify_hint = (
+        "git_worktree_status + read_file 验货"
+        if kind == "subagent"
+        else "read_file 验货"
+    )
     head = text[:_INBOX_CHARS]
     if path:
         return (
             f"{head}\n…(truncated)\n"
-            f"(full output saved: {path})"
+            f"(full output saved: {path}; 可用 {verify_hint})"
         )
     return (
         f"{head}\n…(truncated)\n"
-        "(body truncated in inbox; re-run a narrower command for the rest)"
+        "(body truncated in inbox; re-run a narrower command for the rest; "
+        f"可用 {verify_hint})"
     )
 
 
