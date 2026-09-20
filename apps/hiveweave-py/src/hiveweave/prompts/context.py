@@ -129,9 +129,14 @@ def _workspace_block(workspace_path: str | None, role: str = "") -> str:
             "and are team-visible."
         )
     rel = tree_relpath(ws) or ".hiveweave/worktrees"
+    # TEST_DSH_64 #4：不再教「Shared contracts: MAIN docs/」（docs/ 从未是
+    # 共享契约落点，5 个 executor 各撞一次）。shared 契约读 `.hiveweave/shared/`
+    # （跨树可读）；普通 repo 文档合并后自然可见。
     line = (
         f"Workspace: {tag} ({rel}). Relative writes stay here until merge. "
-        f"Shared contracts: MAIN docs/ after merge (empty MAIN is OK)."
+        "Shared contract files: read from `.hiveweave/shared/` (cross-tree "
+        "readable — if not in your tree it will be found in MAIN or sibling "
+        "trees); regular repo docs arrive via git merge."
     )
     if _is_qa_role(role):
         line += " VERIFY/product: bash_main / browse_main only."

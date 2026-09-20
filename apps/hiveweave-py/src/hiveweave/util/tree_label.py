@@ -73,9 +73,19 @@ def cwd_display(cwd: str, relative: str | None = None) -> str:
 # **无单一权威落点**，读侧顺序必须是"本树优先"（否则会把旧版读成本地最新）。
 # ⇒ 该子目录专属的话术下移到 `util/tree_scope.miss_hint_for(subdir)`（与
 # 候选序同处，顺序与文案不会再分家），本常量只留**与子目录无关**的通用部分。
+#
+# 09-19（TEST_DSH_64 #4）：删掉「Shared contracts are MAIN docs/ after merge」
+# ——5 个 executor 各撞一次 docs/ 失败，就是因为本回执文案自己教错路
+# （docs/design-town.md 在 git 历史与 MAIN 磁盘从未存在；共享契约真身是
+# `.hiveweave/shared/`，读侧跨树候选序早已打通）。现口径：shared 契约读
+# `.hiveweave/shared/`（跨树可读，本树没有会自动在 MAIN/兄弟树命中），
+# 普通 repo 文档（代码/README 等）合并后自然可见；并补一句行动指路。
 READ_MISS_HINT = (
-    " Not in this tree. Shared contracts are MAIN docs/ after merge "
-    "(empty MAIN is OK). 平台自管的共享区（`.hiveweave/` 下的共享子目录）读侧会"
+    " Not in this tree. Check `.hiveweave/shared/` for the same file — "
+    "shared contract files: read from `.hiveweave/shared/` (cross-tree "
+    "readable — if not in your tree it will be found in MAIN or sibling "
+    "trees); regular repo docs arrive via git merge. "
+    "平台自管的共享区（`.hiveweave/` 下的共享子目录）读侧会"
     "自动跨树查找并在回执说明在哪棵树命中 —— 具体顺序与落地姿势见命中/缺失"
     "回执里那一段（各子目录不同）。"
 )

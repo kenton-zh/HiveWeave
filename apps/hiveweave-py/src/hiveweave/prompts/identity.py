@@ -164,7 +164,9 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
   (executors and mid-level coordinators doing seam work). Owners write
   there; mid-level review reads there. CEO and HR stay on MAIN and do
   not have a worktree.
-  Shared contracts teammates read live on MAIN (`docs/`) after merge.
+  Shared contract files: read from `.hiveweave/shared/` (cross-tree readable
+  — if not in your tree it will be found in MAIN or sibling trees); regular
+  repo docs arrive via git merge.
 - **Official evidence location (TEST19 ⑥)**: task evidence goes to
   `.hiveweave/reports/<task-shortId>/` (`evidence*.md`, `test*.log`).
   **reports 可读**：`read_file` / `list_files` 直接给 `.hiveweave/reports/<taskId>/...` 路径即可（平台自动从 MAIN 取，含 QA 预研/取证材料）——不要用别的 shell 工具裸读、不要翻别的 agent 的树。被取消任务的目录会有 CANCELLED.md 标记，里面的材料不作为有效验收依据。
@@ -207,7 +209,7 @@ _MECHANISMS_BLOCK = """## PLATFORM MECHANISMS — 工作前必读（不用试错
 - approve 一个 verdict=FAIL 的提交会**自动转 rework**(强制返修),不会静默关停——FAIL 只能被修复翻转,或被用户显式决策放行。
 
 ### 5. Worktree 隔离与合并
-- executor 与做接缝的中层有**独立 worktree**(`.hiveweave/worktrees/<你的shortId>/`):写代码只写自己的树;MAIN `docs/` 与 `.hiveweave/shared/` 团队共享。
+- executor 与做接缝的中层有**独立 worktree**(`.hiveweave/worktrees/<你的shortId>/`):写代码只写自己的树;共享契约文件读 `.hiveweave/shared/`(跨树可读——本树没有会自动在 MAIN/兄弟树命中),普通 repo 文档 merge 后在 MAIN 自然可见。
 - 提交前 `git_worktree_checkpoint`(工作树清洁);审核人读你的树判"改没改"(不是 MAIN);approve 后 `git_worktree_merge` 进 MAIN。
 - MAIN 有新提交要进你的树:`git_worktree_sync`——untracked 撞车自动进隔离区(可恢复)、dirty 自动 checkpoint、可预判的内容冲突**默认提前拒绝**;要**把冲突制造出来就地手工解**就用 `mode=materialize_conflict`(冲突留在树里,解完自己 `git add`+commit,或 `mode=abort` 退回)。裸跑 `git merge main` 没有这三样护栏(平台不拦,但收拾的是你)。
 - **禁自审**:不能 review 自己 assignee 的任务;merge 自己分支要求该任务已 approved 且批准人≠你(否则拒)。

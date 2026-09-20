@@ -105,6 +105,11 @@ OUT_OF_BOUNDARY_HINT = (
     "平台自管共享产物（``.hiveweave/reports/``、``.hiveweave/shared/`` 等"
     "四目录）会由读侧自动跨树查找并说明在哪棵树命中，**不需要**手写别的树"
     "的路径；写自己的文件请用相对路径（相对你所在的那棵树）。"
+    # TEST_DSH_64 #10①：补官方时序指路——此前只讲读侧与相对路径，没讲
+    # 「想在合并前验证还没 merge 的实现怎么办」，agent 只能试错撞墙。
+    "合并前要验证叶子实现：等 merge 后在 MAIN 验证，或先 "
+    "``git_worktree_merge(dryRun=true)`` 查前置条件；跨树只读需求请该树 "
+    "assignee 代跑/贴结果。"
 )
 
 

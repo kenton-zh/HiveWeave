@@ -17,7 +17,12 @@ def test_pin_rewrites_wrong_short_id_paths():
     assert "[WORKTREE PIN]" in msg
     assert "A005" in msg
     assert "Writes: this tree only" in msg
-    assert "MAIN docs/" in msg
+    # TEST_DSH_64 #4：shared 契约读 `.hiveweave/shared/`（跨树可读），
+    # 不再把 shared 契约指向 MAIN docs/。
+    assert "MAIN docs/" not in msg
+    assert ".hiveweave/shared/" in msg
+    assert "cross-tree readable" in msg
+    assert "regular repo docs arrive via git merge" in msg
     assert "Do NOT edit project root" not in msg
     assert "Review unmerged" not in msg
     assert "git_worktree_merge" not in msg

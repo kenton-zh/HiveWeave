@@ -22,6 +22,21 @@ log = structlog.get_logger(__name__)
 
 # ── get_tasks ───────────────────────────────────────────
 
+# TEST_DSH_64 #7①：截断显式化的取回指针（渲染行内长字段 → 单任务全文）。
+_FULL_VIEW_POINTER = 'get_tasks(taskId="{id}")'
+
+
+def clip_with_pointer(text: str | None, limit: int, pointer: str) -> str:
+    """截断 + 显式截断标记 + 全文取回指路（TEST_DSH_64 #7①）。
+
+    截断必须自含出处：模型看到 ``…[truncated n/total chars — full: <pointer>]``
+    才知道去哪取全文，而不是把半截文本当全文引用。未超限时原样返回。
+    """
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f" …[truncated {limit}/{len(s)} chars — full: {pointer}]"
+
 
 class GetTasksParams(BaseModel):
     """Parameters for get_tasks tool."""
@@ -37,6 +52,17 @@ class GetTasksParams(BaseModel):
         alias="assigneeId",
         description="Filter by assignee agent ID (optional).",
         json_schema_extra={"aliases": ["assigneeId", "assignee_id", "assignee"]},
+    )
+    task_id: str | None = Field(
+        default=None,
+        alias="taskId",
+        description=(
+            "Optional single-task view: return only this task (full id, or a "
+            "unique 8+ char prefix). Long fields such as review_feedback are "
+            "returned in full in this view — use it to read the complete text "
+            "behind a 'truncated' pointer in the listing."
+        ),
+        json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
 
 
@@ -58,8 +84,34 @@ async def get_tasks_tool(
         tasks = await ts.list_tasks(
             project_id, status=params.status, assignee_id=params.assignee_id
         )
+        # TEST_DSH_64 #7①：单任务视图 —— 截断指针承诺的全文取回通道。
+        # 整 id 精确匹配；否则接受唯一 8+ 前缀（与 claim/submit 的解析口径
+        # 一致）；前缀撞多辆 → 报歧义拒绝。
+        wanted = (params.task_id or "").strip()
+        single_task_view = bool(wanted)
+        if single_task_view:
+            exact = [t for t in tasks if str(t.get("id") or "") == wanted]
+            if exact:
+                tasks = exact
+            else:
+                prefixed = [
+                    t for t in tasks
+                    if str(t.get("id") or "").startswith(wanted)
+                ]
+                if len(prefixed) > 1:
+                    return ToolResult.err(
+                        f"taskId '{wanted}' is ambiguous — "
+                        f"{len(prefixed)} tasks share this prefix. Copy the "
+                        "entire id from the listing."
+                    )
+                tasks = prefixed
         if not tasks:
             body = "No tasks found matching the filters."
+            if single_task_view:
+                body = (
+                    f"No task matching taskId='{wanted}'. Copy the entire id "
+                    "from the get_tasks listing."
+                )
             try:
                 from hiveweave.llm.streamer import _build_obligations_snapshot
                 snap = await _build_obligations_snapshot(agent_id)
@@ -367,7 +419,14 @@ async def get_tasks_tool(
                 )
             case = case_by_verify.get(tk) or case_by_original.get(tk)  # type: ignore[assignment]
             if case:
-                notes = (case.get("review_notes") or "").replace("\n", " ")[:120]
+                # TEST_DSH_64 #7①：截断必须显式标记 + 指路（单任务视图不截）。
+                notes_full = (case.get("review_notes") or "").replace("\n", " ")
+                notes = (
+                    notes_full if single_task_view
+                    else clip_with_pointer(
+                        notes_full, 120, _FULL_VIEW_POINTER.format(id=tk)
+                    )
+                )
                 lines.append(
                     f"    verification_case: status={case.get('status')}, "
                     f"merge={str(case.get('merge_commit_hash') or '')[:12] or '—'}, "
@@ -383,21 +442,35 @@ async def get_tasks_tool(
             # 返工后 assignee 靠本字段自助取全文，不再人肉找 reviewer 复述。
             rf = ev.get("review_feedback") if isinstance(ev, dict) else None
             if rf:
-                # 全文放结构化字段；行内截 400 防长反馈撑爆 listing
-                #（审计 P3-7，同表其他字段的截断纪律）。
+                # 全文放结构化字段；listing 行内截 400 防长反馈撑爆列表
+                #（审计 P3-7），截断显式标记 + get_tasks(taskId=…) 指路
+                #（TEST_DSH_64 #7①：单任务视图给全文）。
                 t["review_feedback"] = rf
                 reviewed_by = ev.get("reviewed_by") or "?"
+                shown_rf = (
+                    str(rf) if single_task_view
+                    else clip_with_pointer(
+                        str(rf), 400, _FULL_VIEW_POINTER.format(id=tk)
+                    )
+                )
                 lines.append(
                     f"    review_feedback (from {str(reviewed_by)[:12]}): "
-                    f"{str(rf)[:400]}"
+                    f"{shown_rf}"
                 )
             if isinstance(ev, dict) and ev.get("verification_case") and not case:
                 vc = ev["verification_case"]
                 if isinstance(vc, dict):
+                    vc_notes_full = str(vc.get("review_notes") or "")
+                    vc_notes = (
+                        vc_notes_full if single_task_view
+                        else clip_with_pointer(
+                            vc_notes_full, 80, _FULL_VIEW_POINTER.format(id=tk)
+                        )
+                    )
                     lines.append(
                         f"    verification_case(evidence): "
                         f"status={vc.get('status')}, "
-                        f"notes={str(vc.get('review_notes') or '')[:80]}"
+                        f"notes={vc_notes}"
                     )
         # Informational (TEST11 #7): creator tracking of running work —
         # not an obligation, just a Lead visibility partition.
@@ -431,3 +504,39 @@ async def get_tasks_tool(
         return ToolResult.ok(body, tasks=tasks)
     except Exception as e:
         return ToolResult.err(f"Failed to list tasks: {e}")
+
+
+def _expose_task_id_to_gate() -> None:
+    """把 ``GetTasksParams.taskId`` 同步进 executor 的手写门禁 schema。
+
+    ``TOOL_PARAM_SCHEMAS["get_tasks"]`` 是 executor.py 里的**手写** schema
+    （本组所有权禁改 executor.py），但别名棘轮
+    （``test_no_new_unreachable_aliases_ratchet``）要求 pydantic 声明与
+    门禁两侧同步，否则模型照 clip 截断指针调 ``get_tasks(taskId=…)``
+    会被 Unknown parameters 拒——单任务全文视图就永远兑现不了。
+    executor 在 tools 包 ``__init__`` 里先于本模块导入（:23 vs :48），
+    延迟导入无环；失败静默（棘轮测试会兜底报警）。
+    """
+    try:
+        from hiveweave.tools.executor import TOOL_PARAM_SCHEMAS
+
+        schema = TOOL_PARAM_SCHEMAS.get("get_tasks")
+        if not schema:
+            return
+        props = schema.setdefault("properties", {})
+        if "taskId" not in props:
+            props["taskId"] = {
+                "type": "string",
+                "aliases": ["task_id"],
+                "description": (
+                    "Single-task view: full task id (or unique 8+ char "
+                    "prefix). Long fields such as review_feedback return "
+                    "untruncated — use it to read the full text behind a "
+                    "'truncated' pointer in the listing."
+                ),
+            }
+    except Exception:
+        pass
+
+
+_expose_task_id_to_gate()

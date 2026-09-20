@@ -38,7 +38,7 @@ import structlog
 
 from hiveweave.util import path_guard
 from hiveweave.util.subprocess_decode import decode_subprocess_output
-from hiveweave.util.tree_label import cwd_display
+from hiveweave.util.tree_label import cwd_display, tree_tag
 from hiveweave.tools.fact_positions import classify_error_text
 from hiveweave.tools.result import finalize_fact_dict
 # F5（2026-09-17）：spawn 面事实的**唯一登记点**（决策面 + 加固面 + 执行面）。
@@ -1343,6 +1343,70 @@ def _is_within_workspace(candidate: str, workspace: str) -> bool:
         return False
 
 
+def _foreign_worktree_exists(foreign_id: str, ws: str) -> bool:
+    """被引用的那棵 worktree 在盘上是否实存（TEST_DSH_64 #10②）。
+
+    候选位置：本树的同级兄弟目录（标准/搬迁布局共用的 worktrees 父目录）
+    + 按项目根布局反推的 ``<root>/.hiveweave/worktrees/<id>``。
+    """
+    own_id = path_guard.worktree_id_in_path(ws)
+    candidates: list[Path] = []
+    if own_id:
+        candidates.append(Path(ws).parent / foreign_id)
+        try:
+            parts = Path(ws).resolve().parts
+        except (OSError, ValueError):
+            parts = ()
+        cf = [x.casefold() for x in parts]
+        for i in range(len(cf) - 2):
+            if cf[i] == ".hiveweave" and cf[i + 1] == "worktrees":
+                if i > 0:
+                    candidates.append(
+                        Path(*parts[:i]) / ".hiveweave" / "worktrees" / foreign_id
+                    )
+                break
+    else:
+        candidates.append(Path(ws) / ".hiveweave" / "worktrees" / foreign_id)
+    for c in candidates:
+        try:
+            if c.exists():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _cwd_missing_error(cwd: str, requested: str | None, ws: str) -> str:
+    """cwd 存在性失败的回执文案（TEST_DSH_64 #10② 误报修正）。
+
+    现场签名：worktree 内 agent 把 workdir 写成 ``.hiveweave/worktrees/<别的
+    id>`` ⇒ 相对拼接出本树内的双嵌套路径 ⇒ 不存在 ⇒ 旧文案报「does not
+    exist」，但那棵树**实存**（只是不在你的边界内），且 ``cwd_display`` 把
+    自己树标签与请求路径两个 id 混排在一行。现在先做真实存在性判断：引用
+    的是别的树且该树在盘上实存 ⇒ 报「存在但越界」（自带 ``[worktree <id>]``
+    归因头，``with_cwd_display`` 见头即跳过，不再叠加混排行）；真实缺失才
+    报 does not exist（旧文案原样保留）。
+    """
+    req = (requested or "").strip().strip("\"'")
+    if req and path_guard.is_foreign_worktree_ref(req, ws):
+        foreign_id = path_guard.worktree_id_in_path(req) or "?"
+        # 路径段抽取出 "."/".." 不是树 id（相对穿越），不按越界归因
+        if foreign_id not in {".", ".."} and _foreign_worktree_exists(foreign_id, ws):
+            own_tag = tree_tag(ws)
+            req_posix = req.replace("\\", "/")
+            return (
+                f"Error: directory exists but is outside your tree boundary "
+                f"([{own_tag}]) — requested: {req_posix}. "
+                "那是别的 agent 的 worktree，shell 不能进入；跨树只读用 "
+                "read_file / list_files（读侧自动跨树查找），代跑/贴结果请找"
+                f"该树 assignee（worktree {foreign_id}）。"
+            )
+    return (
+        f"Error: Working directory does not exist: "
+        f"{cwd_display(cwd, requested)}"
+    )
+
+
 def _truncate_output(output: str) -> str:
     """Light-weight truncation: cap at 1MB (layer 2, bash-specific).
 
@@ -2598,9 +2662,10 @@ async def execute_bash(
         # F4 补接线：cwd 不存在 = 命令从未执行（runner_failed）。
         # 该签名在 TEST_DSH_50/51 各出现 2~3 次（幽灵 worktree 前缀路径），
         # 全部因未置位而落在观测盲区里。
+        # TEST_DSH_64 #10②：先做真实存在性判断——引用的是实存的别的树时
+        # 报「存在但越界」，不再误报 does not exist / 混排两个树 id。
         return finalize_fact_dict({"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: "
-                         f"{cwd_display(cwd, workdir)}",
+                "error": _cwd_missing_error(cwd, workdir, ws),
                 "blocked": True, "fact": "runner_failed"})
 
     cwd_hint = _cwd_style_hint(cwd)
@@ -2805,9 +2870,9 @@ async def execute_run_command(
 
     if not Path(full_cwd).exists():
         # F4 补接线：run_command 侧的同一签名（与上面 pwsh 侧对称）。
+        # TEST_DSH_64 #10②：同 execute_bash —— 存在但越界 ≠ does not exist。
         return finalize_fact_dict({"success": False, "output": "",
-                "error": f"Error: Working directory does not exist: "
-                         f"{cwd_display(full_cwd, cwd)}",
+                "error": _cwd_missing_error(full_cwd, cwd, ws),
                 "blocked": True, "fact": "runner_failed"})
 
     # A-2 (P1-4): 未显式给超时时按工具声明取默认（run_command 保持 120s）。

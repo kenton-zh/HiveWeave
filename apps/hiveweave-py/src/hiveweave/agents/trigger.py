@@ -55,6 +55,12 @@ _WATCHDOG_CONTEXT_MARKERS = ("看门狗", "[SILENCE]", "[WAIT_TIMEOUT]")
 _STEER_INBOX_MIN_INTERVAL_S = 60.0
 _steer_inbox_last: dict[str, float] = {}
 
+# TEST_DSH_64 #7②：steer 预览截断必须显式标记。这条是 mid-turn 注入、
+# 不落库，标记必须自含出处（全文本来就落 inbox，指路成立）。
+_STEER_TRUNC_MARK = " …[truncated — full message in your inbox]"
+_STEER_BODY_LIMIT = 240
+_STEER_TOTAL_LIMIT = 1200
+
 
 async def _try_steer_busy_inbox(agent: Any, agent_id: str) -> bool:
     """turn 进行中把可唤醒 inbox 摘要插入 steer 队列（限频）。
@@ -94,11 +100,21 @@ async def _try_steer_busy_inbox(agent: Any, agent_id: str) -> bool:
         body = inbox_digest_content(m) or ""
         # TEST_DSH_32 P2：90 字符会把 REWORK 反馈腰斩成「前半句」——
         # 放宽到 240/条、1200 总长（仍防长清单刷屏），全文走正式 digest。
-        lines.append(f"- from={str(m.get('from_agent_id') or 'system')[:12]}: {body[:240]}")
+        # TEST_DSH_64 #7②：被截断时追加显式标记（原文静默腰斩，模型会把
+        # 半截文本当全文引用；全文落 inbox，指路自含成立）。
+        if len(body) > _STEER_BODY_LIMIT:
+            body = body[:_STEER_BODY_LIMIT] + _STEER_TRUNC_MARK
+        lines.append(f"- from={str(m.get('from_agent_id') or 'system')[:12]}: {body}")
     text = (
         "[INBOX] 你 turn 进行中有新消息待响应（turn 结束后仍会正式处理，"
         "现在按需优先插队处理即可）：\n" + "\n".join(lines)
-    )[:1200]
+    )
+    if len(text) > _STEER_TOTAL_LIMIT:
+        # 整体截断同样显式标记（预算含标记，总长不破 1200）。
+        text = (
+            text[:_STEER_TOTAL_LIMIT - len(_STEER_TRUNC_MARK)].rstrip()
+            + _STEER_TRUNC_MARK
+        )
     try:
         # steer 仅做上下文注入，不落库已读/不回执；agent 看到后可自行决定
         # 「先插队处理」或「继续当前工作、稍后处理」。
