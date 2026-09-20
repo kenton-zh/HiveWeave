@@ -577,6 +577,59 @@ async def _assignee_is_verify_only(
                 pass
 
 
+async def _stranded_scan_candidates(
+    *,
+    tid: str,
+    assignee: str,
+    has_merge: bool,
+    sid_by_agent: dict[str, str],
+    workspace_path: str,
+) -> list[str]:
+    """closed 任务的 stranded 候选分支：``hw/<sid>/t-<8>`` + work 分支兜底。
+
+    TEST_DSH_64：原死注释「Also check hw/<sid>/work fallback」悬空未实现
+    —— ``hw/%/t-<8>`` 模式匹配不上 agent 的稳定工作分支，stranded 扫描
+    对「证据 checkpoint 在 ``hw/<x>/work``」失明（64 现场即此形态）。
+    兜底**只补「报告」面**：仅**无合并事实**的任务追加 work 分支候选 ——
+    有合并事实的任务仍走 t-<8> 候选并按 ``if has_merge:`` 拍板
+    （2026-07-28 Sage W1）重开义务，语义不变；work 是 agent 长驻共享
+    分支（可能载着其它任务的未合并提交），不得作为重开义务的依据，
+    只报告。git 查询失败按无候选（不猜）。
+    """
+    task_branch = f"hw/%/t-{tid[:8]}"
+    ok_tb, tb_out = await _git(
+        ["branch", "--list", task_branch, "--format=%(refname:short)"],
+        workspace_path,
+    )
+    candidate_branches = (
+        [ln.strip() for ln in (tb_out or "").splitlines() if ln.strip()]
+        if ok_tb
+        else []
+    )
+    if not has_merge:
+        sid = sid_by_agent.get(str(assignee))
+        if sid:
+            ok_wb, wb_out = await _git(
+                [
+                    "branch", "--list",
+                    f"hw/{sid}/work",
+                    "--format=%(refname:short)",
+                ],
+                workspace_path,
+            )
+            if ok_wb:
+                # 精确过滤:work 兜底只认 hw/<sid>/work 本身——
+                # 模式无通配符时 git 只会返回该分支,这里再滤一道,
+                # 防将来模式改 glob 时任务分支混进报告面(测试钉住)。
+                _exact = f"hw/{sid}/work"
+                candidate_branches.extend(
+                    ln.strip()
+                    for ln in (wb_out or "").splitlines()
+                    if ln.strip() == _exact
+                )
+    return candidate_branches
+
+
 async def reconcile_worktrees(workspace_path: str) -> dict:
     """孤儿回收对账 (P0) — 注册表 / 磁盘 / 任务表三方核对。
 
@@ -933,6 +986,27 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
             _raw_rows = await cur.fetchall()
             await cur.close()
             rows = [dict(r) for r in _raw_rows]
+            # assignee short_id 批量解析（下面 hw/<sid>/work 兜底要用；
+            # meta 库单查一次，失败按无兜底 —— 只影响「报告」面，不阻断
+            # reconcile 本身）。
+            _sid_by_agent: dict[str, str] = {}
+            _assignee_ids = sorted({
+                str(r.get("assignee_id") or "") for r in rows
+            } - {""})
+            if _assignee_ids:
+                try:
+                    from hiveweave.db import meta as _meta_agents
+
+                    _ph = ",".join("?" * len(_assignee_ids))
+                    _arows = await _meta_agents.query(
+                        f"SELECT id, short_id FROM agents WHERE id IN ({_ph})",
+                        _assignee_ids,
+                    )
+                    for _a in _arows or []:
+                        if _a["id"] and _a["short_id"]:
+                            _sid_by_agent[str(_a["id"])] = str(_a["short_id"])
+                except Exception:
+                    pass
             stranded: list[str] = []
             for row in rows:
                 ev_raw = row.get("evidence") or "{}"
@@ -961,16 +1035,13 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                 if not assignee or not tid:
                     continue
                 # Try to find a branch matching this task
-                task_branch = f"hw/%/t-{tid[:8]}"
-                ok_tb, tb_out = await _git(
-                    ["branch", "--list", task_branch, "--format=%(refname:short)"],
-                    workspace_path,
+                candidate_branches = await _stranded_scan_candidates(
+                    tid=tid,
+                    assignee=str(assignee),
+                    has_merge=has_merge,
+                    sid_by_agent=_sid_by_agent,
+                    workspace_path=workspace_path,
                 )
-                candidate_branches = (
-                    [ln.strip() for ln in (tb_out or "").splitlines() if ln.strip()]
-                    if ok_tb else []
-                )
-                # Also check hw/<sid>/work fallback
                 for cb in candidate_branches:
                     if cb in merged_set:
                         continue  # already in main — fine

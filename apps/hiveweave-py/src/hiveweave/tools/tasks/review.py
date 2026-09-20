@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -156,6 +157,30 @@ async def review_task_tool(
                 f"Task {task.get('id') or params.task_id} is archived and "
                 "cannot be reviewed (full id above — copy directly). "
                 f"It has been cancelled by a coordinator."
+            )
+
+        # TEST_DSH_64 #6：终态（closed）短路 —— 必须排在身份门**之前**
+        # （挨着上面的 archived 检查）。64 现场：assignee 在已 closed 的
+        # VERIFY 上重试评审，先撞 VERIFY 身份门（要求 CEO/独立评审），
+        # 老文案把人引去补身份资格，而真正的状态事实「任务已关闭」被
+        # 身份门挡住带不出来。终态不可评审是状态事实，先于一切资格判断。
+        # 回 **ok**（不进失败签名池，设计意图）：本次调用确实零状态变更、
+        # 无可重试之事。approved 分支**不动**——下方 :669 附近的 err 文案
+        # 自带 rework 指路，那是现存合法推翻通道，保留原语义。
+        if (task.get("status") or "").lower() == "closed":
+            closed_at = task.get("closed_at")
+            when = ""
+            if closed_at:
+                try:
+                    when = time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(int(closed_at) / 1000)
+                    )
+                except (TypeError, ValueError, OverflowError, OSError):
+                    when = ""
+            return ToolResult.ok(
+                f"Task {str(task.get('id') or params.task_id)[:8]} 已于 "
+                f"{when or '（关闭时间未知）'} 关闭——无需评审，本次调用"
+                "未做任何状态变更。"
             )
 
         # D1: VERIFY 审门 —— 如果有有效的 waiver，跳过所有身份门禁。
@@ -966,6 +991,43 @@ async def review_task_tool(
             )
 
             if ts._is_verify_task(task_after or task):
+                # TEST_DSH_64 #2：早退回执必须带上 worktree 领先事实。
+                # 此前一律「No git_worktree_merge needed」—— 64 现场终验
+                # 证据 checkpoint 在 hw/<x>/work（领先 main N 提交）从未合
+                # MAIN，回执却叫人别 merge ⇒ 证据滞留分支。ahead>0 时改述
+                # 事实并给 merge/waive 出路；ahead=0 / 无法判定（None，git
+                # 故障 fail-open）保持原文案。approve 本身仍成功（信息性
+                # 回执，硬门在 delivery blocker 的 EVIDENCE_NOT_LANDED）。
+                v_asg = (task_after or {}).get("assignee_id")
+                v_wt = await agent_worktree_path(v_asg) if v_asg else None
+                v_main = await project_main_workspace(project_id)
+                v_ahead = (
+                    await worktree_commits_ahead(v_main, v_wt)
+                    if v_main and v_wt
+                    else 0
+                )
+                if v_ahead:
+                    v_short = ""
+                    if v_asg:
+                        try:
+                            from hiveweave.services.org import OrgService
+
+                            _va = await OrgService().resolve_agent(v_asg)
+                            v_short = (_va or {}).get("short_id") or ""
+                        except Exception:
+                            v_short = ""
+                    if not v_short and v_wt:
+                        # 兜底：worktree 规范路径 .hiveweave/worktrees/<sid>
+                        v_short = Path(v_wt.replace("\\", "/")).name
+                    return ToolResult.ok(
+                        "VERDICT: APPROVE. "
+                        f"VERIFY task {params.task_id} approved — parent "
+                        "closed. "
+                        f"注意：分支 hw/{v_short or '?'}/work 领先 main "
+                        f"{v_ahead} 提交（可能含终验证据文件）——请 "
+                        "git_worktree_merge 该分支或显式 waive_merge，"
+                        "否则证据滞留分支。" + tf_note
+                    )
                 return ToolResult.ok(
                     "VERDICT: APPROVE. "
                     f"VERIFY task {params.task_id} approved — parent closed. "

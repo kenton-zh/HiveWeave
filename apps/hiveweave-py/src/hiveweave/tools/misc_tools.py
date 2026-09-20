@@ -517,6 +517,67 @@ async def _auto_submit_merged_running_tasks(
         return []
 
 
+async def _supersede_merge_pending_after_merge(
+    project_id: str,
+    caller_agent_id: str,
+    *,
+    task_id: str | None,
+    branches: list[str | None],
+) -> None:
+    """merge 成功 ⇒ 清掉该任务的 [MERGE PENDING] / [MERGE PROXY] 待办。
+
+    不变式：**通知发出与清理必须成对**（approve 经
+    ``_inject_merge_pending_wake`` 发出 ⇒ merge 成功 / waive / close 清除）。
+    此前 approve 注入的提醒在 merge 成功路径从不清除，owner 收件箱堆着
+    已完成事项的假账（TEST_DSH_64 #8 现场：4 个清账回合、17 LLM + 17
+    tool 全耗在向已合并的任务对账）。
+
+    清理对象 = 任务 id 前 8 位（t-<8> 分支反查 + params.taskId）+ 不编码
+    任务 id 的分支名本身（``hw/<sid>/work`` 的 wake 正文含 branchName）；
+    收件人 = caller + 按 id 反查出的 merge owner（creator/reviewer 经
+    ``resolve_merge_owner``，第三方代审场景 caller ≠ owner）。对非收件人
+    调 supersede 是无害的（UPDATE 0 行）。失败只记日志，不回滚 merge。
+    """
+    try:
+        from hiveweave.db import project as project_db
+        from hiveweave.services.inbox import InboxService
+        from hiveweave.services.tasks.verify import resolve_merge_owner
+
+        tid_tokens: set[str] = (
+            {str(task_id)[:8].lower()} if task_id else set()
+        )
+        branch_tokens: set[str] = set()
+        for br in {b for b in branches if b}:
+            m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(br))
+            if m:
+                tid_tokens.add(m.group(2).lower())
+            else:
+                # hw/<sid>/work 等稳定分支不编码任务 id：用分支名做指纹。
+                branch_tokens.add(str(br))
+        owners = {caller_agent_id}
+        if tid_tokens:
+            conn = await project_db.get_project_db_by_project_id(project_id)
+            cur = await conn.execute(
+                "SELECT id, creator_id, reviewer_id FROM tasks WHERE "
+                + " OR ".join("id LIKE ?" for _ in tid_tokens),
+                [f"{t}%" for t in sorted(tid_tokens)],
+            )
+            for r in await cur.fetchall():
+                own = resolve_merge_owner(dict(r), caller_agent_id)
+                if own:
+                    owners.add(str(own))
+            await cur.close()
+        for owner in owners:
+            for token in sorted(tid_tokens | branch_tokens):
+                await InboxService().supersede_watchdog_messages(
+                    owner,
+                    prefixes=["[MERGE PENDING]", "[MERGE PROXY]"],
+                    contains=token,
+                )
+    except Exception as e:
+        log.warning("merge_pending_supersede_failed", error=str(e))
+
+
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
@@ -967,6 +1028,15 @@ async def git_worktree_merge_tool(
                 )
         except Exception as e:
             log.warning("merge_obligation_fulfill_failed", error=str(e))
+
+        # #8（TEST_DSH_64）：merge 成功 ⇒ 成对清理本任务/本分支的
+        # [MERGE PENDING] 提醒（发出与清理必须成对，见 helper docstring）。
+        await _supersede_merge_pending_after_merge(
+            project_id,
+            agent_id,
+            task_id=params.task_id,
+            branches=[branch, branch_name],
+        )
 
         # 里程碑主任务结转：同分支 running 任务 merge 后自动 submit
         auto_titles = await _auto_submit_merged_running_tasks(
@@ -1890,6 +1960,8 @@ def _validate_message_user_images(
 #
 # 三条实质判据（FAIL 终验 / approved 未 closed / 未读人工消息）本身是
 # 状态查询、完全可靠 —— 本次换的是「**何时**检查」，不是「检查什么」。
+# （2026-09-19 起为**四条**：+ ``EVIDENCE_NOT_LANDED``，TEST_DSH_64 报告
+# #1——它同样只做状态/磁盘查询，不读任何消息文本。）
 DELIVERY_STATE_UNMARKED = "unmarked"   # project_meta.delivery_state IS NULL
 DELIVERY_STATE_COMPLETE = "complete"
 DELIVERY_STATE_BLOCKED = "blocked"     # 平台核验未通过时写入（非 agent 声明）
@@ -1899,6 +1971,13 @@ DELIVERY_STATE_BLOCKED = "blocked"     # 平台核验未通过时写入（非 ag
 POLICY_LEDGER_FAIL_VERDICT = "LEDGER_FAIL_VERDICT"
 POLICY_LEDGER_APPROVED_OPEN = "LEDGER_APPROVED_OPEN"
 POLICY_INBOX_UNREAD_HUMAN = "INBOX_UNREAD_HUMAN"
+# TEST_DSH_64 报告 #1：终验证据滞留产出分支，从未落到 MAIN 工作区磁盘。
+POLICY_EVIDENCE_NOT_LANDED = "EVIDENCE_NOT_LANDED"
+
+# 平台自管证据前缀（EVIDENCE_NOT_LANDED 判据只盯这两类路径：它们由
+# message_user/平台写入 MAIN，是「证据必须可从 MAIN 看到」的承诺面；
+# 业务代码路径走 merge 门，不归本判据管）。
+_EVIDENCE_PLATFORM_PREFIXES = (".hiveweave/reports/", ".hiveweave/shared/")
 
 # 未读人工消息在回执里最多列举几条（只供人读；判定用 COUNT，不受此限）
 _DELIVERY_UNREAD_SAMPLE = 5
@@ -1935,7 +2014,14 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
 
       · ``LEDGER_FAIL_VERDICT``  —— 未解决的 FAIL 终验
       · ``LEDGER_APPROVED_OPEN`` —— approved 未 closed 的任务
-      · ``INBOX_UNREAD_HUMAN``   —— **自己**未读的人工消息（from≠system）
+      · ``INBOX_UNREAD_HUMAN``   —— **自己**未读的人工消息
+      · ``EVIDENCE_NOT_LANDED``  —— VERIFY 证据文件未落到 MAIN 磁盘
+        （TEST_DSH_64 #1，2026-09-19 补）：已 approved/closed 的 VERIFY
+        任务在 ``evidence.files_changed`` 里声称的 ``.hiveweave/reports/``
+        / ``.hiveweave/shared/`` 路径必须真实存在于 **MAIN 工作区磁盘**。
+        判据口径是「磁盘存在」而非「git 已跟踪」—— browse_main 直写的
+        截图是合法 untracked，按 git 跟踪判会误伤；只扫 VERIFY 类 +
+        近 7 天（updated_at）+ 上限 50 条做性能护栏。
 
     未读只计人工消息：系统副本（含平台自身的投递失败回执）不是 CEO 的
     账（TEST_DSH_32 P3）。查询失败 / 无项目 → ``[]``（**fail-open**，与
@@ -2001,6 +2087,72 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
                 "message": f"你还有 {len(rows)}+ 条未读人工消息（{listing}）",
             })
     except Exception:  # noqa: BLE001 — 未读列举失败按无此 blocker（fail-open，与前两条计数同语义，不猜）
+        pass
+
+    # 判据 4（TEST_DSH_64 报告 #1：证据滞留）：已 approved/closed 的 VERIFY
+    # 任务，evidence.files_changed 里带平台自管前缀（.hiveweave/reports/ 或
+    # .hiveweave/shared/）的路径必须真的落到 MAIN 工作区磁盘 —— 64 现场
+    # 4 份终验 md 只 checkpoint 到 hw/A140/work 分支从未合 MAIN，三条旧
+    # 判据零触文件系统 ⇒ ship 照常触发。口径 =「MAIN 磁盘存在」（见
+    # docstring：不按 git 跟踪判，browse_main 直写的 untracked 截图合法）。
+    # 无文件型证据的任务天然不触发；MAIN workspace 解析不出来按无此
+    # blocker（fail-open，同前三条，不猜）。
+    try:
+        from hiveweave.services.worktree_review import (
+            normalize_files_changed,
+            project_main_workspace,
+        )
+
+        main_ws = await project_main_workspace(str(project_id))
+        if main_ws and os.path.isdir(main_ws):
+            week_ago_ms = int(time.time() * 1000) - 7 * 86400 * 1000
+            cur = await conn.execute(
+                "SELECT id, evidence FROM tasks "
+                "WHERE is_archived = 0 AND status IN ('approved','closed') "
+                "AND kind = 'verify' AND updated_at >= ? "
+                "ORDER BY updated_at DESC LIMIT 50",
+                [week_ago_ms],
+            )
+            ev_rows = await cur.fetchall()
+            await cur.close()
+            missing_bits: list[str] = []
+            for ev_row in ev_rows:
+                ev_raw = ev_row["evidence"]
+                try:
+                    ev_obj = (
+                        json.loads(ev_raw)
+                        if isinstance(ev_raw, str)
+                        else ev_raw
+                    )
+                except Exception:
+                    continue
+                if not isinstance(ev_obj, dict):
+                    continue
+                files = (
+                    ev_obj.get("files_changed")
+                    or ev_obj.get("filesChanged")
+                    or []
+                )
+                for rel in normalize_files_changed(list(files or [])):
+                    if not rel.startswith(_EVIDENCE_PLATFORM_PREFIXES):
+                        continue
+                    if not (Path(main_ws) / rel).exists():
+                        missing_bits.append(
+                            f"{rel}（任务 {str(ev_row['id'])[:8]}）"
+                        )
+                        break  # 每任务报一件即可，不刷屏
+            if missing_bits:
+                blockers.append({
+                    "code": POLICY_EVIDENCE_NOT_LANDED,
+                    "message": (
+                        f"{len(missing_bits)} 份终验证据未落到 MAIN 工作区："
+                        + "; ".join(
+                            missing_bits[:_DELIVERY_UNREAD_SAMPLE]
+                        )
+                        + "——需 merge 产出分支或在共享空间补齐"
+                    ),
+                })
+    except Exception:  # noqa: BLE001 — fail-open（docstring：判据故障不得把 CEO 卡成"永远标记不了"）
         pass
     return blockers
 
