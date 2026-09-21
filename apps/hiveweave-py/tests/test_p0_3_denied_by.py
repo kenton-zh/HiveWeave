@@ -151,3 +151,42 @@ def test_hint_still_rate_limited_but_stamp_always_set():
     assert all(r.get("denied_by") == "outside_boundary" for r in seen)
     hits = [("[沙箱提示]" in r["stderr"]) for r in seen]
     assert hits[0] is True and hits.count(True) == 1, hits
+
+
+# ── ⑤ 审计 A1/A2/A5 的回归钉（随 fix commit 入库）────────────
+
+
+def test_relative_path_is_not_judged_outside():
+    """A1①：相对路径无从比边界 ⇒ 不得断言越界（曾误判 outside_boundary）。"""
+    assert classify_denied_by(
+        "Access to the path 'src\\a.txt' is denied.", 1, boundary_root=ROOT
+    ) == "unknown_acl"
+
+
+def test_denial_must_not_borrow_paths_from_other_lines():
+    """A1②：拒绝语句不得与**另一行**的无关引号串拼成「那个文件被拒」。"""
+    stderr = "Set-Content : Access is denied.\n+ Copy-Item 'D:\\tmp\\a.txt'\n"
+    assert classify_denied_by(stderr, 1, boundary_root=ROOT) == "unknown_acl"
+
+
+def test_sealed_accepts_bare_path_too():
+    """A2：`sealed` 传**裸路径**也要生效（曾因 split(":",1) 被砍成 `\\x`）。"""
+    path = ROOT + "\\.git\\config"
+    assert (
+        classify_denied_by(DENIED.format(path), 1, boundary_root=ROOT, sealed=[path])
+        == "sealed_git"
+    )
+    assert (
+        classify_denied_by(
+            DENIED.format(path), 1, boundary_root=ROOT, sealed=["seal:" + path]
+        )
+        == "sealed_git"
+    )
+
+
+def test_drive_root_boundary_prefix_matches():
+    """A5：边界是盘符根时，树内路径不得被判 out（曾因尾分隔符永不匹配）。"""
+    assert (
+        classify_denied_by(DENIED.format("D:\\a\\x.txt"), 1, boundary_root="D:\\")
+        == "no_write_sid"
+    )

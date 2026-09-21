@@ -307,8 +307,11 @@ def _rejection_dialect() -> tuple[str, ...]:
     except Exception:  # noqa: BLE001 — 导入环/未装：退回同值，绝不变成「不认方言」
         return ("Access is denied", "Access to the path", "Permission denied")
 _DENIED_PATH_RE = re.compile(
-    r"(?:path|文件|路径)\s*['\"“](?P<q1>[^'\"”]+)['\"”]\s*(?:的访问被拒绝|is denied)"
-    r"|(?:Access to the path|Access is denied)[^'\"“]*['\"“](?P<q2>[^'\"”]+)['\"”]",
+    # ⚠ 两个分支都**限制在同一行内**：跨行会让 `Access is denied.\n+ Copy-Item 'D:\\x'`
+    # 这类「拒绝与另一条无关语句」被拼成「'D:\x' 被拒」⇒ 在**零证据**下断言越界
+    # （审计 A1②：那正是本条要治的病，不能自己再犯一次）。
+    r"(?:path|文件|路径)\s*['\"“](?P<q1>[^'\"”\n]+)['\"”]\s*(?:的访问被拒绝|is denied)"
+    r"|(?:Access to the path|Access is denied)[^'\"“\n]*?['\"“](?P<q2>[^'\"”\n]+)['\"”]",
     re.IGNORECASE,
 )
 
@@ -341,13 +344,25 @@ def _norm_path(value: str) -> str:
     return os.path.normcase(os.path.normpath(str(value)))
 
 
+#: 封条函数（`service.py::_seal_git_bootstrap_files`）产出的戳前缀。
+#: ⚠ 只剥**已知前缀**（不能 `split(":", 1)`：裸 Windows 路径 `D:\x` 会被砍成 `\x`，
+#: 于是"裸路径也能传"的承诺变成谎报 —— 审计 A2）。
+_SEAL_STAMP_PREFIXES: tuple[str, ...] = (
+    "create+seal:",
+    "seal:",
+    "deny-dc-all:",
+)
+
+
 def _sealed_targets(sealed) -> list[str]:
-    """`sealed` 既可传裸路径，也可传封条函数的戳串（`seal:<p>` / `create+seal:<p>`）。"""
+    """`sealed` 可传裸路径，也可传封条戳串（`seal:<p>` / `create+seal:<p>` / `deny-dc-all:<p>`）。"""
     out: list[str] = []
     for item in sealed or ():
         raw = str(item)
-        if ":" in raw:
-            raw = raw.split(":", 1)[1]
+        for pref in _SEAL_STAMP_PREFIXES:
+            if raw.startswith(pref):
+                raw = raw[len(pref):]
+                break
         out.append(_norm_path(raw))
     return out
 
@@ -374,13 +389,16 @@ def classify_denied_by(
         return "unknown_acl"
 
     sealed_norm = _sealed_targets(sealed)
-    root = _norm_path(boundary_root) if boundary_root else ""
+    root = _norm_path(boundary_root).rstrip(os.sep) if boundary_root else ""
+    # ⚠ 去掉尾分隔符：`normpath("D:\\") == "D:\\"` ⇒ `root + os.sep` 永不匹配，
+    #   盘符根下的一切都会被判 out（审计 A5）。
     sides: set[str] = set()
     for raw in paths:
         pn = _norm_path(raw)
         if any(pn == s or pn.startswith(s + os.sep) for s in sealed_norm):
             return "sealed_git"
-        if not root:
+        # ⚠ 相对路径无从比边界（审计 A1①：`'src\a.txt'` 曾被判 outside）⇒ 计入 "?"
+        if not root or not os.path.isabs(raw):
             sides.add("?")
         elif pn == root or pn.startswith(root + os.sep):
             sides.add("in")
