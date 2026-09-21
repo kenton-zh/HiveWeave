@@ -10,6 +10,7 @@
 
 from typing import Awaitable, Callable
 
+import inspect
 import os
 import structlog
 
@@ -61,6 +62,21 @@ SUMMARY_MARKER = "[Earlier conversation summary]"
 
 # LLM 回调类型：(prompt: str) -> summary_text | None
 LLMCallback = Callable[[str], Awaitable[str | None]]
+#: 支持「带主前缀」的回调（P1-2）：额外收 ``prefix_messages``/``tools``，令**压缩请求
+#: 与主请求共享同一段前缀** ⇒ provider 端前缀缓存可命中（现状 `messages=[{user,prompt}]`
+#: + `tools=None` ⇒ 第 0 个 token 即偏离 ⇒ `cache_read=0`）。
+#: ⚠ 旧回调只收 prompt 文本；调用侧用 `_callback_accepts_prefix` **按参数名**探测后分流，
+#:   **不**用 try/except TypeError（那会把回调内部的真实 TypeError 吞掉并重试一次，掩盖故障）。
+PrefixLLMCallback = Callable[..., Awaitable[str | None]]
+
+
+def _callback_accepts_prefix(cb) -> bool:
+    """回调是否支持 `prefix_messages`（按参数名探测）。"""
+    try:
+        params = inspect.signature(cb).parameters
+    except (TypeError, ValueError):
+        return False
+    return "prefix_messages" in params
 
 
 class Compaction:
@@ -92,6 +108,9 @@ class Compaction:
         messages: list[dict],
         target_budget: int,
         llm_callback: LLMCallback | None = None,
+        *,
+        prefix_messages: list[dict] | None = None,
+        tools: list | None = None,
     ) -> list[dict]:
         """压缩消息列表：LLM 摘要旧消息 + 保留近期消息。
 
@@ -151,7 +170,14 @@ class Compaction:
                 self._format_for_summary(old_messages)
             )
             try:
-                summary = await llm_callback(prompt)
+                if _callback_accepts_prefix(llm_callback):
+                    # P1-2：前缀透传给回调（回调再交给 `_call_compactor_llm`）
+                    summary = await llm_callback(
+                        prompt, prefix_messages=prefix_messages, tools=tools
+                    )
+                else:
+                    # 旧回调（只收 prompt 文本）：行为一字不变
+                    summary = await llm_callback(prompt)
             except Exception as e:
                 logger.warning("compaction_llm_failed", error=str(e))
                 summary = None
@@ -363,6 +389,9 @@ async def _call_compactor_llm(
     max_tokens: int | None = None,
     agent_id: str | None = None,
     kind: str = "conversation",
+    *,
+    prefix_messages: list[dict] | None = None,
+    tools: list | None = None,
 ) -> str | None:
     """Call the configured provider (Chat / Responses / Anthropic / Gemini).
 
@@ -391,12 +420,18 @@ async def _call_compactor_llm(
     budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
 
     for attempt in (1, 2):
+        # ⭐ P1-2（2026-09-21）：**带上主前缀**（`prefix_messages`）+ **真实 tools**。
+        # 现状 `[{user,prompt}]` + `tools=None` ⇒ 第 0 个 token 就与主请求不同 ⇒
+        # provider 前缀缓存必然 miss（`cache_read=0`，基线 `inp=110802`）。
+        # 参数**可选**：不传则维持原行为（7 处直调 `_call_compactor_llm(model, "prompt")`
+        # 与旧回调都不受影响）。
+        # ⚠ **不是**独立 summarizer system prompt —— 前缀必须与主请求**逐字相同**才有意义。
         body = config.build_body(
-            messages=[{"role": "user", "content": prompt}],
+            messages=[*(prefix_messages or []), {"role": "user", "content": prompt}],
             stream=False,
             temperature=SUMMARY_TEMPERATURE,
             max_tokens=budget,
-            tools=None,
+            tools=tools,
         )
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
