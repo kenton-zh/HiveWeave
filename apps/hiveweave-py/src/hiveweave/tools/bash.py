@@ -143,8 +143,7 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 _DEV_SERVER_TRIGGER_RE = re.compile(
     r"(?:"
     r"(?:^|\s|;|&|\|)`?(?:"
-    r"(?:npx\s+)?vite(?:\s|$)"               # vite / npx vite (bare = dev server)
-    r"|(?:pythonw?|python3(?:\.\d+)?|py)(?:\.exe)?\s+-m\s+http\.server(?:\s|$)"
+    r"(?:pythonw?|python3(?:\.\d+)?|py)(?:\.exe)?\s+-m\s+http\.server(?:\s|$)"
     r"|npx\s+(?:-y\s+)?(?:http-server|live-server|serve)(?:\s|$)"
     r"|(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start|serve)(?:\s|$)"
     r"|bun\s+(?:run\s+)?(?:dev|start)(?:\s|$)"
@@ -163,7 +162,16 @@ _DEV_SERVER_TRIGGER_RE = re.compile(
     r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)gunicorn(?:\s+\S|$)"
     r"|uv\s+run\b(?:\s+\S+)*?\s+(?<!\s--with\s)(?<!\s--extra\s)(?<!\s--group\s)(?<!\s--package\s)uvicorn(?:\s+\S|$)"
     r")"
-    # 裸 uvicorn / gunicorn：仅段首（含 VAR=val 前缀），避免 --with uvicorn
+    # 裸 vite / uvicorn / gunicorn：仅**命令词位**（含 VAR=val 前缀）。
+    # vite 原先挂在上面那组的 `(?:^|\s|;|&|\|)` 宽锚下 ⇒ `grep -r vite src/`、
+    # `echo vite`、`rm -rf vite` 这些把 vite 当**参数/路径**的命令全被当成
+    # dev server 路由进 spawn 路径（审计 2026-09-21 实证）。命令词位判定后
+    # 这些一律不路由。
+    # ⚠ `npx` 后的 flag 组必须是**可选**的（`(?:(?:--yes|-y)\s+)?`）：
+    # 写成 `(?:--yes|-y)\s+` 会让 `npx vite` 全系不命中 —— 包括平台自己处方
+    # 让 agent 写的 `npx vite --port <p> --strictPort`，那会导致**不注册**
+    # ⇒ 退回「进程杀不掉 / WinError 32」原病（第三轮审计 P0，既有测试实红）。
+    r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*(?:npx\s+(?:(?:--yes|-y)\s+)?)?vite(?:\s|$)"
     r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?uvicorn(?:\s+\S)"
     r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?gunicorn(?:\s+\S)"
     r"|(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*`?flask\b"
@@ -363,13 +371,23 @@ async def _run_registered_dev_server(
 
         async def _native_spawn():
             return spawn_project_process(
-                command, cwd=cwd, project_id=project_id, preferred_port=port
+                command,
+                cwd=cwd,
+                project_id=project_id,
+                preferred_port=port,
+                # 本函数只在 dev-server 路由分支被调用（调用点均在
+                # `_detect_dev_server_command` 命中之后）⇒ 声明该事实，
+                # 让 prepare_spawn_command 兜底「路由了却没端口」的情况。
+                routed_as_dev_server=True,
             )
 
         async def _confined(ctx) -> dict[str, Any] | None:
             # E10：传 argv（逐元素引用，修剥引号根因）。
             cmd2, extra_env, prep_err, _inj_meta = prepare_spawn_command(
-                command, project_id=project_id, preferred_port=port
+                command,
+                project_id=project_id,
+                preferred_port=port,
+                routed_as_dev_server=True,  # 同上：已在 dev-server 路由分支内
             )
             if prep_err:
                 # F4/L3 → L6 修正（2026-09-11）：`prepare_spawn_command` 的
@@ -3893,7 +3911,12 @@ async def _shell_tool_impl(
     project_id = await get_project_id(agent_id)
     raw_cmd = params.command or ""
     cmd, _env, reserved_err, inj_meta = prepare_spawn_command(
-        raw_cmd, project_id=project_id
+        raw_cmd,
+        project_id=project_id,
+        # 本执行体是 bash/pwsh 的**通用**落点：命令可能已被 dev-server 路由
+        # 判据识别（或路由失败后 fall through 至此）⇒ 把该事实传下去，
+        # 否则「路由了但命令无端口」会裸起默认 5173（= 平台保留端口）。
+        routed_as_dev_server=_detect_dev_server_command(raw_cmd) is not None,
     )
     if reserved_err:
         # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，
@@ -4256,7 +4279,12 @@ async def run_command_tool(params: RunCommandParams, agent_id: str, workspace: s
 
     project_id = await get_project_id(agent_id)
     cmd, _env, reserved_err, inj_meta = prepare_spawn_command(
-        params.command, project_id=project_id
+        params.command,
+        project_id=project_id,
+        # 本工具明令不用于 dev server（见工具描述），但调用方仍可能传 ⇒
+        # 按同一判据声明，使「无端口的 dev 命令」被拒并拿到 `start_dev_server`
+        # 处方，而不是在前台裸起默认 5173（= 平台保留端口）。
+        routed_as_dev_server=_detect_dev_server_command(params.command) is not None,
     )
     if reserved_err:
         # L6（2026-09-11）：改判 **bad_args** —— 模型换个 3000+ 端口即可通过，

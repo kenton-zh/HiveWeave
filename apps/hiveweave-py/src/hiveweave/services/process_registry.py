@@ -64,8 +64,40 @@ _GUNICORN_BIND_PORT_RE = re.compile(
     r"(?:--bind|-b)[= ]\s*(?:(?:\[[^\]]+\]|[\w.-]+):|:)?(\d{2,5})\b",
     re.IGNORECASE,
 )
-_VITE_BARE_RE = re.compile(
-    r"\b(npx\s+)?vite\b|\bnpm\s+run\s+dev\b|\bpnpm\s+(?:run\s+)?dev\b",
+# 裸 dev server（vite / npm run dev / pnpm dev）。
+# ⚠ **段首锚是必需项，不是风格选择**：无锚时 `\bvite\b` 会命中 `.vite` **目录名**
+# 与 `vite.config.ts` **文件名**（词边界在 `.` 与 `v` 之间成立），平台据此把整条
+# 命令尾部追 `--port <P> --strictPort` ⇒ 命令变非法，agent 看到的是 pwsh
+# 「找不到接受自变量 <port> 的参数」，归因指向命令本身。
+# 实证 TEST_DSH_65：本项目 11 次（6 次可见失败 + 5 次静默）、跨项目 120 条 / 21 项目。
+# 与 `_FLASK_RUN_FAMILY_RE` / `_UVICORN_FAMILY_RE` 同族取齐（二者各有段首锚）。
+_SEGMENT_START_RE = r"(?:^|&&|\|\||;|\||&)\s*(?:[A-Za-z_][\w]*=\S+\s+)*"
+# vite 的**非服务子命令**：build / optimize / --version / --help 跑完即退，
+# 不是长驻服务 —— 用**负向前瞻**约束在 `vite` 之后。
+# ⚠ `preview` **不在**本清单：它是**长驻**静态服务器（预览生产构建），
+# 默认 4173 亦在 `RESERVED_PORTS` 内 ⇒ 必须照常被判据拦下。
+# ⚠ 不能用「对整条命令 search 阻塞动词」来排除（那正是原先的写法）：
+# `npm install && npm run dev` 里别处的 `install` 会让排除生效 ⇒ 裸起 5173，
+# 等于用一个新文本旁路换掉旧的；注释里写个 `# TODO test` 也能解除拒斥。
+# 约束必须**贴着它要约束的那一段**。
+# ⚠ 本表是**子命令 token 表**（B 档），但名字不带 `_NEEDLES/_PATTERNS/…` 后缀、
+# 也不是 `re.compile(...)` 常量 ⇒ **落在文本判据棘轮的扫描面之外**（本仓已知缺口，
+# 第三轮审计 P3）。这是**故意**的：它约束的是「`vite` 后面紧跟哪个子命令」这种
+# 半结构化 token 位，不是自由自然语言的意图推断。若日后棘轮扩面到此形态，
+# 应把它改名为 `_VITE_NON_SERVER_SUBCMD_NEEDLES` 并入基线，而不是靠它「看不见」。
+_VITE_NON_SERVER_SUBCMD_NEG = (
+    r"(?!\s+(?:build|optimize|--version|-v|--help|-h)\b)"
+)
+_BARE_DEV_SERVER_RE = re.compile(
+    _SEGMENT_START_RE + r"(?:npx\s+)?vite\b" + _VITE_NON_SERVER_SUBCMD_NEG
+    # `dev\b(?!:…)`：用**紧邻负向前瞻**排除 `dev:test` / `dev:lint` 这类
+    # 「跑完即退」的脚本变体。
+    # ⚠ 不要用 `dev(?:\s|$)` 这种尾部约束 —— 它会把 `npm run dev:staging`、
+    # `npm run dev-server` 一起放行，而那些**是**长驻服务（旧 `\bdev\b` 会拒）
+    # ⇒ 净新增漏网（第三轮审计 P2）。
+    + r"|" + _SEGMENT_START_RE
+    + r"(?:npm|pnpm)\s+(?:run\s+)?dev\b"
+    + r"(?!:(?:test|spec|lint|build|e2e|check|typecheck)\b)",
     re.IGNORECASE,
 )
 # python -m app.server / python app/server.py (module-style; not tests)
@@ -613,10 +645,18 @@ def check_command_reserved_ports(command: str) -> str | None:
                 f"(API/UI). Use a project port (e.g. 3000+) via "
                 f"start_dev_server, not --port {port}."
             )
-    # vite / npm run dev without --port often defaults to 5173
+    # 裸 dev server 无显式端口 ⇒ 会默认启在 5173（平台保留端口）。
+    # ⚠ 判据必须是 `_BARE_DEV_SERVER_RE`，**不得**回退到 `"vite" in lower`
+    # 这种裸子串：它会连 `.vite` 目录名 / `vite.config.ts` 文件名一起拒掉 ——
+    # 那只是把「误改写」换成「误拒绝」，同一个洞换张脸。
+    # ⚠⚠ 「有限输出子命令」的排除**内化在判据里**（`vite` 后负向前瞻 +
+    # `dev(?:\s|$)` 尾部约束），**不再**用 `_SPAWN_BLOCKING_VERB_RE` 对整条
+    # 命令 search —— 那种写法可绕过：`npm install && npm run dev` 里别处的
+    # `install` 会让排除生效 ⇒ 裸起 5173（审计 2026-09-21 P1-b），
+    # 注释里写个 `# TODO test` 同样能解除拒斥。
     lower = (command or "").lower()
     if (
-        ("vite" in lower or "npm run dev" in lower or "pnpm dev" in lower)
+        _BARE_DEV_SERVER_RE.search(command or "")
         and not extract_ports_from_command(command)
         and "--port" not in lower
     ):
@@ -779,6 +819,7 @@ def prepare_spawn_command(
     *,
     project_id: str | None = None,
     preferred_port: int = 3000,
+    routed_as_dev_server: bool = False,
 ) -> tuple[str, dict[str, str], str | None, dict | None]:
     """P2 process proxy: rewrite/guard command + inject reserved-port env.
 
@@ -786,6 +827,11 @@ def prepare_spawn_command(
     ``injection_meta``（F2）: ``{note, injected, final_command}`` 描述平台
     对命令的改写 —— 让调用方把「平台动了什么」回显给 Agent
     （result_excerpt），改写可见才不会被当成模型/命令自身的问题。
+
+    ``routed_as_dev_server``：调用方**已按 dev-server 判定路由**本命令时置 True
+    （`bash.py` 的 `_DEV_SERVER_TRIGGER_RE` 命中后走注册 spawn 路径）。
+    置 True 后若命令最终仍无端口，本函数**拒绝**而非放行 —— 见下方兜底注释。
+    加这个参数的原因：上游路由判据比本模块判据**宽**，两者不齐会漏网。
     """
     extra_env = {
         "HIVEWEAVE_RESERVED_PORTS": ",".join(
@@ -813,6 +859,21 @@ def prepare_spawn_command(
                 None,
             )
 
+    # 裸 dev server 且无显式端口 → 拒斥 + 给唯一出口（**不再代其改写**）。
+    #
+    # 原先本函数另有一块「嗅探到 vite 后替 agent 尾部追加 `--port`」，两条害处：
+    #   ① 判据无段首锚 ⇒ 误命中 `.vite` 目录名 / `vite.config.ts` 文件名，
+    #      把正常命令改成非法命令（P0-1，跨项目 120 条 / 21 项目）；
+    #   ② 它抢在拒斥之前命中 ⇒ agent **永远收不到**「用 start_dev_server」
+    #      这条处方，于是学不会走显式通道，下一轮照样手写（循环不破）。
+    # 该块已删除，改由本处拒斥 + 给处方接管。
+    #
+    # 带端口的命令不受影响：走下方 `if ports` 分支提前 return
+    # （`start_dev_server` 走的正是带端口那条）。
+    _bare_dev_err = check_command_reserved_ports(command)
+    if _bare_dev_err:
+        return command, {}, _bare_dev_err, None
+
     # TEST6 P0-3: exclude in-tree worktrees from glob test runners
     pre_inject_command = command
     injected_command, injection_note = _inject_hiveweave_test_exclude(command)
@@ -829,26 +890,11 @@ def prepare_spawn_command(
     if ports:
         return command, extra_env, None, injection_meta
 
-    # Bare vite/npm run dev → allocate project port (don't leave as 5173)
-    if _VITE_BARE_RE.search(command or ""):
-        pid = project_id or "default"
-        port = allocate_project_port(pid, preferred_port)
-        extra_env["PORT"] = str(port)
-        extra_env["VITE_PORT"] = str(port)
-        if "vite" in (command or "").lower():
-            rewritten = f"{command.rstrip()} --port {port} --strictPort"
-        else:
-            rewritten = f"PORT={port} {command}"
-        log.info(
-            "spawn_proxy_rewrote_vite",
-            project_id=project_id,
-            port=port,
-            original=(command or "")[:80],
-        )
-        return rewritten, extra_env, None, injection_meta
+    # 原「裸 vite → 代 agent 尾部追加 `--port`」块已移除（2026-09-21，P0-1），
+    # 理由见上方 `check_command_reserved_ports` 拒斥处的注释。
 
     # 裸 uvicorn 默认 8000，不在 reserved 内，但仍分配 3000+ 并注入 --port
-    # （与 vite 一样走 allocate_project_port；已有 --port/-p/PORT= 的上面已 return）。
+    # （已有 --port/-p/PORT= 的上面已 return）。
     if (
         _UVICORN_FAMILY_RE.search(command or "")
         and not uv_dep_consumed_token(command or "", "uvicorn")
@@ -924,6 +970,41 @@ def prepare_spawn_command(
         )
         return rewritten, extra_env, None, injection_meta
 
+    # ⚠⚠ 兜底：**不依赖任何文本判据**，且必须排在**所有注入分支之后**。
+    #
+    # 调用方已按 dev-server 判定路由本命令（`bash.py` 的
+    # `_DEV_SERVER_TRIGGER_RE` 命中 ⇒ 走注册 spawn 路径以便可杀），
+    # 但命令里既无显式端口、上面也没有任何分支给它注入端口 ⇒ 放行会
+    # **裸起在默认端口**（vite 默认 5173 = 平台保留端口）⇒ 撞平台。
+    #
+    # ⚠ 位置曾放错一次（2026-09-21 复审 P1）：早先放在四个注入分支**之前**，
+    # 于是 `uvicorn app.main:app` / `flask run` / `python -m app.server` 这些
+    # **由下面分支负责注入端口**的命令，在 `extra_env["PORT"]` 尚未设置时就被
+    # 判「无端口」⇒ 工具路径（恒传 routed=True）全部被拒死。**必须在最后。**
+    #
+    # 为什么单靠判据堵不住漏认：判据宽窄只能调误报/漏报配比，`npx --yes vite`
+    # 这类包装形态永远可能漏 —— 但「路由方说有端口、最终却没有」是个
+    # **结构性事实**，与措辞无关。
+    # `_UVICORN_HELP_RE` 排除：`--help/-h/--version` 跑完即退，即便被判据
+    # 漏认成 dev server 也不该拒（它们不需要端口）。
+    if (
+        routed_as_dev_server
+        and not extract_ports_from_command(command)
+        and not extra_env.get("PORT")
+        and not _UVICORN_HELP_RE.search(command or "")
+    ):
+        return (
+            command,
+            {},
+            (
+                "Refusing to start a dev server without an explicit project "
+                "port — the default (vite 5173) is reserved for HiveWeave. "
+                "Use start_dev_server or pass "
+                "`--port <project_port> --strictPort`."
+            ),
+            None,
+        )
+
     return command, extra_env, None, injection_meta
 
 
@@ -934,11 +1015,15 @@ def spawn_project_process(
     project_id: str | None = None,
     preferred_port: int = 3000,
     env: dict[str, str] | None = None,
+    routed_as_dev_server: bool = False,
     **popen_kwargs: Any,
 ) -> tuple[Popen | None, str | None, dict[str, Any]]:
     """Spawn with reserved-port proxy. Returns (proc, error, meta)."""
     cmd, extra_env, err, _inj_meta = prepare_spawn_command(
-        command, project_id=project_id, preferred_port=preferred_port
+        command,
+        project_id=project_id,
+        preferred_port=preferred_port,
+        routed_as_dev_server=routed_as_dev_server,
     )
     if err:
         return None, err, {}

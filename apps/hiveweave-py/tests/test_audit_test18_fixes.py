@@ -613,7 +613,14 @@ async def test_bash_main_uses_project_root_not_worktree():
         patch("hiveweave.tools.bash.execute_bash", fake_exec),
         patch(
             "hiveweave.services.process_registry.prepare_spawn_command",
-            lambda cmd, project_id=None: (cmd, {}, None, None),
+            # 显式具名参数（**不用** `**kwargs`）：桩保留「接口钉」——
+            # 生产端若把 kwarg 名写错，这里会立刻炸而不是被静默吞掉。
+            lambda cmd, project_id=None, routed_as_dev_server=False: (
+                cmd,
+                {},
+                None,
+                None,
+            ),
         ),
         patch(
             "hiveweave.tools.bash._issue_test_run_attestation",
