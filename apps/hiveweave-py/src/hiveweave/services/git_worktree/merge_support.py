@@ -112,7 +112,11 @@ async def restore_regenerable_dirt_or_reject(
     staged_new = [p for p in non_ws if p not in in_head]
     if staged_new:
         ok_rm, rm_out = await _git(
-            ["rm", "--cached", "--quiet", "--"] + staged_new, workspace_path
+            # P1-6 问题 B（2026-09-21，git 层实测）：缺 `-f --ignore-unmatch` 时，
+            # 只要路径里有**一个不存在**的项，整条 `git rm` 就失败（rc=128：
+            # `fatal: pathspec '...' did not match any files`）—— 连已存在的项也没去掉。
+            # 实测：加 `-f --ignore-unmatch` 后同一组输入 rc=0。
+            ["rm", "--cached", "-f", "--ignore-unmatch", "--quiet", "--"] + staged_new, workspace_path
         )
         if not ok_rm:
             return {

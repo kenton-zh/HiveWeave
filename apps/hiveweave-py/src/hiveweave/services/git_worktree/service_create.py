@@ -1180,7 +1180,11 @@ yarn.lock merge=union
                     # De-track: stage the removal so the merge lands
                     # "untracked + gitignored" on main, not just unstaged.
                     await _git(
-                        ["rm", "--cached", "--quiet", "--"] + regen_stripped,
+                        # P1-6 问题 B（2026-09-21，git 层实测）：缺 `-f --ignore-unmatch` 时，
+                        # 只要路径里有**一个不存在**的项，整条 `git rm` 就失败（rc=128：
+                        # `fatal: pathspec '...' did not match any files`）—— 连已存在的项也没去掉。
+                        # 实测：加 `-f --ignore-unmatch` 后同一组输入 rc=0。
+                        ["rm", "--cached", "-f", "--ignore-unmatch", "--quiet", "--"] + regen_stripped,
                         path,
                     )
                     log.info(
