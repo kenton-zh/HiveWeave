@@ -194,6 +194,36 @@ def build_task_event_insert(
     ), ts, event_id
 
 
+def build_task_wait_clear_statement(
+    cleared_at_ms: int, wait_ids: list[str]
+) -> tuple[str, list] | None:
+    """Build the batch clear-UPDATE for ``agent_waits`` row ids.
+
+    P2-5：本语句由**触发侧**（task 转换 + outbox 同一次提交）追加进
+    ``_execute_tx`` 的 statements —— 与 `build_task_event_insert` 同址，
+    是「语句构造器」这一类的唯一落点，调用点不得手写这段 SQL 文案。
+
+    Returns ``None`` when there is nothing to clear（调用方据此决定要不要追加；
+    空 `id IN ()` 是 SQL 语法错）。
+
+    ⚠ **批量形态**：与 `wait_contract.clear_expired` 同款 `id IN (…)` ——
+    验收不得只断言单行 `SELECT cleared_at FROM agent_waits WHERE id = ?`（会漏行）。
+    ⚠ params 必须是 **list**：本文件 `_execute_tx` 的签名不吃 `None`，
+    与底层 `db/project.py:execute_transaction_by_project`（允许 `None`）不同。
+    ⚠ `AND cleared_at IS NULL` 与其余 10 处清等待点同款（幂等：已清的行不重盖章，
+    免得 `cleared_at` 被后续覆盖成更晚的时间、污染 TTL/耗时口径）。
+    """
+    ids = [str(i) for i in wait_ids if i]
+    if not ids:
+        return None
+    placeholders = ",".join("?" * len(ids))
+    return (
+        f"UPDATE agent_waits SET cleared_at = ? "
+        f"WHERE id IN ({placeholders}) AND cleared_at IS NULL",
+        [cleared_at_ms, *ids],
+    )
+
+
 async def publish_task_event(
     project_id: str,
     task_id: str,

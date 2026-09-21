@@ -15,6 +15,7 @@ from .db import (
     _execute_tx,
     _query,
     build_task_event_insert,
+    build_task_wait_clear_statement,
     publish_task_event,
 )
 from .errors import MergeRequiredError
@@ -622,6 +623,109 @@ class CloseMixin:
     ) -> None:
         await self._enforce_merge_on_close(project_id, task)
 
+    # ── 清等待三件套（P2-5：并入触发方那次提交）──────────────
+    #
+    # 病：清等待（`UPDATE agent_waits SET cleared_at`）与触发侧的
+    # 「task 状态写 + task_events outbox」分属两次提交 ⇒ 崩溃窗口可
+    # **只落一边**（等待已清但唤醒事件没落 / 事件落了等待没清）。
+    #
+    # 落点纪律（**不要一刀切**）：全仓清等待写入点共 **11 处**
+    # （`grep -rn "UPDATE agent_waits SET cleared_at" src/`）——10 处在
+    # `services/wait_contract.py`，语义各异（等待方自清 / 被唤醒方 admit /
+    # TTL / 破环 / 事实发布）；**只有 `_clear_task_wait_contracts` 这一处属
+    # task 转换触发侧且原本在事务外**。只动这一处，其余 10 处保持原语义 ——
+    # 一刀切会把语义不同的点同质化，正是本仓「同一语义两表」病灶的**反向形态**。
+    #
+    # 形态：进 tx 前读 waiter 行 → 把批量 UPDATE **追加进触发侧既有
+    # `_execute_tx` 的 statements** → 提交后 `trigger_subordinate`。
+    # 唤醒**必须**在提交之后：提交前唤醒一旦遇回滚，就造出「agent 被叫醒、
+    # 等待却还在」的幻影唤醒。
+    #
+    # ⚠ **本改动的边界（别当成「触发侧全集已覆盖」）**：接的是 4 条已把
+    # 「tasks UPDATE + task_events outbox」放进同一次 `_execute_tx` 的路径
+    # （`transitions.py` 单步 else 支 / blocked 主支 / 多步支 + `archive_task`）。
+    # 已知同形未接线点（独立议题，勿在本批顺手改）：
+    # `services/org.py` dismiss_agent 的无父任务批量归档（同 tx 写
+    # `status='cancelled'` + `task.archived`，不清等待）、
+    # `tools/tasks/verify_spawn.py` 的 rehang（status 与事件分两次提交）。
+
+    async def _pending_task_waiters(
+        self, project_id: str, task_id: str
+    ) -> list[dict]:
+        """Un-cleared ``kind='task'`` wait rows (``id``/``agent_id``).
+
+        ⚠ **ref 必须双形态匹配**：`agent_waits.ref` 存的是 commit_turn 的
+        原始写法，历史上既有完整 task_id 也有 8 位短号（2026-09-21 取证：
+        TEST_DSH_5x/6x + s3-clone 十个项目库里 `kind='task'` 的 2135 行 ref
+        长度分布 = {36: 1918, 8: 214, 12: 7, 20: 1, 19: 1}，其中 214 条 8 位
+        ref **全部**能对上某个真实 `tasks.id` 前缀）。裸 UUID 匹配是假阴性
+        —— 与 09-01 已记录的「按 ref 查询必须带身份变体集合」同源。
+        （残留：`wait_contract._short_circuit_satisfied_task_waits` 仍只按
+        完整 id 匹配，属既有不一致面，另议。）
+
+        Read failure ⇒ ``[]``（fail-open）：读不到只是退回「事务外清等待」
+        的旧语义，绝不能让一次读失败阻断 task 状态转换本身。
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT id, agent_id FROM agent_waits "
+                "WHERE kind = 'task' AND ref IN (?, ?) AND cleared_at IS NULL",
+                [task_id, task_id[:8]],
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:  # noqa: BLE001 — 读失败不阻塞转换
+            log.warning(
+                "task_waiters_read_failed", task_id=task_id, error=str(e)
+            )
+            return []
+
+    async def _wake_task_waiters(
+        self,
+        project_id: str,
+        task_id: str,
+        waiters: list[dict],
+        *,
+        in_tx: bool,
+    ) -> None:
+        """提交后唤醒被清等待的 agent，并发 `task_wait_contracts_cleared`。
+
+        ``in_tx=True`` = 清等待与 task 状态写/outbox 同一次提交（P2-5 主路径）；
+        ``in_tx=False`` = 事务外兜底路径（``_clear_task_wait_contracts``）——
+        字段只用于取证区分，两条路径的语义同一。
+
+        唤醒按 **agent 去重**：同一 agent 可能对同一 task 留有多条等待行
+        （`_pending_task_waiters` 是批量形态），不去重会把它连叫多次。
+        """
+        rows = list(waiters or [])
+        if not rows:
+            return
+        log.info(
+            "task_wait_contracts_cleared",
+            project_id=project_id,
+            task_id=task_id,
+            cleared=len(rows),
+            cleared_in_tx=in_tx,
+            agents=[str(r.get("agent_id") or "") for r in rows],
+        )
+        woken: set[str] = set()
+        for row in rows:
+            agent_id = str(row.get("agent_id") or "")
+            if not agent_id or agent_id in woken:
+                continue
+            woken.add(agent_id)
+            try:
+                from hiveweave.agents.trigger import trigger_subordinate
+
+                await trigger_subordinate(agent_id)
+            except Exception as e:
+                log.warning(
+                    "task_wait_wake_trigger_failed",
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    error=str(e),
+                )
+
     async def _clear_task_wait_contracts(
         self, project_id: str, task_id: str
     ) -> None:
@@ -634,46 +738,25 @@ class CloseMixin:
 
         Does NOT touch the trigger.py task_event filter (TEST3 busy-wait
         guard) — this is a targeted wake for explicit waiters only.
+
+        P2-5 后本方法的**主路径已移入触发方事务**（见上方「清等待三件套」）
+        ——转换点会在 `_execute_tx` 里先清一遍，方法在多数情况下读到 0 行。
+        保留它作为**残余兜底**：覆盖「进 tx 前的读」与「提交」之间新建的
+        等待行（窗口极小但非零），语义与旧版逐字一致。
         """
         try:
-            now_ms = int(time.time() * 1000)
-            rows = await _query(
-                project_id,
-                "SELECT id, agent_id FROM agent_waits "
-                "WHERE kind = 'task' AND ref = ? AND cleared_at IS NULL",
-                [task_id],
-            )
-            if not rows:
+            waiters = await self._pending_task_waiters(project_id, task_id)
+            if not waiters:
                 return
-            ids = [r["id"] for r in rows]
-            placeholders = ",".join("?" * len(ids))
-            await _execute(
-                project_id,
-                f"UPDATE agent_waits SET cleared_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [now_ms] + ids,
+            stmt = build_task_wait_clear_statement(
+                int(time.time() * 1000), [r["id"] for r in waiters]
             )
-            log.info(
-                "task_wait_contracts_cleared",
-                project_id=project_id,
-                task_id=task_id,
-                cleared=len(ids),
-                agents=[r["agent_id"] for r in rows],
+            if stmt is None:
+                return
+            await _execute(project_id, stmt[0], stmt[1])
+            await self._wake_task_waiters(
+                project_id, task_id, waiters, in_tx=False
             )
-            # Trigger each waiting agent to resume
-            for row in rows:
-                agent_id = row["agent_id"]
-                try:
-                    from hiveweave.agents.trigger import trigger_subordinate
-
-                    await trigger_subordinate(agent_id)
-                except Exception as e:
-                    log.warning(
-                        "task_wait_wake_trigger_failed",
-                        agent_id=agent_id,
-                        task_id=task_id,
-                        error=str(e),
-                    )
         except Exception as e:
             log.warning(
                 "clear_task_wait_contracts_failed",
@@ -801,7 +884,12 @@ class CloseMixin:
             project_id, task_id, "task.archived", current, "cancelled",
             actor_id=archived_by, payload=arch_payload, now_ms=now_ms,
         )
-        await _execute_tx(project_id, [
+        # P2-5: 读 waiter 行，清等待并入下方同一次提交（提交后才唤醒）。
+        waiters = await self._pending_task_waiters(project_id, task_id)
+        wait_clear = build_task_wait_clear_statement(
+            now_ms, [r["id"] for r in waiters]
+        )
+        archive_stmts: list[tuple[str, list]] = [
             # 根因修复：归档时同步置终态 status='cancelled'，避免
             # archived=1 但 status 停留在 verifying/submitted 等非终态
             # 导致数据矛盾（直接查 DB / task_events 审计 / 外部脚本困惑）
@@ -813,7 +901,10 @@ class CloseMixin:
             "wake_at = NULL, updated_at = ? WHERE id = ?",
             [archived_by, reason[:500], now_ms, now_ms, task_id]),
             (event_sql, event_params),
-        ])
+        ]
+        if wait_clear is not None:
+            archive_stmts.append(wait_clear)
+        await _execute_tx(project_id, archive_stmts)
         await publish_task_event(
             project_id, task_id, "task.archived", "cancelled", event_ts
         )
@@ -916,7 +1007,9 @@ class CloseMixin:
                             error=str(e),
                         )
 
-        # L3: clear wait contracts referencing this task (waiters must wake)
+        # L3: wake waiters already cleared inside the transaction above,
+        # then run the outside-tx residual net (waiters created mid-window).
+        await self._wake_task_waiters(project_id, task_id, waiters, in_tx=True)
         await self._clear_task_wait_contracts(project_id, task_id)
 
         # L1: detect reverse dependents — tasks whose depends_on contains
