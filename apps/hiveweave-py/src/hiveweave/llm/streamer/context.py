@@ -407,6 +407,17 @@ class ContextMixin:
         if total < pressure_at:
             return messages
 
+        # ⭐ P1-1①（2026-09-21）：**本 run 已改写即短路**。
+        # 前缀缓存的有效性终止于**首个被改写的 token**；本 run 已经改写过一次
+        # （prune/摘要任一实际生效 ⇒ `_context_rewrote`）⇒ 从那个点起缓存早已
+        # 失效，**再改一次买不回任何缓存**，只会把改写点再往前推（作废跨度继续
+        # 变大）+ 制造 churn。故本 run 内**只改写一次**，其余轮次回到 append-only。
+        # ⚠ 不是"不再保护 API 上限"：0.95 硬裁是**独立的安全网**（见 `tool_loop`
+        #   的注释），`_trim_context_if_needed` 也仍在每轮跑；本条只约束
+        #   prune/摘要型改写。
+        if self._context_rewrote:
+            return messages
+
         log.info(
             "working_set_pressure",
             total=total,
