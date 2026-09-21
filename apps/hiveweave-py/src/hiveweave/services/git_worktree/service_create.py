@@ -138,6 +138,10 @@ class CreateMixin:
             # and migrate legacy ignore rules (workspace tracking) if found.
             await self._migrate_legacy_hiveweave_ignore(workspace_path)
             await self._ensure_gitignore_entries(workspace_path)
+            # P1-6 问题 B：**独立于** ignore 补写 —— ignore 对已 tracked 的文件无效，
+            # 且 `_ensure_gitignore_entries` 在「条目齐全」时会提前 return（而
+            # 「条目齐全 + 生成物已 tracked」恰恰是最常见的存量形态）。
+            await self._untrack_generated_paths(workspace_path)
             # 收养仓库也要补兜底身份（审计 2026-09-15 ③）：本分支不写 config，
             # 而 `.git/config` 之后会被「锁死档」锁住 ⇒ 这里是**收养路径上最后的
             # 可写窗口**。只在 `user.name` 完全解析不到时才写（幂等，不动既有身份）。
@@ -635,6 +639,46 @@ yarn.lock merge=union
                 workspace=workspace_path,
                 error=str(e),
             )
+
+    async def _untrack_generated_paths(self, workspace_path: str) -> None:
+        """P1-6 问题 B：让**已 tracked** 的生成物脱离跟踪。
+
+        为什么必须做：`.git/info/exclude`（以及 `GITIGNORE_GENERATED_ENTRIES`）
+        对**已 tracked** 的文件**无效** —— 只拦「新 add」（`constants.py:115` 逐字记着）。
+        所以「补了 ignore 行」≠「生成物不再进版本库」；已在库里的必须显式去跟踪。
+
+        ⚠ **只准碰 `is_generated_path()` 命中项**：否则会把 `.hiveweave/shared/`
+        这类共享契约目录一起 `rm --cached` —— 那是另一条绝对不许碰的边界
+        （`test_checkpoint_dirty_contract` 等守着它）。
+        ⚠ 失败只告警不抛：本步是**卫生工作**，不是安全不变量，不能让它阻断建仓
+        （与 ignore 补写同容忍度）。
+        """
+        from .constants import is_generated_path  # 惰性：不与 constants 的导入顺序耦合
+
+        ok, out = await _git(["ls-files", "-z"], workspace_path)
+        if not ok or not out:
+            return
+        targets = [p for p in out.split("\0") if p and is_generated_path(p)]
+        if not targets:
+            return
+        # P1-6 问题 B：`-f --ignore-unmatch` 必须有 —— 缺它时路径集合里只要有一个
+        # 已不存在的项，整条 git rm 就失败（rc=128），连存在的项也去不掉。
+        ok_rm, rm_out = await _git(
+            ["rm", "--cached", "-f", "--ignore-unmatch", "--quiet", "--"] + targets,
+            workspace_path,
+        )
+        if not ok_rm:
+            log.warning(
+                "git_worktree.untrack_generated_failed",
+                workspace=workspace_path,
+                error=rm_out,
+            )
+            return
+        log.info(
+            "git_worktree.untracked_generated",
+            workspace=workspace_path,
+            count=len(targets),
+        )
 
     def get_worktree_path(self, workspace_path: str, short_id: str) -> str | None:
         """Get the worktree path for an agent, or None if not found."""
