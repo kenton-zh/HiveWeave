@@ -597,6 +597,16 @@ class ToolLoopMixin:
                 messages, provider, session_id=agent_id
             )
             messages = self._trim_context_if_needed(messages, provider)
+            # P1-1②另半（2026-09-21）：**run 内每次请求前也对比一次** —— 否则
+            # 「本 run 内部（prune/摘要改写之后）的漂移」从不进任何桶，零命中会被
+            # 归成「缓存窗口过期（平台侧不可修）」（探针只比相邻 run 首请求 ⇒
+            # 这就是「只报 2 条」的原因）。best-effort：探针失败绝不影响主流程。
+            try:
+                from hiveweave.llm.streamer.probe import compare_and_record
+
+                compare_and_record(agent_id, messages, slot="run_inner")
+            except Exception:  # noqa: BLE001
+                pass
 
             # 中轮提醒: 80% 轮次时注入
             messages = self._maybe_inject_mid_round_reminder(

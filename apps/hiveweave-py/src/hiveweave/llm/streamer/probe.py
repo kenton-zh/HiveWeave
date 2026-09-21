@@ -63,6 +63,11 @@ logger = structlog.get_logger(__name__)
 # per-agent 上次首请求指纹基准与上次 verdict（探针运行态，纯内存）
 _last_request: dict[str, dict[str, Any]] = {}
 _last_verdict: dict[str, dict[str, Any]] = {}
+#: P1-1②另半：**本 run 内是否见过前缀漂移**（粘性；`reset_probe` 清）。
+#: 为什么需要它：探针只对比**相邻 run 的首请求** ⇒ run 内部（prune/摘要改写之后）的
+#: 漂移从不进任何桶；于是「本 run 自己动的刀」造成的零命中会被归成
+#: `cache_window_expired`（**平台侧不可修**）—— 根因判错，正是本条要治的病。
+_inner_drift: dict[str, dict[str, Any]] = {}
 
 
 def reset_probe(agent_id: str | None = None) -> None:
@@ -70,9 +75,11 @@ def reset_probe(agent_id: str | None = None) -> None:
     if agent_id is None:
         _last_request.clear()
         _last_verdict.clear()
+        _inner_drift.clear()
     else:
         _last_request.pop(agent_id, None)
         _last_verdict.pop(agent_id, None)
+        _inner_drift.pop(agent_id, None)
 
 
 def _h(data: Any) -> str:
@@ -139,19 +146,30 @@ def compare_and_record(
     agent_id: str,
     messages: list[dict],
     *,
-    model_key: str,
+    model_key: str | None = None,
     now: float | None = None,
+    slot: str = "run_first",
 ) -> dict[str, Any]:
     """与该 agent 上次 run 首请求指纹对比，更新基准，返回漂移分类。
 
     在每次 run 的首请求组装完成后调用（`_run_llm` 中 `_build_messages`
     之后）。返回 dict 可直接展开进结构化日志。
+
+    ``slot``（P1-1②另半，2026-09-21）：``"run_first"``（默认，run 首请求）·
+    ``"run_inner"``（**run 内每次请求**，由 `tool_loop` 发起）。区别在于**记账去向**：
+    - ``run_first``：写 `_last_verdict`（供 `report_cache_readout` 一次性消费）；
+    - ``run_inner``：**不覆盖**首请求的 verdict，只在**真漂移**时把粘性标记
+      `_inner_drift` 立起来 ⇒ 让「本 run 自己改写过前缀」这件事能被归因。
+    ⚠ `model_key` 在 run 内路径可为 None ⇒ 复用基准里的那个（streamer 拿不到 model_key）。
     """
+    prev = _last_request.get(agent_id)
+    if model_key is None:
+        model_key = str((prev or {}).get("model_key") or "")
     fp = fingerprint_messages(messages, model_key=model_key)
     if now is not None:
         fp["ts"] = now
-    prev = _last_request.get(agent_id)
-    _last_request[agent_id] = fp
+    if slot == "run_first" or prev is None:
+        _last_request[agent_id] = fp
 
     if prev is None:
         verdict: dict[str, Any] = {
@@ -162,7 +180,8 @@ def compare_and_record(
             "dialog_len": fp["dialog_len"],
             "first_mismatch_index": None,
         }
-        _last_verdict[agent_id] = verdict
+        if slot == "run_first":
+            _last_verdict[agent_id] = verdict
         return verdict
 
     drifts: list[str] = []
@@ -218,7 +237,12 @@ def compare_and_record(
         "dialog_len": fp["dialog_len"],
         "first_mismatch_index": first_mismatch_index,
     }
-    _last_verdict[agent_id] = verdict
+    if slot == "run_first":
+        _last_verdict[agent_id] = verdict
+    elif drifts:
+        # 本 run 内**见过**漂移 ⇒ 立粘性标记（供 `report_cache_readout` 归因），
+        # **不覆盖**首请求的 verdict（那个必须留给「相邻 run 对比」的语义）。
+        _inner_drift[agent_id] = verdict
     return verdict
 
 
@@ -270,7 +294,15 @@ def report_cache_readout(
         # 无基准 / 换缓存域 ⇒ 没有可读的缓存，零命中是必然而非漂移
         final = "cold_start"
     elif verdict_str == "prefix_stable":
-        final = "cache_window_expired"
+        # ⭐ P1-1②另半：本 run 内见过漂移（prune/摘要改写过前缀）⇒ 零命中的成因是
+        # **我们自己动的刀**，不是「缓存窗口过期（平台侧不可修）」。
+        # 旧判据只看首请求的 verdict ⇒ 这类 run 内漂移永远进不了 `drift_zero_hit` 桶
+        # （这就是「探针只报 2 条」的原因）。
+        final = (
+            "drift_zero_hit"
+            if _inner_drift.get(agent_id)
+            else "cache_window_expired"
+        )
     else:
         final = "drift_zero_hit"
     result: dict[str, Any] = {
