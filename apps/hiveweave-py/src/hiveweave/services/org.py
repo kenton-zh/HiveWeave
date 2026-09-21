@@ -935,38 +935,14 @@ class OrgService:
                     dismissed_event_ts.append((ev_tid, ev_type, ev_to, ev_ts))
             else:
                 # No parent: archive unfinished work as cancelled (not closed).
-                # 批量 UPDATE + 全部 task.archived 事件同一事务（同生共死）。
-                archive_stmts: list[tuple[str, list]] = [(
-                    "UPDATE tasks SET is_archived = 1, status = 'cancelled', "
-                    "archived_by = 'system', archived_reason = 'agent dismissed', "
-                    "archived_at = ?, updated_at = ? "
-                    "WHERE assignee_id = ? AND is_archived = 0 "
-                    "AND status NOT IN ('closed', 'cancelled')",
-                    [now_ms, now_ms, agent_id],
-                )]
-                for t in open_tasks:
-                    (ev_sql, ev_params), ev_ts, _ev_id = build_task_event_insert(
-                        project_id, t["id"], "task.archived",
-                        (t.get("status") or "").lower(), "cancelled",
-                        actor_id="system",
-                        payload={"archived_by": "system",
-                                 "reason": "agent dismissed",
-                                 "reason_code": "agent_dismiss"},
-                        now_ms=now_ms,
-                    )
-                    archive_stmts.append((ev_sql, ev_params))
-                    dismissed_event_ts.append(
-                        (t["id"], "task.archived", "cancelled", ev_ts)
-                    )
-                try:
-                    await _execute_tx(project_id, archive_stmts)
-                except Exception as arch_err:
-                    log.warning(
-                        "dismiss_archive_batch_failed",
-                        agent_id=agent_id,
-                        error=str(arch_err),
-                    )
-                    dismissed_event_ts.clear()
+                # 新-②（2026-09-21）：整支抽成模块级 helper（文件末尾）—— 原子性与
+                # 「清等待」这类判据必须能**直接驱动**它，否则要造 roster + 无父任务
+                # + 等待行三件套才能到达这一行。返回已提交的事件元组供上方发布。
+                archived_events = await _archive_open_tasks_on_dismiss(
+                    project_id, agent_id, open_tasks, now_ms
+                )
+                if archived_events:
+                    dismissed_event_ts.extend(archived_events)
             # 全部 commit 后逐条发 lobby 失效信号（best-effort，不影响 dismiss 主流程）
             for ev_tid, ev_type, ev_to, ev_ts in dismissed_event_ts:
                 await publish_task_event(project_id, ev_tid, ev_type, ev_to, ev_ts)
@@ -1483,3 +1459,106 @@ class OrgService:
             if isinstance(v, str) and len(v) >= 2:
                 d[k] = _fix_mojibake(v)
         return d
+
+
+# ── 新-②（2026-09-21）：dismiss 无父任务时的归档（含清等待 + 唤醒）──────
+
+
+async def _archive_open_tasks_on_dismiss(
+    project_id: str,
+    agent_id: str,
+    open_tasks: list[dict],
+    now_ms: int,
+) -> list[tuple]:
+    """无父任务时：把该 agent 名下未完成的任务**归档为 cancelled**（一次提交）。
+
+    ⭐ 新-②：原实现只归档（`is_archived=1, status='cancelled'` + 批量
+    `task.archived` 事件，同事务），**不清 `agent_waits`** ⇒ 终态之后那条等待
+    永远不会被满足，等待方只能干等到 TTL。
+
+    现在按 P2-5 纪律：**清等待与状态写/事件写同一次提交**，提交成功后再逐任务唤醒
+    （`in_tx=False`；与 `close.py::_clear_task_wait_contracts` 的兜底路径同款 ——
+    该 docstring 逐字写明两条路径语义同一，`in_tx` 只用于取证区分）。
+    ⚠ 提交失败（整体回滚）时**不得**唤醒：等待没被清，唤醒等于凭幻影事件叫醒。
+    ⚠ `build_task_wait_clear_statement` 收的是 **`agent_waits.id` 列表**（不是 task id）
+    ⇒ 必须先把各任务的等待行捞出来再合并成一条语句。
+
+    Returns: 已提交的事件元组 `(task_id, event_type, to_status, ts)`（供上层发布）。
+    """
+    from hiveweave.services.task import TaskService
+    from hiveweave.services.tasks.db import (
+        _execute_tx,
+        build_task_event_insert,
+        build_task_wait_clear_statement,
+    )
+
+    ts = TaskService()
+    archive_stmts: list[tuple[str, list]] = [(
+        "UPDATE tasks SET is_archived = 1, status = 'cancelled', "
+        "archived_by = 'system', archived_reason = 'agent dismissed', "
+        "archived_at = ?, updated_at = ? "
+        "WHERE assignee_id = ? AND is_archived = 0 "
+        "AND status NOT IN ('closed', 'cancelled')",
+        [now_ms, now_ms, agent_id],
+    )]
+
+    # ① 先捞等待行（清语句按 wait 行 id 形态）
+    waiters_by_task: list[tuple[str, list]] = []
+    wait_ids: list[str] = []
+    for t in open_tasks:
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            rows = await ts._pending_task_waiters(project_id, tid)
+        except Exception as w_err:  # noqa: BLE001 — 捞不到就跳过该任务，见下
+            log.warning(
+                "dismiss_waiters_lookup_failed", task_id=tid, error=str(w_err)
+            )
+            continue
+        if rows:
+            waiters_by_task.append((tid, rows))
+            wait_ids.extend(str(r["id"]) for r in rows)
+    if wait_ids:
+        wait_clear = build_task_wait_clear_statement(now_ms, wait_ids)
+        if wait_clear is not None:
+            archive_stmts.append(wait_clear)
+
+    # ② 事件（与上面同一事务）
+    events: list[tuple] = []
+    for t in open_tasks:
+        (ev_sql, ev_params), ev_ts, _ev_id = build_task_event_insert(
+            project_id,
+            t["id"],
+            "task.archived",
+            (t.get("status") or "").lower(),
+            "cancelled",
+            actor_id="system",
+            payload={
+                "archived_by": "system",
+                "reason": "agent dismissed",
+                "reason_code": "agent_dismiss",
+            },
+            now_ms=now_ms,
+        )
+        archive_stmts.append((ev_sql, ev_params))
+        events.append((t["id"], "task.archived", "cancelled", ev_ts))
+
+    try:
+        await _execute_tx(project_id, archive_stmts)
+    except Exception as arch_err:  # noqa: BLE001 — 与旧实现同容忍度（整体回滚）
+        log.warning(
+            "dismiss_archive_batch_failed",
+            agent_id=agent_id,
+            error=str(arch_err),
+        )
+        return []
+
+    # ③ 提交成功后才唤醒（清与唤醒同批；失败路径已 return，不会唤醒）
+    for tid, rows in waiters_by_task:
+        try:
+            await ts._wake_task_waiters(project_id, tid, rows, in_tx=False)
+        except Exception as w_err:  # noqa: BLE001 — best-effort，不阻断 dismiss
+            log.warning("dismiss_wake_waiters_failed", task_id=tid, error=str(w_err))
+    return events
+
