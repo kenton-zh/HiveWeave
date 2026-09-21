@@ -343,8 +343,13 @@ def select_prune_indices(
     4. 非 tool 结果（无 ``tool_call_id``）跳过；
     5. 已带占位符 ⇒ **停止**（更早的都已裁过）；
     6. 累计受保护 token 超 ``protect_tokens`` 之后的旧 tool 输出进候选；
-    7. 候选总量 < ``minimum_tokens`` ⇒ 收益不足，返回 ``indices=()``
-       （此时 ``candidate_count > 0``，与「无候选」可区分）。
+    7. **够用就停**（P1-1，2026-09-21）：候选累计达 ``minimum_tokens`` 即停止
+       —— 只取**最靠后（最新）**的那批候选，**不再一路取到最旧**。
+       为什么：缓存前缀的有效性终止于**首个被改写的 token**；取最旧的候选会让
+       改写起点尽可能靠前 ⇒ 作废跨度最大（`cache_read` 被切在最老处，实测压缩后
+       `cr=0`）。取最新的那批 ⇒ 改写点尽可能靠后 ⇒ 保住最长前缀。
+    8. 候选总量 < ``minimum_tokens``（即循环自然走完仍不足）⇒ 收益不足，返回
+       ``indices=()``（此时 ``candidate_count > 0``，与「无候选」可区分）。
 
     ⚠ 只选址、不改写。in-loop 的 apply 还要丢 ``images`` 并标记 context-rewrite，
     持久化的 apply 要 in-place 改 cache + 入写队列 —— 那两步**故意不共用**。
@@ -355,6 +360,7 @@ def select_prune_indices(
     indices: list[int] = []
     protected = 0
     turns = 0
+    prune_tokens = 0
 
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -381,13 +387,17 @@ def select_prune_indices(
             protected = new_protected
         else:
             indices.append(i)
+            prune_tokens += tokens
+            # ⭐ P1-1：**够用就停** —— 只取最靠后（最新）的候选集，不再一路取到最旧。
+            # 首个被改写的下标越靠后，缓存前缀的有效部分越长（本条的判据）。
+            if prune_tokens >= minimum_tokens:
+                break
 
     if not indices:
         return PrunePlan((), 0, protected, turns, 0)
 
-    prune_tokens = sum(
-        estimate_tokens_for_messages([messages[i]]) for i in indices
-    )
+    # ⚠ `prune_tokens` 已在循环里累计（P1-1 的「够用就停」依赖它）；
+    # 这里**不得**再求和 —— 那会把循环外新加的消息算进来，与停止判据不同源。
     if prune_tokens < minimum_tokens:
         # 候选非空但收益不足 —— `candidate_count` 让调用方与「无候选」分开
         return PrunePlan((), prune_tokens, protected, turns, len(indices))

@@ -125,16 +125,26 @@ def test_summary_boundary_is_explicit_and_only_for_persisted_path():
     boundary = lambda m: (  # noqa: E731
         m.get("role") == "system" and "SUMMARY" in (m.get("content") or "")
     )
-    in_loop = _pruned_indices(messages)              # 无边界 ⇒ 会一路裁到更旧的
+    # ⚠ P1-1 之后边界的**可观测形态变了**：旧形态是「persisted 是 in_loop 的严格子集」；
+    # 现在是「被边界挡住的候选**不计入收益** ⇒ 可能判定收益不足（空计划）」。
+    # 阈值 60_000：in_loop 有两条候选（105k ≥ 60k ⇒ 取到）；persisted 只剩边界的
+    # 那一条（52.5k < 60k ⇒ 收益不足 ⇒ 空）—— 这个差**正是边界的作用**。
+    in_loop = select_prune_indices(messages, minimum_tokens=60_000).indices
     persisted = select_prune_indices(
-        messages, stop_predicate=boundary
+        messages, minimum_tokens=60_000, stop_predicate=boundary
+    ).indices
+    # 对照：阈值降到边界内那一条就够（50_000 ≤ 52.5k）⇒ 非空
+    # ⇒ 证明空是被**边界挡掉更旧候选**所致，不是别的原因。
+    reachable = select_prune_indices(
+        messages, minimum_tokens=50_000, stop_predicate=boundary
     ).indices
 
-    assert persisted, "摘要边界内的候选仍应被裁"
-    assert set(persisted) < set(in_loop), (
-        "持久化路径必须在摘要边界停下（严格子集）；"
+    assert in_loop, "无边界时应能取到候选"
+    assert persisted == (), (
+        "边界的可观测形态应是「更旧候选被挡 ⇒ 收益不足」；"
         f"in_loop={in_loop} persisted={persisted}"
     )
+    assert reachable, "阈值可达时边界内候选仍应被裁（对照）"
 
 
 # ── ④ 「无候选」与「收益不足」可区分 ─────────────────────────
@@ -209,10 +219,60 @@ def test_indices_are_descending():
         *_round("c2", "recent-two"),
         *_round("c3", "recent-one"),
     ]
-    plan = select_prune_indices(messages)
+    # P1-1 之后默认是「够用就停」（只取最新的那批）；本条测的是**顺序**语义
+    # ⇒ 显式给一个「需要两条候选才够」的阈值（两候选各 ≈52.5k）：
+    #   60_000 ≤ 105_000（总量）⇒ 会取到两条、且不会被判「收益不足」。
+    plan = select_prune_indices(messages, minimum_tokens=60_000)
     assert len(plan.indices) >= 2, plan
     assert list(plan.indices) == sorted(plan.indices, reverse=True)
 
     # 审计发现：context.py 的占位符判停是 break，遮蔽了 stop 之外的路径
     # （见上一条用例）—— 这里顺带确认类型契约（不可变 tuple）
     assert isinstance(plan.indices, tuple)
+
+
+# ── P1-1：改写点必须尽可能靠后（够用就停）────────────────────────
+
+
+def test_p1_1_rewrite_starts_as_late_as_possible():
+    """P1-1：默认阈值下只取**最靠后**的候选 —— 首个被改写下标尽可能大。
+
+    缓存前缀的有效性终止于**首个被改写的 token**；取最旧的候选会让改写起点
+    尽可能靠前 ⇒ 作废跨度最大（压缩后 `cache_read=0` 的机制之一）。
+    """
+    messages = [
+        {"role": "system", "content": "identity"},
+        *_round("c0", "a" * 210_000),   # 最旧：P1-1 之后**不该**被选
+        *_round("c1", "b" * 210_000),
+        *_round("c2", "recent-two"),    # 保护窗内的两轮
+        *_round("c3", "recent-one"),
+    ]
+    default_plan = select_prune_indices(messages)
+    # 「取全量」= 阈值设在总量之下但高于单条（两条各 ≈52.5k ⇒ 总量 ≈105k）
+    all_plan = select_prune_indices(messages, minimum_tokens=100_000)
+
+    assert default_plan.indices, default_plan
+    assert all_plan.indices, all_plan
+    # 默认证的改写起点必须**晚于**全量取法（即不碰最旧那批）
+    assert min(default_plan.indices) > min(all_plan.indices), (
+        f"改写起点没有后移：default={default_plan.indices} all={all_plan.indices}"
+    )
+    # 且默认取法选的都是全量集合里最靠后的那批（子集语义）
+    assert set(default_plan.indices) <= set(all_plan.indices)
+
+
+def test_p1_1_rewrite_point_never_moves_earlier_across_rounds():
+    """§3.1 CI 断言 ①：prune 改写点位置**单调不早于**上一改写点。"""
+    base = [
+        {"role": "system", "content": "identity"},
+        *_round("c0", "a" * 210_000),
+        *_round("c1", "b" * 210_000),
+        *_round("c2", "recent-two"),
+        *_round("c3", "recent-one"),
+    ]
+    first = min(select_prune_indices(base).indices)
+    grown = base + _round("c4", "c" * 210_000)
+    second = min(select_prune_indices(grown).indices)
+    assert second >= first, (
+        f"改写点前移了：第一轮 {first} → 第二轮 {second}（前缀作废跨度变大）"
+    )
