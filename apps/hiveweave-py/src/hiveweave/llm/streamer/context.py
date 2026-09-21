@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 
-from hiveweave.conversation.token_utils import estimate_tokens_for_messages
+from hiveweave.conversation.token_utils import (
+    PRUNE_MINIMUM_TOKENS,
+    PRUNE_PLACEHOLDER,
+    PRUNE_PROTECT_TOKENS,
+    estimate_tokens_for_messages,
+    select_prune_indices,
+)
 from hiveweave.llm.provider import ProviderConfig
 
 from .constants import (
@@ -35,11 +41,14 @@ class ContextMixin:
         _fire_delta: Any
 
     #: Prune 保护窗口（token）— 最近工具输出保留原文
-    _PRUNE_PROTECT_TOKENS = 40_000
+    #: ⚠ 2026-09-21 收口：三个阈值/占位符改为**引用 token_utils 的单一源**
+    #: （原来两份各写一份常量、靠注释对齐；测试 `test_prune_flush_at_compaction`
+    #: 对本类属性做 `==` 断言 ⇒ 必须保留这三个类属性名）。
+    _PRUNE_PROTECT_TOKENS = PRUNE_PROTECT_TOKENS
     #: Prune 最低收益（token）— 候选总量不足此值则不执行
-    _PRUNE_MINIMUM_TOKENS = 10_000
+    _PRUNE_MINIMUM_TOKENS = PRUNE_MINIMUM_TOKENS
     #: Prune 占位符
-    _PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
+    _PRUNE_PLACEHOLDER = PRUNE_PLACEHOLDER
     #: 本 run 是否改写过请求前缀（prune/trim/summary 任一实际生效）。
     #: run 结束后据此决定是否把等价裁剪回写 DB（见 completion.py 3.5 节）：
     #: 改写点即前缀缓存断点，回写不产生额外缓存代价；未改写则 DB 必须
@@ -58,44 +67,19 @@ class ContextMixin:
         旧 tool 输出替换为占位符。候选总量 > 10K 时才执行。
         同一 tool loop 内每轮 replace 会从被改的 token 起作废 DeepSeek 前缀缓存。
         """
-        if len(messages) < 6:
-            return messages
-
-        to_prune_indices: list[int] = []
-        protected = 0
-        turns = 0
-
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            role = msg.get("role", "")
-
-            if role == "assistant":
-                turns += 1
-            if turns < 2:
-                continue
-
-            if "tool_call_id" not in msg:
-                continue
-
-            # 已被裁剪过 → 停止
-            if msg.get("content") == self._PRUNE_PLACEHOLDER:
-                break
-
-            tokens = estimate_tokens_for_messages([msg])
-            new_protected = protected + tokens
-            if new_protected <= self._PRUNE_PROTECT_TOKENS:
-                protected = new_protected
-            else:
-                to_prune_indices.append(i)
-
-        if not to_prune_indices:
-            return messages
-
-        prune_tokens = sum(
-            estimate_tokens_for_messages([messages[i]]) for i in to_prune_indices
+        # ⚠ 消息数下限（< 6）由 select_prune_indices 的 `min_messages` 拥有 ——
+        # 这里不再各写一遍，否则默认值改了也不会有人发现。
+        # 选址走**单一实现**（token_utils.select_prune_indices）—— 持久化裁剪
+        # 路径（conversation/store.py）共用同一个函数，别再就地写一遍。
+        plan = select_prune_indices(
+            messages,
+            protect_tokens=self._PRUNE_PROTECT_TOKENS,
+            minimum_tokens=self._PRUNE_MINIMUM_TOKENS,
+            placeholder=self._PRUNE_PLACEHOLDER,
         )
-        if prune_tokens < self._PRUNE_MINIMUM_TOKENS:
-            return messages  # 收益不足
+        if not plan.indices:
+            return messages
+        to_prune_indices = plan.indices
 
         result = list(messages)
         for i in to_prune_indices:
@@ -112,8 +96,8 @@ class ContextMixin:
         log.info(
             "tool_loop_prune",
             pruned_count=len(to_prune_indices),
-            pruned_tokens=prune_tokens,
-            protected_tokens=protected,
+            pruned_tokens=plan.prune_tokens,
+            protected_tokens=plan.protected_tokens,
         )
         return result
 

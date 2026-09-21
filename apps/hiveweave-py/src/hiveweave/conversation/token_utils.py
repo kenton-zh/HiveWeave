@@ -12,7 +12,9 @@ import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import structlog
 
@@ -24,10 +26,20 @@ PRESERVE_RECENT_MIN = 10
 PRESERVE_RECENT_MAX = 30
 TAIL_TURNS = 2
 PRUNE_PROTECT_TOKENS = 40_000
-# 与 streamer ContextMixin._PRUNE_MINIMUM_TOKENS(10k) 对齐：持久化裁剪只在
+# 与 `ContextMixin._PRUNE_MINIMUM_TOKENS` 是**同一个对象**（2026-09-21 收口；
+# 此前只是「数值恰好相等」+ 注释声称对齐）。持久化裁剪只在
 # 溢出改写点回写（completion 3.5 节），阈值必须覆盖 in-loop prune 的触发带
 # （10k-20k），否则 DB 回写 no-op → 下一 run 读到未裁剪原文 → 前缀 miss。
 PRUNE_MINIMUM_TOKENS = 10_000
+
+# 裁剪后写进 ``content`` 的占位符。
+#
+# ⚠ **单一源**（2026-09-21）：in-loop 裁剪与持久化裁剪必须用**同一个**字符串
+# —— 旧的持久化实现里是硬编码字面量，且「已裁剪 → 停止」的判据也各写一份，
+# 改一处就漏一处（本仓最高频复发形态：同一算法两次实现，本轮是第 5 次）。
+# 取证/消费方请引用本常量（或 `context_marker` 的枚举），不要复制字面量、
+# 更不要按「长度 33」这类形态判据去认它。
+PRUNE_PLACEHOLDER = "[Old tool result content cleared]"
 TOOL_OUTPUT_MAX_CHARS = 2_000
 
 # 有效上下文封顶（HIVEWEAVE_EFFECTIVE_CONTEXT_WINDOW，0 = 关闭封顶）。
@@ -279,3 +291,104 @@ def compute_prefix_hash(content: str) -> str:
     if not isinstance(content, str):
         content = str(content)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+# ── prune 选址：单一实现（两处调用点共用）─────────────────────
+#
+# 背景（2026-09-21 收口）：同一套「逆序挑可裁剪 tool 输出」的算法在
+# `llm/streamer/context.py`（in-loop 临时裁剪）与 `conversation/store.py`
+# （持久化裁剪，写 cache+DB）各写了一份，且**已经漂移**：
+#   · 持久化版多一条「压缩摘要边界」停止条件；
+#   · 占位符一处是常量、一处是硬编码字面量；
+#   · 阈值靠注释「与 streamer 对齐」（声明同源 ≠ 同源）。
+# 本仓反复吃亏的形态就是「同一算法两次实现（已 5 次）」，故收口成下面这一
+# 个函数：**选址**共用，**apply 各写**（两处的 apply 合法地不同）。
+
+
+@dataclass(frozen=True)
+class PrunePlan:
+    """一次 prune 的选址结果（纯数据，不碰消息本体）。
+
+    ``indices`` 空有两种**不同**的成因，调用方要分开记日志/区分处置：
+    ``candidate_count == 0`` = 没有候选；``candidate_count > 0`` 但
+    ``indices == ()`` = 候选收益不足 ``minimum_tokens``。
+    """
+
+    indices: tuple[int, ...]   # 逆序扫描 ⇒ **降序**（越靠后越新）
+    prune_tokens: int
+    protected_tokens: int
+    turns: int
+    candidate_count: int
+
+
+def select_prune_indices(
+    messages: list[dict],
+    *,
+    protect_tokens: int = PRUNE_PROTECT_TOKENS,
+    minimum_tokens: int = PRUNE_MINIMUM_TOKENS,
+    placeholder: str = PRUNE_PLACEHOLDER,
+    stop_predicate: Callable[[dict], bool] | None = None,
+    min_messages: int = 6,
+) -> PrunePlan:
+    """逆序选出可裁剪的 tool 结果下标（**降序**：越靠后越新）。
+
+    规则（**消息数下限这条规则也归本函数** —— 调用点不要再自己写一遍
+    `len(messages) < 6`：否则默认值哪天改了也没人会发现，正是本次要治的
+    「声明与实际不同源」）：
+
+    1. 消息数 < ``min_messages``（默认 6）⇒ 空计划；
+    2. 逆序遍历，``role == "assistant"`` 计一轮；最近 2 轮内的消息不动；
+    3. ``stop_predicate`` 命中即**停止**（调用方声明自己的边界：持久化路径要
+       停在「压缩摘要边界」，in-loop 路径不需要）；
+    4. 非 tool 结果（无 ``tool_call_id``）跳过；
+    5. 已带占位符 ⇒ **停止**（更早的都已裁过）；
+    6. 累计受保护 token 超 ``protect_tokens`` 之后的旧 tool 输出进候选；
+    7. 候选总量 < ``minimum_tokens`` ⇒ 收益不足，返回 ``indices=()``
+       （此时 ``candidate_count > 0``，与「无候选」可区分）。
+
+    ⚠ 只选址、不改写。in-loop 的 apply 还要丢 ``images`` 并标记 context-rewrite，
+    持久化的 apply 要 in-place 改 cache + 入写队列 —— 那两步**故意不共用**。
+    """
+    if len(messages) < min_messages:
+        return PrunePlan((), 0, 0, 0, 0)
+
+    indices: list[int] = []
+    protected = 0
+    turns = 0
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        role = msg.get("role", "")
+
+        if role == "assistant":
+            turns += 1
+        if turns < 2:
+            continue
+
+        if stop_predicate is not None and stop_predicate(msg):
+            break
+
+        if "tool_call_id" not in msg:
+            continue
+
+        # 已被裁剪过 → 停止（更早的也已裁剪）
+        if msg.get("content") == placeholder:
+            break
+
+        tokens = estimate_tokens_for_messages([msg])
+        new_protected = protected + tokens
+        if new_protected <= protect_tokens:
+            protected = new_protected
+        else:
+            indices.append(i)
+
+    if not indices:
+        return PrunePlan((), 0, protected, turns, 0)
+
+    prune_tokens = sum(
+        estimate_tokens_for_messages([messages[i]]) for i in indices
+    )
+    if prune_tokens < minimum_tokens:
+        # 候选非空但收益不足 —— `candidate_count` 让调用方与「无候选」分开
+        return PrunePlan((), prune_tokens, protected, turns, len(indices))
+    return PrunePlan(tuple(indices), prune_tokens, protected, turns, len(indices))

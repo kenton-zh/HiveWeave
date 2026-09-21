@@ -23,10 +23,12 @@ from hiveweave.conversation.compaction import (
 )
 from hiveweave.conversation.token_utils import (
     PRUNE_MINIMUM_TOKENS,
+    PRUNE_PLACEHOLDER,
     PRUNE_PROTECT_TOKENS,
     TAIL_TURNS,
     estimate_tokens_for_messages,
     resolve_effective_context_window,
+    select_prune_indices,
 )
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
@@ -662,45 +664,26 @@ class ConversationStore:
         """
         key = (project_id, agent_id)
         messages = self._cache.get(key)
-        if not messages or len(messages) < 6:
+        # 消息数下限（< 6）由 select_prune_indices 的 `min_messages` 拥有。
+        if not messages:
             return
 
-        to_prune_indices: list[int] = []
-        protected = 0
-        turns = 0
-
-        for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            role = msg.get("role", "")
-
-            # 计算轮次（assistant 消息 = 一轮 LLM 回复的开始）
-            # HiveWeave 用 OpenAI 格式：tool 结果 role="tool"（不是 "user"）
-            if role == "assistant":
-                turns += 1
-            # 跳过最近 2 轮（保护当前上下文）
-            if turns < 2:
-                continue
-
-            # 停在压缩摘要边界
-            if role == "system" and SUMMARY_MARKER in (msg.get("content") or ""):
-                break
-
-            # 只处理 tool 结果消息
-            if "tool_call_id" not in msg:
-                continue
-
-            # 已被裁剪过 → 停止（更早的也已裁剪）
-            if msg.get("content") == "[Old tool result content cleared]":
-                break
-
-            tokens = estimate_tokens_for_messages([msg])
-            new_protected = protected + tokens
-            if new_protected <= PRUNE_PROTECT_TOKENS:
-                protected = new_protected
-            else:
-                to_prune_indices.append(i)
-
-        if not to_prune_indices:
+        # 选址走**单一实现**（token_utils.select_prune_indices）—— 与 in-loop
+        # 裁剪（llm/streamer/context.py）共用同一个函数：本路径**多一条**边界
+        # 「停在压缩摘要边界」，用 stop_predicate 声明，而不是就地再写一遍循环。
+        plan = select_prune_indices(
+            messages,
+            protect_tokens=PRUNE_PROTECT_TOKENS,
+            minimum_tokens=PRUNE_MINIMUM_TOKENS,
+            placeholder=PRUNE_PLACEHOLDER,
+            stop_predicate=lambda m: (
+                m.get("role") == "system"
+                and SUMMARY_MARKER in (m.get("content") or "")
+            ),
+        )
+        turns = plan.turns
+        protected = plan.protected_tokens
+        if plan.candidate_count == 0:
             logger.debug(
                 "prune_no_candidates",
                 agent_id=agent_id,
@@ -709,23 +692,21 @@ class ConversationStore:
                 protected_tokens=protected,
             )
             return
-
-        prune_tokens = sum(
-            estimate_tokens_for_messages([messages[i]]) for i in to_prune_indices
-        )
-        if prune_tokens < PRUNE_MINIMUM_TOKENS:
+        prune_tokens = plan.prune_tokens
+        if not plan.indices:
             logger.debug(
                 "prune_insufficient",
                 agent_id=agent_id,
                 prune_tokens=prune_tokens,
                 minimum=PRUNE_MINIMUM_TOKENS,
-                candidates=len(to_prune_indices),
+                candidates=plan.candidate_count,
             )
             return  # 收益不足，不执行
+        to_prune_indices = plan.indices
 
         # 永久替换 cache 中的内容（in-place 修改）
         for i in to_prune_indices:
-            messages[i] = {**messages[i], "content": "[Old tool result content cleared]"}
+            messages[i] = {**messages[i], "content": PRUNE_PLACEHOLDER}
 
         # 持久化到 DB — 通过写队列串行化，读取执行时的最新 cache
         await self._enqueue_write(key, self._persist_pruned, agent_id, key)
