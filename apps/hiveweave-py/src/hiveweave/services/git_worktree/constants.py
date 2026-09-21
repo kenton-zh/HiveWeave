@@ -58,6 +58,13 @@ REGENERABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 2 次；同引擎同版本同一天的 50 因叶子补了 .gitignore 而零复发）。
     # 注意与 `ENGINE_GITIGNORE_SEEDS` 互补：种子防新增入库，本模式治**已有**脏。
     re.compile(r"(?:^|/)\.godot/(?:.*)$"),
+    # P0（2026-09-20 TEST_DSH_65）：Vite 依赖预构建缓存，与 `.godot/` 完全同族。
+    # 被 checkpoint 的 `git add -A` 提交进分支 ⇒ MAIN 永久脏 ⇒ merge 门禁把它
+    # 判进 `non_regen` 硬拒，而门禁自己开出的 `checkout HEAD --` 又撞 `.git` 封条
+    # ⇒ 三机制相乘死锁（本项目 6 次拒合 / 5 次恢复失败 / 项目未交付）。
+    # 跨项目实测：**14 个**项目的 MAIN 跟踪着同一对 `.vite/deps/_metadata.json`
+    # + `.vite/deps/package.json`，其中 12 个尚未撞门禁 = 装好引信的哑弹。
+    re.compile(r"(?:^|/)\.vite/(?:.*)$"),
 )
 
 
@@ -65,6 +72,25 @@ def is_regenerable_path(path: str) -> bool:
     """True when *path* is a regenerable build/test artifact."""
     norm = (path or "").replace("\\", "/")
     return any(rx.search(norm) for rx in REGENERABLE_PATTERNS)
+
+def is_generated_path(path: str) -> bool:
+    """单一判定源：路径是否属于「平台必剥离 / 可再生」产物。
+
+    判据 = ``GENERATED_FILES``（lockfile 名集合）∪ ``REGENERABLE_PATTERNS``（正则）。
+
+    ⚠ 凡要判「这是不是生成物」的地方**一律走这里**，不要单独读某一张表。
+    2026-09-20 的实证代价：merge 门禁只认 ``REGENERABLE_PATTERNS``，而
+    checkpoint 侧只认 ``GENERATED_FILES`` —— 同一语义两张表、两处各自表达：
+    ① `.vite/` 两张表都没有 ⇒ MAIN 永久脏 ⇒ 门禁硬拒 6 次 ⇒ TEST_DSH_65 未交付；
+    ② `package-lock.json` 在 ``GENERATED_FILES`` 里但门禁不读 ⇒ TEST_DSH_35
+    被硬拒 2 次。平台自己在 ``worktree_review`` 的 T1.1 口径里早已把两张表
+    并起来，并逐字记录「会造成 checkpoint 报剥离、dirty 门禁又计数的死锁闭环
+    （tracked 变体实测复现）」—— 那处修了，merge 门禁这处没修。本函数就是把
+    那处收口成唯一权威点，避免继续「一处补、一处漏」。
+    """
+    norm = (path or "").strip().strip('"').replace("\\", "/")
+    base = norm.rsplit("/", 1)[-1]
+    return base in GENERATED_FILES or is_regenerable_path(norm)
 
 
 # .gitignore entries the platform guarantees for every project repo.
@@ -114,6 +140,19 @@ ENGINE_GITIGNORE_SEEDS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
         # 只排缓存目录。`*.import` / `*.uid` **必须保持版本化** —— 把它们忽略
         # 掉会让资源引用断链（50 号在 5054b7d 已踩过这一层）。
         (".godot/",),
+    ),
+    (
+        (
+            "vite.config.js",
+            "vite.config.ts",
+            "vite.config.mjs",
+            "vite.config.mts",
+            "vite.config.cjs",
+            "vite.config.cts",
+        ),
+        # 只排依赖预构建缓存目录。`dist/` / `build/` 是**交付物**，必须保持
+        # 版本化，不能一并忽略（与上面 `*.import` / `*.uid` 同款纪律）。
+        (".vite/",),
     ),
 )
 

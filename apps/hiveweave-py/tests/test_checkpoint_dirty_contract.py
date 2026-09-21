@@ -550,3 +550,149 @@ async def test_all_checkpoint_paths_expose_identical_key_sets(
     # 早退路径的体积字段必须是"零"，不能是上一棵树的值
     assert noop["staged_deleted"] == 0 and noop["volume_alarm"] is False
     assert add_failed["volume_alarm"] is False
+
+# ── 用例：`.vite/` 依赖预构建缓存（P0-2 · TEST_DSH_65 死锁复发防线）────────
+#
+# 背景（2026-09-20 平台问题研究 P0-2）：`.vite/deps/_metadata.json` 与
+# `.vite/deps/package.json` 被 checkpoint 的 `git add -A` 提交进分支 ⇒ MAIN
+# 永久脏 ⇒ merge 门禁把它们判进 `hard_blockers` 硬拒 6 次，而门禁自己开出的
+# `checkout HEAD --` 又撞 `.git` 封条 ⇒ 三机制相乘死锁、项目未交付。跨项目
+# 实测 **14 个**项目的 MAIN 跟踪着同一对文件，其中 12 个尚未撞门禁（哑弹）。
+#
+# 阳性对照做法：注释掉 `constants.REGENERABLE_PATTERNS` 里 `.vite/` 那一条后
+# 重跑本文件 —— 下面三条断言**必须转红**（硬 blockers 非空 / 边界判据反向 /
+# 种子探测为空）。转不红即为假绿。
+
+async def test_vite_tracked_dirt_is_not_a_hard_blocker(tmp_path: Path):
+    """已被跟踪的 `.vite/` 缓存脏 ⇒ 不得进 hard_blockers（本项目拒合 6 次）。"""
+    from hiveweave.services.git_worktree.merge_support import classify_main_dirt
+
+    main = tmp_path / "vite-main"
+    main.mkdir()
+    _init_repo(main)
+
+    vite = main / ".vite" / "deps"
+    vite.mkdir(parents=True)
+    (vite / "_metadata.json").write_text('{"a": 1}\n', encoding="utf-8")
+    (vite / "package.json").write_text('{"b": 2}\n', encoding="utf-8")
+    _git(main, "add", "-f", ".vite/deps/_metadata.json", ".vite/deps/package.json")
+    _git(main, "commit", "-m", "vite cache (platform bug: git add -A)")
+
+    # 复现「MAIN 永久脏」：缓存被 dev server 改写
+    (vite / "_metadata.json").write_text('{"a": 99}\n', encoding="utf-8")
+    (vite / "package.json").write_text('{"b": 99}\n', encoding="utf-8")
+
+    verdict = await classify_main_dirt(str(main))
+    assert ".vite/deps/_metadata.json" in verdict["dirty_paths"]
+    assert ".vite/deps/package.json" in verdict["dirty_paths"]
+    assert verdict["hard_blockers"] == [], verdict["hard_blockers"]
+    assert verdict["user_suspect"] == [], verdict["user_suspect"]
+
+
+def test_vite_regenerable_boundaries_do_not_overreach():
+    """正样本命中、负样本不误伤（`.vitebuild/` 曾是同族误伤面）。"""
+    from hiveweave.services.git_worktree.constants import is_generated_path
+
+    # 报告里实测被提交进分支、且 14 个项目都在跟踪的那一对
+    assert is_generated_path(".vite/deps/_metadata.json") is True
+    # 目录级口径（与 `.godot/` 一致）：只判 `.vite/deps/` 会漏掉 temp/ 等子目录
+    assert is_generated_path("web/.vite/temp/hash.js") is True
+    assert is_generated_path(".vite/temp/hash.js") is True
+    assert is_generated_path(".vite/deps/package.json") is True
+    assert is_generated_path("mini-town/.vite/deps/_metadata.json") is True
+
+    # 负样本：`.vitebuild/` 是另一个目录名；配置与源码更不是产物
+    assert is_generated_path(".vitebuild/x.js") is False
+    assert is_generated_path("vite.config.ts") is False
+    assert is_generated_path("src/main.ts") is False
+
+
+def test_vite_gitignore_seed_detected_from_vite_config(tmp_path: Path):
+    """有 vite 标记文件才补 `.vite/` 种子；无标记不得凭空补（同 `.godot/`）。"""
+    from hiveweave.services.git_worktree.constants import (
+        detect_engine_gitignore_entries,
+    )
+
+    proj = tmp_path / "vite-proj"
+    proj.mkdir()
+    (proj / "vite.config.ts").write_text("export default {}\n", encoding="utf-8")
+    assert ".vite/" in detect_engine_gitignore_entries(str(proj))
+
+    plain = tmp_path / "plain-proj"
+    plain.mkdir()
+    (plain / "package.json").write_text("{}\n", encoding="utf-8")
+    assert detect_engine_gitignore_entries(str(plain)) == ()
+
+async def test_lockfile_tracked_dirt_is_not_a_hard_blocker(tmp_path: Path):
+    """`GENERATED_FILES`（lockfile）脏也不得硬拒 —— 门禁此前**只读**
+    ``REGENERABLE_PATTERNS``、不读 ``GENERATED_FILES``，于是 TEST_DSH_35 被
+    逐字判成 `Dirty: package-lock.json` 硬拒 2 次。两处判定现已收口到
+    ``constants.is_generated_path``（单一判定源），本条即该收口的守卫。
+
+    阳性对照：把 ``is_generated_path`` 里的 ``GENERATED_FILES`` 分支去掉
+    ⇒ 本条必须转红（hard_blockers 非空）。
+    """
+    from hiveweave.services.git_worktree.constants import is_generated_path
+    from hiveweave.services.git_worktree.merge_support import classify_main_dirt
+
+    # 先钉住判定源本身：lockfile 与 .vite/ 在**同一个函数**里被认成生成物
+    assert is_generated_path("package-lock.json") is True
+    assert is_generated_path(".vite/deps/_metadata.json") is True
+    assert is_generated_path("src/main.ts") is False
+
+    main = tmp_path / "lock-main"
+    main.mkdir()
+    _init_repo(main)
+    (main / "package-lock.json").write_text('{"v": 1}\n', encoding="utf-8")
+    _git(main, "add", "package-lock.json")
+    _git(main, "commit", "-m", "lock")
+    (main / "package-lock.json").write_text('{"v": 2}\n', encoding="utf-8")
+
+    verdict = await classify_main_dirt(str(main))
+    assert "package-lock.json" in verdict["dirty_paths"]
+    assert verdict["hard_blockers"] == [], verdict["hard_blockers"]
+
+async def test_checkpoint_never_commits_vite_cache(tmp_path: Path):
+    """引入点守卫：`git add -A` 不得把 `.vite/` 提交进分支（本次事故源头）。
+
+    阳性对照：删掉 ``REGENERABLE_PATTERNS`` 里的 `.vite/` ⇒ 本条必须转红
+    （审计实测：删正则后提交里出现 `.vite/deps/_metadata.json` + `package.json`）。
+    """
+    main, wt = _make_worktree(tmp_path, "vite-ck")
+    v = wt / ".vite" / "deps"
+    v.mkdir(parents=True)
+    (v / "_metadata.json").write_text('{"a": 1}\n', encoding="utf-8")
+    (v / "package.json").write_text('{"b": 2}\n', encoding="utf-8")
+    (wt / "src").mkdir()
+    (wt / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
+
+    result = await _service_with_worktree(wt).checkpoint(str(main), "tv", "vite")
+    assert result["success"] is True, result
+
+    committed = _git(wt, "diff", "--name-only", "HEAD~1", "HEAD")
+    assert "src/a.ts" in committed, committed   # 防空提交导致的恒真
+    assert ".vite/" not in committed, committed  # 事故形态
+    assert ".vite/deps/_metadata.json" in (result.get("message") or "")
+
+
+async def test_merge_gate_restores_vite_dirt_instead_of_rejecting(tmp_path: Path):
+    """merge 真实入口：`restore_regenerable_dirt_or_reject` 应恢复而非拒合。
+    阳性对照：删掉 `.vite/` 正则 ⇒ 返回 reason='main_dirty' 拒合（事故原话）。
+    """
+    from hiveweave.services.git_worktree.merge_support import (
+        restore_regenerable_dirt_or_reject,
+    )
+
+    main = tmp_path / "vite-restore"
+    main.mkdir()
+    _init_repo(main)
+    v = main / ".vite" / "deps"
+    v.mkdir(parents=True)
+    (v / "_metadata.json").write_text('{"a": 1}\n', encoding="utf-8")
+    _git(main, "add", "-f", ".vite/deps/_metadata.json")
+    _git(main, "commit", "-m", "vite cache")
+    (v / "_metadata.json").write_text('{"a": 99}\n', encoding="utf-8")
+
+    verdict = await restore_regenerable_dirt_or_reject(str(main), branch="main")
+    assert verdict is None, verdict
+    assert _git(main, "status", "--porcelain") == ""

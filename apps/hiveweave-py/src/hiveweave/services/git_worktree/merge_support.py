@@ -10,7 +10,7 @@ from .constants import (
     TRACKED_WS_DIRS,
     _UNTRACKED_FILE_LINE_RE,
     _UNTRACKED_OVERWRITE_RE,
-    is_regenerable_path,
+    is_generated_path,
 )
 from .git_cmd import _git
 from .porcelain import _in_tracked_ws_dir, _porcelain_tracked_dirty_paths
@@ -37,7 +37,7 @@ async def classify_main_dirt(workspace_path: str) -> dict:
     dirty_paths = _porcelain_tracked_dirty_paths(st_out) if ok_st else []
     hard = [
         p for p in dirty_paths
-        if not is_regenerable_path(p) and not _in_tracked_ws_dir(p)
+        if not is_generated_path(p) and not _in_tracked_ws_dir(p)
     ]
     return {
         "dirty_paths": dirty_paths,
@@ -72,12 +72,12 @@ async def restore_regenerable_dirt_or_reject(
     dirty_paths = dirt["dirty_paths"]
     if not dirty_paths:
         return None
-    non_regen = [p for p in dirty_paths if not is_regenerable_path(p)]
+    non_regen = [p for p in dirty_paths if not is_generated_path(p)]
     if non_regen and not all(_in_tracked_ws_dir(p) for p in non_regen):
         # 按路径类别分流处方（fixlist #7）：生成物与源码脏的**正确动作不同**。
         # 原来笼统一句 "clean or commit" 会让团队把引擎缓存 commit 进库 ——
         # 51 号实测的形态（`.godot/global_script_class_cache.cfg` 被拒 2 次）。
-        regen_dirty = [p for p in dirty_paths if is_regenerable_path(p)]
+        regen_dirty = [p for p in dirty_paths if is_generated_path(p)]
         parts: list[str] = []
         parts.append(
             "SOURCE changes — commit them on a side branch (or discard if "

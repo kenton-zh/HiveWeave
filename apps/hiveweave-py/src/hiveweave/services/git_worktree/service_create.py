@@ -23,6 +23,7 @@ from .constants import (
     _WT_LIST_RE,
     _create_locks,
     _create_locks_guard,
+    is_generated_path,
     is_regenerable_path,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
@@ -1263,13 +1264,16 @@ yarn.lock merge=union
                     if ln.startswith("!!")
                 ]
                 # 只关注可能是产物的文件（排除 .pyc/__pycache__/.hiveweave 等）
-                # 再生文件走上面的 regen_note（`git add -f` 建议对它们是死循环）
+                # 生成物走上面的 regen_note（`git add -f` 建议对它们是死循环）
+                # ↓ 用单一判定源：lockfile 属于 `GENERATED_FILES`，若继续只读
+                #   `is_regenerable_path` 则 lockfile 会被当成“人为忽略的源码”而建议
+                #   `git add -f`，而 checkpoint 必剥离它 ⇒ 死循环。
                 _NOISE = (".pyc", "__pycache__", ".hiveweave/", "node_modules/",
                           ".venv/", ".git/")
                 product_ignored = [
                     f for f in ignored_files
                     if not any(n in f for n in _NOISE)
-                    and not is_regenerable_path(f)
+                    and not is_generated_path(f)
                 ]
                 if product_ignored:
                     ignored_warning = (

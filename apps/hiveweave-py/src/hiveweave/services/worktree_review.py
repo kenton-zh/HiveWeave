@@ -240,23 +240,20 @@ async def worktree_commits_ahead(
         return None
 
 
-def _is_generated_untracked(path: str) -> bool:
+def _is_generated_path(path: str) -> bool:
     """True 当路径属于生成物（checkpoint 会剥离的那类）。
 
-    生成物两套都算（T1.1 口径修正）：``GENERATED_FILES``（7 个 lockfile 名）
-    + ``is_regenerable_path``（.tsbuildinfo / test_output*.json）。只排除
-    这类路径，**不是排除全部 ``??``** —— untracked 新源码必须继续计入
+    判定**一律委托** ``constants.is_generated_path``（唯一权威判定源 = 
+    ``GENERATED_FILES`` ∪ ``REGENERABLE_PATTERNS``）。此处不再自己拼两张表
+    —— 那份拷贝正是「同一语义两处表达」的分裂源（证据见该函数的 docstring）。
+
+    只排除这类路径，**不是排除全部 ``??``** —— untracked 新源码必须继续计入
     dirty，否则「零 commit + 纯 untracked 交付」会绕过 Rita escape 防线，
     且 ``org._in_progress_keep_status`` 会把 worktree 连同未提交源码删掉。
     """
-    from hiveweave.services.git_worktree.constants import (
-        GENERATED_FILES,
-        is_regenerable_path,
-    )
+    from hiveweave.services.git_worktree.constants import is_generated_path
 
-    norm = (path or "").strip().strip('"').replace("\\", "/")
-    base = norm.rsplit("/", 1)[-1]
-    return base in GENERATED_FILES or is_regenerable_path(norm)
+    return is_generated_path(path)
 
 
 #: porcelain XY 前缀 + 路径。``_git`` 对整段输出做了 strip()，首行的
@@ -318,14 +315,14 @@ async def worktree_dirty_counts(worktree_ws: str) -> dict[str, Any]:
             if ln.startswith("??") or ln.startswith("!!"):
                 untracked += 1
                 path = ln[2:].strip()
-                if _is_generated_untracked(path):
+                if _is_generated_path(path):
                     generated += 1
                     generated_paths.append(path)
                 else:
                     dirty += 1
             else:
                 paths = _porcelain_paths(ln)
-                if paths and all(_is_generated_untracked(p) for p in paths):
+                if paths and all(_is_generated_path(p) for p in paths):
                     # tracked 生成物修改：checkpoint 必剥离（reset/checkout），
                     # 不可提交 → 与 untracked 生成物同口径，不计 dirty。
                     generated += 1
