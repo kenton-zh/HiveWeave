@@ -845,6 +845,17 @@ def prepare_spawn_command(
     # 尾部 & 会让后续注入的 --port 落到后台作业之外；spawn 路径已脱离前台。
     command = re.sub(r"\s*&+\s*$", "", (command or "").strip()).strip()
 
+    # P1-8a 新-④（2026-09-21）：可移植性别名归一化 —— `python3`→`python` /
+    # `pip3`→`pip`。本路径最后经 `hidden_popen(cmd, shell=True)`（Windows 上是
+    # cmd /c）起**长驻进程**，此前**完全不归一化** ⇒ `python3 -m uvicorn …` 在
+    # Windows 上要么落 Store stub、要么落到 PATH 上恰好存在的某个解释器，
+    # 与 bash 工具那四个分支（Git Bash / cmd / unix / pwsh）语义不一致。
+    # ⚠ `skip_cmd_mapping=True`：只做别名，**不做** unix→cmd 动词映射
+    # （命令是起服务的，动词映射会改坏参数语义；与 pwsh 分支同口径）。
+    from hiveweave.tools.bash import _normalize_command  # 惰性：避免 tools↔services 环
+
+    command = _normalize_command(command, skip_cmd_mapping=True)
+
     # Explicit reserved port → hard reject
     for port in extract_ports_from_command(command):
         if is_reserved_port(port):
