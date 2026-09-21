@@ -465,6 +465,14 @@ async def _short_circuit_satisfied_task_waits(
     if conn is None:
         return 0
     from hiveweave.agents.trigger import trigger_subordinate
+    # P1-3 ①：`blocked` **不进** `_TASK_WAIT_SATISFIED_STATUSES`（它有活出口：
+    # `_TRANSITIONS` 允许 blocked → running/closed，`reconcile_blocked_tasks` 会解封
+    # 并续走 ⇒ `task_transition` 会来）。把 blocked 塞进那个集合会让等待/唤醒**空转**。
+    # 但「**没有**自动解封路径的 blocked」是另一回事 —— 那正是僵尸：
+    # `lifecycle.blocked_task_has_wake_path`（纯结构化字段：deps 非空 或 timer+wake_at）
+    # 早已实现这条判据，此前**只被义务面消费**（`services/obligation.py`），
+    # wait 侧不读 ⇒ 这类等待只能干等到 TTL。
+    from hiveweave.services.tasks.lifecycle import blocked_task_has_wake_path
 
     now = int(time.time() * 1000)
     woken = 0
@@ -474,14 +482,25 @@ async def _short_circuit_satisfied_task_waits(
             continue
         try:
             cur = await conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", [ref]
+                "SELECT status, depends_on, wait_kind, wake_at FROM tasks "
+                "WHERE id = ?",
+                [ref],
             )
             row = await cur.fetchone()
             await cur.close()
         except Exception:  # noqa: BLE001 — 查不到按未满足处理
             continue
         status = (row[0] if row else "") or ""
-        if status not in _TASK_WAIT_SATISFIED_STATUSES:
+        zombie_blocked = False
+        if row is not None and status == "blocked":
+            zombie_blocked = not blocked_task_has_wake_path(
+                {
+                    "depends_on": row[1],
+                    "wait_kind": row[2],
+                    "wake_at": row[3],
+                }
+            )
+        if status not in _TASK_WAIT_SATISFIED_STATUSES and not zombie_blocked:
             continue
         # 审计[1]：UPDATE rowcount 守卫——与任务转换路径并发时，转换可能已清
         # 同一行并唤醒过；0 行 = 这次短路没有"清"到任何东西，不重复唤醒。
@@ -500,6 +519,8 @@ async def _short_circuit_satisfied_task_waits(
             agent_id=w.get("agentId"),
             task_ref=ref,
             task_status=status,
+            # P1-3 ①：标明是哪一支命中（终态 / blocked 且无自动解封路径）
+            reason=("blocked_no_wake_path" if zombie_blocked else "terminal_status"),
         )
         try:
             await trigger_subordinate(str(w.get("agentId") or ""))
