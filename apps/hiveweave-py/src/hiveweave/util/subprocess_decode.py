@@ -35,7 +35,9 @@ def decode_subprocess_output(data: bytes) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        pass
+        # 棘轮纪律（2026-09-21）：落到下一档 codec 前**记一笔**（原来是 `pass`；
+        # 随后 `..._fallback_used` 只说明"用了 fallback"，不说明 utf-8 失败过）。
+        logger.debug("subprocess_decode_utf8_failed nbytes=%d", len(data))
     codec = fallback_codec()
     try:
         text = data.decode(codec)

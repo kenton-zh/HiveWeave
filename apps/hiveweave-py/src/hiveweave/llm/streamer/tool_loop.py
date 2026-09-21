@@ -605,8 +605,10 @@ class ToolLoopMixin:
                 from hiveweave.llm.streamer.probe import compare_and_record
 
                 compare_and_record(agent_id, messages, slot="run_inner")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as probe_err:  # noqa: BLE001
+                # 探针是诊断设施：失败不得影响主流程，但**不许静默**（棘轮纪律：
+                # 写明吞掉了什么）。此处只记 debug，因为下一轮还会再探。
+                log.debug("inner_prefix_probe_failed", error=str(probe_err))
 
             # 中轮提醒: 80% 轮次时注入
             messages = self._maybe_inject_mid_round_reminder(

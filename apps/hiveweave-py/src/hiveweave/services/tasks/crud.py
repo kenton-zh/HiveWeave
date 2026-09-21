@@ -133,9 +133,22 @@ class CrudMixin:
         await _ensure_schema(project_id)
         # P1-7 ②：唯一写口上的查重门（旁路也走这里）。
         if dedup_policy != "allow" and source == "agent" and kind is None:
-            existing = await self.find_similar_open_task(
-                project_id, title, assignee_id, include_unassigned=True
-            )
+            try:
+                existing = await self.find_similar_open_task(
+                    project_id, title, assignee_id, include_unassigned=True
+                )
+            except Exception as e:  # noqa: BLE001
+                # ⚠ 查重是**建议性**门，不是安全不变量 ⇒ **查不动时不阻断创建**：
+                # 它内部要 `_ensure_schema` + 解析 workspace，未注册 workspace 的场景
+                #（如 `test_audit_secondpass_regression::test_create_task_normalizes_depends_on`）
+                # 以前能建任务，加了门之后不能 ⇒ 那是把建议性门当成了硬前置。
+                # 失败留一条 debug（不静默：可观测，但不改变创建语义）。
+                log.debug(
+                    "task_dedup_lookup_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
+                existing = None
             if existing is not None:
                 existing_id = str(existing.get("id") or "")
                 if dedup_policy == "reuse" and existing_id:

@@ -1301,6 +1301,7 @@ async def _validate_command_safety_resolved(
     tool_args: dict | None = None,
     ask_already_resolved: bool = False,
     cwd: str | None = None,
+    boundary_root: str | None = None,
 ) -> tuple[bool, str]:
     """交互式执行入口用：校验 + ask 在线审批解析（T2.2）。
 
@@ -1326,7 +1327,10 @@ async def _validate_command_safety_resolved(
 
     # #15：删除命令落点判定（越界 → deny，不进入 ask 等待）
     landing = await resolve_delete_landing_for_agent(
-        command, agent_id=agent_id, cwd=cwd
+        command, agent_id=agent_id, cwd=cwd,
+        # P1-4：删除落点边界以**执行侧授权树**为准（= 本次 spawn 的 workspace_path）。
+        # 不透传 ⇒ 守卫只能按 agent 身份猜，`pwsh_main` 下 ACL 授 MAIN 却按 worktree 判。
+        boundary_root=boundary_root,
     )
     if landing is not None and landing.blocked:
         return True, landing.reason

@@ -2152,8 +2152,9 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
                         + "——需 merge 产出分支或在共享空间补齐"
                     ),
                 })
-    except Exception:  # noqa: BLE001 — fail-open（docstring：判据故障不得把 CEO 卡成"永远标记不了"）
-        pass
+    except Exception as judge_err:  # noqa: BLE001 — fail-open（docstring：判据故障不得把 CEO 卡成"永远标记不了"）
+        # 棘轮纪律（2026-09-21）：fail-open 同样要**可观测**（原来是 `pass`）。
+        log.debug("delivery_blockers_failed", error=str(judge_err))
     return blockers
 
 

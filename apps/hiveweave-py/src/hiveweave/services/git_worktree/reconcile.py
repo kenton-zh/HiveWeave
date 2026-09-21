@@ -1005,8 +1005,9 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                     for _a in _arows or []:
                         if _a["id"] and _a["short_id"]:
                             _sid_by_agent[str(_a["id"])] = str(_a["short_id"])
-                except Exception:
-                    pass
+                except Exception as sid_err:  # noqa: BLE001
+                    # 棘轮纪律（2026-09-21）：best-effort 也要写明吞掉了什么。
+                    log.debug("reconcile_sid_map_failed", error=str(sid_err))
             stranded: list[str] = []
             for row in rows:
                 ev_raw = row.get("evidence") or "{}"

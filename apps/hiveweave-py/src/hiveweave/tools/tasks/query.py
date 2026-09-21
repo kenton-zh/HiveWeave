@@ -155,8 +155,10 @@ async def get_tasks_tool(
                     case_by_verify[str(vid)] = case
                 if oid:
                     case_by_original[str(oid)] = case
-        except Exception:
-            pass
+        except Exception as case_err:  # noqa: BLE001
+            # 棘轮纪律（2026-09-21）：verification_cases 预取失败要可观测
+            #（原来是 `pass` —— 预取为空会让下游把"查不到"当成"没有"）。
+            log.debug("verification_cases_prefetch_failed", error=str(case_err))
         # P0-1: prefetch active waivers so agents can SEE who waived a task
         # (waived_by third-party isolation is otherwise invisible — agents
         # guessed wrong in TEST18 and deadlocked approve for hours).
