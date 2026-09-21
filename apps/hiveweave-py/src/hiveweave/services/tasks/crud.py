@@ -93,6 +93,7 @@ class CrudMixin:
                           expected_modules: list[str] | None = None,
                           tags: list[str] | None = None,
                           source: str = "agent",
+                          dedup_policy: str = "reuse",
                           evidence: dict | None = None,
                           contract_json: dict | None = None,
                           policy_id: str | None = None,
@@ -115,8 +116,42 @@ class CrudMixin:
         When ``contract_json`` is set the task is a slice: validated, given an
         initial ``slice_status`` (draft|ready), and subject to ready / pre-run
         gates on start/submit.
+
+        ``dedup_policy``（**P1-7 ②，2026-09-21**）：查重门**下沉到本方法**（唯一写口）。
+        此前门只在工具层（`tools/tasks/create.py` / `dispatch.py`），三条旁路
+        —— HTTP `POST /tasks`（`api/tasks.py:199`）、`services/dispatch.py:312`、
+        `tools/misc_tools.py:338` —— **都能绕过**（该文件查重函数 grep = 0）。
+        取值：``reuse``（默认：命中相似 open 任务 ⇒ **返回既有 id**，不新建 ——
+        与工具层回执里已有的「请复用 dispatch_task(...)」同向，属「复用而非拦截」）·
+        ``warn``（命中只告警、照常新建）· ``allow``（完全跳过检查）。
+
+        **豁免**：`source != "agent"`（平台内部 spawn）**或** 显式 `kind`
+        （VERIFY 等系统种类）—— 两条都是**状态判据**（不是标题文案），且平台
+        内部 spawn 路径本来就传 `source="system"`（`verify_spawn.py:499` /
+        `misc_tools.py:346`）。不加豁免会把 VERIFY 自动建单挡掉。
         """
         await _ensure_schema(project_id)
+        # P1-7 ②：唯一写口上的查重门（旁路也走这里）。
+        if dedup_policy != "allow" and source == "agent" and kind is None:
+            existing = await self.find_similar_open_task(
+                project_id, title, assignee_id, include_unassigned=True
+            )
+            if existing is not None:
+                existing_id = str(existing.get("id") or "")
+                if dedup_policy == "reuse" and existing_id:
+                    log.warning(
+                        "task_create_reused_similar_open",
+                        project_id=project_id,
+                        existing_task_id=existing_id,
+                        title=(title or "")[:60],
+                    )
+                    return existing_id
+                log.warning(
+                    "task_create_duplicate_title",
+                    project_id=project_id,
+                    existing_task_id=existing_id,
+                    title=(title or "")[:60],
+                )
         now_ms = int(time.time() * 1000)
         task_id = str(uuid.uuid4())
 
