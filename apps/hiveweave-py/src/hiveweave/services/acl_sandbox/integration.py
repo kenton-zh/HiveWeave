@@ -92,8 +92,11 @@ def build_confined_argv(command: str, *, dialect: str = "bash") -> list[str]:
       在受限模式以 PowerShell 语义原样执行；unix-only 命令由
       ``tools/bash._pwsh_dialect_gate`` 在执行前拒绝并给 pwsh 等价（不再
       静默错译/混血参数）。无 pwsh 时 cmd 兜底（``/s /c`` + ``_normalize_command``）。
-    - ``dialect="pwsh"``：命令**已是 PowerShell 方言**（pwsh 工具），原样直传，
-      不做任何 unix→pwsh 转译（转译会破坏合法 pwsh 语法，DSH_33 P0）。
+    - ``dialect="pwsh"``：命令**已是 PowerShell 方言**（pwsh 工具），不做
+      unix→pwsh 转译（转译会破坏合法 pwsh 语法，DSH_33 P0）；但**仍做可移植性
+      别名规范化**（`python3`→`python`、`pip3`→`pip`，`skip_cmd_mapping=True`
+      ⇒ 不映射 unix 动词）—— 与 `tools/bash._run_native` 的 pwsh 分支同语义
+      （P1-8a：此前两个 pwsh 分支都不调归一化，是四处分支里唯二的例外）。
     - 两分支都注入 ``PWSH_ENCODING_PREAMBLE``（UTF-8 钉），防中文乱码（P1-3）。
 
     与 ``build_confined_command`` 的区别：返回 argv 数组，由 spawn 侧用
@@ -108,11 +111,20 @@ def build_confined_argv(command: str, *, dialect: str = "bash") -> list[str]:
                 "pwsh (PowerShell 7+) not found on PATH — the pwsh tool "
                 "requires it. Use the bash tool instead."
             )
+        from hiveweave.tools.bash import _normalize_command  # 惰性，避免循环导入
+
         return [pwsh, "-NoProfile", "-NonInteractive", "-Command",
-                f"{PWSH_ENCODING_PREAMBLE}{command}"]
+                f"{PWSH_ENCODING_PREAMBLE}{_normalize_command(command, skip_cmd_mapping=True)}"]
     if pwsh:
+        # P1-8a：这里过去也是**裸串直传**（与 pwsh 分支同病）。`dialect="bash"` 的
+        # 「verbatim 交给 pwsh」指的是**不做方言转译**（不映射 unix 动词、不改写
+        # pipe/flag），而 `python3`→`python` 是**可移植性别名**，不属于转译 ⇒ 必须做。
+        # ⚠ `run_command` 在 pwsh 宿主仍暴露且走本分支（`tools_filter` 只隐藏
+        # bash/bash_main），不接上则默认受限模式下 `python3` 仍原样落 pwsh。
+        from hiveweave.tools.bash import _normalize_command  # 惰性，避免循环导入
+
         return [pwsh, "-NoProfile", "-NonInteractive", "-Command",
-                f"{PWSH_ENCODING_PREAMBLE}{command}"]
+                f"{PWSH_ENCODING_PREAMBLE}{_normalize_command(command, skip_cmd_mapping=True)}"]
     cmd = os.environ.get("COMSPEC", "cmd.exe")
     from hiveweave.tools.bash import _normalize_command  # 惰性，避免循环导入
 

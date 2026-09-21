@@ -1555,6 +1555,27 @@ def _find_bash_exe() -> str | None:
     return None
 
 
+# `python3`/`pip3` → `python`/`pip` 的匹配（P1-8a）。
+#
+# ⚠ 措辞校准：这**不是**「命令位置」匹配，而是**词/路径边界收紧** —— 与旧的 `\b`
+# 相比只收窄两侧集合（单调收窄 ⇒ 不会产生旧实现没有的新误伤）。实测旧边界会改坏
+# `python3.11` → `python.11`、`C:/tools/python3/bin/x` → `C:/tools/python/bin/x`。
+# 已知取舍（三个老分支同口径）：`Get-Command python3` 这类**存在性探针**也会被改写成
+# 探 `python`（生产库有 1 例）—— 要改判据得引入「命令位置」解析器，另开单。
+# 前后界排除：词字符 / `.` / `/` / `\` / `-`（路径段、`python3.11`、`python3-dev`）。
+# `.exe` 形态**必须保留映射**（Windows 上 `python3.exe` 同样普遍不存在）。
+_PY3_CMD_RE = re.compile(r"(?<![\w./\\-])python3(\.exe)?(?![.\w/-])")
+_PIP3_CMD_RE = re.compile(r"(?<![\w./\\-])pip3(\.exe)?(?![.\w/-])")
+
+
+def _sub_py3(m: "re.Match[str]") -> str:
+    return "python" + (m.group(1) or "")
+
+
+def _sub_pip3(m: "re.Match[str]") -> str:
+    return "pip" + (m.group(1) or "")
+
+
 def _normalize_command(command: str, *, skip_cmd_mapping: bool = False) -> str:
     """Pre-process command for cross-platform compatibility.
 
@@ -1562,11 +1583,13 @@ def _normalize_command(command: str, *, skip_cmd_mapping: bool = False) -> str:
     - pip3 → pip
     - P2 fix(TEST10): Windows 下常见 unix 命令映射到 cmd 等价物
     - P2 fix(TEST11-R3): 带 unix 风格 flag 的命令不映射，避免参数错乱
+
+    P1-8a：两条替换只作用于**命令位置**（边界见 `_PY3_CMD_RE`），且**四个分支都调**
+    —— pwsh 分支曾经不调（自述「已是 PowerShell 方言」），于是 `python3` 会原样
+    落到 pwsh（Windows 上普遍不存在）。
     """
-    import re
-    # Replace python3/pip3 with python/pip (word-boundary safe)
-    cmd = re.sub(r'\bpython3\b', 'python', command)
-    cmd = re.sub(r'\bpip3\b', 'pip', cmd)
+    cmd = _PY3_CMD_RE.sub(_sub_py3, command)
+    cmd = _PIP3_CMD_RE.sub(_sub_pip3, cmd)
 
     # Windows: map common unix commands to cmd equivalents (fallback path only)
     if sys.platform.startswith("win") and not skip_cmd_mapping:
@@ -2258,8 +2281,10 @@ async def _run_native(
     根治 cmd 不支持管道/变量赋值/&&复合/bash script.sh 的固有限制。
     无 Git Bash 时降级为 cmd /s /c + 命令映射兜底。
 
-    ``dialect="pwsh"``（pwsh 工具）：命令已是 PowerShell 方言 —— 直接交给
-    pwsh，不做 unix 规范化（沙箱 off 时也要与受限路径同语义）。
+    ``dialect="pwsh"``（pwsh 工具）：命令已是 PowerShell 方言 —— 交给 pwsh 前只做
+    **可移植性别名**规范化（`python3`→`python`、`pip3`→`pip`，`skip_cmd_mapping=True`
+    ⇒ 不做 unix→cmd 映射），因为 pwsh 宿主上 `python3` 普遍不存在（P1-8a；
+    在此之前 pwsh 分支是四个分支里**唯一**不调 `_normalize_command` 的）。
     """
     is_windows = sys.platform.startswith("win")
     if dialect == "pwsh":
@@ -2271,6 +2296,7 @@ async def _run_native(
                     "exit_code": None, "timed_out": False,
                     "error": "pwsh (PowerShell 7+) not found on PATH — "
                              "the pwsh tool requires it. Use bash instead."}
+        command = _normalize_command(command, skip_cmd_mapping=True)
         shell_args = [pwsh_exe, "-NoProfile", "-NonInteractive",
                       "-Command", f"{PWSH_ENCODING_PREAMBLE}{command}"]
     elif is_windows:
@@ -4165,7 +4191,9 @@ PWSH_TOOL_DESCRIPTION = (
     "- Your command reaches pwsh with a **narrow auto-translation** applied "
     "first for two closed sets: a trailing `| head/-n N` or `| tail/-n N` or "
     "`| wc -l` pipe tail, and a whole-command `head -N f` / `tail -N f` / "
-    "`wc -l f`. Everything else is **verbatim** — sed/awk/grep/xargs do not "
+    "`wc -l f`. `python3` / `pip3` (and their `.exe` forms) are also rewritten "
+    "to `python` / `pip` — there is no python3 here; prefer `uv run python`. "
+    "Everything else is **verbatim** — sed/awk/grep/xargs do not "
     "exist in pwsh: use -replace, Select-String, ForEach-Object.\n"
     "- Call an external program with the & call operator when the name or "
     "path is quoted: & \"python\" \"script.py\" (bare \"python\" \"x.py\" is "

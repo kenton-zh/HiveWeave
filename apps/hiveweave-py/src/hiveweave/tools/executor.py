@@ -2298,8 +2298,9 @@ TOOL_PARAM_SCHEMAS["pwsh"] = {
                 "The PowerShell command to execute. A narrow auto-translation "
                 "handles two closed sets first (`| head/-n N` / `| tail/-n N` / "
                 "`| wc -l` pipe tail, and whole-command `head -N f` / "
-                "`tail -N f` / `wc -l f`); everything else reaches pwsh "
-                "verbatim. Use $env:NAME for environment "
+                "`tail -N f` / `wc -l f`); `python3` / `pip3` (with or without "
+                "`.exe`) are rewritten to `python` / `pip`; everything else "
+                "reaches pwsh verbatim. Use $env:NAME for environment "
                 "variables and the & call operator for quoted programs: "
                 "& \"python\" \"script.py\"."
             ),
@@ -2316,7 +2317,12 @@ TOOL_PARAM_SCHEMAS["pwsh_main"] = {
     "description": (
         "Same as pwsh, but cwd is the PROJECT ROOT (shared MAIN), not your "
         "worktree. Use for milestone VERIFY tests and anything that must see "
-        "merged HEAD. Slice unit tests stay on pwsh."
+        "merged HEAD. Slice unit tests stay on pwsh. "
+        # P1-8a ③：本描述**整体覆盖**了 pwsh 的 description ⇒ 不继承方言契约
+        # （DB 实测 pwsh_main 上确有 1 次方言拒绝）—— 至少把这一句带上。
+        "Dialect: PowerShell 7 (not bash) — unix-only commands are rejected "
+        "up front; python3 / pip3 are normalized to python / pip for you "
+        "(there is no python3 here), but prefer `uv run python`."
     ),
 }
 TOOL_PARAM_SCHEMAS["browse_main"] = {
