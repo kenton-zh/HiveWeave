@@ -806,6 +806,10 @@ def _maybe_append_test_hints(command: str, error_msg: str) -> str:
 _SHELL_FACT_FLAG_KEYS: tuple[str, ...] = (
     "fact", "runner_failed", "command_failed", "injection_applied",
     "timeout_kind", "timeout_ms", "dialect_failed",
+    # P0-3：拒绝成因三键（由 acl_sandbox 的拒绝提示点盖戳）。
+    # ⚠ 登记点不止此处：`_native_shaped` 会**重建** dict，那边也要带过来
+    #   （审计 B：只补白名单会白做）。
+    "denied_by", "blocked_by_environment", "sealed_by",
     # 0-3 + #1 + F5：spawn 面戳（决策面 4 键 + 加固面 git_hardened +
     # 执行面 executed）。从 policy 派生而非再列一遍 —— 见上方补正。
     *ALL_SPAWN_STAMP_KEYS,
@@ -866,6 +870,11 @@ def _native_shaped(result: dict) -> dict[str, Any]:
     if result.get("fact") is not None:
         out["fact"] = result["fact"]
     out.update(_enforcement_stamp(result))
+    # P0-3：拒绝成因三键随归一化活下来（本函数是**重建**新 dict，
+    # 不带过来就等于位又被这一层吃掉 —— 与 fact 同款教训）。
+    for _k in ("denied_by", "blocked_by_environment", "sealed_by"):
+        if result.get(_k) is not None:
+            out[_k] = result[_k]
     return out
 
 

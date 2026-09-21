@@ -1034,6 +1034,11 @@ def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> 
         return result
     result = dict(result)
     result["denied_by"] = denied_by
+    # P0-3：`blocked_by_environment` = 「方言命中**且 runner 没失败**」。
+    # 判据用状态（exit_code 非 None = 进程确实跑过），不用文案。
+    result["blocked_by_environment"] = (
+        True if result.get("exit_code") is not None else None
+    )
     with _hint_guard:
         n = _hint_counts.get(agent_id, 0)
         _hint_counts[agent_id] = n + 1

@@ -360,6 +360,11 @@ async def on_tool_call(
                     None if result.get("executed") is False
                     else result.get("enforcement")
                 ),
+                # P0-3：拒绝成因（闭合枚举）/ 环境拒绝位 / 封条来源。
+                # 非 spawn 工具、且未发生拒绝时这些键不存在 ⇒ None ⇒ 列留 NULL。
+                denied_by=result.get("denied_by"),
+                blocked_by_environment=result.get("blocked_by_environment"),
+                sealed_by=result.get("sealed_by"),
                 # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
                 # 工具层给不出（None）⇒ 列留 NULL = 不适用/未判定，不回填 0。
                 git_hardened=result.get("git_hardened"),

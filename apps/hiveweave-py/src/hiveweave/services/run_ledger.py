@@ -430,6 +430,9 @@ class RunLedger:
         enforcement: str | None = None,
         git_hardened: bool | None = None,
         executed: bool | None = None,
+        denied_by: str | None = None,
+        blocked_by_environment: bool | None = None,
+        sealed_by: str | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -496,7 +499,7 @@ class RunLedger:
             if any(v is not None for v in (
                 runner_failed, command_failed, injection_applied,
                 timeout_kind, timeout_ms, enforcement, git_hardened,
-                executed,
+                executed, denied_by, blocked_by_environment, sealed_by,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -509,7 +512,11 @@ class RunLedger:
                     "timeout_ms = COALESCE(?, timeout_ms), "
                     "enforcement = COALESCE(?, enforcement), "
                     "git_hardened = COALESCE(?, git_hardened), "
-                    "executed = COALESCE(?, executed) "
+                    "executed = COALESCE(?, executed), "
+                    # P0-3：同款 COALESCE —— 否则既有真值会被后来的 NULL 覆写。
+                    "denied_by = COALESCE(?, denied_by), "
+                    "blocked_by_environment = COALESCE(?, blocked_by_environment), "
+                    "sealed_by = COALESCE(?, sealed_by) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -527,6 +534,11 @@ class RunLedger:
                     # F5：False **必须**写成 0（不能与 None 混同）——
                     # 「确认没启动」正是本列存在的理由。
                     None if executed is None else (1 if executed else 0),
+                    denied_by,
+                    None if blocked_by_environment is None else (
+                        1 if blocked_by_environment else 0
+                    ),
+                    sealed_by,
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层

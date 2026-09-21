@@ -622,6 +622,14 @@ PROJECT_DB_TABLES = [
         started INTEGER DEFAULT 0,
         enforcement TEXT,
         git_hardened INTEGER,
+        -- P0-3：沙箱/ACL 拒绝的成因细分（闭合枚举，见 tools/result.py::DeniedBy）。
+        -- ⚠ **无 DEFAULT**：NULL 表示「当时未记录」（老行），与任何枚举值都不同形，
+        --   回扫判据 `denied_by IS NULL` 才能区分「新增行漏填」与「老行没这列」。
+        denied_by TEXT,
+        -- 「拒绝来自环境（ACL/封条）而非 runner 没跑起来」—— 与 denied_by 同批观测。
+        blocked_by_environment INTEGER,
+        -- 由**封条函数**赋值（它唯一知道封了什么）：`acl_lockdown:<path>` 形态。
+        sealed_by TEXT,
         executed INTEGER
     )
     """,
@@ -639,6 +647,14 @@ PROJECT_DB_TABLES = [
     # 形态纪律与 `enforcement` 完全一致：**无 DEFAULT**（未知 = NULL，
     # 不是 0/否），新行由 INSERT 显式写值，写入方只在能确定时传。
     """ALTER TABLE run_steps ADD COLUMN executed INTEGER""",
+    # P0-3（2026-09-21）：拒绝成因细分落库。`denied_by` 是**闭合枚举**
+    # （outside_boundary / sealed_git / no_write_sid / unknown_acl），由
+    # `tools/fact_positions.py::classify_denied_by` 判定；`blocked_by_environment`
+    # 区分「环境拒绝」与「runner 没起来」；`sealed_by` 由封条函数赋值。
+    # ⚠ 三列都**无 DEFAULT**（NULL = 老行未记录，与 False/0 不同形）。
+    """ALTER TABLE run_steps ADD COLUMN denied_by TEXT""",
+    """ALTER TABLE run_steps ADD COLUMN blocked_by_environment INTEGER""",
+    """ALTER TABLE run_steps ADD COLUMN sealed_by TEXT""",
     # TEST10: 既有库迁移 — run_steps 增加结果摘录列（观测性，截断 2KB）
     """ALTER TABLE run_steps ADD COLUMN result_excerpt TEXT""",
     # P2-1: 既有库迁移 — run_steps 增加工具参数原文摘录列（观测性，
@@ -913,6 +929,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
         # CREATE 前被吞、或旧库没跑 ALTER）会在启动时 fail-loud，而不是让
         # 「宣告了沙箱却没跑」再次静默退化成 NULL（本仓 TEST_DSH_37 P0-1 形态）。
         "executed",
+        # P0-3（2026-09-21）：拒绝成因细分三列。登记进启动自检 ⇒ 迁移断裂
+        #（ALTER 排到 CREATE 前被吞 / 旧库没跑 ALTER）会在启动时 fail-loud，
+        # 而不是让「成因永远 NULL」静默退化成本条要治的那种假归因。
+        "denied_by", "blocked_by_environment", "sealed_by",
     },
     # meeting_utterances.abstain_reason（2026-09-18）：区分「主动弃权」与
     # 「被轮次预算掐断/超时/异常」。登记进自检 ⇒ 迁移断裂会在启动时 fail-loud，
