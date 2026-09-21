@@ -242,3 +242,32 @@ def test_chinese_outside_path():
     assert classify_denied_by(
         "对路径“D:\\tmp\\a.txt”的访问被拒绝。", 1, boundary_root=ROOT
     ) == "outside_boundary"
+
+
+# ── 审计 A3：native 回落时不得宣称「写入被沙箱拒绝」（看同结果的事实位）──
+
+
+def _hint_full(stderr, exit_code, agent_id, **extra):
+    S._hint_counts.pop(agent_id, None)
+    payload = {"stderr": stderr, "exit_code": exit_code, **extra}
+    return S._maybe_append_rejection_hint(agent_id, ROOT, payload)
+
+
+def test_native_enforcement_does_not_claim_sandbox():
+    """`enforcement="native"` ⇒ 沙箱没生效 ⇒ 不追加「写入被沙箱拒绝」文案。"""
+    res = _hint_full(
+        f"Access to the path '{ROOT}\\src\\a.txt' is denied.", 1,
+        "p03-a3-native", enforcement="native",
+    )
+    assert res["denied_by"] == "no_write_sid"          # 事实照落
+    assert res["blocked_by_environment"] is True
+    assert "[沙箱提示]" not in res["stderr"]            # 但不再说谎
+
+
+def test_confined_enforcement_still_hints():
+    res = _hint_full(
+        f"Access to the path '{ROOT}\\src\\a.txt' is denied.", 1,
+        "p03-a3-confined", enforcement="confined",
+    )
+    assert "[沙箱提示]" in res["stderr"]
+    assert "沙箱" in res["stderr"]

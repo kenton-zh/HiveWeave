@@ -41,6 +41,7 @@ from hiveweave.services.acl_sandbox.grant import (
     WriteGrant,
 )
 from hiveweave.services.acl_sandbox.policy import (
+    ENF_CONFINED,
     SpawnDecision,
     resolve_policy,
 )
@@ -1087,6 +1088,7 @@ def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> 
         return result
     result = dict(result)
     result["denied_by"] = denied_by
+
     if denied_by == "sealed_git":
         # 如实记录「谁封的 + 封的是哪个目标」（值形态见 SEALED_BY_PREFIX）
         matched = sealed_match(stderr_in, sealed)
@@ -1097,6 +1099,14 @@ def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> 
     result["blocked_by_environment"] = (
         True if result.get("exit_code") is not None else None
     )
+    # P0-3 / 审计 A3：判成因与选文案都要看**同结果上已有的事实位**。
+    # `enforcement` 是决策面戳（confined|native）：native 回落时沙箱**没生效**，
+    # 此处不过是一次普通 OS 权限拒绝 ⇒ 再印「写入被沙箱拒绝…授权树（X）之外」
+    # 就是新的假话（那棵树在 native 模式下并不存在）。
+    # ⚠ 结构化事实照落（`denied_by` 与 `blocked_by_environment` 都要记），只是不追加文案。
+    enforcement = result.get("enforcement")
+    if enforcement is not None and enforcement != ENF_CONFINED:
+        return result
     with _hint_guard:
         n = _hint_counts.get(agent_id, 0)
         _hint_counts[agent_id] = n + 1
