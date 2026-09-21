@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import functools
 import json
 import time
 import uuid
@@ -146,7 +147,8 @@ class ConversationStore:
         return self._trim_to_budget(cleaned, token_budget)
 
     async def append_turn(
-        self, agent_id: str, project_id: str, messages: list[dict]
+        self, agent_id: str, project_id: str, messages: list[dict],
+        *, prefix_messages: list[dict] | None = None, tools: list | None = None,
     ) -> None:
         """追加一轮消息，过滤 system，异步持久化到 DB。"""
         if not messages:
@@ -175,7 +177,10 @@ class ConversationStore:
         await self._enqueue_write(key, self._persist_turn, agent_id, filtered_new)
 
         # 触发 compaction 检查
-        await self._maybe_trigger_compaction(agent_id, project_id, key, combined)
+        await self._maybe_trigger_compaction(
+            agent_id, project_id, key, combined,
+            prefix_messages=prefix_messages, tools=tools,
+        )
 
     async def clear(self, agent_id: str, project_id: str) -> None:
         """清空指定 agent 的缓存和 DB 记录。"""
@@ -265,7 +270,8 @@ class ConversationStore:
     # ── Compaction ──────────────────────────────────────────
 
     async def _maybe_trigger_compaction(
-        self, agent_id, project_id, key, messages
+        self, agent_id, project_id, key, messages,
+        *, prefix_messages=None, tools=None,
     ) -> None:
         total = estimate_tokens_for_messages(messages)
         ctx = await self._get_agent_context_window(agent_id)
@@ -303,8 +309,14 @@ class ConversationStore:
                 target=target_budget,
             )
             try:
+                # P1-2：`_enqueue_write` 只吃位置参数 ⇒ 用 partial 把前缀/tools 绑进去
                 await self._enqueue_write(
-                    key, self._do_compaction, agent_id, project_id, key, messages, target_budget
+                    key,
+                    functools.partial(
+                        self._do_compaction,
+                        agent_id, project_id, key, messages, target_budget,
+                        prefix_messages=prefix_messages, tools=tools,
+                    ),
                 )
             except Exception:
                 # 入队失败（loop 关闭等罕见）→ 清 pending，避免该 agent 永久不再压缩
@@ -365,7 +377,10 @@ class ConversationStore:
                 error=str(e),
             )
 
-    async def _do_compaction(self, agent_id, project_id, key, messages, budget) -> None:
+    async def _do_compaction(
+        self, agent_id, project_id, key, messages, budget,
+        *, prefix_messages=None, tools=None,
+    ) -> None:
         lock = self._get_compaction_lock(key)
         if lock.locked():
             # 已有压缩在进行 — 跳过，下次 append_turn 会重新检查
@@ -392,7 +407,11 @@ class ConversationStore:
                 anchor_fp = _msg_fp(live[-1]) if live else None
 
                 callback = await resolve_compactor_callback(agent_id)
-                compacted = await self._compaction.compact(live, budget, callback)
+                # P1-2：把主前缀/tools 传到压缩请求（None ⇒ 维持旧行为）
+                compacted = await self._compaction.compact(
+                    live, budget, callback,
+                    prefix_messages=prefix_messages, tools=tools,
+                )
                 # 压缩实际发起后写入冷却时间戳（M2：锁被占早退不消耗冷却；
                 # 缓存为空不发请求也不消耗）。成功/失败/无变化都写——成功
                 # 后历史必在预算内（成功=摘要替换旧段，失败=硬裁），故只防

@@ -369,12 +369,21 @@ async def resolve_compactor_callback(
             max_output_tokens=max_output or SUMMARY_MAX_TOKENS_ESCALATED,
         )
 
-        async def callback(prompt: str) -> str | None:
+        async def callback(
+            prompt: str,
+            *,
+            prefix_messages: list[dict] | None = None,
+            tools: list | None = None,
+        ) -> str | None:
+            # P1-2：接受并转发主前缀/tools（`compact` 用 `_callback_accepts_prefix`
+            # 探测到这里支持 ⇒ 会带参调用；旧回调仍只收 prompt）。
             return await _call_compactor_llm(
                 model, prompt,
                 max_tokens=max_output or None,
                 agent_id=agent_id,
                 kind=kind,
+                prefix_messages=prefix_messages,
+                tools=tools,
             )
 
         return callback

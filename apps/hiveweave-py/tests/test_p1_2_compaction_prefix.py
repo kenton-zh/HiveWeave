@@ -59,3 +59,35 @@ async def test_without_prefix_behaviour_is_unchanged():
         await _call_compactor_llm(_compactor_model(), "INSTRUCTION")
     body = client.posts[0]["json"]
     assert body["messages"] == [{"role": "user", "content": "INSTRUCTION"}]
+
+
+# ── 回调适配判据（按参数名探测，不用 try/except）────────────────
+
+
+def test_callback_adapter_detects_prefix_support():
+    from hiveweave.conversation.compaction import _callback_accepts_prefix
+
+    async def new_cb(prompt, *, prefix_messages=None, tools=None):
+        return "S"
+
+    async def legacy_cb(prompt):
+        return "S"
+
+    assert _callback_accepts_prefix(new_cb) is True
+    assert _callback_accepts_prefix(legacy_cb) is False, (
+        "旧回调被误判为支持前缀 ⇒ 带参调用会 TypeError"
+    )
+
+
+def test_callback_adapter_is_not_try_except_based():
+    """反回归（结构判据）：探测不得靠 try/except TypeError。
+
+    用 try 探协议会把回调**内部**真实的 TypeError 也吞掉并重试一次，掩盖故障。
+    """
+    import inspect as _inspect
+
+    from hiveweave.conversation.compaction import _callback_accepts_prefix
+
+    src = _inspect.getsource(_callback_accepts_prefix)
+    assert "except TypeError" not in src
+    assert "signature" in src

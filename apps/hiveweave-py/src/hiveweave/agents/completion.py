@@ -386,9 +386,18 @@ async def handle_completion(
     # keep_user=True: user-uploaded images stay on the persisted user turn.
     from hiveweave.services.vision import messages_without_images
 
+    # ⭐ P1-2：把**主前缀**（System 1 = identity，与主请求逐字相同）与**真实 tools**
+    # 交给对话存储 —— 压缩请求据此与主请求共享前缀，provider 前缀缓存才可能命中
+    # （否则第 0 个 token 即偏离 ⇒ `cache_read=0`）。
+    # ⚠ 必须用**同一个来源**（`_get_identity_prompt()`，即 `_build_messages` 里 System 1
+    #   的取值）而不是重建一份措辞 —— byte-for-byte 才有缓存意义。
     await agent._conversation.append_turn(
         agent.id, agent.project_id,
         messages_without_images(turn_messages, keep_user=True),
+        prefix_messages=[
+            {"role": "system", "content": agent._get_identity_prompt()}
+        ],
+        tools=await agent._get_tool_definitions(),
     )
 
     # 3. Turn exit gates — validate only; scheduler decides continue/park

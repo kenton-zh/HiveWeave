@@ -1872,8 +1872,14 @@ class Agent:
 
         对齐 Elixir streamer.ex: build_identity_prompt/1。
         """
-        if self._identity_prompt is not None:
-            return self._identity_prompt
+        # ⚠ 用 `getattr` 读缓存：本方法会被**半构造**的 agent 调用（测试常直接
+        # `Agent.__new__` 造对象 —— P1-2 把 `_get_identity_prompt()` 接进 completion
+        # 落库路径后，`test_prune_flush_at_compaction` 的两个用例即因此炸在这里）。
+        # 与类级默认（如 `_context_rewrote = False`）同款：**未初始化 = 未缓存**，
+        # 就地构建即可，不必要求调用方一定跑过 `__init__`。
+        cached = getattr(self, "_identity_prompt", None)
+        if cached is not None:
+            return cached
 
         self._identity_prompt = build_identity_prompt(
             role=self.config.get("role", "executor"),
