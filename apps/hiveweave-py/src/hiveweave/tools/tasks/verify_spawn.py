@@ -868,36 +868,7 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
             # 既有 nudge 通道（claim + [POST-MERGE VERIFY] + trigger）接管。
             # 参照 archive_task：生命周期外纠偏，不走 _TRANSITIONS。
             now_ms = int(_time.time() * 1000)
-            try:
-                await task_module._execute(
-                    project_id,
-                    "UPDATE tasks SET status = 'created', blocked_reason = NULL, "
-                    "wait_kind = NULL, wake_at = NULL, updated_at = ? "
-                    "WHERE id = ?",
-                    [now_ms, tid],
-                )
-            except Exception:
-                await task_module._execute(
-                    project_id,
-                    "UPDATE tasks SET status = 'created', "
-                    "blocked_reason = NULL, updated_at = ? WHERE id = ?",
-                    [now_ms, tid],
-                )
-            from hiveweave.services.tasks.db import insert_task_event
-
-            try:
-                await insert_task_event(
-                    project_id,
-                    tid,
-                    "task.verify_rehang",
-                    "blocked",
-                    "created",
-                    actor_id="system",
-                    payload={"reason_code": "verify_rehang"},
-                    now_ms=now_ms,
-                )
-            except Exception as ev_err:
-                log.debug("verify_rehang_event_failed", error=str(ev_err))
+            await _rehang_blocked_verify_task(project_id, tid, now_ms)
             nudged = await _nudge_one_verify_task(
                 project_id,
                 "system",
@@ -934,6 +905,63 @@ async def retry_qa_blocked_verify_tasks(project_id: str) -> int:
         )
     return reattached
 
+
+async def _rehang_blocked_verify_task(
+    project_id: str, tid: str, now_ms: int
+) -> None:
+    """把 blocked 的 VERIFY 挂回 ``created``，并**在同一次提交**里写 rehang 事件。
+
+    ⭐ 新-③（2026-09-21）：旧实现是**两次写** —— 先 `_execute(UPDATE … status='created')`，
+    再 `insert_task_event('task.verify_rehang')` **独立提交**（后者还自带 try/except 吞错）
+    ⇒ 两次提交之间的崩溃窗口只落一边：任务被纠偏回 created，而 outbox 里没有
+    `task.verify_rehang` ⇒ 下游永远不知道这次纠偏（**正是 P2-5 要消灭的形态**）。
+
+    复用 P2-5 建的设施：`_execute_tx`（一次 `BEGIN IMMEDIATE..COMMIT`）+
+    `build_task_event_insert`（语句构造器 —— 调用点不得手写那段 SQL）。
+
+    抽成独立函数（本轮一并做）：原实体内联在 `retry_qa_blocked_verify_tasks` 的循环里，
+    要驱动它必须先把 roster 填出候选 QA（`_find_independent_qa` 才返回）⇒ **验证成本
+    全花在 setup 上**。抽出后可直接对函数本身做原子性验收。
+    """
+    from hiveweave.services.tasks.db import (
+        _execute_tx,
+        build_task_event_insert,
+    )
+
+    ev_stmt, _ev_ts, _ev_id = build_task_event_insert(
+        project_id,
+        tid,
+        "task.verify_rehang",
+        "blocked",
+        "created",
+        actor_id="system",
+        payload={"reason_code": "verify_rehang"},
+        now_ms=now_ms,
+    )
+    primary = (
+        "UPDATE tasks SET status = 'created', blocked_reason = NULL, "
+        "wait_kind = NULL, wake_at = NULL, updated_at = ? "
+        "WHERE id = ?",
+        [now_ms, tid],
+    )
+    # 老库无 wait_kind/wake_at 列 ⇒ 退三列形态（保留原降级路径），仍与事件**同事务**。
+    fallback = (
+        "UPDATE tasks SET status = 'created', "
+        "blocked_reason = NULL, updated_at = ? WHERE id = ?",
+        [now_ms, tid],
+    )
+    try:
+        await _execute_tx(project_id, [primary, ev_stmt])
+    except Exception as tx_err:  # noqa: BLE001 — 降级/兜底，容忍度同旧实现
+        try:
+            await _execute_tx(project_id, [fallback, ev_stmt])
+        except Exception as fallback_err:  # noqa: BLE001
+            # 整体失败 ⇒ 状态与事件**都没落**（可回滚是特性）—— 记一条，不静默。
+            log.debug(
+                "verify_rehang_tx_failed",
+                error=str(fallback_err),
+                first_error=str(tx_err),
+            )
 
 async def _count_prior_stall_notices(
     project_id: str, task_id: str, to_agent_id: str
