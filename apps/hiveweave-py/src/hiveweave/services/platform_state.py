@@ -136,19 +136,26 @@ def _compact_scope_task(
         "parent_task_id": _slice_id(t.get("parent_task_id")) or None,
         "policy_id": t.get("policy_id"),
         # T4.3: submitGate 所需证据 kind 前置可见
-        "required_evidence": _policy_required_evidence(t.get("policy_id")),
+        "required_evidence": _policy_required_evidence(t),
         "depends_on": _depends_on_compact(t.get("depends_on")),
     }
 
 
-def _policy_required_evidence(policy_id: Any) -> list[str] | None:
-    """T4.3: policy → 排序后的所需证据 kind 清单（soft → None）。"""
-    if not policy_id:
-        return None
-    try:
-        from hiveweave.services.attestation import required_attestation_kinds
+def _policy_required_evidence(task: dict[str, Any]) -> list[str] | None:
+    """T4.3: task → 排序后的所需证据 kind 清单（soft → None）。
 
-        kinds = required_attestation_kinds(str(policy_id))
+    **P2-4(b)：必须与门禁同源** —— 门禁走 `ledger_policy_id(task)`（`policy_id`
+    为空时按 title/tags 派生）。旧实现只读裸 `policy_id` ⇒ 「`policy_id` 为空但
+    可派生」的任务会**行上看不到契约、提交时却被要求**（同族：可见性与判据
+    不同源）。派生函数本身是单一源，勿在别处再写一份。
+    """
+    try:
+        from hiveweave.services.attestation import (
+            ledger_policy_id,
+            required_attestation_kinds,
+        )
+
+        kinds = required_attestation_kinds(ledger_policy_id(task))
         return sorted(kinds) if kinds is not None else None
     except Exception:
         return None

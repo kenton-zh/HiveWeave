@@ -483,12 +483,16 @@ async def _submit_preflight(
                         task_id=task_id,
                         count=len(attest_ids),
                     )
+            # P2-4：门禁回执要带结构化事实（expected/given/ignored kinds），
+            # 免得调用方去解析 error 文案。
+            _gate_report: dict = {}
             ok, err = await attestation_service.verify_ids(
                 project_id,
                 attest_ids,
                 expected_agent_id=agent_id,
                 expected_kinds=gate_needed,
                 task_id=task_id,
+                report=_gate_report,
             )
             if not ok:
                 from hiveweave.services.attestation import (
@@ -503,6 +507,10 @@ async def _submit_preflight(
                     issues.append({
                         "code": "attestation",
                         "message": format_umbrella_gate_hint(policy_id, err),
+                        "gate": "submit_attestation",
+                        "expectedKinds": _gate_report.get("expectedKinds", []),
+                        "givenKinds": _gate_report.get("givenKinds", []),
+                        "ignoredKinds": _gate_report.get("ignoredKinds", []),
                     })
                 else:
                     if policy_id == "docs_only":
@@ -561,6 +569,10 @@ async def _submit_preflight(
                                 f"Bare testsPassed is rejected."
                             )
                         ),
+                        "gate": "submit_attestation",
+                        "expectedKinds": _gate_report.get("expectedKinds", []),
+                        "givenKinds": _gate_report.get("givenKinds", []),
+                        "ignoredKinds": _gate_report.get("ignoredKinds", []),
                     })
                 if audit_soft and CODE_AUDIT_KIND in gate_needed:
                     issues.append({
@@ -965,11 +977,13 @@ async def _submit_preflight(
                         ),
                     })
                 else:
+                    _dc_report: dict = {}
                     _tok, _terr = await attestation_service.verify_ids(
                         project_id,
                         [aid],
                         expected_kinds=["test_run"],
                         task_id=task_id,
+                        report=_dc_report,
                     )
                     if not _tok:
                         issues.append({
@@ -979,6 +993,10 @@ async def _submit_preflight(
                                 f"test_run:{aid} —— {_terr}。"
                                 "请用真实 test_run 凭证 id（bash 跑测试自动落库）。"
                             ),
+                            "gate": "delivery_contract_test",
+                            "expectedKinds": _dc_report.get("expectedKinds", []),
+                            "givenKinds": _dc_report.get("givenKinds", []),
+                            "ignoredKinds": _dc_report.get("ignoredKinds", []),
                         })
 
     return {

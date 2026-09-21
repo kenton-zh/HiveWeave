@@ -885,11 +885,28 @@ class AttestationService:
         expected_kinds: list[str] | frozenset[str] | None = None,
         task_id: str | None = None,
         max_age_ms: int | None = None,
+        report: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Verify attestations exist, not expired, and match constraints.
 
         Returns (ok, error_str). error_str empty on success.
+
+        **P2-4 判据语义（勿改回）**：``expected_kinds`` 是**集合包含**语义 ——
+        「所需 kind 齐全（AND）」是唯一硬判；**多给的 kind 不是错误**。
+        旧实现对每个入参 id 要求 ``kind in expected``（等价于要求
+        「给定集合 ⊆ 所需集合」= 集合**相等**），于是「本已含所需 kind、只是
+        夹带一个 surplus」被整体拒 —— 实测 20/27 次误拒属此类（标本：
+        ``code_audit_visual`` 任务多带一个 ``test_run`` ⇒
+        `Attestation kind 'test_run' not in expected ['browse_e2e', 'code_audit']`）。
+
+        ``report``：调用方传入的 dict，函数**就地填充**结构化事实
+        （``expectedKinds`` / ``givenKinds`` / ``ignoredKinds``）供门禁回执透出
+        —— 回执不要靠解析 error 文案去还原这些字段。
+        **必须每次传入全新的 dict**（函数只写键、不清空：复用同一个 dict 会在
+        早退路径上读到上一次的值）。
         """
+        if report is not None:
+            report.clear()
         if not attestation_ids:
             return False, "No attestation_ids provided"
         await self.ensure_schema(project_id)
@@ -899,6 +916,11 @@ class AttestationService:
         )
         kinds_ok = set(expected_kinds) if expected_kinds else None
         seen_kinds: set[str] = set()
+        ignored_kinds: list[str] = []
+        if report is not None:
+            report["expectedKinds"] = sorted(kinds_ok) if kinds_ok else []
+            report["givenKinds"] = []
+            report["ignoredKinds"] = []
 
         for aid in attestation_ids:
             if not aid:
@@ -909,6 +931,24 @@ class AttestationService:
                 return False, str(e)
             if not row:
                 return False, f"Attestation not found: {aid}"
+            # P2-4：surplus kind —— **不是错误**，忽略该行（连同它的其余校验：
+            # 它不解锁任何门，也不该有能力把整次提交打回。旧实现连
+            # 「surplus + 已过期 / 换人 / exit≠0」都会整体拒）。
+            # 留痕：忽略是静默的，但必须可事后审计（aid 不记就查不出是谁挂的）。
+            kind = row.get("kind") or ""
+            if kinds_ok is not None and kind not in kinds_ok:
+                if kind and kind not in ignored_kinds:
+                    ignored_kinds.append(kind)
+                log.info(
+                    "attestation_surplus_kind_ignored",
+                    project_id=project_id,
+                    attestation_id=aid,
+                    kind=kind,
+                    expected=sorted(kinds_ok),
+                )
+                if report is not None:
+                    report["ignoredKinds"] = sorted(ignored_kinds)
+                continue
             exp = row.get("expires_at")
             created = row.get("created_at") or 0
             if exp is not None and int(exp) <= now:
@@ -933,12 +973,6 @@ class AttestationService:
                         f"(expected {expected_agent_id}, "
                         f"got {row.get('agent_id') or ''})",
                     )
-            kind = row.get("kind") or ""
-            if kinds_ok is not None and kind not in kinds_ok:
-                return (
-                    False,
-                    f"Attestation kind '{kind}' not in expected {sorted(kinds_ok)}",
-                )
             bind_ok, bind_err = await check_attestation_reuse_binding(
                 project_id,
                 row,
@@ -960,14 +994,22 @@ class AttestationService:
                         f"only pass (exit_code=0) unlocks submit/approve",
                     )
             seen_kinds.add(kind)
+            if report is not None:
+                report["givenKinds"] = sorted(seen_kinds)
 
         # ALL required kinds must be present (AND), not just any one (OR).
+        # P2-4：这是**唯一**硬判 —— surplus 已被忽略（上面 continue），
+        # 不再有「多给也拒」的第二道判据。
         if kinds_ok is not None and not kinds_ok.issubset(seen_kinds):
             missing = sorted(kinds_ok - seen_kinds)
+            # P2-4：把被忽略的 surplus 拼进失败文案 —— 否则「id 都给了却缺
+            # kind」会显示 `got none`，读者以为 id 丢了（review/api/acceptance
+            # 三个入口不传 report，只拿得到这个字符串）。
+            _ign = f" (ignored surplus kinds: {sorted(ignored_kinds)})" if ignored_kinds else ""
             return (
                 False,
                 f"Missing required attestation kind(s) {missing}; "
-                f"got {sorted(seen_kinds) or 'none'}",
+                f"got {sorted(seen_kinds) or 'none'}{_ign}",
             )
         return True, ""
 

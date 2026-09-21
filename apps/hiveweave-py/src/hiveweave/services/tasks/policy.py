@@ -109,8 +109,9 @@ def format_submit_expectations(task: dict[str, Any] | None) -> str:
         )
         lines.append(
             f"- 必需 attestation kind：{kinds}（缺一即拒）。取证方式：{how}。"
-            f"submit_task(attestationIds=[…]) 的凭证必须正好是这些 kind 且"
-            f"绑定本任务 —— kind 对不上（少一个、或交了门不要的那种）同样被拒。"
+            f"submit_task(attestationIds=[…]) 必须**包含**这些 kind 且绑定本任务"
+            f" —— 判据是集合**包含**：少任何一个都会被拒；多带的 kind 无害"
+            f"（被忽略，可留可去，不要为了「凑对」而撤回已挂的凭证）。"
         )
     elif exp["policy_unknown"]:
         lines.append(

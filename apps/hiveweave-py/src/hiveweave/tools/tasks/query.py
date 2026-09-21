@@ -364,9 +364,12 @@ async def get_tasks_tool(
             tk = str(t.get("id") or "")
             # T4.3: submitGate 所需证据 kind 前置可见（契约写了没人看见 →
             # 3 个 Agent 各踩一遍的修复；软 policy 无要求则不显示）
-            from hiveweave.services.attestation import policy_required_kinds_label
+            from hiveweave.services.attestation import (
+                ledger_policy_id,
+                policy_required_kinds_label,
+            )
 
-            _ev = policy_required_kinds_label(str(t.get("policy_id") or ""))
+            _ev = policy_required_kinds_label(ledger_policy_id(t))
             lines.append(
                 f"- [{t.get('status', '?')}] {t.get('title', '?')} "
                 f"(id={tk}, "
