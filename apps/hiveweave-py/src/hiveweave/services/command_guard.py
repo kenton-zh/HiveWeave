@@ -624,7 +624,11 @@ def resolve_delete_landing(
 
 
 async def resolve_delete_landing_for_agent(
-    command: str, *, agent_id: str, cwd: str | None = None
+    command: str,
+    *,
+    agent_id: str,
+    cwd: str | None = None,
+    boundary_root: str | None = None,
 ) -> GuardVerdict | None:
     """#15：以本 agent 的**授权树**判定删除命令落点（授权事实与沙箱同源）。
 
@@ -644,6 +648,21 @@ async def resolve_delete_landing_for_agent(
     （worktree agent 的 workspace_path 即 worktree；项目根角色即项目根），
     在调用方未提供时这是最保守且与沙箱一致的选择。
 
+    ``boundary_root``（P1-4 更正③，2026-09-21）：**执行侧的授权树**，由调用方传入
+    （= 该次 spawn 实际使用的 ``workspace_path``）。为什么必须能显式传：ACL 的写 SID
+    由调用方的 ``workspace_path`` 派生（``acl_sandbox/policy.py:337``），而本守卫此前
+    **只从 agent 身份**派生（``agent_worktree_path``）⇒ **同一事实被判了两次**。
+    `pwsh_main` 场景下 ACL 授权的是 MAIN（``entry.py`` 传 ``workspace_path=MAIN``），
+    守卫却按**自有 worktree** 判删除落点 ⇒ 在 MAIN 里删自己刚写的文件被拒（实测
+    DB：`pwsh_main/confined` 37 行）。
+    ⚠ **缺省 ``None`` ⇒ 一字不动地保留旧行为**（worktree → 项目根）——
+    `test_delete_landing_boundary.py::test_relative_delete_without_cwd_is_allowed`
+    等三条守卫依赖它。
+    ⚠ 显式传入时**先 realpath**，与 ``acl_sandbox.policy`` 的 ``boundary_root`` **同源同算法**
+    （AC3 要求的「唯一来源」）；否则两侧拼写差异会造出新的误判。
+    ⚠ **不可把 ``cwd`` 当边界**：``cwd = workspace_path/workdir``，带 workdir 时是
+    **子目录** ⇒ 会把「删自己 workspace 里的兄弟目录」误杀（新故障面）。
+
     解析失败/无 agent → None（不发明规则，退回规则表既有行为）。
     """
     aid = (agent_id or "").strip()
@@ -661,7 +680,11 @@ async def resolve_delete_landing_for_agent(
         row = await meta_db.get_agent_by_id(aid)
         project_id = (row or {}).get("project_id")
         worktree = await agent_worktree_path(aid)
-        if worktree:
+        explicit = (boundary_root or "").strip()
+        if explicit:
+            # P1-4：显式来源优先，且**与 acl_sandbox.policy 同源同算法**（realpath）
+            boundary = os.path.realpath(explicit)
+        elif worktree:
             boundary = worktree
         else:
             boundary = await resolve_project_root(str(project_id) if project_id else None)

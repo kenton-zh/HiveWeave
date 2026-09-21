@@ -2621,6 +2621,8 @@ async def execute_bash(
         command,
         agent_id=agent_id or "",
         tool_name="bash" if dialect != "pwsh" else "pwsh",
+        # P1-4：执行侧授权树 = 本次 spawn 的 workspace_path（ACL 写 SID 由它派生）
+        boundary_root=workspace_path,
         tool_args={"command": command[:200]},
         ask_already_resolved=guard_ask_resolved,
         cwd=str(Path(workspace_path or os.getcwd()) / workdir)
@@ -2864,6 +2866,8 @@ async def execute_run_command(
         command,
         agent_id=agent_id or "",
         tool_name="run_command",
+        # P1-4：同上——与 ACL 的 workspace_path 同源（run_command 的 cwd 可能只是子目录）
+        boundary_root=workspace_path,
         tool_args={"command": command[:200]},
         cwd=cwd or workspace_path,
     )
@@ -3795,6 +3799,8 @@ async def _bash_background(
         cmd,
         agent_id=agent_id,
         tool_name="bash" if dialect != "pwsh" else "pwsh",
+        # P1-4：与 spawn 口径一致（exec_ws 就是本次执行的工作区根）
+        boundary_root=exec_ws,
         tool_args={"command": cmd[:200]},
         cwd=str(Path(exec_ws) / workdir) if workdir else exec_ws,
     )
