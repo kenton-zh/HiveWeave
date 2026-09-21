@@ -118,6 +118,25 @@ class DispatchService:
     (mirrors Elixir ``ProjectFactory.query``).
     """
 
+    def _parent_for_new_dispatch(self, explicit_parent: str | None) -> str | None:
+        """派单新建任务时的 parent **单一决策点**（P1-7 ①，2026-09-21）。
+
+        **只认显式 parent，不再自动认父。**
+
+        旧行为：未显式给 parent 时调 `_infer_parent_task_id` —— 只要派发者当前
+        恰好有**唯一一个**「别人派给我、我在跑」的任务（`role_hint=assignee` +
+        `claimed|running` + `creator != 我`），就把它当成新任务的父
+        ⇒ **任何派单都被挂到那个任务下**：父子不是拆解出来的，是被**猜**出来的。
+        该函数 `grep tests = 0`（零测试），且这条猜法无法区分「我一边在跑 X、
+        一边被要求单独立一个 Y」—— 误挂父子会污染任务图与进度口径。
+
+        `_infer_parent_task_id` **保留但不默认调用**：需要「挂到当前任务下」时由
+        调用方显式传 `parent_task_id`；想复用推断也由调用方自己显式调。
+
+        ⚠ 验收（§10.3 AC2）：无 `parentTaskId` 新建 ⇒ `SELECT parent_task_id` IS NULL。
+        """
+        return (explicit_parent or "").strip() or None
+
     def __init__(self) -> None:
         self.inbox = InboxService()
         self.handoff = HandoffService()
@@ -252,11 +271,10 @@ class DispatchService:
                 project_id, task_id, assignee_id=to_agent_id
             )
             if not parent_task_id:
+                # 复用既有任务的 parent 是**事实继承**（不是猜），保留。
                 parent_task_id = (existing or {}).get("parent_task_id") or None
-            if not parent_task_id:
-                parent_task_id = await self._infer_parent_task_id(
-                    project_id, from_agent_id
-                )
+            # P1-7 ①：兜底不再自动认父（见 `_parent_for_new_dispatch`）。
+            parent_task_id = self._parent_for_new_dispatch(parent_task_id)
             if parent_task_id and not (existing or {}).get("parent_task_id"):
                 try:
                     await self.task_service.update_task(
@@ -289,10 +307,8 @@ class DispatchService:
                         error=str(e),
                     )
         else:
-            if not parent_task_id:
-                parent_task_id = await self._infer_parent_task_id(
-                    project_id, from_agent_id
-                )
+            # P1-7 ①：不再自动认父 —— 只认显式传进来的 parent。
+            parent_task_id = self._parent_for_new_dispatch(parent_task_id)
             task_id = await self.task_service.create_task(
                 project_id=project_id,
                 title=(title or description)[:100],
