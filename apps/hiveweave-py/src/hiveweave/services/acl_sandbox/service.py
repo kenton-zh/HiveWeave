@@ -64,10 +64,34 @@ REJECTION_DIALECT = (
     "Permission denied",
 )
 _HINT_EVERY_N_ROUNDS = 3
-_REJECTION_HINT = (
-    "写入被沙箱拒绝：目标在授权树（{boundary}）之外。"
-    "git 元数据/缓存目录已授权；确需其他位置用 message_user 申请豁免。"
-)
+# P0-3：提示文案**由成因驱动**（不再一律说"在授权树之外"）。
+#
+# 病灶实证（55 库 / 53 行提示 / 33 可判定）：**19 行（57.6%）**的被拒路径其实
+# **就在提示自己印出的授权树之内**（全部落在 `.hiveweave\reports|worktrees`
+# 这类平台 PROTECTED 面）⇒ agent 被告知"越界、去申请豁免"，而申请毫无用处。
+_HINT_BY_DENIED_BY: dict[str, str] = {
+    "outside_boundary": (
+        "写入被沙箱拒绝：目标在授权树（{boundary}）之外。"
+        "git 元数据/缓存目录已授权；确需其他位置用 message_user 申请豁免。"
+    ),
+    "sealed_git": (
+        "写入被沙箱拒绝：目标是平台**封条**保护的 git 引导文件（{boundary} 下）。"
+        "这是有意的安全封条 —— 申请豁免也不会放行；请改用平台支持的 git 操作。"
+    ),
+    "no_write_sid": (
+        "写入被沙箱拒绝：目标**在授权树（{boundary}）之内、但不在已授权的写入面**"
+        "（例如 .hiveweave 下的平台保护目录）。**这不是越界**，申请豁免无用；"
+        "请写到自己的工作区路径，或把需求交回协调者。"
+    ),
+    "unknown_acl": (
+        "写入被沙箱拒绝（成因未能判定；本次结果带 denied_by=unknown_acl，"
+        "落库列是下一阶段）："
+        "本次命令的授权树是 {boundary}。先换到该树内的路径重试，"
+        "**不要**按「越界」处理。"
+    ),
+}
+# 兼容旧名（对外/测试引用的仍是这段默认文案；成因判不出时用它）
+_REJECTION_HINT = _HINT_BY_DENIED_BY["outside_boundary"]
 
 # §4.9 缓存覆盖（§8：项目级共享缓存）
 _CACHE_ENV_OVERRIDES = {
@@ -263,12 +287,14 @@ def _repair_shared_islands_once(
 
 
 def is_rejection(stderr: str, exit_code: Any) -> bool:
-    """拒绝方言命中判定：非零退出且 stderr 含拒绝特征。"""
-    if not exit_code or exit_code == 0:
-        return False
-    if not stderr:
-        return False
-    return any(d in stderr for d in REJECTION_DIALECT)
+    """拒绝方言命中判定：非零退出且 stderr 含拒绝特征。
+
+    P0-3：判定实现收口到 `tools.fact_positions.is_acl_rejection`（与本模块的
+    `REJECTION_DIALECT` 同源 —— 那边惰性引用本常量），避免"同一语义两处实现"。
+    """
+    from hiveweave.tools.fact_positions import is_acl_rejection
+
+    return is_acl_rejection(stderr, exit_code)
 
 
 def _build_sandbox_env(
@@ -992,19 +1018,29 @@ async def _ensure_temp(policy, agrant: _AsyncGrant) -> None:
 
 
 def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> dict:
-    hit = is_rejection(result.get("stderr", ""), result.get("exit_code"))
-    telemetry.record_rejection(hit)
-    if not hit:
+    """拒绝提示：**成因先判定，文案再驱动**（P0-3）。
+
+    `denied_by` 落在结果上（结构化，供 run_steps / 回执消费），文案按它选模板
+    —— 旧实现无论成因一律说"目标在授权树之外"，实测 57.6% 是假话。
+    """
+    from hiveweave.tools.fact_positions import classify_denied_by
+
+    stderr_in = result.get("stderr", "")
+    denied_by = classify_denied_by(
+        stderr_in, result.get("exit_code"), boundary_root=boundary
+    )
+    telemetry.record_rejection(denied_by is not None)
+    if denied_by is None:
         return result
+    result = dict(result)
+    result["denied_by"] = denied_by
     with _hint_guard:
         n = _hint_counts.get(agent_id, 0)
         _hint_counts[agent_id] = n + 1
     if n % _HINT_EVERY_N_ROUNDS != 0:
         return result
-    hint = _REJECTION_HINT.format(boundary=boundary)
-    stderr = result.get("stderr", "") + f"\n\n[沙箱提示] {hint}"
-    result = dict(result)
-    result["stderr"] = stderr
+    hint = _HINT_BY_DENIED_BY.get(denied_by, _REJECTION_HINT).format(boundary=boundary)
+    result["stderr"] = stderr_in + f"\n\n[沙箱提示] {hint}"
     return result
 
 

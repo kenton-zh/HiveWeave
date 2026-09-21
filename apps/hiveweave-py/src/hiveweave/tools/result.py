@@ -52,6 +52,32 @@ _BLOCKED_FACT_KINDS: frozenset[str] = frozenset(
 )
 
 
+# ── P0-3：沙箱/ACL 拒绝的**成因**（DeniedBy）──────────────────
+#
+# `runner_failed` 是「命令从未执行」这一**格**；本枚举把其中最常见的
+# 「沙箱拒绝」再细分一层 —— 四类的**处方完全不同**：
+#
+#   outside_boundary — 目标确在授权树外 ⇒ 换落点，或 message_user 申请豁免
+#   sealed_git       — 命中平台封条（git 引导文件）⇒ **申请也没用**，别写那儿
+#   no_write_sid     — 路径在授权树内但没授写权（平台装配面，含 `.hiveweave`
+#                      这类 PROTECTED 子面）⇒ 报给协调者/换落点，别去申请豁免
+#   unknown_acl      — 证据不足 ⇒ **不许猜**（猜错比不知道更贵：会把 agent
+#                      指向错误的处方，这正是本条的病灶：57.6% 的假越界）
+#
+# ⚠ 为什么单独一个枚举而不是塞进 `FactKind`：`FactKind` 四格是**归因归属**
+# （谁的锅），本枚举是同一格内的**成因细分**（同样是"平台的锅"，但处方不同）。
+# 二者不许互相替代 —— 文案由本枚举驱动，事实位仍落 `runner_failed`。
+DeniedBy = Literal[
+    "outside_boundary",
+    "sealed_git",
+    "no_write_sid",
+    "unknown_acl",
+]
+DENIED_BY_KINDS: frozenset[str] = frozenset(
+    ("outside_boundary", "sealed_git", "no_write_sid", "unknown_acl")
+)
+
+
 @dataclass
 class ToolResult:
     """Unified tool return value.

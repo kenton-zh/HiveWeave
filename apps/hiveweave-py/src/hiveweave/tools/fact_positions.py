@@ -276,6 +276,124 @@ def fact_from_bits(source: dict | object) -> FactKind | None:
     return None
 
 
+# ── P0-3：沙箱/ACL 拒绝的**成因细分**（DeniedBy）────────────────
+#
+# 层次与既有一致：**先状态、后证据、不足不猜**。
+#   1. 状态层 `is_acl_rejection`：非零退出 + 拒绝方言命中 ⇒ 才算「一次拒绝」；
+#      否则返回 None（不是拒绝，别硬贴成因）。
+#   2. 证据层 `extract_denied_paths`：OS 只给文本，被拒**路径**是唯一的路径证据。
+#      与 `boundary_root` 比（normalize 后）：
+#        · 命中**显式传入的封条集合** ⇒ `sealed_git`
+#        · 全部在授权树**外**            ⇒ `outside_boundary`
+#        · 全部在授权树**内**            ⇒ `no_write_sid`
+#          （树内的 `.hiveweave` 等 PROTECTED 面正是这一类 —— 实测 19/33 假越界全在这）
+#        · 内外**混着**、或抽不到路径    ⇒ `unknown_acl`（不猜）
+#   3. 本函数只细分**处方**；事实位仍落 `runner_failed`（归因归属不变）。
+#
+# ⚠ 这不是「用文案判意图」：方言与路径是**操作系统的拒绝证据**，不是 agent 的措辞；
+#    与 `classify_error_text` 同族但更窄（只认拒绝方言 + 路径），且**证据不足时
+#    显式返回 unknown_acl**，绝不默认归到某一格。
+def _rejection_dialect() -> tuple[str, ...]:
+    """拒绝方言的**唯一源**在 `services/acl_sandbox/service.py::REJECTION_DIALECT`
+    （对外公开面 + 被 `test_acl_sandbox_dialect` pin 住）。
+
+    惰性导入：`acl_sandbox` 包 `__init__` 会拉 `service.py`，模块级导入有环风险。
+    兜底同值 + 由测试钉住「兜底 == 唯一源」⇒ 兜底不会静默漂移。
+    """
+    try:
+        from hiveweave.services.acl_sandbox.service import REJECTION_DIALECT
+
+        return tuple(REJECTION_DIALECT)
+    except Exception:  # noqa: BLE001 — 导入环/未装：退回同值，绝不变成「不认方言」
+        return ("Access is denied", "Access to the path", "Permission denied")
+_DENIED_PATH_RE = re.compile(
+    r"(?:path|文件|路径)\s*['\"“](?P<q1>[^'\"”]+)['\"”]\s*(?:的访问被拒绝|is denied)"
+    r"|(?:Access to the path|Access is denied)[^'\"“]*['\"“](?P<q2>[^'\"”]+)['\"”]",
+    re.IGNORECASE,
+)
+
+
+def is_acl_rejection(stderr: str, exit_code: object) -> bool:
+    """状态层：非零退出 + 拒绝方言命中 = 一次沙箱/ACL 拒绝（`None`/0 都不算）。"""
+    try:
+        if exit_code is None or int(exit_code) == 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    norm = _normalize(stderr)
+    if not norm:
+        return False
+    return any(d.lower() in norm for d in _rejection_dialect())
+
+
+def extract_denied_paths(stderr: str) -> list[str]:
+    """抽出被拒路径（单/双引号、中英两种形态）；抽不到返回 `[]`（不猜）。"""
+    out: list[str] = []
+    for m in _DENIED_PATH_RE.finditer(stderr or ""):
+        for key in ("q1", "q2"):
+            v = m.groupdict().get(key)
+            if v and v.strip() and v not in out:
+                out.append(v.strip())
+    return out
+
+
+def _norm_path(value: str) -> str:
+    return os.path.normcase(os.path.normpath(str(value)))
+
+
+def _sealed_targets(sealed) -> list[str]:
+    """`sealed` 既可传裸路径，也可传封条函数的戳串（`seal:<p>` / `create+seal:<p>`）。"""
+    out: list[str] = []
+    for item in sealed or ():
+        raw = str(item)
+        if ":" in raw:
+            raw = raw.split(":", 1)[1]
+        out.append(_norm_path(raw))
+    return out
+
+
+def classify_denied_by(
+    stderr: str,
+    exit_code: object,
+    *,
+    boundary_root: str | None = None,
+    sealed=None,
+) -> str | None:
+    """把一次沙箱拒绝细分成 `DeniedBy` 之一。
+
+    返回 ``None`` = **不是**沙箱/ACL 拒绝（调用方不要追加沙箱提示）。
+    返回 ``"unknown_acl"`` = 是拒绝，但证据不足以细分（**不许猜**）。
+
+    ⚠ Stage 边界（2026-09-21）：`sealed_git` 目前**只在显式传入 `sealed`** 时判定；
+    「封条返回值 → 执行阶段」的携带（`sealed_by` 位）是下一阶段，尚未接线。
+    """
+    if not is_acl_rejection(stderr, exit_code):
+        return None
+    paths = extract_denied_paths(stderr)
+    if not paths:
+        return "unknown_acl"
+
+    sealed_norm = _sealed_targets(sealed)
+    root = _norm_path(boundary_root) if boundary_root else ""
+    sides: set[str] = set()
+    for raw in paths:
+        pn = _norm_path(raw)
+        if any(pn == s or pn.startswith(s + os.sep) for s in sealed_norm):
+            return "sealed_git"
+        if not root:
+            sides.add("?")
+        elif pn == root or pn.startswith(root + os.sep):
+            sides.add("in")
+        else:
+            sides.add("out")
+
+    if sides == {"out"}:
+        return "outside_boundary"
+    if sides == {"in"}:
+        return "no_write_sid"
+    return "unknown_acl"
+
+
 def classify_error_text(error: str) -> FactKind | None:
     """**第二层判据**：按签名表归类错误的成因；**无签名命中时返回 None**（不猜）。
 
