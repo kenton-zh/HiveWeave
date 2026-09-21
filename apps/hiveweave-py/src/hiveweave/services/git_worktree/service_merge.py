@@ -112,6 +112,31 @@ async def _attach_quarantine_events(
     return result
 
 
+def _publish_merge_landed(
+    short_id: str, *, branch: str, target: str, hash_: str
+) -> None:
+    """merge 成功必须留下**事实**（P1-3 ②，2026-09-21）。
+
+    病灶：`grep -rn "fact_bus.publish(" src/` = **1**（只有 `fs_errors.py:57`），
+    而 merge 的**三个成功返回点**（`service_merge.py` 的三处）**一处都没发**
+    —— 尽管 `fact_bus.py` 的 docstring 把 `merge_landed` 当例子。
+    后果：等待 `merge_landed` 的 agent（`kind="fact"` 契约）永远等不到
+    ⇒ 只能干等到 TTL（与 P1-3 ① 的僵尸等待同族）。
+
+    best-effort：总线/落库故障不影响 merge 结果本身（与 `fs_errors` 同款）。
+    """
+    try:
+        from hiveweave.services import fact_bus
+
+        fact_bus.publish(
+            "merge_landed",
+            short_id,
+            {"branch": branch, "target": target, "hash": hash_ or ""},
+        )
+    except Exception as e:  # noqa: BLE001 — 事实缺失不该把 merge 判失败
+        log.debug("merge_landed_publish_failed", short_id=short_id, error=str(e))
+
+
 class MergeMixin:
     """merge / merge_by_branch / branch resolution."""
 
@@ -747,6 +772,9 @@ class MergeMixin:
         log.info("git_worktree.merge", short_id=short_id,
                  target=target_branch, hash=head if ok else "",
                  already_up_to_date=already)
+        _publish_merge_landed(
+            short_id, branch=branch, target=target_branch, hash_=head if ok else ""
+        )
         result = {
             "success": True,
             "merged": True,
@@ -853,6 +881,10 @@ class MergeMixin:
             log.info(
                 "git_worktree.merge_idempotent_already_merged",
                 branch=branch, target=target_branch,
+            )
+            _publish_merge_landed(
+                short_id, branch=branch, target=target_branch,
+                hash_=await _target_tip_short(workspace_path, target_branch),
             )
             return {
                 "success": True,
@@ -1170,6 +1202,10 @@ class MergeMixin:
         log.info("git_worktree.merge_by_branch", branch=branch,
                  target=target_branch, hash=head if ok_head else "",
                  warnings=verification_errors, already_up_to_date=already)
+        _publish_merge_landed(
+            short_id, branch=branch, target=target_branch,
+            hash_=head if ok_head else "",
+        )
         result = {
             "success": True,
             "merged": True,
