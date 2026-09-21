@@ -113,3 +113,16 @@ async def test_durable_wake_survives_demote_even_if_trigger_crashes(env):
     assert flags.get(LEGACY) == 0, (
         f"旧式提示行没被降级 → 降级逻辑被我一并放过（{flags}）"
     )
+
+
+@pytest.mark.asyncio
+async def test_transition_also_writes_durable_wake(env):
+    """投放点之二：普通状态转换（`_transition` 的 else 支）也要落 durable 唤醒行。"""
+    tid = await _setup(env)
+    ts = TaskService()
+    await ts.start_task(env["project_id"], tid)
+
+    flags = await _wake_flags(env, tid)
+    assert flags.get(WAITER) == 1, (
+        f"状态转换路径没落 durable 唤醒行（{flags}）—— 崩在提交后即永久丢失"
+    )

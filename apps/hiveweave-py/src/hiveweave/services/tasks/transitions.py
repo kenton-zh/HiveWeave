@@ -132,6 +132,11 @@ class TransitionsMixin:
             ]
             if wait_clear is not None:
                 stmts.append(wait_clear)
+            # 新-①：唤醒行并入**同一次提交**（否则崩在「提交后、trigger 前」= 等待
+            # 已清而唤醒永不发生）。单一实现见 `_durable_wake_stmts`。
+            stmts.extend(
+                await self._durable_wake_stmts(task_id, waiters, now_ms)
+            )
             await _execute_tx(project_id, stmts)
         await publish_task_event(
             project_id, task_id, f"task.{target}", target, event_ts
@@ -200,6 +205,10 @@ class TransitionsMixin:
         ]
         if wait_clear is not None:
             multi_stmts.append(wait_clear)
+        # 新-①：同上（multi 路径的 waiters 同样要 durable 唤醒）
+        multi_stmts.extend(
+            await self._durable_wake_stmts(task_id, waiters, now_ms)
+        )
         await _execute_tx(project_id, multi_stmts)
         await publish_task_event(
             project_id, task_id, f"task.{final}", final, event_ts

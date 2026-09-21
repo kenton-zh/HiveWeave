@@ -728,6 +728,29 @@ class CloseMixin:
                     error=str(e),
                 )
 
+    async def _durable_wake_stmts(
+        self, task_id: str, waiters: list[dict], now_ms: int
+    ) -> list[tuple[str, list]]:
+        """把「durable 唤醒行」构造成可并入**触发侧事务**的语句列表（新-①）。
+
+        单一实现：4 个投放点（`archive_task` / `_transition` / `_transition_multi` /
+        `_clear_task_wait_contracts` 兜底）都调用它 —— 各写一遍必然漂移。
+        按 **agent 去重**（同一 agent 可能对同一 task 留多条等待行，不去重会连叫多次）。
+        """
+        stmts: list[tuple[str, list]] = []
+        for agent_id in sorted(
+            {str(r.get("agent_id") or "") for r in waiters if r.get("agent_id")}
+        ):
+            stmt, _ts, _iid = build_inbox_wake_insert(
+                agent_id,
+                f"[等待解除] 任务 {task_id} 已进入终态或有新进展，你的等待已解除 —— "
+                "不必再等，请转向其它任务。",
+                task_id=task_id,
+                now_ms=now_ms,
+            )
+            stmts.append(stmt)
+        return stmts
+
     async def _clear_task_wait_contracts(
         self, project_id: str, task_id: str
     ) -> None:
@@ -755,7 +778,14 @@ class CloseMixin:
             )
             if stmt is None:
                 return
-            await _execute(project_id, stmt[0], stmt[1])
+            # 新-①：唤醒行与清等待**同一事务**（旧形态：清完再提交后才 trigger，
+            # 崩在中间就只剩「等待已清、唤醒永不发生」）。
+            await _execute_tx(
+                project_id,
+                [stmt, *await self._durable_wake_stmts(
+                    task_id, waiters, int(time.time() * 1000)
+                )],
+            )
             await self._wake_task_waiters(
                 project_id, task_id, waiters, in_tx=False
             )
@@ -911,17 +941,9 @@ class CloseMixin:
         # 它之间就只剩「等待已清、唤醒永不发生」。⚠ 该行的 `wake_category` 必须与
         # `inbox.demote_wake_for_task` 的降级条件互斥，否则刚落就会被降成 wake=0
         #（2026-09-21 实测踩过：durable 唤醒形同虚设）。
-        for _wake_agent in sorted(
-            {str(r.get("agent_id") or "") for r in waiters if r.get("agent_id")}
-        ):
-            _wake_stmt, _wts, _wid = build_inbox_wake_insert(
-                _wake_agent,
-                f"[等待解除] 任务 {task_id} 已进入终态（归档为 cancelled）。"
-                "你等待的这件事不会再有进展，不必再等 —— 请转向其它任务。",
-                task_id=task_id,
-                now_ms=now_ms,
-            )
-            archive_stmts.append(_wake_stmt)
+        archive_stmts.extend(
+            await self._durable_wake_stmts(task_id, waiters, now_ms)
+        )
         await _execute_tx(project_id, archive_stmts)
         await publish_task_event(
             project_id, task_id, "task.archived", "cancelled", event_ts
