@@ -553,7 +553,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "include enough context to make it unique. Empty new_string "
             "deletes the match. If exact match fails, a whitespace/"
             "indentation-tolerant fuzzy match is attempted before erroring. "
-            "Read the file first."
+            "Read the file first. NOTE (P1-6): adding a path to .gitignore does "
+            "NOT untrack a file that is already tracked -- ignore rules only "
+            "apply to new adds. The platform de-tracks generated artifacts for "
+            "you on repo ensure; do not try to fix tracking by editing "
+            ".gitignore."
         ),
         "properties": {
             "filePath": {
