@@ -16,6 +16,8 @@ import pytest
 from hiveweave.db.schema import PROJECT_DB_COLUMN_CHECKS, PROJECT_DB_TABLES
 from hiveweave.services.acl_sandbox import service as S
 from hiveweave.tools.bash import _SHELL_FACT_FLAG_KEYS, _native_shaped
+from hiveweave.tools.fact_positions import sealed_match
+from hiveweave.tools.result import SEALED_BY_PREFIX
 
 NEW_COLUMNS = ("denied_by", "blocked_by_environment", "sealed_by")
 ROOT = r"D:\PC_AI\Project\HiveTestProject\TEST_DSH_65"
@@ -116,3 +118,75 @@ def test_blocked_by_environment_none_when_no_exit_code():
     res = _hint("Access to the path 'x' is denied.", None, "p03-bwe2")
     assert res.get("denied_by") is None
     assert res.get("blocked_by_environment") is None
+
+
+# ── Stage 2b：封条知识的**携带**（装配阶段记住 → 执行阶段读取）────
+
+
+class _Policy:
+    """最小假 policy（只带封条携带用到的两个根）。"""
+
+    def __init__(self, boundary: str, project: str) -> None:
+        self.boundary_root = boundary
+        self.project_root = project
+
+
+def test_sealed_carry_and_lookup_by_boundary():
+    policy = _Policy(ROOT, ROOT)
+    S._remember_sealed(policy, [f"seal:{ROOT}\\.git\\config"])
+    got = S._sealed_for_boundary(ROOT)
+    assert got == (f"seal:{ROOT}\\.git\\config",)
+    # 别的边界查不到（不许串台）
+    assert S._sealed_for_boundary(r"D:\\other\\place") == ()
+    assert S._sealed_for_boundary(None) == ()
+
+
+def test_no_seal_recorded_means_empty_not_guessed():
+    S._remember_sealed(_Policy(r"D:\\no\\seal", r"D:\\no\\seal"), [])
+    assert S._sealed_for_boundary(r"D:\\no\\seal") == ()
+
+
+def test_sealed_match_returns_raw_target():
+    stamped = [f"seal:{ROOT}\\.git\\config", f"deny-dc-all:{ROOT}\\.git"]
+    # 目录级封条覆盖其子项
+    assert sealed_match(
+        f"Access to the path '{ROOT}\\.git\\index.lock' is denied.", stamped
+    ) == f"{ROOT}\\.git"
+    # 文件级封条
+    assert sealed_match(
+        f"Access to the path '{ROOT}\\.git\\config' is denied.", stamped
+    ) == f"{ROOT}\\.git\\config"
+    assert sealed_match("Access to the path 'D:\\tmp\\a' is denied.", stamped) is None
+
+
+def test_acceptance5_git_index_lock_is_sealed_git():
+    """⭐ §1 验收 5：受限命令写 `.git/index.lock` ⇒ `denied_by='sealed_git'`
+    且 `sealed_by LIKE 'acl_lockdown%'`。
+
+    夹具走**真实链路的一半**：装配阶段记住封条（`_remember_sealed`）→ 执行阶段
+    的拒绝提示点（`_maybe_append_rejection_hint`）读到它并改判成因。
+    """
+    S._remember_sealed(_Policy(ROOT, ROOT), [
+        f"create+seal:{ROOT}\\.git\\config",
+        f"deny-dc-all:{ROOT}\\.git",
+    ])
+    res = _hint(
+        f"Set-Content: Access to the path '{ROOT}\\.git\\index.lock' is denied.",
+        1,
+        "p03-accept5",
+    )
+    assert res["denied_by"] == "sealed_git"
+    assert res["sealed_by"].startswith(SEALED_BY_PREFIX), res["sealed_by"]
+    assert res["sealed_by"] == f"{SEALED_BY_PREFIX}{ROOT}\\.git"
+    # 文案也必须换成「封条」口径（不能再劝去申请豁免）
+    assert "封条" in res["stderr"]
+    assert "之外" not in res["stderr"]
+
+
+def test_sealed_mark_absent_when_not_sealed():
+    """没命中封条 ⇒ 不得凭空写 `sealed_by`（NULL = 不知道）。"""
+    res = _hint(
+        f"Access to the path '{ROOT}\\src\\a.txt' is denied.", 1, "p03-noseal"
+    )
+    assert res["denied_by"] == "no_write_sid"
+    assert "sealed_by" not in res

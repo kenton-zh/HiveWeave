@@ -354,17 +354,43 @@ _SEAL_STAMP_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _sealed_targets(sealed) -> list[str]:
-    """`sealed` 可传裸路径，也可传封条戳串（`seal:<p>` / `create+seal:<p>` / `deny-dc-all:<p>`）。"""
-    out: list[str] = []
+def _sealed_pairs(sealed) -> list[tuple[str, str]]:
+    """`sealed` → `[(原始路径, 归一化路径)]`。
+
+    可传裸路径，也可传封条戳串（`seal:<p>` / `create+seal:<p>` / `deny-dc-all:<p>`）。
+    保留原始形态是为了 `sealed_by` 能**如实记录**封条函数说的话（而不是重推一遍）。
+    """
+    out: list[tuple[str, str]] = []
     for item in sealed or ():
         raw = str(item)
         for pref in _SEAL_STAMP_PREFIXES:
             if raw.startswith(pref):
                 raw = raw[len(pref):]
                 break
-        out.append(_norm_path(raw))
+        out.append((raw, _norm_path(raw)))
     return out
+
+
+def _sealed_targets(sealed) -> list[str]:
+    """仅归一化形态（内部/测试用）。"""
+    return [norm for _raw, norm in _sealed_pairs(sealed)]
+
+
+def sealed_match(stderr: str, sealed) -> str | None:
+    """被拒路径命中封条集合时返回**该封条目标路径**（已剥戳前缀），否则 `None`。
+
+    单一匹配实现：`classify_denied_by` 的 `sealed_git` 分支与 `sealed_by` 的取值
+    都用它 —— 两处各写一遍必然漂移。
+    """
+    pairs = _sealed_pairs(sealed)
+    if not pairs:
+        return None
+    for denied in extract_denied_paths(stderr):
+        dn = _norm_path(denied)
+        for raw, norm in pairs:
+            if dn == norm or dn.startswith(norm + os.sep):
+                return raw
+    return None
 
 
 def classify_denied_by(
@@ -388,15 +414,14 @@ def classify_denied_by(
     if not paths:
         return "unknown_acl"
 
-    sealed_norm = _sealed_targets(sealed)
+    if sealed_match(stderr, sealed) is not None:
+        return "sealed_git"
     root = _norm_path(boundary_root).rstrip(os.sep) if boundary_root else ""
     # ⚠ 去掉尾分隔符：`normpath("D:\\") == "D:\\"` ⇒ `root + os.sep` 永不匹配，
     #   盘符根下的一切都会被判 out（审计 A5）。
     sides: set[str] = set()
     for raw in paths:
         pn = _norm_path(raw)
-        if any(pn == s or pn.startswith(s + os.sep) for s in sealed_norm):
-            return "sealed_git"
         # ⚠ 相对路径无从比边界（审计 A1①：`'src\a.txt'` 曾被判 outside）⇒ 计入 "?"
         if not root or not os.path.isabs(raw):
             sides.add("?")

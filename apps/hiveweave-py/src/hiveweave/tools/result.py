@@ -76,6 +76,9 @@ DeniedBy = Literal[
 DENIED_BY_KINDS: frozenset[str] = frozenset(
     ("outside_boundary", "sealed_git", "no_write_sid", "unknown_acl")
 )
+#: `sealed_by` 列的值前缀（机制名 + 封条目标路径），如
+#: `acl_lockdown:D:\proj\.git\config`。§1 验收 5 按 `LIKE 'acl_lockdown%'` 判。
+SEALED_BY_PREFIX = "acl_lockdown:"
 
 
 @dataclass

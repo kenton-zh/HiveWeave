@@ -423,6 +423,50 @@ _runner_guard = threading.Lock()
 _hint_counts: dict[str, int] = {}
 _hint_guard = threading.Lock()
 
+# P0-3：**封条知识的携带**（装配阶段 → 执行阶段）。
+#
+# 病灶：`_seal_git_bootstrap_files()` 返回「本次实际封了什么」的戳串，但唯一
+# 调用点**丢弃返回值** ⇒ 执行阶段遇到 git 引导文件被拒时无从知道那是封条
+#（§0 发现 #1：「知识存在、无消费者」）。
+#
+# ⚠ 为什么用记忆而**不重推**：封条函数是唯一知道封了什么的地方；在下游重新
+#   枚举一遍 ＝ 复制它的判据 ⇒ 必然漂移（本仓「同一语义两处」的通病）。
+# 键按 `boundary_root` 与 `project_root`（都是 realpath+normcase）双写 —— 执行
+# 阶段拿到的是 boundary，装配阶段两个都知道。
+_sealed_by_boundary: dict[str, tuple[str, ...]] = {}
+_seal_guard = threading.Lock()
+
+
+def _remember_sealed(policy, changed: list[str]) -> None:
+    """把封条函数本次的产出记下来（幂等、只增不改）。"""
+    if not changed:
+        return
+    keys: set[str] = set()
+    for attr in ("boundary_root", "project_root"):
+        value = getattr(policy, attr, None)
+        if value:
+            try:
+                keys.add(os.path.normcase(os.path.realpath(value)))
+            except Exception:  # noqa: BLE001 — 路径异常不该阻断 spawn
+                continue
+    if not keys:
+        return
+    with _seal_guard:
+        for key in keys:
+            _sealed_by_boundary[key] = tuple(changed)
+
+
+def _sealed_for_boundary(boundary: str | None) -> tuple[str, ...]:
+    """读取该边界下的封条戳；没有记录则空（= 「不知道」，不是「没封」）。"""
+    if not boundary:
+        return ()
+    try:
+        key = os.path.normcase(os.path.realpath(boundary))
+    except Exception:  # noqa: BLE001
+        return ()
+    with _seal_guard:
+        return _sealed_by_boundary.get(key, ())
+
 
 async def _root_lock(path: str) -> asyncio.Lock:
     norm = os.path.realpath(path)
@@ -859,7 +903,8 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         # #2：**不再**对 `.git` 整棵授 GRANT_MASK（那正是「agent 能改 config」的
         # 来源，且会被 lock+rename 一路穿透封条）。改由封条函数收窄写面 + 只授
         # git 真正需要写的子目录（objects/refs/logs + 各 worktree gitdir）。
-        await _seal_git_bootstrap_files(policy, agrant)
+        # P0-3：**接住返回值** —— 封条函数说的话是执行阶段判「封条拒绝」的唯一依据。
+        _remember_sealed(policy, await _seal_git_bootstrap_files(policy, agrant))
 
     cache_dir = policy.cache_dir
     if not os.path.isdir(cache_dir):
@@ -1023,17 +1068,26 @@ def _maybe_append_rejection_hint(agent_id: str, boundary: str, result: dict) -> 
     `denied_by` 落在结果上（结构化，供 run_steps / 回执消费），文案按它选模板
     —— 旧实现无论成因一律说"目标在授权树之外"，实测 57.6% 是假话。
     """
-    from hiveweave.tools.fact_positions import classify_denied_by
+    from hiveweave.tools.fact_positions import classify_denied_by, sealed_match
+    from hiveweave.tools.result import SEALED_BY_PREFIX
 
     stderr_in = result.get("stderr", "")
+    # P0-3：把**装配阶段记住的封条**带进来 ⇒ 才知道这次拒绝是不是封条所致。
+    sealed = _sealed_for_boundary(boundary)
     denied_by = classify_denied_by(
-        stderr_in, result.get("exit_code"), boundary_root=boundary
+        stderr_in, result.get("exit_code"), boundary_root=boundary,
+        sealed=sealed,
     )
     telemetry.record_rejection(denied_by is not None)
     if denied_by is None:
         return result
     result = dict(result)
     result["denied_by"] = denied_by
+    if denied_by == "sealed_git":
+        # 如实记录「谁封的 + 封的是哪个目标」（值形态见 SEALED_BY_PREFIX）
+        matched = sealed_match(stderr_in, sealed)
+        if matched:
+            result["sealed_by"] = f"{SEALED_BY_PREFIX}{matched}"
     # P0-3：`blocked_by_environment` = 「方言命中**且 runner 没失败**」。
     # 判据用状态（exit_code 非 None = 进程确实跑过），不用文案。
     result["blocked_by_environment"] = (
