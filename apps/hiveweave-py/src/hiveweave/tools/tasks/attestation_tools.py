@@ -23,6 +23,30 @@ log = structlog.get_logger(__name__)
 # ── attest_doc_review ────────────────────────────────────────
 
 
+class DocReviewFile(BaseModel):
+    """``attest_doc_review(files=[…])`` 的单条形状（P2-1）。
+
+    旧形态是 ``files: list[Any]`` —— ``Any`` 让 pydantic **永不报错**，
+    缺/空 path 一路漏到服务层才炸成 `Unsafe or empty path: ''`（报错点离
+    调用点十万八千里，agent 无从自纠；另有 `path=123` → AttributeError 被
+    兜成 `'int' object has no attribute 'strip'`）。收官成带形状的类型后，
+    校验在**门内**完成，回执直接点名 `files[0].path`。
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    path: str = Field(
+        min_length=1,
+        description="File path relative to the chosen root.",
+    )
+    min_lines: int | None = Field(
+        default=None,
+        alias="minLines",
+        description="Optional minimum LF-line count.",
+        json_schema_extra={"aliases": ["minLines", "min_lines"]},
+    )
+
+
 class AttestDocReviewParams(BaseModel):
     """Parameters for attest_doc_review tool."""
 
@@ -34,7 +58,8 @@ class AttestDocReviewParams(BaseModel):
         description="Optional task to bind this attestation to.",
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
-    files: list[Any] = Field(
+    files: list[DocReviewFile] = Field(
+        min_length=1,
         description=(
             "Files to verify, each {path, minLines?}. Paths relative to the "
             "chosen workspace root (worktree or project main)."
@@ -50,6 +75,32 @@ class AttestDocReviewParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["source", "workspaceSource", "workspace"]},
     )
+
+    @field_validator("files", mode="before")
+    @classmethod
+    def _coerce_files(cls, v: Any) -> Any:
+        """把历史的宽容写法收成规范形状（收窄形状 ≠ 收窄输入面）。
+
+        - 单个 dict ⇒ ``[dict]``（旧代码在工具体内做过同样的包装）
+        - 单个 / 多个字符串 ⇒ ``{path: s}``
+        - ``{file: …}``（服务层旧别名）⇒ ``{path: …}``
+        """
+        def _norm(item: Any) -> Any:
+            if isinstance(item, str):
+                return {"path": item}
+            if isinstance(item, dict) and not item.get("path") and item.get("file"):
+                rest = {k: val for k, val in item.items() if k != "file"}
+                return {**rest, "path": item.get("file")}
+            return item
+
+        if isinstance(v, dict):
+            return [_norm(v)]
+        if isinstance(v, str):
+            return [_norm(v)]
+        if isinstance(v, (list, tuple)):
+            return [_norm(item) for item in v]
+        return v
+
 
 
 @tool(
@@ -75,10 +126,10 @@ async def attest_doc_review_tool(
     if not project_id:
         return ToolResult.err(f"Agent {agent_id} has no project")
 
-    files = params.files or []
-    if isinstance(files, dict):
-        files = [files]
-    if not isinstance(files, list) or not files:
+    # P2-1：形状已在 pydantic 门内校验（`list[DocReviewFile]`），这里只做
+    # 「规范化给服务层」—— 服务读的是 dict 键 `path` / `min_lines`。
+    files = [f.model_dump() for f in (params.files or [])]
+    if not files:
         return ToolResult.err(
             "attest_doc_review requires files=[{path, minLines?}, ...]"
         )

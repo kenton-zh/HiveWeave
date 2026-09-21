@@ -1282,31 +1282,45 @@ async def create_doc_review(
         raise ValueError(f"Workspace not found: {workspace}")
 
     checked: list[dict[str, Any]] = []
-    for entry in files:
+    for _i, entry in enumerate(files):
+        # P2-1：报错必须**点名第几条**（`files[0].path`）—— 旧的
+        # `Unsafe or empty path: ''` 既不说哪条、也不说字段名，agent 无从自纠。
         if not isinstance(entry, dict):
-            raise ValueError(f"Invalid file entry: {entry!r}")
+            raise ValueError(f"files[{_i}] 必须是 {{path, minLines?}} 对象：{entry!r}")
         rel = (entry.get("path") or entry.get("file") or "").strip().replace(
             "\\", "/"
         )
         if not rel or rel.startswith("/") or ".." in rel.split("/"):
-            raise ValueError(f"Unsafe or empty path: {rel!r}")
+            # ⚠ 保留原措辞 + **追加**定位：`test_dogfood_p1_fixes.py` 的
+            # escape/missing 两条用例按 `Unsafe|escapes|not found` 匹配旧文案
+            #（施工单只核了「Unsafe or empty path」一处零 pin，另三处是 pinned）。
+            raise ValueError(
+                f"Unsafe or empty path: {rel!r} (files[{_i}].path)"
+            )
         root_resolved = root.resolve()
         full = (root / rel).resolve()
         try:
             full.relative_to(root_resolved)
         except ValueError as e:
-            raise ValueError(f"Path escapes workspace: {rel}") from e
+            raise ValueError(
+                f"Path escapes workspace: {rel} (files[{_i}].path)"
+            ) from e
         if not full.is_file():
-            raise ValueError(f"File not found on workspace: {rel}")
+            raise ValueError(
+                f"File not found on workspace: {rel} (files[{_i}].path)"
+            )
         raw = full.read_bytes()
         # Normalize newlines so CRLF/LF checkouts share the same hash (TEST13 P2-3)
         raw_norm = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         text = raw_norm.decode("utf-8", errors="replace")
         lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+        # ⚠ 第二个分支（camelCase）只服务**直调**本函数的调用方 ——
+        # 工具路径经 `DocReviewFile.model_dump()` 后键已统一为 `min_lines`，
+        # 那条分支在工具路径上永不为真。别当冗余清掉（会打红直调用例）。
         min_lines = entry.get("min_lines") or entry.get("minLines")
         if min_lines is not None and lines < int(min_lines):
             raise ValueError(
-                f"{rel}: {lines} lines < min_lines={min_lines}"
+                f"{rel}: {lines} lines < min_lines={min_lines} (files[{_i}].path)"
             )
         digest = hashlib.sha256(raw_norm).hexdigest()
         checked.append(

@@ -1894,6 +1894,23 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "files": {
                 "type": "array",
                 "description": "Each {path, minLines?}. Paths relative to the chosen root.",
+                # P2-1：补 items 形状 —— 只有 {"type":"array"} 时模型端看不到
+                # 元素契约（`files: list[Any]` 让它「永不报错」），缺 path 的
+                # 调用只能漏到服务层才炸。
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to the chosen root.",
+                        },
+                        "minLines": {
+                            "type": "integer",
+                            "description": "Optional minimum LF-line count.",
+                        },
+                    },
+                    "required": ["path"],
+                },
             },
             "source": {
                 "type": "string",

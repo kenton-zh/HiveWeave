@@ -294,7 +294,7 @@ async def execute_registered_tool(
         return None  # Not registered — fall back to legacy dispatch
 
     # 2. Parameter validation + alias normalization (Pydantic)
-    params, error = tool_def.validate(raw_args)
+    params, error, violations = tool_def.validate_detailed(raw_args)
     if error:
         log.info(
             "pipeline.args_invalid",
@@ -319,7 +319,13 @@ async def execute_registered_tool(
         return ToolResult.err(
             f"Parameter error in '{tool_name}': {error}.{expected} "
             f"You provided these parameters: {received_keys}. "
-            f"Check the parameter names and make sure all required fields are included."
+            f"Check the parameter names and make sure all required fields are included.",
+            # P2-1：结构化违规清单（`path` 为方括号形态，如 files[0].path）。
+            # ⚠ 口径：**落库/进模型可见面的只有 `error` 文本**（点号形态
+            # `files.0.path`，见 streaming 的 excerpt 取 result_content/error）；
+            # `invalidArgs` 目前只供进程内消费方与测试断言，别按「已入库」用它做统计。
+            # 空数组 = 无结构化违规（含非 ValidationError 的异常分支）。
+            invalidArgs=violations,
         ).to_dict()
 
     # 3. Permission evaluation

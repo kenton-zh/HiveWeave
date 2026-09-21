@@ -20,6 +20,22 @@ from pydantic import BaseModel, Field, ConfigDict, ValidationError
 _TOOL_REGISTRY: dict[str, "ToolDef"] = {}
 
 
+def loc_to_bracket_path(loc: Any) -> str:
+    """``('files', 0, 'path')`` → ``'files[0].path'``（结构化回执用）。
+
+    整数段写成下标、字符串段按点号连接 —— 与 pydantic 原生文案里的
+    ``files.0.path`` 刻意区分：两条表述**同时**可在回执中检索到
+    （P2-1 验收：`error` 含点号形态、`invalidArgs[].path` 含方括号形态）。
+    """
+    out = ""
+    for seg in loc or ():
+        if isinstance(seg, int):
+            out += f"[{seg}]"
+        else:
+            out += ("." if out else "") + str(seg)
+    return out or "<root>"
+
+
 def get_registry() -> dict[str, "ToolDef"]:
     """Return the global tool registry (for introspection/testing)."""
     return _TOOL_REGISTRY
@@ -107,20 +123,39 @@ class ToolDef:
 
     # ── validation ───────────────────────────────────────
 
-    def validate(self, raw_args: dict[str, Any]) -> tuple[BaseModel | None, str | None]:
+    def validate(
+        self, raw_args: dict[str, Any]
+    ) -> tuple[BaseModel | None, str | None]:
         """Validate + alias-normalize raw args via the Pydantic model.
 
         Returns ``(model_instance, None)`` on success or ``(None, error_msg)``.
         The error message is formatted to be actionable for LLM self-correction:
         includes the field name, what went wrong, and the expected type/description.
+
+        P2-1：结构化违规清单见 :meth:`validate_detailed` —— 本方法保持二元组
+        签名（既有调用方与测试依赖它）。
+        """
+        params, error, _violations = self.validate_detailed(raw_args)
+        return params, error
+
+    def validate_detailed(
+        self, raw_args: dict[str, Any]
+    ) -> tuple[BaseModel | None, str | None, list[dict[str, Any]]]:
+        """同 :meth:`validate`，额外返回**结构化**违规清单。
+
+        ``violations`` 形如 ``[{"path": "files[0].path", "message": "...",
+        "type": "missing"}]`` —— 索引写成 ``files[0].path``（方括号）供机器
+        消费；文案里保留 pydantic 原生的点号形态（``files.0.path``），
+        两条表述都在回执里能查到。
         """
         try:
             normalized = self._normalize_aliases(raw_args)
             params = self.params_model(**normalized)
-            return params, None
+            return params, None, []
         except ValidationError as exc:
             # Build a concise, actionable error message for the LLM
             parts: list[str] = []
+            violations: list[dict[str, Any]] = []
             for err in exc.errors():
                 field = ".".join(str(x) for x in err["loc"])
                 msg = err["msg"]
@@ -132,9 +167,16 @@ class ToolDef:
                 if field_info and field_info.description:
                     desc = f" ({field_info.description})"
                 parts.append(f"'{field}': {msg}{desc}")
-            return None, "; ".join(parts)
+                violations.append(
+                    {
+                        "path": loc_to_bracket_path(err["loc"]),
+                        "message": msg,
+                        "type": str(err.get("type") or ""),
+                    }
+                )
+            return None, "; ".join(parts), violations
         except Exception as exc:
-            return None, str(exc)
+            return None, str(exc), []
 
     def _normalize_aliases(self, raw_args: dict[str, Any]) -> dict[str, Any]:
         """Map alias names to canonical Pydantic field names.
