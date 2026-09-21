@@ -243,7 +243,12 @@ def _build_evidence(
     # 验收清单覆盖声明 → evidence（acceptance.py 覆盖门的结构化判据）。
     # 此前该门经 submit_task 结构上不可满足：参数无入口，模型硬传也被
     # pydantic extra=ignore 静默吞掉（TEST_DSH_63：82 次调用 0 次带参）。
-    if params.acceptance_coverage:
+    if getattr(params, "acceptance_coverage", None):
+        # ⚠ 必须 `getattr` 容读：与上面 `delivery_contract` / `contract_waived` 同款。
+        # 直读 `params.acceptance_coverage` 时，任何**未带该字段**的 params（进程内
+        # 其它调用点、测试里的 SimpleNamespace 假参数）都会 `AttributeError`
+        # ⇒ 实测全量 17 条红（`test_submit_audit_reminder` 9 / `test_submit_conflict_gate` 5 /
+        # `test_submit_auto_no_code_change` 3）全部落在这一行。
         evidence["acceptance_coverage"] = params.acceptance_coverage
     if params.files_changed:
         from hiveweave.services.worktree_review import normalize_files_changed

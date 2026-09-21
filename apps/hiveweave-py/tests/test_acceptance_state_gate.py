@@ -76,6 +76,10 @@ async def _mk_task(env, criteria=CRITERIA) -> str:
         creator_id=COORD,
         assignee_id=EXEC,
         acceptance_criteria=criteria,
+        # ⚠ P1-7② 之后 `create_task` 有查重门（命中相似 open 任务会**复用**既有 id）。
+        # 本文件的用例**刻意**建多条同名任务来验"凭证/豁免是否绑任务"
+        # ⇒ 显式声明 `allow`（这正是该出口存在的理由；不声明会把两条用例变成单任务）。
+        dedup_policy="allow",
     )
 
 
