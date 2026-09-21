@@ -16,7 +16,7 @@ import pytest
 from hiveweave.db.schema import PROJECT_DB_COLUMN_CHECKS, PROJECT_DB_TABLES
 from hiveweave.services.acl_sandbox import service as S
 from hiveweave.tools.bash import _SHELL_FACT_FLAG_KEYS, _native_shaped
-from hiveweave.tools.fact_positions import sealed_match
+from hiveweave.tools.fact_positions import classify_denied_by, sealed_match
 from hiveweave.tools.result import SEALED_BY_PREFIX
 
 NEW_COLUMNS = ("denied_by", "blocked_by_environment", "sealed_by")
@@ -190,3 +190,55 @@ def test_sealed_mark_absent_when_not_sealed():
     )
     assert res["denied_by"] == "no_write_sid"
     assert "sealed_by" not in res
+
+
+# ── Stage 2c：门去噪（`warning:` 行不是拒绝证据）+ 中文方言（A4）──
+
+
+def test_pytest_warning_is_not_a_rejection():
+    """⭐ 实证形态：19/53 条历史提示行的 stderr 是 **pytest 的非致命警告**
+    （`warning: could not open directory 'pytest-cache-files-X/': Permission denied`）
+    ⇒ 旧门据此追加「写入被沙箱拒绝：目标在授权树之外」——**那行没有发生任何写入拒绝**。
+    """
+    from hiveweave.tools.fact_positions import is_acl_rejection
+
+    warning_only = (
+        "warning: could not open directory 'pytest-cache-files-c3zwxps4/': "
+        "Permission denied\nhead: The term 'head' is not recognized as a name\n"
+    )
+    assert is_acl_rejection(warning_only, 1) is False
+    res = _hint(warning_only, 1, "p03-noise")
+    assert "denied_by" not in res
+    assert "[沙箱提示]" not in res["stderr"]
+
+
+def test_real_denial_alongside_warning_still_counts():
+    """同一段里有警告 + **真的**拒绝行 ⇒ 仍是拒绝（逐行判定，不是整段否定）。"""
+    from hiveweave.tools.fact_positions import is_acl_rejection
+
+    blob = (
+        "warning: could not open directory 'x/': Permission denied\n"
+        f"Out-File: Access to the path '{ROOT}\\src\\a.txt' is denied.\n"
+    )
+    assert is_acl_rejection(blob, 1) is True
+    assert classify_denied_by(blob, 1, boundary_root=ROOT) == "no_write_sid"
+
+
+def test_chinese_acl_dialect_is_recognized():
+    """A4：中文 Windows 的 ACL 文案此前是**死支**（既不追加提示也不落位）。"""
+    from hiveweave.tools.fact_positions import is_acl_rejection
+
+    chinese = f"Out-File: 对路径“{ROOT}\\src\\a.txt”的访问被拒绝。"
+    assert is_acl_rejection(chinese, 1) is True
+    assert classify_denied_by(chinese, 1, boundary_root=ROOT) == "no_write_sid"
+    inside = classify_denied_by(
+        f"对路径“{ROOT}\\.hiveweave\\reports\\x”的访问被拒绝。", 1,
+        boundary_root=ROOT,
+    )
+    assert inside == "no_write_sid"
+
+
+def test_chinese_outside_path():
+    assert classify_denied_by(
+        "对路径“D:\\tmp\\a.txt”的访问被拒绝。", 1, boundary_root=ROOT
+    ) == "outside_boundary"

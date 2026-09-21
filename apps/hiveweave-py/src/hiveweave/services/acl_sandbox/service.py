@@ -62,6 +62,10 @@ REJECTION_DIALECT = (
     "Access is denied",
     "Access to the path",
     "Permission denied",
+    # P0-3 Stage 2c（审计 A4）：中文 Windows 的 ACL 文案同样是**拒绝证据** ——
+    # 此前不认 ⇒ 既不追加提示、也不落 denied_by（死支）。
+    "访问被拒绝",
+    "拒绝访问",
 )
 _HINT_EVERY_N_ROUNDS = 3
 # P0-3：提示文案**由成因驱动**（不再一律说"在授权树之外"）。

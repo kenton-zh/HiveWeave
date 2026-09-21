@@ -316,17 +316,37 @@ _DENIED_PATH_RE = re.compile(
 )
 
 
+#: 「不是拒绝证据」的行形态（Stage 2c，**实证**）：
+#: 实测 19/53 条平台提示行的 stderr 是 **pytest 自己的非致命警告** ——
+#:   `warning: could not open directory 'pytest-cache-files-X/': Permission denied`
+#: （pytest 缓存目录打不开），而旧门只看"整段 stderr 里有没有 Permission denied 子串"
+#: ⇒ 对**根本没发生任何写入拒绝**的行也追加「写入被沙箱拒绝：目标在授权树之外」。
+#: `warning:` 前缀是 pytest/Python 的**非致命**约定 ⇒ 该行不构成拒绝证据。
+_NOISE_LINE_RE = re.compile(r"^\s*(?:warning|w)\s*:", re.IGNORECASE)
+
+
 def is_acl_rejection(stderr: str, exit_code: object) -> bool:
-    """状态层：非零退出 + 拒绝方言命中 = 一次沙箱/ACL 拒绝（`None`/0 都不算）。"""
+    """状态层：非零退出 + **某一行**含拒绝方言 = 一次沙箱/ACL 拒绝。
+
+    Stage 2c：判定从「整段子串」改成「**逐行** + 去噪」——
+    ① 逐行：拒绝证据是**某一行**的性质（整段匹配会把无关行的子串算进来）；
+    ② 去噪：`warning:` 前缀行（pytest/Python 非致命警告）不算拒绝证据。
+    """
     try:
         if exit_code is None or int(exit_code) == 0:
             return False
     except (TypeError, ValueError):
         return False
-    norm = _normalize(stderr)
-    if not norm:
+    if not stderr:
         return False
-    return any(d.lower() in norm for d in _rejection_dialect())
+    dialect = [d.lower() for d in _rejection_dialect()]
+    for line in stderr.splitlines():
+        if _NOISE_LINE_RE.match(line):
+            continue
+        low = line.lower()
+        if any(d in low for d in dialect):
+            return True
+    return False
 
 
 def extract_denied_paths(stderr: str) -> list[str]:
