@@ -599,7 +599,13 @@ class CrudMixin:
             params.append(assignee_id)
         elif include_unassigned:
             sql += "AND (assignee_id IS NULL OR assignee_id = '') "
-        sql += "ORDER BY created_at DESC LIMIT 40"
+        # ⭐ P1-7 ③（2026-09-21）：**去掉 `LIMIT 40`**。
+        # 原实现先截「最近 40 条 open」再在 Python 里比标题 ⇒ 一旦 open 任务 > 40，
+        # 命中项落窗外就**静默查重失效**（同一件事被派两次的真根因之一）。
+        # ⚠ 不在 SQL 里复刻标题比对口径：`" ".join(lower().split())` 的归一化
+        # 无法逐字搬进 SQL ⇒ 会造成「同一规则两处实现」的漂移（本仓通病）。
+        # 代价：本项目 open 任务的整表扫（配 `is_archived/status` 过滤）；正确性优先。
+        sql += "ORDER BY created_at DESC"
         rows = await _query(project_id, sql, params)
         for r in rows:
             row = self._row(r)
