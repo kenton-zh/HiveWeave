@@ -226,7 +226,7 @@ def report_cache_readout(
     agent_id: str,
     *,
     input_tokens: int,
-    cache_read: int,
+    cache_read: int | None,
     cache_creation: int,
 ) -> dict[str, Any] | None:
     """首请求 usage 回读后调用（`token_meter.record_rounds` 之后）。
@@ -245,6 +245,8 @@ def report_cache_readout(
     - ``cache_window_expired``   前缀对齐但 cache_read=0 → provider 缓存窗口
                                  过期/驱逐（平台侧不可修）
     - ``drift_zero_hit``         前缀**真漂移**且 cache_read=0 ⇒ 平台侧可修
+    - ``unknown_usage``          usage 里**没有** cache_read（None）⇒ 未知，**不得**记成漂移
+                                 （P1-1②：None ≠ 0；旧判据会把"没这个数"读成"零命中"）
 
     为什么必须把 cold_start 单列：TEST_DSH_54 的 15 个 drift_zero_hit 里
     有 8 个落在各 Agent 首次活动窗口（12:03–12:50）—— 那里的 cache_read=0
@@ -255,7 +257,14 @@ def report_cache_readout(
     if last is None:
         return None
     verdict_str = str(last.get("verdict") or "")
-    if cache_read and cache_read > 0:
+    if cache_read is None:
+        # ⭐ P1-1②：**未知 ≠ 零命中**（与 `executed` 同族纪律：None 不得与 0 混同）。
+        # usage 里没有 cache_read（provider 不回 / 解析失败）时，旧判据
+        # `cache_read and cache_read > 0` 会落进下面的 else 链 ⇒ 被记成
+        # `drift_zero_hit`「平台改写了前缀、可修」—— 把排查引向错误根因
+        #（与 cold_start 单列同理：TEST_DSH_54 里 8/15 条 drift_zero_hit 就是这么来的）。
+        final = "unknown_usage"
+    elif cache_read > 0:
         final = "hit_ok"
     elif "no_baseline" in verdict_str or "model_changed" in verdict_str:
         # 无基准 / 换缓存域 ⇒ 没有可读的缓存，零命中是必然而非漂移
