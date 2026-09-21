@@ -194,6 +194,61 @@ def build_task_event_insert(
     ), ts, event_id
 
 
+#: 新-①：durable 唤醒行的 `wake_category` —— **单一源**。
+#: `archive_task` 末尾的 `demote_wake_for_task` 会把该 task 名下所有
+#: `read=0 AND wake=1` 的行降级成背景（义务消失、别再唤醒），而本行恰恰是
+#: 「等待已解除、请转向别处」—— 语义相反，必须在降级条件里排除它。
+#: 2026-09-21 实测：不排除时落库 `wake` 会从 1 被改成 0（durable 唤醒形同虚设）。
+WAKE_CATEGORY_TASK_WAIT_CLEARED = "task_wait_cleared"
+
+
+def build_inbox_wake_insert(
+    to_agent_id: str,
+    message: str,
+    *,
+    from_agent_id: str = "system",
+    message_type: str = "normal",
+    task_id: str | None = None,
+    wake_category: str = WAKE_CATEGORY_TASK_WAIT_CLEARED,
+    now_ms: int | None = None,
+) -> tuple[tuple[str, list], int, str]:
+    """构造「**durable 唤醒行**」的 inbox INSERT（新-① / P2-5b）。
+
+    为什么需要它：唤醒此前只在**事务提交后**调 `trigger_subordinate()` —— 那是
+    **进程内调用，不是写库**。崩在 COMMIT 与它之间就会留下：等待已清（durable）
+    而**唤醒永不发生**（比 TTL 更糟：等待行已清，没有任何东西会再叫醒它）。
+    落成**一行**并与触发侧同一次提交 ⇒ 崩溃后那一行仍在，由既有 watcher 的
+    「unread wake=1」口径消费（`inbox.py:863`：*wake=1 or legacy NULL*）——
+    **消费方已存在**，不需要新泵。
+
+    ⚠ 行类型**不能**是 `task_event`：`inbox.is_fyi_task_event`（`inbox.py:58-62`）
+      只按 `message_type` 过滤 FYI ⇒ 那种行不会被当作待唤醒。
+    ⚠ `read=0` + `delivered=0` + `wake=1` = **pending 且可唤醒**。
+    ⚠ `wake_category` 必须与降级条件互斥（见常量注释），否则刚落就被降成 0。
+
+    Returns: ``((sql, params), ts, inbox_id)``。
+    """
+    now = int(time.time() * 1000 if now_ms is None else now_ms)
+    inbox_id = str(uuid.uuid4())
+    sql = (
+        "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
+        "created_at, message_type, expect_report, priority, task_id, wake, "
+        "delivered, wake_category) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, 0, 'normal', ?, 1, 0, ?)"
+    )
+    params = [
+        inbox_id,
+        from_agent_id,
+        to_agent_id,
+        message,
+        now,
+        message_type,
+        task_id,
+        wake_category,
+    ]
+    return (sql, params), now, inbox_id
+
+
 def build_task_wait_clear_statement(
     cleared_at_ms: int, wait_ids: list[str]
 ) -> tuple[str, list] | None:

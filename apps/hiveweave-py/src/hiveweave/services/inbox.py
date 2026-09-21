@@ -1208,11 +1208,19 @@ class InboxService:
             )
             conn = await project_db.get_project_db_by_project_id(project_id)
 
+            # 新-①：durable 唤醒行（`task_wait_cleared`）语义与「义务消失、
+            # 别再唤醒」**相反**（它要唤醒 agent 去转向别的工作）⇒ 必须排除，
+            # 否则刚落库就被降成 wake=0，durable 唤醒形同虚设（2026-09-21 实测）。
+            from hiveweave.services.tasks.db import (
+                WAKE_CATEGORY_TASK_WAIT_CLEARED,
+            )
+
             async def _demote() -> int:
                 cursor = await conn.execute(
                     "UPDATE inbox SET wake = 0 "
-                    "WHERE task_id = ? AND read = 0 AND COALESCE(wake, 1) = 1",
-                    [task_id],
+                    "WHERE task_id = ? AND read = 0 AND COALESCE(wake, 1) = 1 "
+                    "AND COALESCE(wake_category, '') != ?",
+                    [task_id, WAKE_CATEGORY_TASK_WAIT_CLEARED],
                 )
                 n = cursor.rowcount or 0
                 await conn.commit()

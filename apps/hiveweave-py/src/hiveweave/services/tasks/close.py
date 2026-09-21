@@ -15,6 +15,8 @@ from .db import (
     _execute_tx,
     _query,
     build_task_event_insert,
+    WAKE_CATEGORY_TASK_WAIT_CLEARED,
+    build_inbox_wake_insert,
     build_task_wait_clear_statement,
     publish_task_event,
 )
@@ -904,6 +906,22 @@ class CloseMixin:
         ]
         if wait_clear is not None:
             archive_stmts.append(wait_clear)
+        # ⭐ 新-①（2026-09-21）：**唤醒也落成一行**，与状态写/事件/清等待同一次提交。
+        # 旧形态只在提交后调 `trigger_subordinate()`（进程内调用）⇒ 崩在 COMMIT 与
+        # 它之间就只剩「等待已清、唤醒永不发生」。⚠ 该行的 `wake_category` 必须与
+        # `inbox.demote_wake_for_task` 的降级条件互斥，否则刚落就会被降成 wake=0
+        #（2026-09-21 实测踩过：durable 唤醒形同虚设）。
+        for _wake_agent in sorted(
+            {str(r.get("agent_id") or "") for r in waiters if r.get("agent_id")}
+        ):
+            _wake_stmt, _wts, _wid = build_inbox_wake_insert(
+                _wake_agent,
+                f"[等待解除] 任务 {task_id} 已进入终态（归档为 cancelled）。"
+                "你等待的这件事不会再有进展，不必再等 —— 请转向其它任务。",
+                task_id=task_id,
+                now_ms=now_ms,
+            )
+            archive_stmts.append(_wake_stmt)
         await _execute_tx(project_id, archive_stmts)
         await publish_task_event(
             project_id, task_id, "task.archived", "cancelled", event_ts
