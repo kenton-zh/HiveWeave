@@ -597,7 +597,15 @@ PROJECT_DB_TABLES = [
         --   使这一列在"命中率是否达标"这个问题上**不可用于判 FAIL**。
         --   该列**无 CHECK 约束**（TEXT），新增档位不需要迁移。
         empty_stream INTEGER DEFAULT 0,
-        cache_verdict TEXT
+        cache_verdict TEXT,
+        -- P1-5（2026-09-22，用户选 E）：**跨轮**上游重试累计。
+        -- 病灶：计数器 `agents/agent.py:1421` 是**挂在 live agent 对象上的内存属性**，
+        -- 且每开一轮无条件归零 ⇒ 进程重启/被重新唤醒就**重新满血**，"每轮 ≤2 次"
+        -- 实际是"**每轮** ≤2 次"，而轮可无限开 ⇒ 同一个活的累计重试**无上界**。
+        -- 有它 ⇒ 续跑（上一 run 被中断/失败）时**承接**上一 run 的计数，可跨进程重建。
+        -- ⚠ **无 DEFAULT**（同 P0-3 三列的纪律）：NULL = 该 run 从未记录（老行/未重试过），
+        --   与 0（明确记录"0 次"）**不同形**；新行由写口显式写值。
+        upstream_retry_attempt INTEGER
     )
     """,
     """

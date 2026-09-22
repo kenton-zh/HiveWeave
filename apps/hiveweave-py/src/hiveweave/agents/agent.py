@@ -1003,6 +1003,17 @@ class Agent:
             except Exception as e:
                 log.debug("run_ledger.check_interrupted_failed", error=str(e))
 
+            # ⭐⭐ P1-5：承接判定**必须在这里**（本轮的 run 尚未 `create_run`）——
+            # 时序是这条的**承重结构**，不是风格：
+            # `_resume_upstream_attempt` 内部用 `is_latest_run` 判"那条中断 run 是不是
+            # 本 agent 最后一个 run"。若把判定放到 `create_run` **之后**（原实现的位置），
+            # "最后一个 run"就永远是**本轮刚建的那一条** ⇒ 恒 False ⇒ **承接永不生效**，
+            # 整个 P1-5 退化成旧的"每轮归零"（而且 5 条测试全绿 —— 它们构造的状态在生产
+            # 里不可达）。⇒ 只在这里求值一次，下面 `create_run` 之后直接用它。
+            restored_upstream_attempt = await self._resume_upstream_attempt(
+                interrupted_run_id
+            )
+
             # Create activation record
             trigger = opts.get("trigger") or {}
             trigger_type = (opts.get("source") or "chat")
@@ -1418,7 +1429,16 @@ class Agent:
             # 边界重试——每 turn 至多 _MAIN_LOOP_STREAM_RETRIES 次
             # （子代理侧同款语义，批次 1 已落）。
             # 46/11 实测主循环 idle 死亡 3+8 run / 68min error run。
-            self._main_upstream_attempt = 0
+            #
+            # ⭐ P1-5（2026-09-22，用户选 **E**）：**只在"新工作"时清零**。
+            # 旧形态是无条件 `= 0` —— 而计数器是**内存属性**，于是"每轮 ≤2 次"
+            # 实际是"每一轮 ≤2 次"，轮可无限开（重启 / 被重新唤醒）⇒ **同一个活的
+            # 累计重试没有上界**（实测锚点：本文件原先只有归零 / 自增两处）。
+            # 现改为：本次 activation **承接了被中断的 run** ⇒ 续算它那一行的
+            # `upstream_retry_attempt`；否则（真正的新工作）才归零。
+            # ⚠⚠ 值在本轮 `create_run` **之前**就算好了（见 `restored_upstream_attempt`
+            # 的注释）—— **不要**改到 create_run 之后来求值，那会让判定恒 False。
+            self._main_upstream_attempt = restored_upstream_attempt
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
@@ -1593,6 +1613,18 @@ class Agent:
                     err_text = str(result.get("error") or "")
                     if _is_upstream_stream_error(err_text):
                         self._main_upstream_attempt += 1
+                        # P1-5：**随增随落库** —— 本 run 若随后被中断/失败，
+                        # 下一个 turn 的承接才有源可读（内存值不算承载）。
+                        # ⚠ **不要再包一层 try/except**：写口
+                        # `run_ledger.set_upstream_attempt` 自己已 best-effort
+                        # （内部 try + 告警）。在此再加一层只会多一个**裸 except**
+                        # —— 本仓有「静默 except 棘轮」逐文件盯着（实测：加它立即
+                        # 把 agent.py 从 19 顶到 20 并转红）。
+                        _rid = getattr(self, "_current_run_id", None)
+                        if _rid:
+                            await self._run_ledger.set_upstream_attempt(
+                                self.id, _rid, self._main_upstream_attempt
+                            )
                         from hiveweave.llm.retry import compute_backoff
 
                         delay_s = compute_backoff(self._main_upstream_attempt) / 1000.0
@@ -3198,6 +3230,43 @@ class Agent:
         )
 
     # ── 内部: 自检 re-trigger ────────────────────────────────
+
+    async def _resume_upstream_attempt(self, interrupted_run_id: str | None) -> int:
+        """P1-5（用户选 **E**）：本轮的上游重试预算**起点** —— 续跑则承接，新工作才归零。
+
+        判据是**状态**，不是文案/措辞：
+        - `interrupted_run_id` 非空 ⇒ 本次 activation 在**承接一个被中断的 run**
+          （它由 `run_ledger.find_interrupted_run` 派生，见本方法调用点上方）
+          ⇒ 读那一行的 `upstream_retry_attempt` **续算**；
+        - 为空 ⇒ 这是**新工作**（上一轮正常结束，或压根没有上一轮）⇒ 归零。
+
+        ⚠ 为什么必须落在 DB 而不是内存：旧形态计数器是 `self._main_upstream_attempt`
+        （挂在 live agent 上的**内存属性**）⇒ 进程重启 / agent 重建即归零，
+        "每轮 ≤2 次"于是变成"每个**轮** ≤2 次"而轮无上界。承载落在
+        `agent_runs.upstream_retry_attempt` ⇒ **可跨进程重启重建**。
+
+        ⚠ 读失败 → 0（保守）：退回到改动前的行为，不制造"读不到就把正常工作卡死"的新故障面。
+
+        ⚠⚠ **必须同时要求"那条 run 是本 agent 最新的一行"**（`is_latest_run`）——
+        这一步是本条唯一的 P0 防线，不要删：`status='interrupted'` 全仓**无人清除**，
+        而 `find_interrupted_run` 只取"最新一条 interrupted" ⇒ **一条陈旧的中断 run
+        会一直当选**。若只看"非空就承接"，则"某轮成功续跑之后，之后每一轮都继续
+        承接那条陈旧计数" ⇒ 计数达上限后**该 agent 永久不再重试**（把"无上界"换成
+        "永久关闭"）。三场景对照见 `run_ledger.is_latest_run` 的 docstring。
+        """
+        rid = str(interrupted_run_id or "").strip()
+        if not rid:
+            return 0
+        try:
+            if not await self._run_ledger.is_latest_run(self.id, rid):
+                log.debug("resume_upstream_attempt_stale_run_skipped",
+                          agent_id=self.id, interrupted_run_id=rid)
+                return 0
+            return await self._run_ledger.get_upstream_attempt(self.id, rid)
+        except Exception as e:  # noqa: BLE001
+            log.debug("resume_upstream_attempt_failed", agent_id=self.id,
+                      interrupted_run_id=rid, error=str(e))
+            return 0
 
     async def _maybe_self_retrigger(self) -> None:
         """自检 re-trigger。

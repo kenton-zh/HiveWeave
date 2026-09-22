@@ -49,6 +49,10 @@ _FACT_COLUMNS: tuple[tuple[str, str], ...] = (
     # report TEST_DSH_54 #2：run 级孤儿计数事实位 —— 让"run 报 completed
     # 但里面有从未执行/结果未知的步骤"可被机器读出，而不必改 completed 枚举。
     ("orphan_steps", "INTEGER DEFAULT 0"),
+    # P1-5（2026-09-22，用户选 E）：**跨轮**上游重试累计。
+    # ⚠ 与 `db/schema.py` 的正典 DDL **双登记点**（其一遗漏 ⇒ 新旧库行为分叉，
+    #   同 P0-3 的教训）；**无 DEFAULT**（NULL = 老行未记录，与 0 不同形）。
+    ("upstream_retry_attempt", "INTEGER"),
 )
 _fact_columns_ready: set[tuple[str, int]] = set()
 
@@ -295,6 +299,104 @@ class RunLedger:
         except Exception as e:
             log.warning("run_ledger.create_activation_failed", agent_id=agent_id, error=str(e))
         return activation_id
+
+    async def get_upstream_attempt(self, agent_id: str, run_id: str) -> int:
+        """读某 run 的**上游重试累计**（P1-5）。fail-open → 0。
+
+        用于"续跑时承接上一 run 的计数"：`agents/agent.py` 在**每轮开头**问它，
+        而不再无条件把内存计数器清零。
+
+        fail-open 的理由：**读不到不该让 agent 起不来**；但方向必须是**保守**的 ——
+        读不到就 0（= 给满额度），这与"少给额度把正常工作卡死"相比，前者只是回到
+        改动前的行为，后者是新故障面。
+        """
+        rid = str(run_id or "").strip()
+        if not rid:
+            return 0
+        try:
+            await _ensure_fact_columns(agent_id)
+            rows = await project_db.query(
+                agent_id,
+                "SELECT upstream_retry_attempt FROM agent_runs WHERE id = ?",
+                [rid],
+            )
+            if not rows:
+                return 0
+            return int(rows[0]["upstream_retry_attempt"] or 0)
+        except Exception as e:  # noqa: BLE001
+            log.debug("run_ledger.get_upstream_attempt_failed",
+                      agent_id=agent_id, run_id=rid, error=str(e))
+            return 0
+
+    async def set_upstream_attempt(
+        self, agent_id: str, run_id: str, value: int
+    ) -> None:
+        """写**当前 run** 的上游重试累计（P1-5）。best-effort，失败只告警。
+
+        写当前 run（不是上一 run）：本 run 若随后被中断/失败，**下一个 turn 就
+        能从这一行把它承接走** —— 这就是"可重建的持久承载"。
+        ⚠ 不 merge/不清零：只覆盖为调用方给的值（调用方持有唯一权威计数）。
+        """
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        try:
+            await _ensure_fact_columns(agent_id)
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET upstream_retry_attempt = ? WHERE id = ?",
+                [int(value), rid],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("run_ledger.set_upstream_attempt_failed",
+                        agent_id=agent_id, run_id=rid, error=str(e))
+
+    async def is_latest_run(self, agent_id: str, run_id: str) -> bool:
+        """该 run 是否**本 agent 最新的一行**（P1-5 承接判据）。fail-open → **False**。
+
+        为什么要这一问（P1-5 自查实测的 **P0**）：`status='interrupted'` **全仓
+        没有任何地方清除**（只在 `:711` / `:1053` 置位），而
+        `find_interrupted_run` 只按 `ended_at DESC LIMIT 1` 取"最新一条 interrupted"
+        ⇒ **一条陈旧的中断 run 会一直当选**。若承接只看"`interrupted_run_id` 非空"，
+        那么"某轮成功续跑之后，之后每一轮都会继续承接那条陈旧的计数" ⇒
+        计数一旦达上限，**该 agent 永久不再重试** —— 把"重试无上界"换成"重试被永久关闭"。
+
+        ⇒ 承接的**正确作用域**是"**正在续跑**"，即那条被中断的 run 就是本 agent
+        最后一个 run（其后没有任何 run 被创建过）。三种场景逐一验证：
+        - 中断后**还没跑过** ⇒ 它就是最后一个 ⇒ 承接 ✓（链接续）
+        - 续跑那轮**成功**了 ⇒ 其后有新 run ⇒ **不承接** ✓（陈旧 run 不再当选）
+        - 续跑那轮**又中断** ⇒ 新的那条才是"最新 interrupted"且是最后一个 ⇒ 承接 ✓
+
+        fail-open → False 的方向是**保守**的：不承接 = 归零 = 拿满预算 = 退回改动前
+        行为；反过来（读不到就当"已承接"）会凭空扣额度。
+        """
+        rid = str(run_id or "").strip()
+        if not rid:
+            return False
+        try:
+            await _ensure_fact_columns(agent_id)
+            # ⚠ 先判"这一行到底在不在"：不存在时子查询是 NULL，`started_at >= NULL`
+            # 是 NULL ⇒ 一行都不匹配 ⇒ 会**误返回 True**（与 docstring 的"fail-open
+            # → False"相反，且方向危险：把不存在的 run 当作"正在续跑"）。
+            if not await project_db.query(
+                agent_id, "SELECT id FROM agent_runs WHERE id = ?", [rid]
+            ):
+                return False
+            # ⚠ `id != ?` 是**必须的**：同一毫秒内建的两行 `started_at` 相等，
+            # 若子查询/外查询用 `>=` 又不排自己，就会把自己算成"更新的那一行"。
+            # `>=` + 排除自己 = 同刻的其他行也算"更新" ⇒ 方向保守（不承接）。
+            newer = await project_db.query_one(
+                agent_id,
+                "SELECT 1 AS newer FROM agent_runs "
+                "WHERE agent_id = ? AND id != ? AND started_at >= "
+                "(SELECT started_at FROM agent_runs WHERE id = ?) LIMIT 1",
+                [agent_id, rid, rid],
+            )
+            return newer is None
+        except Exception as e:  # noqa: BLE001
+            log.debug("run_ledger.is_latest_run_failed",
+                      agent_id=agent_id, run_id=rid, error=str(e))
+            return False
 
     async def create_run(
         self,
