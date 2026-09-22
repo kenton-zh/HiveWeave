@@ -356,18 +356,56 @@ class ObligationLedger:
         return None
 
     async def fulfill_by_owner(
-        self, project_id: str, owner_agent_id: str, obligation_type: str
+        self,
+        project_id: str,
+        owner_agent_id: str,
+        obligation_type: str,
+        *,
+        short_id: str | None = None,
     ) -> int:
-        """Fulfill all pending obligations of a type for a given owner."""
+        """Fulfill all pending obligations of a type for a given owner.
+
+        ``short_id``（审计 ②-2，2026-09-22）：把兜底**收紧到本次 merge 的
+        那条分支**。不传 = 旧行为（清该 owner 全部 pending），**保留是为
+        了别的调用方语义不变**；但 merge 结算路径**必须**传 —— 否则
+        `git_worktree_merge` 的 ``taskId`` 是可选参数（misc_tools.py），
+        第三方代合（架构师合别人的 worktree）时会**误清被代合者账上其它
+        任务的 merge 义务**：义务清单按 (owner, type) 全清，没有 task 过滤。
+
+        判据取 ``context_json.short_id``（现场形态唯一键，形如 ``"A149"``）——
+        义务创建方（reconcile/close/review）写入的 branch/short_id 同源，
+        见 ``_scan_context_commit`` 的取证说明。行型兼容同该函数：
+        索引式取值优先，``KeyError``/``TypeError`` 兜底 ``.get``。
+        """
         now = int(time.time() * 1000)
         rows = await _query(
             project_id,
-            "SELECT id FROM obligations WHERE owner_agent_id = ? "
+            "SELECT id, context_json FROM obligations WHERE owner_agent_id = ? "
             "AND obligation_type = ? AND status = 'pending'",
             [owner_agent_id, obligation_type],
         )
         if not rows:
             return 0
+        if short_id is not None:
+            want = str(short_id).strip()
+            kept: list = []
+            for r in rows:
+                try:
+                    raw = r["context_json"]
+                except (KeyError, IndexError, TypeError):
+                    raw = r.get("context_json") if isinstance(r, dict) else None
+                try:
+                    ctx = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(ctx, dict):
+                    continue
+                got = str(ctx.get("short_id") or "").strip()
+                if got and got == want:
+                    kept.append(r)
+            rows = kept
+            if not rows:
+                return 0
         ids = [r["id"] for r in rows]
         placeholders = ",".join("?" * len(ids))
         await _execute(

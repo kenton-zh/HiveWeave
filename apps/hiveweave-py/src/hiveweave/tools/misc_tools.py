@@ -541,6 +541,7 @@ async def _supersede_merge_pending_after_merge(
     try:
         from hiveweave.db import project as project_db
         from hiveweave.services.inbox import InboxService
+        from hiveweave.services.git_worktree import parse_hw_branch
         from hiveweave.services.tasks.verify import resolve_merge_owner
 
         tid_tokens: set[str] = (
@@ -548,11 +549,13 @@ async def _supersede_merge_pending_after_merge(
         )
         branch_tokens: set[str] = set()
         for br in {b for b in branches if b}:
-            m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(br))
-            if m:
-                tid_tokens.add(m.group(2).lower())
+            # Q1 同源修复（TEST_DSH_66）：解析走 `parse_hw_branch`，不再就地
+            # 收窄成 `t-<8>` —— `hw/<sid>/work` 取不到 id 时按**分支名本身**
+            # 做指纹（原 else 分支的行为），二者语义在此函数内仍然完备。
+            _sid, _tid = parse_hw_branch(br)
+            if _tid:
+                tid_tokens.add(_tid)
             else:
-                # hw/<sid>/work 等稳定分支不编码任务 id：用分支名做指纹。
                 branch_tokens.add(str(br))
         owners = {caller_agent_id}
         if tid_tokens:
@@ -576,6 +579,101 @@ async def _supersede_merge_pending_after_merge(
                 )
     except Exception as e:
         log.warning("merge_pending_supersede_failed", error=str(e))
+
+
+async def _settle_merge_obligations_after_merge(
+    project_id: str,
+    caller_agent_id: str,
+    *,
+    task_id: str | None,
+    branches: list[str | None],
+    merge_commit: str | None,
+) -> int:
+    """merge 落地后结算 merge 义务 —— **两条路径唯一的判定源**。
+
+    结算顺序（三层，前层结算到就不必再往后）：
+    1. 按**分支名反查** task 短 id（`hw/<sid>/t-<8>` 形态）
+    2. 按 caller 传入的 ``task_id``（`hw/<sid>/work` 主形态下**唯一**判据）
+    3. ``fulfilled == 0`` ⇒ 按 **owner** 兜底（caller 就是执行 merge 的人），
+       **并带 short_id 范围**（审计 ②-2，防第三方代合误清他人义务）；
+       两个不同 sid ⇒ **不兜底**（审计 B4，宁可漏清不可误清）
+
+    返回结算条数（供调用方判断是否要额外查 leftover）。
+
+    为什么抽成函数（审计 ①-1，2026-09-22）：修 Q1 时这段逻辑在
+    ``already_up_to_date`` 早退分支与主路径**各写了一份**，而两份的兜底
+    条件不同（早退分支是 ``if task_id: ... else: by_owner``，主路径是
+    ``if not fulfilled: by_owner``）—— 同一个事件两个结论。这正是本仓
+    「统一判定源落地成逐点替换清单 ⇒ 必然漏点」的前科（F6）：
+    **声明同源而实现分裂**。现合并为单一实现，两条路径都调它。
+
+    ``branches`` 里的 None/"" 会被剔除，重复的 task id 只结算一次。
+    """
+    from hiveweave.services.git_worktree import parse_hw_branch
+    from hiveweave.services.obligation import ObligationLedger
+
+    ledger = ObligationLedger()
+    fulfilled = 0
+    seen: set[str] = set()
+    # 本次 merge 涉及的分支短 id（`hw/<sid>/...` 的 `<sid>`）—— 只用于给
+    # owner 兜底**划范围**（审计 ②-2），不参与按 task 结算。
+    merge_short_ids: set[str] = set()
+    for br in branches:
+        if not br:
+            continue
+        # `parse_hw_branch` 是 `compute_branch_name` 的逆函数 —— 同时认
+        # `t-<8>`（取 id 结算）与 `hw/<sid>/work`（取不到 id，交给下面
+        # task_id / owner 兜底）。旧的就地窄正则只认 `t-<8>`
+        # ⇒ 本仓主形态恒不匹配 ⇒ 命中 0（Q1 病灶）。
+        _sid, _tid = parse_hw_branch(br)
+        if _sid:
+            merge_short_ids.add(_sid)
+        if not _tid or _tid in seen:
+            continue
+        seen.add(_tid)
+        fulfilled += await ledger.fulfill(
+            project_id, _tid, "merge", merge_commit=merge_commit
+        )
+    if task_id:
+        fulfilled += await ledger.fulfill(
+            project_id, task_id, "merge", merge_commit=merge_commit
+        )
+    if not fulfilled:
+        # 分支/task 都没匹配上 ⇒ caller 就是执行 merge 的人，按 owner 清。
+        # ⚠ 这里是 `if not fulfilled`（不是 `if not task_id`）：task_id 非空
+        # 但结算返回 0（该任务本无 merge 义务 / id 已过期）时同样要走到这里。
+        #
+        # ⚠ 审计 ②-2（2026-09-22）：**必须带范围**。`git_worktree_merge` 的
+        # `taskId` 是**可选**参数，第三方代合（架构师合别人的 worktree）时若
+        # 不带范围，`fulfill_by_owner` 会把该 owner 账上**其它任务的 merge
+        # 义务一并清掉**（该方法原先按 (owner, type) 全清，无 task 过滤）。
+        #
+        # 范围取值分支（审计 B4 后收紧）：
+        #   * 恰好解析出 1 个 sid ⇒ 限定到它（本仓主形态：
+        #     `branches=["hw/A149/work", "A149"]` ⇒ sids={A149} ⇒ 限定 A149）。
+        #   * 解析出 **≥2 个不同 sid** ⇒ 本次调用语义不明确（两个参数指向
+        #     不同人的分支，几乎必然是调用方传错）⇒ **不兜底**（`return`），
+        #     而不是退回全清。理由：全清正是 ②-2 要治的误清，**静默消失**；
+        #     不兜底只是**该清未清**，会留 pending 给看门狗催，**可观测可修**。
+        #     —— 这就是本仓「失败方向要选可观测的那边」。
+        #   * 一个 sid 都没解析出来（只按 legacy slug 合 / 没传分支名）⇒
+        #     调用方本来就没有更精确判据，退回旧语义（不限定范围）是诚实的。
+        # ⚠ `next(iter(...))` 取单元素，**不是** 传整个集合 ——
+        #    传集合会让 SQL 过滤永远不匹配（曾经的 bug）。
+        if len(merge_short_ids) > 1:
+            log.warning(
+                "merge_obligation_owner_scope_ambiguous",
+                project_id=project_id,
+                caller=caller_agent_id,
+                short_ids=sorted(merge_short_ids),
+                branches=[b for b in branches if b],
+            )
+            return fulfilled
+        sid_scope = next(iter(merge_short_ids)) if len(merge_short_ids) == 1 else None
+        fulfilled += await ledger.fulfill_by_owner(
+            project_id, caller_agent_id, "merge", short_id=sid_scope
+        )
+    return fulfilled
 
 
 @tool(
@@ -945,17 +1043,16 @@ async def git_worktree_merge_tool(
             # merge 义务——这是 07 实测 3 条义务僵尸 4.5h 的最可能路径
             # （no-op 早退 → 从不 fulfill → 只能等 dwell 超时）。
             try:
-                from hiveweave.services.obligation import ObligationLedger
-
-                for _br in {branch, branch_name} - {None, ""}:
-                    m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(_br))
-                    if m:
-                        await ObligationLedger().fulfill(
-                            project_id, m.group(2), "merge",
-                            merge_commit=result.get("hash"),
-                        )
+                await _settle_merge_obligations_after_merge(
+                    project_id,
+                    agent_id,
+                    task_id=params.task_id,
+                    branches=[branch, branch_name],
+                    merge_commit=result.get("hash"),
+                )
             except Exception as e:
                 log.warning("merge_obligation_fulfill_failed", error=str(e))
+
             auto_titles = await _auto_submit_merged_running_tasks(
                 project_id, workspace_path,
                 branch=branch or branch_name, short_id=short,
@@ -983,24 +1080,20 @@ async def git_worktree_merge_tool(
         # 统建合并多个模块分支时 params.task_id 指向统建任务，模块级 merge
         # 义务会漏掉——07 实测 3 条义务僵尸 4.5h。按分支反查逐分支清义务；
         # 分支与 task_id 都没匹配上才退回按 owner 清（旧行为兜底）。
+        #
+        # ⚠ 与上面 `already_up_to_date` 早退分支**共用同一个 helper**（审计 ①-1）：
+        # 两条路径对同一个 merge 事件必须给出同一个结论 —— 本仓「统一判定源
+        # 落地成逐点替换清单 ⇒ 必然漏点」的前科（F6）就是两条路径各写一份。
         try:
             from hiveweave.services.obligation import ObligationLedger
 
-            fulfilled = 0
-            seen_branch_tasks: set[str] = set()
-            for _br in {branch, branch_name} - {None, ""}:
-                m = re.match(r"^hw/([^/]+)/t-([0-9a-fA-F]{8})$", str(_br))
-                if m and m.group(2).lower() not in seen_branch_tasks:
-                    seen_branch_tasks.add(m.group(2).lower())
-                    fulfilled += await ObligationLedger().fulfill(
-                        project_id, m.group(2), "merge",
-                        merge_commit=result.get("hash"),
-                    )
-            if params.task_id:
-                fulfilled += await ObligationLedger().fulfill(
-                    project_id, params.task_id, "merge",
-                    merge_commit=result.get("hash"),
-                )
+            fulfilled = await _settle_merge_obligations_after_merge(
+                project_id,
+                agent_id,
+                task_id=params.task_id,
+                branches=[branch, branch_name],
+                merge_commit=result.get("hash"),
+            )
             # 审计[1]：分支/task 结算后，caller 名下若仍有 pending merge 义务
             # （如历史非规范分支名遗留、或 caller 自身其它任务的义务），
             # 记 warning 供观测——这些义务不会再被本次 merge 事件短路，
@@ -1021,11 +1114,6 @@ async def git_worktree_merge_tool(
                             str(o.get("task_id"))[:8] for o in leftovers
                         ],
                     )
-            if not fulfilled:
-                # No branch/task match — fulfill by owner (the caller did the merge)
-                await ObligationLedger().fulfill_by_owner(
-                    project_id, agent_id, "merge"
-                )
         except Exception as e:
             log.warning("merge_obligation_fulfill_failed", error=str(e))
 

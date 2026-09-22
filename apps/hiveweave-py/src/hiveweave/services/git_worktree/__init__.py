@@ -39,7 +39,12 @@ from .constants import (
     _create_locks,
     _create_locks_guard,
 )
-from .naming import _branch_name, _slugify, compute_branch_name
+from .naming import (
+    _branch_name,
+    _slugify,
+    compute_branch_name,
+    parse_hw_branch,
+)
 from .paths import (
     _force_clear_path,
     _has_git,
@@ -117,6 +122,7 @@ _PATCH_NAMES = frozenset({
     "_slugify",
     "_branch_name",
     "compute_branch_name",
+    "parse_hw_branch",
     "ensure_executor_worktree",
     "agent_gets_write_worktree",
     "GitWorktreeService",
@@ -167,6 +173,7 @@ __all__ = [
     "GIT_TIMEOUT",
     "SLUG_MAX_LEN",
     "compute_branch_name",
+    "parse_hw_branch",
     "reconcile_worktrees",
     "quarantine_orphan_branch",
     "ensure_executor_worktree",

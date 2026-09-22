@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 152,
+ "_total": 154,
  "_by_tier": {
   "table": 26,
-  "regex": 126
+  "regex": 128
  },
  "_suffixes": [
   "_NEEDLES",
@@ -42,6 +42,7 @@
   "services/git_worktree/constants.py",
   "services/git_worktree/dispatch_pin.py",
   "services/git_worktree/integrity.py",
+  "services/git_worktree/naming.py",
   "services/git_worktree/paths.py",
   "services/git_worktree/porcelain.py",
   "services/git_worktree/reconcile.py",
@@ -316,6 +317,14 @@
    "tier": "regex",
    "line": 35
   },
+  "services/git_worktree/naming.py::_HW_BRANCH_RE": {
+   "tier": "regex",
+   "line": 27
+  },
+  "services/git_worktree/naming.py::_HW_TASK_ID_RE": {
+   "tier": "regex",
+   "line": 29
+  },
   "services/git_worktree/paths.py::_WORKTREE_SEG_RE": {
    "tier": "regex",
    "line": 19
@@ -330,7 +339,7 @@
   },
   "services/git_worktree/service_merge.py::_TASK_BRANCH_RE": {
    "tier": "regex",
-   "line": 1248
+   "line": 1266
   },
   "services/mcp_supervisor.py::_SAFE_RE": {
    "tier": "regex",
