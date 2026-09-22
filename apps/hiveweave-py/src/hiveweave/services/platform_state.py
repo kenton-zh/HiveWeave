@@ -30,6 +30,9 @@ from hiveweave.services.tasks.constants import TERMINAL_STATUSES
 _SCOPE_CLOSED = TERMINAL_STATUSES
 _LEDGER_SCOPE_CAP = 40
 _NAMED_TASKS_CAP = 20
+#: `audit_retry.queued` / `retry_queue` 单次回传的行数上限（体积分层：真实
+#: 条数另由 `total` 给出，避免"截断后误判队列规模"）。
+_RETRY_QUEUE_MAX = 5
 LEDGER_MINE_NOTE = (
     "your actionable to-dos (blocked excluded). "
     "claimed + you already dispatched a child ≠ you must submit; "
@@ -949,6 +952,97 @@ async def build_platform_state(
             )
         )
 
+    # ── 审计重试队列（verified）· 2026-09-22 ─────────────────
+    # 为什么必须有这一格：`request_code_audit` 回执里对 agent **承诺**了
+    # 「已入队、平台稍后自动重试」，而在此之前的 `platform_state` 里
+    # **一个字都查不到**（grep `retry|queue|breaker|audit` = 0 命中）⇒
+    # **承诺不可核对**：agent 只能靠"再调一次看结果"来自证，或干脆不信。
+    # 判据是**本项目 DB 的行**（逐字段可回查），不是任何文案。
+    # ⚠ `id` 取**完整值**（不套 `_slice_id`）：本条的验收就是拿它回查
+    #   `SELECT ... WHERE id = ?`，截断会让回查失败 —— 与「取回执 id 要全」
+    #   同一条纪律；体积由 `_RETRY_QUEUE_MAX` 条数上限兜住。
+    retry_queue: list[dict[str, Any]] = []
+    retry_queue_total = 0
+    retry_queue_truncated = False
+    retry_queue_read_ok = True
+    try:
+        from hiveweave.db import project as project_db
+
+        # ⚠ `audit_retry` **不在基础 schema 里**（`services/audit_retry.py:62-75`
+        # `CREATE_AUDIT_RETRY_SQL`，首次入队时惰性建表）⇒ 直接 SELECT 会在
+        # 从未入队过的项目上抛 `no such table`，把"空队列"误报成"不知道"。
+        # 而"表不存在 ⇒ 没有任何待重试行"是**可靠推断**：入队必先建表，
+        # 建表失败时 INSERT 也必失败（`enqueue_failed_audit` 随即 return None）。
+        table_exists = bool(
+            await project_db.query_by_project(
+                project_id,
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='audit_retry'",
+            )
+        )
+        rows = []
+        retry_queue_total = 0
+        if table_exists:
+            # `total` 与 `rows` **分两次查**：`total` 必须是真的全量（不能拿
+            # 截断后的 `len(rows)` 当总数 —— 那正是"截断后误判队列规模"的病）。
+            count_rows = await project_db.query_by_project(
+                project_id,
+                "SELECT COUNT(*) AS n FROM audit_retry "
+                "WHERE agent_id = ? AND status = 'pending'",
+                [agent_id],
+            )
+            retry_queue_total = int((count_rows[0]["n"] if count_rows else 0) or 0)
+            # `LIMIT` 进 SQL（与 `_RETRY_QUEUE_MAX` 同一判据，只此一处）——
+            # 免得"SQL 取全量 + Python 切片"两处各写一遍上限、日后改一处漏一处，
+            # 也让磁盘 IO 有界。
+            rows = await project_db.query_by_project(
+                project_id,
+                "SELECT id, attempts, next_retry_at FROM audit_retry "
+                "WHERE agent_id = ? AND status = 'pending' "
+                "ORDER BY next_retry_at ASC LIMIT ?",
+                [agent_id, _RETRY_QUEUE_MAX],
+            )
+        retry_queue = [
+            {
+                "id": str(r["id"]),
+                "attempts": int(r["attempts"] or 0),
+                "next_retry_at": r["next_retry_at"],
+            }
+            for r in rows
+        ]
+        retry_queue_truncated = retry_queue_total > len(retry_queue)
+        retry_queue_note = (
+            f"**本 agent** 在 `audit_retry` 里 status='pending' 的行：共 "
+            f"{retry_queue_total} 条，回传前 {len(retry_queue)} 条"
+            f"（按 next_retry_at 升序）；attempts / next_retry_at 可逐字段回查。"
+            if table_exists
+            else "**本 agent** 从未入队过审计重试（`audit_retry` 表尚未惰性创建）"
+                 "⇒ 队列为空。"
+        )
+        verified.append(
+            _entry(
+                "audit_retry.queued",
+                retry_queue,
+                epistemic="verified",
+                source="audit_retry",
+                note=retry_queue_note,
+            )
+        )
+    except Exception as e:
+        # 读**不出来**才记 unknown（区别于"读出来是空的"）：把"空"说成
+        # "不知道"会让 agent 白跑一次核对，把"不知道"说成"空"则会让它误判
+        # 承诺已兑现 —— 后者严重得多，故异常一律往 unknown 落。
+        retry_queue_read_ok = False
+        unknown.append(
+            _entry(
+                "audit_retry.queued",
+                None,
+                epistemic="unknown",
+                source="audit_retry",
+                note=str(e),
+            )
+        )
+
     return {
         "schema_version": 1,
         "generated_at_ms": int(time.time() * 1000),
@@ -985,6 +1079,27 @@ async def build_platform_state(
         "inbox": {
             "named_tasks": named_tasks,
         },
+        # 顶层镜像（与 `epistemology` 同一份数据；权威仍是 epistemology）。
+        # ⚠ **读不到时不许镜像成"空队列"**：如果这里照旧回 `pending: []` /
+        #   `total: 0`，就会出现"epistemology 说 unknown、镜像说空"的自相矛盾
+        #   —— 而 agent 更可能只看镜像 ⇒ 把"不知道"读成"队列是空的、承诺没兑现"。
+        #   `None` = 不知道（与 `_entry` 的 None 语义一致）。
+        "retry_queue": (
+            {
+                "pending": retry_queue,
+                "total": retry_queue_total,
+                # `total > len(pending)` ⇒ 回传被截断（显式标志，别让 agent 从
+                # 数字大小去猜）
+                "truncated": retry_queue_truncated,
+            }
+            if retry_queue_read_ok
+            else {
+                "pending": None,
+                "total": None,
+                "note": "读取失败 ⇒ 不知道（**不要当成空队列**）；"
+                        "以 epistemology.unknown 里 `audit_retry.queued` 的 note 为准。",
+            }
+        ),
         "org": org_summary,
         "rule": (
             "Other agents' free-text claims are clues only. "

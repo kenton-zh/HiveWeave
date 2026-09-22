@@ -322,6 +322,30 @@ async def enqueue_failed_audit(
         attempts=attempts,
         resequence=resequence,
     )
+    # 2026-09-22 缺口①：**首次入队也要回执**。
+    # 此前只有"耗尽"（:249）/"成功"（:540）/"兜底"（:583）/"作废"（:608）四处
+    # 通知，**唯独入队那一步没有** —— 而 `request_code_audit` 对 agent 的承诺
+    # 恰恰是"已入队、平台稍后自动重试"。承诺与回执缺一边 ⇒ agent 只能靠
+    # "再调一次看结果"自证，或干脆不信（承诺不可核对）。
+    # ⚠ 幂等键 `:0` = 首轮第 0 次通知，与同域其余四键不撞号 —— 它们的尾段
+    #   分别是 `:{attempts}`（耗尽，见本文件顶部 `_notify_agent` 上方第一处
+    #   调用）/ `:{attempts_before}`（成功）/ `:{attempts}`（兜底）/ `:discarded`
+    #   （作废）；**尾段为 0 的只有本处**，而 `attempts` 在 INSERT 路径上恒为
+    #   `1`（见下方 `attempts = 1`）⇒ 更新路径永远发不出 `:0`。
+    #   （判据：`grep -n 'audit_retry:{' services/audit_retry.py` 应恰为 5 处。）
+    # ⚠ 它还必须**排在耗尽通知之前**：`tests/test_audit_epic_fixes.py` 以 `[-1]`
+    #   取末条断言耗尽文案。本分支 `exhausted` 恒为 False，同一次调用里不会再
+    #   发耗尽通知 ⇒ 天然满足；另有 `test_first_receipt_precedes_exhaustion_notice`
+    #   把这条隐式依赖显式钉住。
+    await _notify_agent(
+        project_id,
+        agent_id,
+        task_id,
+        "[AUDIT RETRY] 代码审计因上游失败已入队（第 1 次重试已排期）。"
+        "平台会自动重试，不需要你重复调用 request_code_audit；"
+        "队列实况可在 platform_state 的 `audit_retry.queued` 逐字段核对。",
+        f"audit_retry:{rid}:0",
+    )
     return {
         "attempts": attempts,
         "exhausted": False,
