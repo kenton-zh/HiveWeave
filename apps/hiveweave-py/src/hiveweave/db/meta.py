@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import os
 
 import aiosqlite
 import structlog
@@ -256,6 +257,27 @@ async def get_project_workspace(project_id: str) -> str | None:
     if row is None:
         return None
     return row["workspace_path"]
+
+
+async def get_project_id_by_workspace(workspace_path: str) -> str | None:
+    """反向查：``workspace_path`` → ``project_id``（正向只有 `get_project_workspace`）。
+
+    用途：merge 成功时要发 `merge_landed` 事实，而 `fact_bus._persist` **必须**有
+    `project_id` 才落库（`fact_bus.py:74` 第一行就是 `if not fact.project_id: return`）。
+    merge 侧的上下文只有 workspace ⇒ 需要这个反向查。
+
+    ⚠ 精确匹配失败再试 normcase/normpath 形态：`projects.workspace_path` 存的是登记时
+    的写法，调用方手上可能是 realpath/另一种分隔符形态。两形态都试，避免"查不到 ⇒
+    事实静默不落库"（落库本身就是 fail-open，再静默就没有任何信号了）。
+    """
+    cands = [workspace_path, os.path.normcase(os.path.normpath(str(workspace_path)))]
+    for cand in cands:
+        row = await query_one(
+            "SELECT id FROM projects WHERE workspace_path = ? LIMIT 1", [cand]
+        )
+        if row:
+            return str(row["id"])
+    return None
 
 
 async def get_agent_by_id(agent_id: str) -> dict | None:

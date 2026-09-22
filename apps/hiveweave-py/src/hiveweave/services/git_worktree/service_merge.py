@@ -112,8 +112,8 @@ async def _attach_quarantine_events(
     return result
 
 
-def _publish_merge_landed(
-    short_id: str, *, branch: str, target: str, hash_: str
+async def _publish_merge_landed(
+    workspace_path: str, short_id: str, *, branch: str, target: str, hash_: str
 ) -> None:
     """merge 成功必须留下**事实**（P1-3 ②，2026-09-21）。
 
@@ -123,15 +123,32 @@ def _publish_merge_landed(
     后果：等待 `merge_landed` 的 agent（`kind="fact"` 契约）永远等不到
     ⇒ 只能干等到 TTL（与 P1-3 ① 的僵尸等待同族）。
 
-    best-effort：总线/落库故障不影响 merge 结果本身（与 `fs_errors` 同款）。
+    ⚠⚠ **必须带 `project_id`**：`fact_bus._persist` 第一行就是
+    ``if not fact.project_id: return`` ⇒ 不带它时事实**只活在内存环里**
+    （进程内等待者仍会被唤醒，但**永不落库**、重启即丢）。
+    实测（TEST_DSH_66，2026-09-22）：`git_worktree_merge` **47 步全 completed**、
+    `task.merged` **9 次**，而项目库 `facts` 表 **0 行** —— 就是漏了它。
+
+    best-effort：总线/落库故障不影响 merge 结果本身（与 `fs_errors` 同款）；
+    但**project 查不到要 log.warning**（否则与"根本没发生 merge"同形）。
     """
     try:
+        from hiveweave.db import meta as meta_db
         from hiveweave.services import fact_bus
 
+        project_id = await meta_db.get_project_id_by_workspace(workspace_path)
+        if not project_id:
+            log.warning(
+                "merge_landed_project_unresolved",
+                workspace=workspace_path,
+                short_id=short_id,
+            )
+            return
         fact_bus.publish(
             "merge_landed",
             short_id,
             {"branch": branch, "target": target, "hash": hash_ or ""},
+            project_id=project_id,
         )
     except Exception as e:  # noqa: BLE001 — 事实缺失不该把 merge 判失败
         log.debug("merge_landed_publish_failed", short_id=short_id, error=str(e))
@@ -772,8 +789,9 @@ class MergeMixin:
         log.info("git_worktree.merge", short_id=short_id,
                  target=target_branch, hash=head if ok else "",
                  already_up_to_date=already)
-        _publish_merge_landed(
-            short_id, branch=branch, target=target_branch, hash_=head if ok else ""
+        await _publish_merge_landed(
+            workspace_path, short_id,
+            branch=branch, target=target_branch, hash_=head if ok else "",
         )
         result = {
             "success": True,
@@ -882,8 +900,8 @@ class MergeMixin:
                 "git_worktree.merge_idempotent_already_merged",
                 branch=branch, target=target_branch,
             )
-            _publish_merge_landed(
-                short_id, branch=branch, target=target_branch,
+            await _publish_merge_landed(
+                workspace_path, short_id, branch=branch, target=target_branch,
                 hash_=await _target_tip_short(workspace_path, target_branch),
             )
             return {
@@ -1202,8 +1220,8 @@ class MergeMixin:
         log.info("git_worktree.merge_by_branch", branch=branch,
                  target=target_branch, hash=head if ok_head else "",
                  warnings=verification_errors, already_up_to_date=already)
-        _publish_merge_landed(
-            short_id, branch=branch, target=target_branch,
+        await _publish_merge_landed(
+            workspace_path, short_id, branch=branch, target=target_branch,
             hash_=head if ok_head else "",
         )
         result = {
