@@ -573,16 +573,27 @@ async def test_main_boundary_still_denied_outside_shared(project: Path) -> None:
     """⭐ 作用域精确守卫：放开 shared **不得**顺带放开 `.hiveweave` 其余部分。
 
     靶子 = `.hiveweave/data.db`（平台自管系统文件）。判据是**看盘**：
-    文件内容必须仍是原值、不得出现新文件。探针 N3a 同构。
+    文件内容必须仍是原值、且**新建文件也不得出现**。探针 N3a 同构。
+
+    ⚠⚠ 两处量具纪律（审计 P2 实测，都已修正）：
+      1. 靶文件**必须预先创建** —— 否则 `exit != 0` 也可能是 cmd 的
+         "系统找不到指定的路径"，把「没权限」与「路径不存在」混成一句话
+         （探针首跑就吃过这个假阴性 ⇒ **先建靶路径，失败原因才唯一**）。
+      2. 两个动作**各起一次 spawn**，不要用 `&&` 串起来 —— 串起来时第一条一失败
+         第二条就不执行，于是"新文件未出现"这条断言**信息量归零**（它绿得没有意义）。
     """
     db = project / ".hiveweave" / "data.db"
     db.write_text("orig", encoding="utf-8")
 
     r = await _spawn_main(
-        project, "CEO",
-        _cmd(r"echo pwned > .hiveweave\data.db "
-             r"&& echo x > .hiveweave\evil.md"))
+        project, "CEO", _cmd(r"echo pwned > .hiveweave\data.db"))
     assert r is not None
     assert r["exit_code"] != 0, "MAIN 边界写 data.db 必须失败"
     assert db.read_text(encoding="utf-8") == "orig", "data.db 内容被改了"
-    assert not (project / ".hiveweave" / "evil.md").exists()
+
+    evil = project / ".hiveweave" / "evil.md"
+    r2 = await _spawn_main(
+        project, "CEO", _cmd(r"echo x > .hiveweave\evil.md"))
+    assert r2 is not None
+    assert r2["exit_code"] != 0, "MAIN 边界在 .hiveweave 下新建文件必须失败"
+    assert not evil.exists(), "`.hiveweave` 下不得出现新文件（作用域被放宽了？）"
