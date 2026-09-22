@@ -585,11 +585,17 @@ PROJECT_DB_TABLES = [
         --   zero chunks arrived）。有它 ⇒ usage=0 是**正确记账**，不是丢账
         --   （0 chunk 无 token 可记）。此前只有 recovery.py 的一行日志，
         --   回归脚本读不到 ⇒ R11 只能把这类"秒杀型"标为"未排除"。
-        -- cache_verdict：首请求的前缀指纹分类（hit_ok / cache_window_expired /
-        --   drift_zero_hit），由 llm/streamer/probe.py 计算、此前只落日志。
+        -- cache_verdict：首请求的前缀指纹分类（hit_ok / near_zero_hit /
+        --   cold_start / cache_window_expired / drift_zero_hit / unknown_usage），
+        --   由 llm/streamer/probe.py 计算、此前只落日志。
         --   有它 ⇒ R3 能只在 `drift_zero_hit`（漂移实锤、平台侧可修）判 FAIL，
         --   而不是把三者混成一个命中率数字（那会把"provider 缓存窗口过期"
         --   和"平台自己把前缀改写了"当成同一件事）。
+        --   ⚠ Q2（TEST_DSH_66，2026-09-22）：`near_zero_hit` 是**新档**——
+        --   此前 `hit_ok` 用存在性判据（cache_read > 0）⇒ 实测 77 条
+        --   cache_read≈113 / input≈4.9万（命中率 0.2%~1%）全判绿，
+        --   使这一列在"命中率是否达标"这个问题上**不可用于判 FAIL**。
+        --   该列**无 CHECK 约束**（TEXT），新增档位不需要迁移。
         empty_stream INTEGER DEFAULT 0,
         cache_verdict TEXT
     )

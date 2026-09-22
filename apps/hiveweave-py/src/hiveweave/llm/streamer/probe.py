@@ -25,7 +25,10 @@ run 首请求 ``cache_read=0``，零命中 input 合计 1,742,881 tokens。R3 �
 
 最终分类（``final``，report_cache_readout 输出，联合首请求 usage）：
 
-- ``hit_ok``                 首请求 cache_read > 0（命中）
+- ``hit_ok``                 命中率 ≥ ``_HIT_OK_MIN_RATIO``（真命中）
+- ``near_zero_hit``          cache_read > 0 但命中率低于阈值（形式命中，2026-09-22
+                             增，report TEST_DSH_66 Q2：旧判据 `> 0` 把 77 条
+                             cache_read≈113 / input≈4.9万 判绿）
 - ``cold_start``             **没有可读的缓存域**（no_baseline / model_changed）
                              ⇒ cache_read=0 是必然，非平台责任（2026-09-12 新增，
                              report TEST_DSH_54 #6：此前与 drift 混成一档）
@@ -68,6 +71,44 @@ _last_verdict: dict[str, dict[str, Any]] = {}
 #: 漂移从不进任何桶；于是「本 run 自己动的刀」造成的零命中会被归成
 #: `cache_window_expired`（**平台侧不可修**）—— 根因判错，正是本条要治的病。
 _inner_drift: dict[str, dict[str, Any]] = {}
+
+#: Q2（TEST_DSH_66）：`hit_ok` 的**命中率下界**（比例判据，不是存在性判据）。
+#: 判据 = cache_read / (input_tokens + cache_read)。
+#:
+#: ⚠ 分母口径（**审计 A1 复核实证，2026-09-22**）。判据写死 `input + cache_read`
+#: 的前提是「落库的 `input_tokens` 是**未命中桶**」，此前提已逐环验证：
+#:   ① 写路径必经 `llm/util.normalize_usage`（`streamer/tool_loop.py:725`），
+#:      对非 anthropic 且 `cache_read>0` 走 `input = prompt_tokens - cache_read`
+#:      （`util.py:156-159`）—— 实测 `{input_tokens:133036, cached:113}` ⇒
+#:      归一化为 `input=132923, cache_read=113`，确实减过。
+#:   ② `total_tokens = input + output`（**1456/1456 行**成立，且
+#:      `cache_read` 不进 total）—— 独立佐证 input 已剥离命中。
+#:   ③ 故现场 `cache_read > input` 占 94%（1354/1456）**不是**口径异常，
+#:      而是「长稳定前缀 + 少量新增」的正常签名（input p50=875 对
+#:      cache_read p50≈50k）。⚠ 曾据此把口径判为双计，方向是反的。
+#: ⇒ 已有同族工具 `util.cache_hit_percent(input, cr, cw, input_inclusive=)`
+#:    用于 **DeepSeek 系**（`provider_input_inclusive` 为真时 input 即分母）。
+#:    本探针只面对 `openai-responses`（现场 1456/1456），故不退化为通用调用；
+#:    **若将来接入 input-inclusive 的 provider，此处必须改用该工具**。
+#:    （「两处同源」的正例：`regression_check.py:299` 的 R3 用 `i+cr+cc`，
+#:     与本判据同口径。）
+#:
+#: ⚠ 审计 ②-5 后由 0.5 下调为 0.05（2026-09-22）。依据现场库全量分布
+#: （1441 条 cache_read>0 的请求，TEST_DSH_66）——**存在一个巨大的空档**：
+#:   * 目标病灶 77 条：ratio < 0.05（cr 恒为 113，input 10k~133k）；
+#:     其中 ratio ∈ [0.0008, 0.0016] 11 条、∈ (0.0016, 0.0112] 66 条
+#:   * 次低的一群从 **0.2332** 起（16497/54236，真实的部分命中）
+#:   * 0.0112 ~ 0.2332 之间 **一条都没有**（实测 0 条）
+#: ⇒ 阈值取在这个空档里的任何值都同样能摘出 77 条；取 0.5 会**额外**把
+#: 0.23~0.50 的 **10** 条真实部分命中误判成 `near_zero_hit`
+#: （实测：0.5 ⇒ near_zero 87 条；0.05 ⇒ 77 条，差 10 条）。
+#: 取 0.05 落在空档下沿：紧贴病灶群上界（0.0112）留 4.5 倍余量，
+#: 同时不碰任何真实命中。
+#: 这也是本仓纪律「阈值要落在**数据空档**里，而不是落在'看起来像一半'的
+#: 整数上」——0.5 是猜的，0.05 是量出来的。
+#: ⚠ **0.05 是单次事故拟合的**：若后续分布变化（空档消失），应重新按分布取，
+#: 不要照抄这个数。
+_HIT_OK_MIN_RATIO = 0.05
 
 
 def reset_probe(agent_id: str | None = None) -> None:
@@ -260,9 +301,12 @@ def report_cache_readout(
     空响应重试循环不会用同一指纹重复报告；无基准或 verdict 已消费时
     返回 None。
 
-    分类（2026-09-12 增 `cold_start`，report TEST_DSH_54 #6）：
+    分类（2026-09-12 增 `cold_start`，report TEST_DSH_54 #6；
+    2026-09-22 增 `near_zero_hit` 阈，report TEST_DSH_66 Q2）：
 
-    - ``hit_ok``                 首请求 cache_read > 0（命中）
+    - ``hit_ok``                 命中率 ≥ `_HIT_OK_MIN_RATIO`（真命中）
+    - ``near_zero_hit``          cache_read > 0 但命中率 < 阈值 —— **形式命中、
+                                 实质未命中**（provider 只回了极少量前缀）
     - ``cold_start``             **没有可读的缓存域**（`no_baseline` 首次
                                  run / `model_changed` 换了缓存域）——
                                  cache_read=0 是**必然**，与平台无关
@@ -271,6 +315,23 @@ def report_cache_readout(
     - ``drift_zero_hit``         前缀**真漂移**且 cache_read=0 ⇒ 平台侧可修
     - ``unknown_usage``          usage 里**没有** cache_read（None）⇒ 未知，**不得**记成漂移
                                  （P1-1②：None ≠ 0；旧判据会把"没这个数"读成"零命中"）
+
+    ⚠⚠ **Q2（TEST_DSH_66）：为什么 `cache_read > 0` 不足以判绿**。
+    旧判据是**存在性**判据（"有任何一个 token 命中即 OK"），它对这个仓的
+    真实故障形态**完全失效**：实测 77 条请求 `cache_read` 落在 1..500、
+    而 `input_tokens` 合计 **3,793,790**（均值 ~4.9 万/条）—— 命中率
+    量级 **0.2%~1%**，等于**没命中**，却被 77/77 全判 `hit_ok`
+    （`GROUP BY r.cache_verdict` 只有一档）。判决与证据自相矛盾。
+    ⇒ 判据必须是**比例**（命中 ÷ 可命中总量），不是存在性。
+
+    阈值取向：`_HIT_OK_MIN_RATIO`（当前 **0.05**）。判据本身是「命中 ÷
+    可命中总量」，阈值只决定分档边界。⚠ 该值**由实测空档定**，不是拍的
+    （审计 ②-5）：现场 1441 条 `cache_read>0` 的分布里存在一个巨大空档 ——
+    目标病灶 77 条 ratio ∈ [0.00085, 0.0112]，次低的一群从 **0.2332** 起
+    （那是**真实的部分命中**），两者之间**一条都没有**。阈值落在这个空档
+    内即可；取 0.05（略高于病灶上界）留出余量，且**不再误伤** 0.23~0.47
+    那 10 条真实部分命中（0.5 会把它们错划进近零档）。
+    ⇒ 若后续分布变化（空档消失），这个值应当**重新按分布取**，而不是照抄。
 
     为什么必须把 cold_start 单列：TEST_DSH_54 的 15 个 drift_zero_hit 里
     有 8 个落在各 Agent 首次活动窗口（12:03–12:50）—— 那里的 cache_read=0
@@ -281,6 +342,11 @@ def report_cache_readout(
     if last is None:
         return None
     verdict_str = str(last.get("verdict") or "")
+    # 可命中总量 = 本次请求读了 input_tokens + 其中已命中的 cache_read。
+    # 只除 input 会让 ratio 在"命中被算进 input"与"不算进去"两种 provider
+    # 口径下漂移，故显式把两者都算作分母（保守取大 ⇒ 宁可少判 green）。
+    cacheable = max(0, int(input_tokens or 0)) + max(0, int(cache_read or 0))
+    ratio = (cache_read / cacheable) if (cache_read and cacheable) else 0.0
     if cache_read is None:
         # ⭐ P1-1②：**未知 ≠ 零命中**（与 `executed` 同族纪律：None 不得与 0 混同）。
         # usage 里没有 cache_read（provider 不回 / 解析失败）时，旧判据
@@ -288,8 +354,14 @@ def report_cache_readout(
         # `drift_zero_hit`「平台改写了前缀、可修」—— 把排查引向错误根因
         #（与 cold_start 单列同理：TEST_DSH_54 里 8/15 条 drift_zero_hit 就是这么来的）。
         final = "unknown_usage"
-    elif cache_read > 0:
+    elif cache_read > 0 and ratio >= _HIT_OK_MIN_RATIO:
         final = "hit_ok"
+    elif cache_read > 0:
+        # 形式命中、实质未命中（Q2）：**不进**下面的 0 命中分支 ——
+        # 那三档（cold_start / cache_window_expired / drift_zero_hit）
+        # 都以 "cache_read == 0" 为语义前提，把 113 判成它们同样失真。
+        # 单列一档才能同时保住「有字节回来」与「量级不对」两个事实。
+        final = "near_zero_hit"
     elif "no_baseline" in verdict_str or "model_changed" in verdict_str:
         # 无基准 / 换缓存域 ⇒ 没有可读的缓存，零命中是必然而非漂移
         final = "cold_start"
@@ -311,6 +383,7 @@ def report_cache_readout(
         "input_tokens": input_tokens,
         "cache_read": cache_read,
         "cache_creation": cache_creation,
+        "cache_hit_ratio": round(ratio, 4),
     }
     log = logger.bind(agent_id=agent_id)
     log.info(
@@ -318,6 +391,7 @@ def report_cache_readout(
         **result,
     )
     return result
+
 
 
 def clear_verdict(agent_id: str) -> None:

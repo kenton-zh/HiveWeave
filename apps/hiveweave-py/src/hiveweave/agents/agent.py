@@ -1540,6 +1540,13 @@ class Agent:
                         # drift_zero_hit —— 只有后者是"平台自己改写了前缀"的实锤；
                         # 混成一个命中率数字会把 provider 缓存窗口过期也算到我们头上。
                         #
+                        # ⚠ Q2（TEST_DSH_66，2026-09-22）：`hit_ok` 已改为**比例**
+                        # 判据（命中率 ≥ `_HIT_OK_MIN_RATIO`，当前 **0.05**），
+                        # 形式命中单列 `near_zero_hit`。
+                        # 旧的存在性判据（cache_read > 0）使这一列在"命中是否达标"
+                        # 上不可用于判 FAIL（77 条近零命中全绿）。
+                        # ⇒ 消费该列的判据要认 `near_zero_hit`，别再只认三档。
+                        #
                         # TEST_DSH_54 #6（2026-09-12）：同时落**漂移明细**
                         # （`drifts[]`：到底是 compacted_drift /
                         # history_rewritten / tail_hint_drift）。此前明细只在
