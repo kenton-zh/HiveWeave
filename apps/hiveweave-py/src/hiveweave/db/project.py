@@ -290,8 +290,18 @@ async def get_project_db_for_agent(agent_id: str) -> aiosqlite.Connection:
     # Query Meta DB for project_id
     project_id = await meta_db.get_agent_project_id(agent_id)
     if project_id is None:
+        # ⚠ 旧文案写的是 "(agent not registered in Meta DB)" —— **这句话是假的**：
+        # Meta DB **没有 `agents` 表**（只有 projects/agent_templates/llm_models/
+        # mcp_servers/meta_index）。真实路由源是 `AgentRouter` **内存表**
+        # （`db/meta.py::get_agent_project_id` → `agent_router.get_project_id`）。
+        # 照旧文案去查库会查到一张不存在的表上（D67-1 取证时实测踩到）。
         raise ProjectDbError(
-            f"No project found for agent_id={agent_id} (agent not registered in Meta DB)"
+            f"No project found for agent_id={agent_id} "
+            f"(not in the AgentRouter in-memory registry — Meta DB has no "
+            f"'agents' table; AgentRouter.rebuild() registers only agents with "
+            f"status='active', so runtime-only ids such as "
+            f"'sub-<parent>-<suffix>' are never present; see "
+            f"AgentRouter.register_transient)"
         )
 
     # Query Meta DB for workspace_path

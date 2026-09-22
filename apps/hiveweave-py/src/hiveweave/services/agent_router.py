@@ -3,17 +3,31 @@
 替代 Meta DB 中的 agent_index 表。启动时遍历所有 per-project DB 重建路由表。
 create_agent / delete_agent 时同步更新内存映射。
 
+另有**瞬态身份**一族（`register_transient` 等）：承载**不落库的运行时 id**
+（当前唯一生产者 = `sub-*` 子代理）。它们不在 `rebuild()` 的扫描范围内，
+所以只在正式路由里找它们的调用方**必然解析失败**（D67-1 实测：
+`event_audit` 对子代理 23/23 全丢）。两族**物理隔离**，互不污染。
+
 性能: O(1) 查找，启动时 O(N) 重建（N = 所有项目的 agent 总数）。
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 
 log = structlog.get_logger(__name__)
+
+# 瞬态身份（**不落库的运行时 id**）登记上限。
+# 现存唯一生产者是 `tools/subagent.py` 的 `sub-<parent>-<suffix>` —— 它
+# **运行时临时生成、从不入库**，所以 `rebuild()`/`register_project()` 永远
+# 看不到它，而一切按 agent_id 路由的 DB 访问对它**必然解析失败**。
+# 正常路径在子代理结束时 `unregister_transient`；本上限只是异常路径
+# （进程被取消 / 父协程崩溃）的兜底，按**登记先后**驱逐最旧的。
+_TRANSIENT_MAX = 512
 
 
 @dataclass
@@ -40,6 +54,11 @@ class AgentRouter:
         self._routes: dict[str, AgentRoute] = {}
         self._short_ids: dict[str, str] = {}  # short_id → agent_id
         self._project_agents: dict[str, list[str]] = {}  # project_id → [agent_id]
+        # 瞬态身份（见 `_TRANSIENT_MAX` 注释）：agent_id → project_id。
+        # ⚠ **与 `_routes` 物理隔离**，且**刻意不参与** `list_active_routes` /
+        # `get_project_agent_ids` / `_project_agents` —— 否则一个短命的
+        # `sub-*` 会作为"幽灵成员"漏进组织面与前端名册。
+        self._transient: OrderedDict[str, str] = OrderedDict()
 
     async def rebuild(self) -> int:
         """启动时遍历所有 per-project DB 重建路由表。
@@ -164,11 +183,74 @@ class AgentRouter:
         self._routes.clear()
         self._short_ids.clear()
         self._project_agents.clear()
+        self._transient.clear()
 
     def get_project_id(self, agent_id: str) -> str | None:
         """agent_id → project_id，O(1) 查找。"""
         route = self._routes.get(agent_id)
         return route.project_id if route else None
+
+    # ── 瞬态身份（不落库的运行时 id，如 `sub-*` 子代理）────────────
+    # 为什么需要单独一族方法而不是把 `sub-*` 塞进 `_routes`：
+    #   `_routes` 是**组织面的事实源**（`list_active_routes` 供 org/前端名册）；
+    #   塞进去 ⇒ 每个子代理都会以"成员"身份出现并残留（它没有 name/role/短名，
+    #   也永远不会被 `unregister` 之外的路径清理）。而我们要的只是**DB 路由**。
+    # 判据性质：这是**状态判据** —— project_id 在**子代理产生的那一刻**由
+    #   父的 `project_id` 写入（`tools/subagent.py::spawn_subagent_tool`），
+    #   不是运行时去猜 id 的字面形状（形如 `sub-<parent>-<suffix>` 的字符串
+    #   解析属文本判据，换前缀即失效 ⇒ 不入此族）。
+
+    def register_transient(self, agent_id: str, project_id: str) -> None:
+        """登记**运行时临时身份** → 所属项目（唯一消费者：取证类 DB 路由）。
+
+        幂等：重复登记同一 `agent_id` 覆盖并刷新 LRU 次序。
+        有界：超过 `_TRANSIENT_MAX` 驱逐**最早登记**的（异常路径兜底）。
+        """
+        aid = str(agent_id or "").strip()
+        pid = str(project_id or "").strip()
+        if not aid or not pid:
+            # 空值不得进表：否则"查得到但查出来是空串"会把调用方的
+            # `or ""` 判空逻辑变成哑弹（劣化成"看起来路由成功"）。
+            return
+        self._transient[aid] = pid
+        self._transient.move_to_end(aid)
+        while len(self._transient) > _TRANSIENT_MAX:
+            evicted, _ = self._transient.popitem(last=False)
+            # **warning 而非 debug**（审计 P2-b）：驱逐意味着"有生产者漏了
+            # `unregister_transient`"（`_work` 的 `finally` 是唯一的正常出口）
+            # —— 它是一条**告警信号**，而且此刻被逐掉的那条身份的后续事件会
+            # 解析失败（症状回到 D67-1 本身）。debug 级等于把信号藏起来。
+            log.warning(
+                "agent_router.transient_evicted",
+                agent_id=evicted,
+                reason="超过 _TRANSIENT_MAX —— 生产者可能漏了 unregister_transient",
+                cap=_TRANSIENT_MAX,
+            )
+
+    def unregister_transient(self, agent_id: str) -> None:
+        """注销瞬态身份（子代理结束时调用；不在表内为无害空操作）。"""
+        self._transient.pop(str(agent_id or "").strip(), None)
+
+    def resolve_transient_project_id(self, agent_id: str) -> str | None:
+        """**只查瞬态表**：`agent_id` → project_id（正式路由不在此列）。
+
+        刻意不回落 `get_project_id` —— 两条通道各自可断言，消费方按次序
+        组合（见 `services/event_audit.py::_resolve_project_id`），
+        免得"两个判据取其一"变成"谁都负责、谁都说不清"。
+        """
+        return self._transient.get(str(agent_id or "").strip())
+
+    def transient_count(self) -> int:
+        """当前登记的瞬态身份数量（供有界性断言/诊断）。"""
+        return len(self._transient)
+
+    def clear_transient_for_project(self, project_id: str) -> int:
+        """摘掉指向某项目的全部瞬态身份（项目删除时用）。"""
+        pid = str(project_id or "").strip()
+        gone = [k for k, v in self._transient.items() if v == pid]
+        for k in gone:
+            self._transient.pop(k, None)
+        return len(gone)
 
     def get_route(self, agent_id: str) -> AgentRoute | None:
         """获取完整路由信息。"""
@@ -267,6 +349,9 @@ class AgentRouter:
             route = self._routes.pop(aid, None)
             if route and route.short_id:
                 self._short_ids.pop(route.short_id, None)
+        # 瞬态身份同批摘掉：项目没了，子代理的事件不该再往一个已删项目的
+        # workspace 上写（那边只会 raise ProjectDbError，徒增噪声）。
+        self.clear_transient_for_project(project_id)
         if agent_ids:
             log.info(
                 "agent_router_project_cleared",

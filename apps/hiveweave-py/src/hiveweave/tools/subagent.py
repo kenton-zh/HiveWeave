@@ -280,17 +280,34 @@ async def spawn_subagent_tool(
     snap_run_id = getattr(parent, "_current_run_id", None)
     snap_counter = getattr(parent, "_run_step_counter", 0)
 
+    # D67-1：子代理 id 在**这里**产生（不是 `_run_subagent` 内部）—— 因为登记
+    # 瞬态路由需要 `project_id`，而 `project_id` 在本函数里已经解析出来了。
+    # 登记/注销成对包住 `_run_subagent` 的**唯一入口+唯一出口**（`_work` 是
+    # 它的唯一调用者）：`_run_subagent` 内部有 3 条早返回，逐个补 unregister
+    # 是"逐点替换清单"式改法，必然漏点。
+    sub_id = _new_subagent_id(parent)
+    project_id = str(getattr(parent, "project_id", "") or "")
+
     async def _work() -> tuple:
-        result = await _run_subagent(
-            parent,
-            prompt,
-            params.description,
-            timeout_s,
-            subagent_type,
-            workspace=resolved_ws,
-            snap_run_id=snap_run_id,
-            snap_step_counter=snap_counter,
-        )
+        from hiveweave.services.agent_router import agent_router
+
+        agent_router.register_transient(sub_id, project_id)
+        try:
+            result = await _run_subagent(
+                parent,
+                prompt,
+                params.description,
+                timeout_s,
+                subagent_type,
+                workspace=resolved_ws,
+                snap_run_id=snap_run_id,
+                snap_step_counter=snap_counter,
+                sub_id=sub_id,
+            )
+        finally:
+            # 子代理是短命的：出界即摘，瞬态表不长期留痕。异常路径下
+            # `_TRANSIENT_MAX` 的 FIFO 驱逐是第二道兜底。
+            agent_router.unregister_transient(sub_id)
         if result.get("status") != "ok":
             return False, str(result.get("error") or "unknown error")
         # P0-1：父在等的是「这批活干完没有」。子代理的 LLM 轮次被预算切断时
@@ -313,7 +330,6 @@ async def spawn_subagent_tool(
             )
         return True, text
 
-    project_id = str(getattr(parent, "project_id", "") or "")
     task_id = await resolve_assignee_task_id(project_id, agent_id)
     job_id = start_offturn_job(
         kind="subagent",
@@ -631,6 +647,18 @@ async def _record_subagent_step(
         pass  # best-effort
 
 
+def _new_subagent_id(parent: Any) -> str:
+    """生成子代理的**运行时临时身份**（唯一实现，两个调用点共用）。
+
+    ⚠ 这个 id **从不入库** ⇒ `AgentRouter.rebuild()` 永远看不到它。凡是
+    「按 agent_id 找 project」的路径（取证写入、`get_agent_project_id`）对
+    它必然失败。唯一的补救是**在产生它的那一刻**把 project_id 登记进
+    `AgentRouter` 的瞬态表（D67-1）—— 登记点在 `spawn_subagent_tool`，
+    那里同时拿到 `parent.project_id` 与 id 本身；本函数只负责造 id。
+    """
+    return f"sub-{parent.id}-{uuid.uuid4().hex[:8]}"
+
+
 async def _run_subagent(
     parent: Any,
     prompt: str,
@@ -640,8 +668,15 @@ async def _run_subagent(
     workspace: str | None = None,
     snap_run_id: str | None = None,
     snap_step_counter: int | None = None,
+    sub_id: str | None = None,
 ) -> dict[str, Any]:
-    """Run the subagent's own Streamer loop. Returns Streamer result dict."""
+    """Run the subagent's own Streamer loop. Returns Streamer result dict.
+
+    ``sub_id``（D67-1）：子代理的**运行时临时身份**。由 ``spawn_subagent_tool``
+    产生并传入（那里才是登记瞬态路由的地方，见 ``_new_subagent_id`` 注释）；
+    直接调用本函数的测试不传 ⇒ 就地生成一个（**同一实现**，不新开第二条生成路径）。
+    """
+    sub_id = sub_id or _new_subagent_id(parent)
     # 1. 工作区：优先用 spawn 时已校验的路径（write 已拒绝 MAIN）
     if not (workspace or "").strip():
         workspace = await parent._get_workspace_path()
@@ -692,7 +727,6 @@ async def _run_subagent(
     #    子代理流用合成 agent_id（避免 poll-gate 计数/遥测污染父），
     #    但工具执行始终转发父的 agent_id（权限/硬门按父身份评估）。
     executor = parent._tool_executor
-    sub_id = f"sub-{parent.id}-{uuid.uuid4().hex[:8]}"
     holder: dict[str, dict[str, str]] = {}
     on_tool_call = _subagent_on_tool_call(
         parent, executor, workspace, project_root, holder, whitelist
