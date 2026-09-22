@@ -934,11 +934,13 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
     # `unable to create file .hiveweave/shared/m2-interface.md` + unlink
     # warning。对边界 shared 子树补授**项目级** shared_sid（GRANT_MASK 同
     # worktree/git 授法；OI/CI 继承 → 子树内新建文件自动带 ACE）。
-    # 授予面 = worktree 边界（executor + builder coordinator，policy 层
-    # boundary != project 判定）；CEO/HR/bash_main 项目根边界 shared_sid_str
-    # 为 None，token 也不携带 —— HR/只读授予面不变。目录不存在（老项目/尚未
-    # 物化）跳过，下一轮 standing grants（每命令 verify-then-skip）重试。
-    # 授失败只告警不阻断 agent 启动（与探针同哲学），下轮重试。
+    # 授予面 = **所有边界**（2026-09-22 P2-2「团队网盘」起；此前只授 worktree
+    # 边界 ⇒ MAIN 边界（CEO/HR/bash_main）写不了网盘）。授予面**只在 shared
+    # 子树**，其余 `.hiveweave` 子目录不受影响（真令牌探针 N3a/N3b/N3c 全拒）。
+    # ⚠ 目录不存在仍**跳过**（老项目/尚未物化）—— 那是**刻意设计**、有守卫
+    # （`test_shared_absent_skip_then_backfill`：跳过不报错、物化后下一条命令补授）。
+    # 本轮**不**改成"平台代建"：那会越过 P2-2 的范围，且物化本就有自愈路径
+    # （`write_file` 平台侧可建 / worktree 内 agent 可 mkdir —— 探针 N1m ALLOWED）。
     if policy.shared_sid_str:
         try:
             if os.path.isdir(policy.shared_dir):

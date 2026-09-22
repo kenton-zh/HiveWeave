@@ -160,6 +160,21 @@ async def _spawn(project: Path, wt: Path, agent_id: str, command: str, *,
         agent_id=agent_id, timeout_s=timeout_s, entry="bash")
 
 
+async def _spawn_main(project: Path, agent_id: str, command: str, *,
+                      timeout_s: float = 60):
+    """**项目根边界**形态（CEO / HR / `pwsh_main`；`root == project`）。
+
+    ⚠ 形态必须交代：`workspace_path == project_workspace_path` ⇒
+    `resolve_policy` 得 `boundary == project`。P2-2 之前这一侧**不带**
+    shared SID（正是网盘写不了的来源）。
+    """
+    return await spawn_confined(
+        command=command, workdir=str(project),
+        workspace_path=str(project),
+        project_workspace_path=str(project),
+        agent_id=agent_id, timeout_s=timeout_s, entry="bash_main")
+
+
 def _cmd(inner: str) -> str:
     return f'"{COMSPEC}" /c {inner}'
 
@@ -507,3 +522,67 @@ async def test_shared_walk_watermark_retry_on_failure(
 
     # 第三轮 → 命中水位，零扫描
     assert svc._repair_shared_islands_once(str(shared), sid, usid) == (0, 0, False)
+
+
+# ── P2-2（2026-09-22）：**项目根边界**（CEO/HR）也能写网盘 ──────────
+async def test_main_boundary_can_write_netdisk(project: Path) -> None:
+    """P2-2 验收：项目根边界（CEO/HR 形态）对 `<proj>/.hiveweave/shared/…`
+    可写 —— 与 worktree 边界**一致**（"网盘谁都可以操作"）。
+
+    真令牌实测（探针 `scripts/probe_netdisk_write_surface.py` 的 N2 格同构）：
+    修复前该格 **DENIED**（`bash_main` 不带 shared SID）。
+    """
+    shared = project / ".hiveweave" / "shared"
+    shared.mkdir(parents=True, exist_ok=True)
+
+    policy = resolve_policy(workspace_path=str(project), agent_id="CEO",
+                            project_workspace_path=str(project))
+    assert policy.shared_sid_str, "项目根边界必须携带 shared SID（P2-2）"
+    # sanity（修复前形态）：授前该子树无 shared_sid ACE
+    assert not WriteGrant.ace_present(
+        str(shared), policy.shared_sid_str, GRANT_MASK)
+
+    # ⚠⚠ 量具自纠：**必须先把「个人夹」建出来**再测"能不能写文件"。
+    # 否则 `echo > …\shared\ceo\note.md` 的失败原因是 cmd 的"系统找不到指定的路径"，
+    # 而同一条非零退出把「没权限」与「路径不存在」混成一句话 —— 探针首跑就吃过
+    # 这个假阴性（`scripts/probe_netdisk_write_surface.py` §18.3）。
+    (shared / "ceo").mkdir(parents=True, exist_ok=True)
+
+    target = shared / "ceo" / "note.md"
+    r = await _spawn_main(
+        project, "CEO",
+        _cmd(r"echo hi > .hiveweave\shared\ceo\note.md"))
+    assert r is not None, "spawn_confined 返回 None（沙箱未启用？）"
+    assert r["exit_code"] == 0, {
+        "exit": r["exit_code"], "stdout": (r.get("stdout") or "")[-400:],
+        "stderr": (r.get("stderr") or "")[-600:]}
+    assert target.read_text(encoding="utf-8").strip() == "hi"
+    # 另：**"个人夹能否自建"** 单列一格（探针 N1m/N2m 同构）——
+    # 授予带 OI/CI ⇒ 子树内新建目录自动继承 ACE。
+    own = shared / "hr"
+    r2 = await _spawn_main(project, "HR", _cmd(r"mkdir .hiveweave\shared\hr"))
+    assert r2 is not None and r2["exit_code"] == 0, (
+        "MAIN 边界必须能自建个人夹（否则'个人夹'要平台代建）", r2 and r2.get("stderr"))
+    assert own.is_dir()
+    # standing ACE 已落盘（写文件那一格）
+    assert WriteGrant.ace_present(
+        str(target.parent), policy.shared_sid_str, GRANT_MASK)
+
+
+async def test_main_boundary_still_denied_outside_shared(project: Path) -> None:
+    """⭐ 作用域精确守卫：放开 shared **不得**顺带放开 `.hiveweave` 其余部分。
+
+    靶子 = `.hiveweave/data.db`（平台自管系统文件）。判据是**看盘**：
+    文件内容必须仍是原值、不得出现新文件。探针 N3a 同构。
+    """
+    db = project / ".hiveweave" / "data.db"
+    db.write_text("orig", encoding="utf-8")
+
+    r = await _spawn_main(
+        project, "CEO",
+        _cmd(r"echo pwned > .hiveweave\data.db "
+             r"&& echo x > .hiveweave\evil.md"))
+    assert r is not None
+    assert r["exit_code"] != 0, "MAIN 边界写 data.db 必须失败"
+    assert db.read_text(encoding="utf-8") == "orig", "data.db 内容被改了"
+    assert not (project / ".hiveweave" / "evil.md").exists()

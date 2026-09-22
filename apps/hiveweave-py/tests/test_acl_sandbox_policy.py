@@ -38,8 +38,9 @@ def test_entry_boundary_covers_all_six_rows() -> None:
 def test_build_write_sids_structure(tmp_path) -> None:
     """组装顺序/构成：boundary + cache(项目根) + git(项目根) + temp + shared。
 
-    shared（s3c09 git×ACL 修复）仅在 worktree 边界（boundary != project）
-    追加，派生自**项目根**。
+    shared（s3c09 git×ACL 修复）派生自**项目根**；**所有边界都带**
+    （2026-09-22 P2-2「团队网盘」起 —— 此前仅 worktree 边界，使 MAIN 边界
+    角色写不了网盘；真令牌探针 N2 DENIED 实测）。
     """
     boundary = str(tmp_path / "worktree-A")
     project = str(tmp_path)
@@ -50,8 +51,11 @@ def test_build_write_sids_structure(tmp_path) -> None:
         cache_sid(project),       # cache/git SID 派生自**项目根**（§4.8/§8）
         git_sid(project),
         t,
-        shared_sid(project),      # shared SID 派生自项目根（worktree 边界才带）
+        shared_sid(project),      # shared SID 派生自项目根（**所有边界**）
     ]
+    # 项目根边界（boundary == project，CEO/HR/bash_main 形态）**同样带** ——
+    # 否则网盘对那一侧不可写（P2-2 的缺口本体）。
+    assert shared_sid(project) in build_write_sids(project, project, t)
 
 
 def test_build_write_sids_project_root_separate_from_boundary(tmp_path) -> None:
@@ -80,8 +84,9 @@ def test_build_write_sids_extra_dirs(tmp_path) -> None:
     t = temp_sid(str(tmp_path / "t"))
     sids = build_write_sids(boundary, project, t, extra_dirs=(extra,))
     assert sids[-1] == extra_sid(extra)
-    # extra SID 与其余域不撞
-    assert len(set(sids)) == 5
+    # extra SID 与其余域不撞：worktree + cache + git + temp + **shared** + extra = 6
+    # （2026-09-22 P2-2 起项目根边界也带 shared ⇒ 比旧的 5 多一个）
+    assert len(set(sids)) == 6
 
 
 def test_resolve_temp_dir_nesting(tmp_path) -> None:
@@ -103,13 +108,15 @@ def test_resolve_policy_full(tmp_path) -> None:
     assert p.boundary_root == str(tmp_path)
     assert p.project_root == str(tmp_path)  # 缺省 project_workspace_path → 回退边界
     assert p.temp_dir == resolve_temp_dir(str(tmp_path), "A001")
-    # 39 审计 P0-1：write_sids 顺序 = [worktree, cache, git, temp, venv]
+    # 39 审计 P0-1：write_sids 顺序 = [worktree, cache, git, temp, shared, venv]
     assert p.temp_sid == p.write_sids[3]
     assert p.venv_sid_str in p.write_sids
     assert p.venv_dir == str(tmp_path / ".venv")
-    assert len(p.write_sids) == 5
-    # s3c09 修复：项目根边界（root == project）不带 shared SID，授予面不变
-    assert p.shared_sid_str is None
+    assert len(p.write_sids) == 6
+    # P2-2（2026-09-22）：项目根边界（root == project）**也带** shared SID ——
+    # 网盘（`.hiveweave/shared`）要对 CEO/HR 同样可写。授予面仍只在 shared 子树。
+    assert p.shared_sid_str == shared_sid(str(tmp_path))
+    assert p.shared_sid_str in p.write_sids
     assert p.shared_dir == str(tmp_path / SHARED_REL)
 
 
@@ -127,7 +134,11 @@ def test_resolve_policy_project_root_override(tmp_path) -> None:
 
 
 def test_resolve_policy_shared_fields_worktree_boundary(tmp_path) -> None:
-    """s3c09 修复：worktree 边界携带项目级 shared SID；项目根边界不携带。"""
+    """s3c09 + P2-2：**两种边界都**携带项目级 shared SID（网盘两侧一致）。
+
+    旧断言（P2-2 之前）是"worktree 边界携带、项目根边界**不**携带" ——
+    那正是网盘对 CEO/HR 不可写的来源，已作废。
+    """
     project = str(tmp_path)
     wt = str(tmp_path / ".hiveweave" / "worktrees" / "A")
     p = resolve_policy(workspace_path=wt, agent_id="A001",
@@ -139,8 +150,11 @@ def test_resolve_policy_shared_fields_worktree_boundary(tmp_path) -> None:
 
     p_root = resolve_policy(workspace_path=project, agent_id="CEO",
                             project_workspace_path=project)
-    assert p_root.shared_sid_str is None
-    assert shared_sid(project) not in p_root.write_sids
+    assert p_root.shared_sid_str == shared_sid(project)
+    assert shared_sid(project) in p_root.write_sids
+    # ⚠ 作用域精确：项目根边界下 shared_dir 指向**项目根**的网盘（不是工作树那份）
+    assert p_root.shared_dir == str(tmp_path / SHARED_REL)
+    assert p_root.shared_dir != p.shared_dir
 
 
 def test_shared_sid_same_across_worktrees(tmp_path) -> None:

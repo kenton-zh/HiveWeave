@@ -261,7 +261,7 @@ class SandboxPolicy:
     shared_dir: str                         # 边界内 `.hiveweave/shared`（授予目标，可能不存在）
     extra_dirs: list[str] = field(default_factory=list)   # §5.5b②：附加可写目录（realpath）
     extra_sids: list[str] = field(default_factory=list)
-    shared_sid_str: str | None = None       # worktree 边界才有值（项目级派生，非 per-agent）
+    shared_sid_str: str | None = None       # 项目级派生（非 per-agent）；**所有边界**都有值（见 build_write_sids）
 
 
 def resolve_temp_dir(workspace_path: str, agent_id: str) -> str:
@@ -298,8 +298,9 @@ def build_write_sids(
       同一 git/cache/venv 能力，跨项目 SID 不同（域前缀 + 路径）；
     - shared\\0：**派生自项目根且仅 worktree 边界携带**（boundary != project）——
       shared 是 git 跟踪的跨 agent 契约区，各 worktree 内 git rebase/checkout
-      要写删 `<wt>/.hiveweave/shared/*`；CEO/HR/bash_main 项目根边界不携带，
-      HR/只读授予面不变（s3c09 git×ACL 死锁修复，2026-09-05）；
+      要写删 `<wt>/.hiveweave/shared/*`，**且它是团队网盘**（谁都可以读写）
+      ⇒ **所有边界**都带 shared SID（2026-09-22 P2-2 起；此前仅 worktree 边界，
+      使 MAIN 边界角色写不了网盘 —— 真令牌探针实测 N2 DENIED）；
     - temp\\0 / extra\\0 各自域分离。跨项目同 SID 撞车需全 60-bit 碰撞（~2⁻⁵⁴）。
     """
     boundary = os.path.realpath(boundary_root)
@@ -310,8 +311,15 @@ def build_write_sids(
         git_sid(project),
         temp_sid_str,
     ]
-    if boundary != project:
-        sids.append(shared_sid(project))
+    # shared SID **所有边界都给**（2026-09-22 P2-2「团队网盘」）。
+    # 旧形态是 `if boundary != project`（理由是"CEO/HR/bash_main 项目根边界
+    # 不授予不携带，行为不变"）—— 那让网盘**只对工作树里的 agent 可用**：
+    # 真令牌探针实测 `scripts/probe_netdisk_write_surface.py`：
+    # N1 executor 写 `<wt>/.hiveweave/shared/…` **ALLOWED**，
+    # N2 MAIN 形态（`bash_main`）写 `<proj>/.hiveweave/shared/…` **DENIED**。
+    # 而"谁都可以操作网盘"要求两侧一致 ⇒ 去掉该条件（负对照仍全拒：
+    # `data.db` / 别家 `worktrees/<树>` / 边界外 —— 授予面**只**在 shared 子树）。
+    sids.append(shared_sid(project))
     if venv_sid_str:
         sids.append(venv_sid_str)
     for d in extra_dirs:
@@ -341,9 +349,12 @@ def resolve_policy(
     extra_paths = [os.path.realpath(d) for d in extra_dirs]
     venv_dir = resolve_venv_dir(project)
     venv_sid_str = venv_sid(project)
-    # shared 授予面 = worktree 边界（executor + builder coordinator）：
-    # CEO/HR/bash_main 项目根边界（root == project）不授予不携带，行为不变。
-    is_worktree_boundary = root != project
+    # shared 授予面 = **所有边界**（2026-09-22 P2-2）。旧形态只授 worktree 边界
+    # （executor + builder coordinator），理由是"CEO/HR/bash_main 项目根边界
+    # 不授予不携带，HR/只读授予面不变"—— 但那等于**网盘对 MAIN 边界角色不可写**，
+    # 与"网盘谁都可以操作"相悖（探针 N2 DENIED 实测）。授予面仍**只在 shared 子树**
+    # （`_ensure_standing_grants` 按 `policy.shared_dir` 落地），其余 `.hiveweave`
+    # 子目录（`data.db` / `worktrees` / `tool_outputs` …）**一字未动**。
     return SandboxPolicy(
         boundary_root=root,
         project_root=project,
@@ -358,5 +369,5 @@ def resolve_policy(
         shared_dir=str(Path(root) / SHARED_REL),
         extra_dirs=extra_paths,
         extra_sids=[extra_sid(d) for d in extra_paths],
-        shared_sid_str=shared_sid(project) if is_worktree_boundary else None,
+        shared_sid_str=shared_sid(project),
     )
