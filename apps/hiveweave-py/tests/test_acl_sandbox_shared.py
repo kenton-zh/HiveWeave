@@ -261,11 +261,17 @@ async def test_shared_write_denied_without_shared_sid(project: Path) -> None:
 async def test_shared_sid_isolation_and_cross_agent_share(project: Path) -> None:
     """三条边界一次钉死：
 
-    (a) MAIN shared（项目根边界）**不**被授予 —— 授予面仅 worktree 边界；
+    (a) MAIN shared（项目根边界）**也**被授予 —— P2-2（2026-09-22）起授予面
+        覆盖**所有边界**（"网盘谁都可以读写"）；
     (b) `.hiveweave` 根 / sandbox-temp 根 / A 的私有锚点无 shared_sid ACE，
         B 的受限 token 写 A 的锚点仍被拒；
     (c) 同项目 shared = 跨 agent 共享：B 的 token 可写 A worktree 的 shared
         （per-project 同一 SID 的本意）。
+
+    ⚠ 旧的 (a) 断言是「MAIN shared **不**授予」—— 那是 P2-2 之前的行为。它当时
+    仍然"绿"，**只是因为本用例全程只走 worktree 边界的 `_spawn`**，从不触发
+    MAIN 授予（陈旧断言 + 走不到的路径 = 空洞守卫，审计 P2-3 实测）。
+    现改为**先跑一条 MAIN 边界的命令再断言 ACE 已落** ⇒ 改回旧行为即转红。
     """
     wt_a, shared_a = _make_worktree(project, "A001")
     (shared_a / "from-a.md").write_text("a\n", encoding="utf-8")
@@ -277,10 +283,16 @@ async def test_shared_sid_isolation_and_cross_agent_share(project: Path) -> None
                               project_workspace_path=str(project))
     sid = policy_a.shared_sid_str
 
-    # (a) MAIN shared 不授（项目根边界不授予，CEO/HR 行为不变）
+    # (a) P2-2：MAIN shared **也授**（项目根边界同样携带并授予 shared SID）
     main_shared = project / ".hiveweave" / "shared"
-    assert main_shared.is_dir()
+    main_shared.mkdir(parents=True, exist_ok=True)
+    # 授权前 sanity（修复前形态）：ACE 不该已经在
     assert not WriteGrant.ace_present(str(main_shared), sid, GRANT_MASK)
+    r_main = await _spawn_main(project, "CEO", _cmd("echo boot"))
+    assert r_main is not None and r_main["exit_code"] == 0, r_main
+    assert WriteGrant.ace_present(str(main_shared), sid, GRANT_MASK), (
+        "P2-2 起 MAIN 边界的 shared 也必须拿到 shared_sid ACE"
+    )
     # (b) PROTECTED 区各根 + A 的锚点：无 shared_sid ACE
     #     （worktree 布局下 temp 锚点在 worktree 侧；MAIN 侧 shared 已在 (a) 钉过）
     a_anchor = wt_a / ".hiveweave" / "sandbox-temp" / "A001"

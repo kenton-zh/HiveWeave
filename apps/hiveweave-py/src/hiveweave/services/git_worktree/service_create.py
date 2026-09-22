@@ -133,6 +133,18 @@ class CreateMixin:
 
         Returns ``{success, initialized}`` or ``{success: False, message}``.
         """
+        # ⭐ P2-2 跟进（P1-1，2026-09-22 审计）：物化**项目根**的
+        # `.hiveweave/shared/`（团队网盘根）。
+        # 为什么必须在这里、且**放在分支之前**：`_materialize_shared_dir` 原先
+        # **只被 worktree 路径调用** ⇒ 存量/收养项目里 `<proj>/.hiveweave/shared`
+        # 可能根本不存在；而 `_ensure_standing_grants` 对缺失目录是**刻意跳过**
+        # （fail-soft，有守卫），MAIN 边界又**没有** `.hiveweave` 写权、无法自建
+        # ⇒ **"谁都能写网盘"在那一格上不成立**（真令牌拟真实测：MAIN 边界
+        # `mkdir .hiveweave\shared` exit=1、写文件 exit=1）。
+        # ⚠ 放在**分支之前**是刻意的：`ensure_git_repo` 有两条路（存量/收养 走
+        # 上方 early return、新建 走下方 init）—— 放分支前**一次覆盖两条**，
+        # 避免"逐点替换清单"式漏点。幂等 + best-effort（内部 try 兜住）。
+        await self._materialize_shared_dir(workspace_path)
         if _has_git(workspace_path):
             # Existing repo — still patch .gitignore idempotently (TEST6 P1-A),
             # and migrate legacy ignore rules (workspace tracking) if found.

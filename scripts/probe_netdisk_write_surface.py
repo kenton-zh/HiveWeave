@@ -101,6 +101,27 @@ async def main() -> int:
         note(tag, verdict, f"exit={r.get('exit_code') if r else None} "
                            f"{target.name}")
 
+    async def attempt_unchanged(tag: str, inner: str, target: Path,
+                                expect_text: str, *, main_boundary: bool) -> None:
+        """跑一条受限命令，判据 = **靶文件内容是否仍是 `expect_text`**。
+
+        ⚠ 这类"**不得改动既有文件**"的负对照**不能用"存在与否"当判据** ——
+        靶子本来就存在 ⇒ 存在性恒真。审计 P1-2 实测的正是这个恒绿形态。
+        内容比对才是状态判据。靶文件由调用方**预先创建**（失败原因才唯一）。
+        """
+        workdir = proj if main_boundary else wt
+        who = "CEO" if main_boundary else "A001"
+        r = await _run(workdir, who, inner, entry="bash_main" if main_boundary
+                       else "bash", workspace=workdir, project=proj)
+        try:
+            got = target.read_text(encoding="utf-8")
+        except OSError as e:
+            note(tag, f"**READ_FAILED {type(e).__name__}**", str(target))
+            return
+        verdict = "INTACT" if got == expect_text else f"**MODIFIED={got[:20]!r}**"
+        note(tag, verdict,
+             f"exit={r.get('exit_code') if r else None} {target.name}")
+
     try:
         boot0 = await _run(proj, "CEO", "echo boot", entry="bash_main",
                            workspace=proj, project=proj)
@@ -125,9 +146,19 @@ async def main() -> int:
                       sd_pj / "hr",
                       main_boundary=True, expect="ALLOWED")
         # ── 负对照（必须 DENIED）──────────────────────────────
-        await attempt("N3a-deny-datadb",
-                      f'echo pwned > "{_fwd(proj / ".hiveweave" / "data.db")}"',
-                      proj / ".hiveweave" / "data.db.marker",
+        # ⚠⚠ 量具自纠 #2（审计 P1-2 实测）：N3a 原来把**靶子**写成
+        # `data.db.marker`，而命令写的是 `data.db` ⇒ 那个靶子**永远不会出现**，
+        # 于是该格**恒 DENIED**（一条永不失败的断言 = 空守卫）。
+        # 修法：靶子就是 `data.db` **本体**，判据改成"**内容是否被改**"
+        # （下面 `attempt_unchanged`），并把"新文件是否出现"单列一格。
+        await attempt_unchanged(
+            "N3a-deny-datadb",
+            f'echo pwned > "{_fwd(proj / ".hiveweave" / "data.db")}"',
+            proj / ".hiveweave" / "data.db", "x",
+            main_boundary=False)
+        await attempt("N3a2-deny-new-file",
+                      f'echo pwned > "{_fwd(proj / ".hiveweave" / "evil.md")}"',
+                      proj / ".hiveweave" / "evil.md",
                       main_boundary=False, expect="DENIED")
         await attempt("N3b-deny-other-worktree",
                       f'echo pwned > "{_fwd(other_wt / "x.txt")}"',
@@ -137,11 +168,6 @@ async def main() -> int:
                       f'echo pwned > "{_fwd(outside)}"',
                       outside,
                       main_boundary=False, expect="DENIED")
-
-        # 关闭 set 判定：data.db 本体没被改（负对照的补充状态判据）
-        note("N3a-note-datadb-intact",
-             "INTACT" if (proj / ".hiveweave" / "data.db").read_text(
-                 encoding="utf-8") == "x" else "**MODIFIED**", "data.db")
 
         print("\n== SUMMARY ==")
         for tag, verdict, detail in rows:
