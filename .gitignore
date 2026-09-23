@@ -213,10 +213,10 @@ docs/platform-issue-research/
 #   dist）。两处必须同源：漏写一条 ⇒ 文件进 git 且**同时**被打进 EXE 产物
 #   （2026-09-17 审计发现的漂移点：`.pre-lama2.png` 无 `.bak` 那类此前两边
 #   不一致）。新增一条中间产物命名时**两处都要加**。
-apps/web/public/office-assets/*.bak.png
-apps/web/public/office-assets/*.patched.png
-apps/web/public/office-assets/*.pre-lama.png
-apps/web/public/office-assets/*.pre-lama2.png
+# 美术工作文件（LaMa 修图中间产物，可从 assets/art/office/source/ + 脚本再生；约 8 MB 不进 git）
+# 2026-09-22 从 apps/web/public/office-assets/ 迁至 assets/art/office/working/
+# —— 搬迁动机：public/ 下一切都会进 dist/EXE，这里才是「不让中间产物进包」的根治（原先只靠构建脚本 /XF 止血）
+assets/art/office/working/
 
 # Local AI memory backups (AI_MEMORY.local.md 已 ignore，备份同精神)
 AI_MEMORY.local.md.bak*
