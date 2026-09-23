@@ -3,6 +3,7 @@
   "plugin": ["superpowers@git+https://github.com/obra/superpowers.git"],
   "skills": {
     "paths": [
+      "skills",
       ".opencode/skills-sources/agent-skills/skills",
       ".opencode/skills-sources/emilkowalski-skills/skills"
     ]
