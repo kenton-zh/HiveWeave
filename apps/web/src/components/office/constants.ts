@@ -16,40 +16,60 @@ export const TILE_H = 32;
 // ── Desk Layout ───────────────────────────────────────────────────
 
 /**
- * 7 个桌位，按背景图 office-scene-bg.png（1672×941，world = px / 1.30625）标定：
- *   中排 3 桌 + 下排 3 桌 + 前台柜台。坐标 = 该桌「落座基准点」，
- *   桌套件/椅位全部由 DESK_SET 的相对偏移从此点推出（角色腰线对齐桌远缘）。
- * 顺序即 getDesk() 的分配顺序；紫衣演示走 purpleDemoSeat()（0 号占前台柜台，
- * 其余按工作位顺序坐 B 位近侧椅）。
+ * 桌位 = **规则网格**（3 列 × 2 排），按背景图 office-scene-bg.png（KAIROSOFT 平面）标定。
+ * 该底图在场景里被拉伸到 WORLD_W×WORLD_H = 1280×720 ⇒ **world 与底图像素 1:1**。
+ * 坐标 = 该桌「落座基准点」，桌套件/椅位由 DESK_SET 的相对偏移从此点推出；
+ * 顺序即 getDesk() / purpleDemoSeat() 的分配顺序。
+ *
+ * ── 2026-09-23 排成整齐网格（用户要求「桌椅摆整齐」）──
+ * 由 **`apps/web/scripts/calibrate-desk-grid.mjs`** 程序化求解（该脚本同时是改底图后的标定工具）：
+ * 枚举 (列距, 行距, 起点)，要求**每个格位**的桌套件包围盒（x∈[-78,+81] / y∈[-62,+67]）
+ * 整块落在木地板空地上（基色 RGB(242,170,96) ±26），取「间距尽可能大 + 整体居中」的最优解：
+ * **dx=166 / dy=132 / 起点 (535,360)**。`DIAG=1` 可打印逐行可用空地范围。
+ *
+ * ⚠ **整齐 ⇒ 上限 6 席，这是底图形状的硬约束，不是没搜够**：
+ * 空地是「上宽下窄」的楔形（诊断见 `_desk_grid.mjs` 的 `DIAG=1`）——
+ * y≈430 那一行最宽（x 460..1110，宽 651，恰好只够 3 列）；
+ * y≥510 起右半侧就只剩 x 815..1050（宽 ~240 ⇒ 只放得下 1 席）。
+ * 4 列 × 2 排 / 2 列 × 4 排 / 3 列 × 3 排 全部**零可行解**（都枚举过）。
+ * ⇒ 要 8 席就必须放弃规则网格（第 5 席起只能塞进右侧那块窄空地），要 10 席（§5.3）
+ *   只能换/扩底图。
+ * ⚠ 间距下限：同排 x 差 ≥ 162（桌宽 159）、上下 y 差 ≥ 130（套件高 129），再小就穿插。
+ * 当前 dx=166 / dy=132 已贴近下限 ⇒ 两排之间只有 3 world px 缝，观感偏紧凑。
+ *
+ * ⚠ 命名禁忌：`furnitureSet()` 按 **id === "review-2"** 特判为**前台套件**（FRONTDESK_SET）。
+ * 故任何工位**绝不能用 `review-2`**（会让那席位渲染成前台柜台）；前台槽位一旦标定也要另起名字。
  */
 export const DESKS: DeskSlot[] = [
-  { id: "lead-1",   x: 747, y: 326, role: "lead" },   // 中排中桌
-  { id: "lead-2",   x: 966, y: 379, role: "lead" },   // 中排右桌
-  { id: "build-1",  x: 510, y: 278, role: "build" },  // 中排左桌
-  { id: "build-2",  x: 510, y: 433, role: "build" },  // 下排左桌
-  { id: "build-3",  x: 794, y: 510, role: "build" },  // 下排中桌
-  { id: "review-1", x: 1019, y: 581, role: "review" },// 下排右桌
-  { id: "review-2", x: 563, y: 547, role: "review" }, // 前台柜台（F 视角接待员预留）
+  // 上排（y=360）
+  { id: "lead-1",   x: 535, y: 360, role: "lead" },   // 左
+  { id: "build-1",  x: 701, y: 360, role: "build" },  // 中
+  { id: "build-2",  x: 867, y: 360, role: "build" },  // 右
+  // 下排（y=492）
+  { id: "build-3",  x: 535, y: 492, role: "build" },  // 左
+  { id: "review-1", x: 701, y: 492, role: "review" }, // 中
+  { id: "review-3", x: 867, y: 492, role: "review" }, // 右（跳过 review-2：前台槽位保留名）
 ];
 
 // ── Common Area (talking / roaming targets) ───────────────────────
 
-/** Gather point when agents are "talking" — 入口前绿地毯旁的大厅等候区 */
+/** Gather point when agents are "talking" — 工位下方空地（KAIROSOFT 平面无前台，
+ *  改用空地中央；roaming/talking 当前未接线，仅作状态机目标点保留） */
 export const COMMON_TARGETS = [
-  { x: 510, y: 660 },
-  { x: 540, y: 668 },
-  { x: 570, y: 660 },
-  { x: 600, y: 668 },
+  { x: 700, y: 560 },
+  { x: 740, y: 570 },
+  { x: 780, y: 560 },
+  { x: 820, y: 570 },
 ];
 
-/** Roaming waypoints（办公室 5 个地标之间散步）：
- *  蓝沙发+黄豆袋休息区 / 弧形前台 / 玻璃会议室外 / 厨房吧台 / 电视会客区  */
+/** Roaming waypoints（办公室 5 个地标之间散步），按 KAIROSOFT 平面重标：
+ *  左上会议室外 / 左下蓝沙发+豆袋 / 中上双沙发会客区 / 右上厨房吧台 / 右侧灰沙发电视区 */
 export const ROAM_WAYPOINTS = [
-  { x: 238, y: 462 },  // 左下 蓝双人沙发 + 黄豆袋
-  { x: 532, y: 575 },  // HiveWeave 弧形前台 前（前台已移至正门内侧，面向大门）
-  { x: 305, y: 210 },  // 玻璃会议室门外 白板旁
-  { x: 735, y: 150 },  // 右上 厨房吧台 高脚凳前
-  { x: 935, y: 178 },  // 右上 灰色沙发+电视+会客区 地毯边
+  { x: 174, y: 300 },   // 左上 玻璃会议室外
+  { x: 196, y: 545 },   // 左下 蓝沙发 + 黄豆袋休息区
+  { x: 406, y: 140 },   // 中上 双蓝沙发 + 茶几
+  { x: 696, y: 120 },   // 右上 厨房吧台 高脚凳前
+  { x: 1020, y: 280 },  // 右侧 灰沙发 + 电视 + 会客区
 ];
 
 // ── Role Colours ──────────────────────────────────────────────────
@@ -60,6 +80,8 @@ export const ROLE_COLORS: Record<string, number> = {
   manager:          0x3b82f6, // blue
   hr:               0xf43f5e, // rose
   qa:               0xeab308, // yellow
+  qa_lead:          0xeab308, // yellow（2026-09-23 补：实测 TEST_DSH_47 有 qa_lead，
+  //                             原本落兜底 slate ⇒ 名牌职位行与 qa/test_engineer 不同色）
   test_engineer:    0xeab308,
   code_reviewer:    0x818cf8, // indigo
   security_auditor: 0xef4444, // red
@@ -120,27 +142,25 @@ export function isoToScreen(tx: number, ty: number) {
 
 /**
  * 像素资产 URL（Vite public 目录静态文件）。
- * 生成规格见 docs/前端像素办公室规格.md §10；等距风格与场景一致。
+ * 生成规格见 docs/前端设计规格.md §11；等距风格与场景一致。
  */
 export const ASSET_URLS = {
   AGENT_DEV: "/office-assets/agent-dev-sheet.png",
-  AGENT_MANAGER: "/office-assets/agent-manager-sheet.png",
-  AGENT_QA: "/office-assets/agent-qa-sheet.png",
-  DESK: "/office-assets/desk-computer.png",
-  FLOOR_TILE: "/office-assets/floor-tile.png",
-  CHAIR: "/office-assets/office-chair.png",
-  PLANT: "/office-assets/plant.png",
-  SPEECH_BUBBLE: "/office-assets/speech-bubble.png",
-  WALL_WINDOW: "/office-assets/wall-window.png",
-  WHITEBOARD: "/office-assets/whiteboard.png",
-  /** 整间办公室背景（PIL 逐行插值去桌椅版，1672×941：地板/墙/沙发/吧台/绿植等
-   *  不与角色交互的陈设；桌椅全部改由引擎 sprite 渲染。原带桌版备份
-   *  office-scene-bg.with-desks.bak.png）。场景内缩到 WORLD_W×WORLD_H = 1280×720。 */
-  OFFICE_BG: "/office-assets/office-scene-bg.png",
-  /** 分层家具 sprite。BACK = 后椅+远侧显示器；FRONT = 近侧桌面/前椅（挡腿）。
-   *  白桌面楔必须留在 FRONT。query 只为强刷 public/ 无 hash 的 PNG。 */
-  OFFICE_DESK_BACK: "/office-assets/office-desk-back.png?v=chair2",
-  OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png?v=chair2",
+  // ⚠ 全部旧**像素风**素材已于 2026-09-22 清除（用户钦定「永远放弃这个方向」）：
+  //   AGENT_MANAGER / AGENT_QA / FLOOR_TILE / DESK / CHAIR / PLANT /
+  //   SPEECH_BUBBLE / WALL_WINDOW / WHITEBOARD —— 九件，外加 assets/mvp 整条像素管线
+  //   （124 文件 / 5.5 MB）。
+  //   它们服务的绘制路径（程序化房间 + 像素家具，含 _drawRoom / _drawFurniture /
+  //   _drawDesk / _drawPlant … 共 12 个方法、542 行）在 bg 模式下**永不可达**，已一并删除。
+  //   **方向不再恢复**；若需新的场景配件，按 §11.1 的等距高清路线重做（§17-T15）。
+  /** 整间办公室背景。2026-09-21 换为 KAIROSOFT 平面（1104×608 源 → 写入 1280×720 =
+   *  WORLD_W×WORLD_H，world 与底图像素 1:1）。旧底图（1672×941）备份为
+   *  office-scene-bg.pre-kairo.bak.png。陈设不与角色交互，桌椅全部由引擎 sprite 渲染。 */
+  OFFICE_BG: "/office-assets/office-scene-bg.png?v=kairo",
+  /** 分层家具 sprite。BACK = 后椅+远侧显示器+隔板；FRONT = 近侧桌面/前椅（挡腿）。
+   *  2026-09-21 随底图重切（取自真值工位整件、无旧底图烤入阴影），query 递增强刷。 */
+  OFFICE_DESK_BACK: "/office-assets/office-desk-back.png?v=kairo",
+  OFFICE_DESK_FRONT: "/office-assets/office-desk-front.png?v=kairo",
   OFFICE_FRONTDESK_SET: "/office-assets/office-frontdesk-set.png",
   /** 紫衣女孩动画表 v2（2026-09-08：MiniMax H3 本地视频生成抽帧，4×2 = 8 帧全
    *  身坐姿 96×96：帧 0-3 打字循环、帧 4-7 坐姿呼吸。侧视朝右（与 v1/dev 同向，
@@ -178,8 +198,8 @@ export const SHEET_LAYOUTS: Record<string, SheetLayout> = {
   // scaleMode 一律 nearest：linear 会在帧边界采样到相邻帧像素（frame bleeding），
   // 浏览器实拍表现为角色周围半透明矩形"面纱"（2026-09-01 实测，nearest 后消失）
   [ASSET_URLS.AGENT_DEV]: { cols: 8, rows: 4, frameW: 64, frameH: 96, scale: 0.8, scaleMode: "nearest" },
-  [ASSET_URLS.AGENT_MANAGER]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
-  [ASSET_URLS.AGENT_QA]: { cols: 4, rows: 3, frameW: 32, frameH: 48, scale: 1.6, scaleMode: "nearest" },
+  // 旧像素角色表 AGENT_MANAGER / AGENT_QA（32×48 帧）条目 2026-09-22 删除：
+  // lead / review 两类现统一走 AGENT_DEV（高清 64×96），见下方 sheetUrlForKind。
   [ASSET_URLS.AGENT_PURPLE]: { cols: 4, rows: 2, frameW: 96, frameH: 96, scale: 0.8, scaleMode: "nearest" },
 };
 
@@ -263,8 +283,11 @@ export const DESK_SET: {
   rearChair: { dx: number; dy: number };
   frontChair: { dx: number; dy: number };
 } = {
-  back: { w: 159.2, h: 127.8, leftTop: { x: -78.2, y: -62.1 } },  // 208×167：后椅+远侧显示器
-  front: { w: 159.2, h: 88.8, leftTop: { x: -78.2, y: -20.8 } },
+  // 2026-09-21 换底图为 KAIROSOFT 平面后**重切**：整件取自 image_1789991327976.jpg
+  // （848×689 透明底真值工位，无旧底图烤入阴影），切边用旧 front 片已验证的 ∧ 曲线
+  // 作 oracle 映射而来。世界尺度不变（159.2 world ↔ 848 px，S=0.1877）。
+  back: { w: 159.2, h: 106.8, leftTop: { x: -78.2, y: -62.1 } },  // 848×569：后椅+远侧显示器+隔板
+  front: { w: 143.2, h: 88.0, leftTop: { x: -63.2, y: -20.8 } },  // 763×469：近侧桌面+前椅（挡腿）
   /**
    * 后椅（A 位）：锚点 x / 鞋底锚点 y（相对槽位，world 单位）。
    * 2026-09-04：后椅从 BACK 抠除后人看起来坐在桌面上、近侧空椅才像「椅子」。
@@ -305,7 +328,12 @@ export function furnitureSet(desk: DeskSlot): FurnitureSet {
  */
 export function deskDepthBase(desk: DeskSlot): number {
   const set = furnitureSet(desk);
-  return desk.y + set.front.leftTop.y + set.front.h;
+  // + desk.x * 1e-3：**同排并列的 tiebreak**。
+  // 2026-09-23 改成规则网格后，同一排的多张桌 `y` 完全相同 ⇒ base 并列；跨排仍差 132，
+  // 同排靠「JS sort 稳定 + 恰好不重叠」兜底（实测同排 back 间隙仅 6.8px）。
+  // 一旦精灵变宽或席位挪位就会失序，故加一个远小于 1 个 zIndex 单位、只用于同排定序的偏移。
+  // ⚠ 调用方**不得再 Math.round** 这个返回值（会把 1e-3 抹平，tiebreak 失效）。
+  return desk.y + set.front.leftTop.y + set.front.h + desk.x * 1e-3;
 }
 
 /**
@@ -414,8 +442,10 @@ export type AgentAnimKind = keyof typeof AGENT_PROC_ANIM;
 /** role → spritesheet URL（与 resolveDeskRole 三池对齐） */
 export function roleSheetUrl(role: string): string {
   const kind = resolveDeskRole(role);
-  if (kind === "lead") return ASSET_URLS.AGENT_MANAGER;
-  if (kind === "review") return ASSET_URLS.AGENT_QA;
+  // lead / review 曾各有独立像素 sheet（agent-manager / agent-qa，32×48 帧），
+  // 2026-09-22 随美术路线裁决统一到 AGENT_DEV（高清 64×96）—— 像素方向永久放弃。
+  if (kind === "lead") return ASSET_URLS.AGENT_DEV;
+  if (kind === "review") return ASSET_URLS.AGENT_DEV;
   return ASSET_URLS.AGENT_DEV;
 }
 
@@ -457,4 +487,9 @@ export type AssetId = (typeof ASSET_IDS)[keyof typeof ASSET_IDS];
 
 // ── Max Visible Agents ────────────────────────────────────────────
 
-export const MAX_VISIBLE_AGENTS = DESKS.length; // 7（6 张白桌 + 前台柜台）
+/**
+ * 同屏角色上限 = 标定出的席位数（**不是** 7，也不是 §5.3 的 10）。
+ * `OfficeScene._orderedAgents()` 按 id 排序后 `slice(0, 这个数)` —— 超出的 agent
+ * **不上场且无任何提示**（2026-09-22 实测：6 人项目只坐 4 席）。改席位数就是改这个值。
+ */
+export const MAX_VISIBLE_AGENTS = DESKS.length;

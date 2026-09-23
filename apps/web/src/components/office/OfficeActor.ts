@@ -32,17 +32,97 @@ const FOOT_ANCHOR_Y = 0.875;
 
 // ── Label Factory ─────────────────────────────────────────────────
 
-function makeLabel(text: string, size = 12): PIXI.Text {
+/** 名牌排版常量（规格 §4.7：整块 ≤96px、头顶上方 4px） */
+const NAME_FONT_SIZE = 12;
+const ROLE_FONT_SIZE = 10;
+const LABEL_PAD_X = 6;
+const LABEL_PAD_Y = 2;
+/** 行间负 gap：正文行高自带上下留白，直接叠放会多出空行，贴紧才像一块名签 */
+const LABEL_LINE_TIGHTEN = 3;
+const LABEL_BG = 0x0f172a;
+/**
+ * 名牌横向外偏量（world px）。为什么需要（2026-09-23 审计实测）：
+ * 同排相邻两席的**角色中心距**只有 **72.5**（席距 dx=166，A 位在桌左 `-50`、B 位在桌右 `+43.5`），
+ * 而名牌整块可达 96 ⇒ 居中摆放时相邻两块**重叠 23.5px**（`review-3`(A,x=817) 与 `review-1`(B,x=744.5) 即实例）。
+ * 故按座位朝向把名牌**向外**偏：A 位（座在桌左）向左、B 位（座在桌右）向右。
+ * 16 使中心距 72.5 + 2×16 = 104.5 > 96 ✓（留 8.5 缝隙）。
+ */
+const LABEL_SIDE_SHIFT = 16;
+/**
+ * 名牌底板不透明度。0.72 → 0.84（2026-09-23）：底板压在橙色木地板这类亮背景上时，
+ * 0.72 会被稀释到"半透明灰"，名牌两行的对比度都被拉低（职位行的 rose/amber 尤甚）。
+ * 抬到底板更实 = 两行一起变清，不用给文字加描边（描边会糊 10px 中文笔画）。
+ */
+const LABEL_BG_ALPHA = 0.84;
+const LABEL_HEAD_GAP = 4;
+/** 名字行上限 72px = 等宽 12px 下「中文 6 字 / 英文 10 字符」的实测宽度 */
+const NAME_MAX_TEXT_W = 72;
+/** 职位行上限 84px = 整块 96 - 左右内边距 12（中英混排的职务更吃宽度，故比名字行放宽） */
+const ROLE_MAX_TEXT_W = 84;
+
+/**
+ * 名牌文字工厂。描边走 `TextStyle.stroke`（Pixi 直接按字形轮廓画硬边），
+ * 不用 `BlurFilter`/描边滤镜：滤镜在 100+ 名牌下每帧多一次离屏 pass，
+ * 且模糊会把 1px 黑边糊成灰晕，与规格「4 向 1px 硬边、无 blur」相反。
+ */
+function makeLabel(
+  text: string,
+  size: number,
+  color: number,
+  stroke?: { width: number; color: number },
+): PIXI.Text {
   return new PIXI.Text({
     text,
     style: {
       fontFamily: "monospace",
       fontSize: size,
-      fill: 0xf8fafc,
+      fill: color,
       fontWeight: "700",
       align: "center",
+      ...(stroke ? { stroke } : {}),
     },
   });
+}
+
+/**
+ * 按**实测渲染宽度**截断（超出补 "…"）。用宽度而非字数表，是因为 role 有时直接是
+ * 后端给的中文职务（实测有 `Three.js技术负责人`），中英混排下字数与宽度不成比例。
+ */
+function fitText(t: PIXI.Text, maxW: number): void {
+  if (t.width <= maxW) return;
+  const raw = t.text;
+  for (let n = raw.length - 1; n > 0; n--) {
+    t.text = raw.slice(0, n) + "…";
+    if (t.width <= maxW) return;
+  }
+  t.text = "…";
+}
+
+// ── Role Display Name ─────────────────────────────────────────────
+
+/** 后端 role（英文 key）→ 中文显示名，对齐 agent_templates 的职务列 */
+const ROLE_LABELS: Record<string, string> = {
+  ceo: "CEO",
+  hr: "HR",
+  qa_lead: "QA 负责人",
+  test_engineer: "测试工程师",
+  developer: "开发工程师",
+  architect: "架构师",
+  manager: "经理",
+  code_reviewer: "代码审查",
+  security_auditor: "安全审计",
+};
+
+/**
+ * 兜底「员工」而不是原样显示 role：裸 key（`web_perf_auditor`）直接上名牌比不显示更糟。
+ * 但后端部分项目直接下发中文职务，这类必须原样保留 —— 否则按 key 查不到会被吞成「员工」。
+ */
+function roleDisplayName(role: string | undefined | null): string {
+  const raw = (role ?? "").trim();
+  if (!raw) return "员工";
+  const mapped = ROLE_LABELS[raw];
+  if (mapped) return mapped;
+  return /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(raw) ? raw : "员工";
 }
 
 /** Darken a 0xRRGGBB colour by a factor (for shading body parts). */
@@ -57,6 +137,25 @@ function shade(color: number, factor: number): number {
 
 function roleColor(agent: OfficeAgent): number {
   return ROLE_COLORS[agent.role] ?? DEFAULT_ROLE_COLOR;
+}
+
+/**
+ * 名牌上的职位色：深色主色（尤其兜底的 slate `0x64748b`）落在深色底板上等于看不见
+ * ——测试项目 6 个 agent 里 4 个是中文职务/`qa_lead`，全走兜底色，实测那行字糊成一片。
+ * 按比例放大三通道（保 HSL 的色相与饱和度，只抬亮度），阈值取「最亮通道 ≥200」：
+ * amber/blue/red/purple/indigo/yellow/cyan 本来就在阈值上，取值一字不变，
+ * 只有兜底的 slate 被抬成浅灰蓝。**只作用于名牌**，角色身体的 accent 仍用原主色。
+ */
+function labelRoleColor(agent: OfficeAgent): number {
+  const c = roleColor(agent);
+  const r = (c >> 16) & 0xff;
+  const g = (c >> 8) & 0xff;
+  const b = c & 0xff;
+  const max = Math.max(r, g, b);
+  if (max >= 200) return c;
+  const k = 200 / Math.max(1, max);
+  const lift = (v: number) => Math.min(255, Math.round(v * k));
+  return (lift(r) << 16) | (lift(g) << 8) | lift(b);
 }
 
 // ── Actor ─────────────────────────────────────────────────────────
@@ -89,6 +188,8 @@ export class OfficeActor {
   private face: PIXI.Graphics | null = null;
   private workDots = new PIXI.Graphics();
   private label: PIXI.Container;
+  /** 名牌整块高度（两行 + 内边距），构造期量一次用于「头顶上方 4px」定位 */
+  private labelHeight = 0;
   private bubble: PIXI.Container;
   private bubbleDots = new PIXI.Graphics();
 
@@ -112,7 +213,7 @@ export class OfficeActor {
     this.agent = agent;
     this.bubbleTex = bubbleTex;
     this.animSeqs = animSeqs;
-    this.label = this._buildLabel(agent.name);
+    this.label = this._buildLabel(agent.name, agent.role);
     this.bubble = this._buildBubble(bubbleTex);
 
     // Interaction
@@ -164,7 +265,13 @@ export class OfficeActor {
     // shadow 只画一次（脚底位置不变，bounce 只改变 scale）；须在 sprite/body 定案后调用
     this._drawShadow();
     this.container.addChild(this.workDots, this.bubble, this.label);
-    this.label.y = 40;
+    // 名牌底边落在「头顶上方 4px」：sprite 模式头顶 = 帧高 × 脚底锚点比例（96×0.875×0.8 ≈ 67），
+    // 程序化模式发梢硬编码在 -33（见 _drawBody 的 hair roundRect）。
+    // 名牌容器原点 = 底板顶边中线，故 y = 头顶 - 4 - 整个名牌高度。
+    const headTop = this.sprite
+      ? -Math.abs(this.sprite.scale.y) * this.sprite.texture.height * FOOT_ANCHOR_Y
+      : -33;
+    this.label.y = headTop - LABEL_HEAD_GAP - this.labelHeight;
     this.bubble.visible = false;
 
     // Listen for state transitions (e.g. bubble pop animation)
@@ -192,7 +299,13 @@ export class OfficeActor {
     const output = this.fsm.evaluate(input);
     this.bubble.visible = output.showBubble;
     this.bubble.y = input.talking ? -56 : -48;
-    this.label.visible = selected || input.talking;
+    // 名牌默认常显（§4.7「默认开」）。此前只在选中/说话时显示，画面上根本认不出谁是谁；
+    // 选中改用轻微放大做强调，不再兼作可见性开关（关闭开关留给 HUD，未接）。
+    this.label.scale.set(selected ? 1.08 : 1);
+    // 名牌按座位朝向向外偏，避免与邻座名牌重叠（理由见 LABEL_SIDE_SHIFT）。
+    // 只在取值变化时赋值：这是一帧一次的 setTarget，不是构造期，避免无谓的 transform 记号。
+    const sideShift = sitVariant === "B" ? LABEL_SIDE_SHIFT : -LABEL_SIDE_SHIFT;
+    if (this.label.x !== sideShift) this.label.x = sideShift;
     const a = stateAlpha(output.visual);
     if (this.body) this.body.alpha = a;
     if (this.face) this.face.alpha = a;
@@ -392,16 +505,36 @@ export class OfficeActor {
 
   // ── Private ───────────────────────────────────────────────────
 
-  private _buildLabel(name: string): PIXI.Container {
+  /**
+   * 两行名牌：名字（12px 白字 + 1px 黑描边）+ 职位（10px，role 主色）。
+   * **只在构造期建一次** —— Pixi Text 自带纹理缓存，只要不重设 `.text` 就不重上传纹理；
+   * 名牌随小人走位时更新的是容器 transform，代价接近 0。
+   * 深色圆角底板保留：role 主色里有 amber/yellow/cyan 这类浅色，落在地板或玻璃墙前
+   * 单靠描边仍会糊；底板同时把两行括成一块，读起来是一个人的名签而不是两条标签。
+   */
+  private _buildLabel(name: string, role: string): PIXI.Container {
     const c = new PIXI.Container();
-    const text = makeLabel(name, 10);
-    text.anchor.set(0.5, 0);
-    text.y = 1;
-    const w = Math.max(30, text.width + 14);
+    const nameText = makeLabel(name, NAME_FONT_SIZE, 0xf8fafc, { width: 1, color: 0x000000 });
+    // 职位行**不加描边**（2026-09-23 审计后回退我先加的那版）：10px 中文叠 1px 描边会糊笔画，
+    // 且两行权重失衡。真因是底板只有 72% 不透明、压在橙色木地板上被稀释 ⇒ 抬底板不透明度
+    // （LABEL_BG_ALPHA）一行同时修好两行的对比度，比"两行都加描边"干净。
+    const roleText = makeLabel(roleDisplayName(role), ROLE_FONT_SIZE, labelRoleColor(this.agent));
+    fitText(nameText, NAME_MAX_TEXT_W);
+    fitText(roleText, ROLE_MAX_TEXT_W);
+    nameText.anchor.set(0.5, 0);
+    roleText.anchor.set(0.5, 0);
+    nameText.y = LABEL_PAD_Y;
+    roleText.y = nameText.y + nameText.height - LABEL_LINE_TIGHTEN;
+
+    const innerW = Math.max(nameText.width, roleText.width);
+    const w = Math.min(96, innerW + LABEL_PAD_X * 2);
+    const h = roleText.y + roleText.height + LABEL_PAD_Y;
     const bg = new PIXI.Graphics();
-    bg.roundRect(-w / 2, -2, w, 17, 8.5);
-    bg.fill({ color: 0x0f172a, alpha: 0.72 });
-    c.addChild(bg, text);
+    bg.roundRect(-w / 2, 0, w, h, 7);
+    bg.fill({ color: LABEL_BG, alpha: LABEL_BG_ALPHA });
+
+    this.labelHeight = h;
+    c.addChild(bg, nameText, roleText);
     return c;
   }
 

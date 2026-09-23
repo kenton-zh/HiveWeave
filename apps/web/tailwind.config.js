@@ -41,6 +41,21 @@ export default {
           purple: "#7c3aed",
           "purple-bg": "#f3e8ff",
           "purple-vivid": "#a78bfa",
+          // ── 游戏窗口层（与办公室等距场景同风格）──────────────────────
+          // 取值自 docs/design-refs/office-main-ui-ref-v1.png（3daistudio
+          // edit_image_gpt 以 office-scene-bg.png 为参考图生成，2026-09-22）。
+          // ⚠ 这里不是像素皮肤 —— 场景是等距高清插画，见设计规格 §3 的美术路线裁决。
+          "win-header": "#394d6a",
+          "win-header-fg": "#f2f5f9",
+          "win-header-hover": "#2f405a",
+          "win-body": "rgba(246,242,236,.97)",
+          "win-border": "rgba(28,38,56,.12)",
+          "win-close": "#d24d44",
+          "win-close-hover": "#c03d34",
+          "win-control": "#b9c3d1",
+          "win-control-hover": "rgba(255,255,255,.12)",
+          "win-scroll": "rgba(57,77,106,.26)",
+          "win-scroll-hover": "rgba(57,77,106,.42)",
         },
       },
       borderRadius: {
@@ -54,6 +69,8 @@ export default {
         "gm-lg": "0 4px 8px -2px rgba(23,25,35,.06), 0 12px 28px -6px rgba(23,25,35,.12)",
         "gm-pop": "0 6px 12px -2px rgba(23,25,35,.08), 0 20px 44px -10px rgba(23,25,35,.18)",
         "gm-glow": "0 0 0 1px rgba(79,70,229,.16), 0 4px 16px 2px rgba(79,70,229,.20)",
+        // 游戏窗口：大范围柔阴影（**无硬边**），与等距场景的柔光感一致
+        "gm-window": "0 18px 40px -12px rgba(16,24,40,.34), 0 4px 12px -4px rgba(16,24,40,.16)",
       },
       transitionTimingFunction: {
         "gm-out": "cubic-bezier(0.22, 1, 0.36, 1)",

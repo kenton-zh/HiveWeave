@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCommunications, getOrgTree } from "../api";
 import { useAppStore } from "../store";
 import { OfficeScene } from "./office/OfficeScene";
+import { MAX_VISIBLE_AGENTS } from "./office/constants";
 import type { OfficeAgent, OfficeInteraction, SceneSnapshot } from "./office/types";
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -213,6 +214,13 @@ export default function OfficeView() {
           <span className={`w-1.5 h-1.5 rounded-full ${processingAgents.length > 0 ? "bg-g-green-vivid animate-pulse" : "bg-g-fg-4"}`} />
           <span className="text-[10px] text-g-fg-3 font-mono">
             PixiJS v8 · {agents.length} agents · {processingAgents.length} active
+            {/* 超过席位的 agent 会被 OfficeScene 静默 slice 掉（不上场、无提示）。
+                规则网格上限见 office/constants.ts 的 DESKS —— 这里把"丢了几个人"说出来。 */}
+            {agents.length > MAX_VISIBLE_AGENTS && (
+              <span className="text-g-yellow" title={`席位只有 ${MAX_VISIBLE_AGENTS} 个（规则网格上限），超出的不会出现在场景里`}>
+                {" "}· ⚠ {agents.length - MAX_VISIBLE_AGENTS} 人无座
+              </span>
+            )}
           </span>
         </div>
       )}

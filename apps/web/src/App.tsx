@@ -9,6 +9,7 @@ import TokenUsagePanel from "./components/TokenUsagePanel";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { useLiveStatusPoll } from "./hooks/useLiveStatusPoll";
 import AssistantBall from "./components/AssistantBall";
+import OfficeWorkspace from "./components/OfficeWorkspace";
 import { lazyRetry, resolveLeftPanel } from "./mainPanel";
 
 // Lazy-loaded: only fetched when the user navigates to them.
@@ -51,6 +52,9 @@ function App() {
   const activeView = useAppStore((s) => s.activeView);
   const setActiveView = useAppStore((s) => s.setActiveView);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
+  // 主界面形态：office = 办公室主界面（默认，ADR-011 §D2）｜ workbench = 旧三栏工作台
+  // （过渡期回退形态；验证稳定后按 ADR-011 迁移第 2 步退役三栏）
+  const [workspaceMode, setWorkspaceMode] = useState<"office" | "workbench">("office");
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
   // P3-3 窄屏降级（<1280px）：三栏折回两栏 + tab（Chat 回到右栏）。
@@ -537,6 +541,7 @@ function App() {
         {/* Project Selector */}
         <div className="ml-6 relative" ref={projectMenuRef}>
           <button
+            data-testid="project-trigger"
             onClick={() => setShowProjectMenu(!showProjectMenu)}
             className={`flex items-center gap-2 px-3 py-1.5 rounded-gm bg-white border transition-all duration-200 text-[12px] text-g-fg shadow-gm-sm hover:shadow-gm active:scale-[0.98] ${
               showProjectMenu ? "border-g-blue/50 ring-2 ring-g-blue/15" : "border-g-border hover:border-g-border-strong"
@@ -558,7 +563,10 @@ function App() {
             </div>
           )}
           {showProjectMenu && (
-            <div className="absolute top-full left-0 mt-1.5 w-56 max-h-[calc(100vh-5rem)] flex flex-col bg-white border border-g-border rounded-gmLg shadow-gm-pop z-50 py-1.5 px-1 animate-scale-in origin-top-left">
+            <div
+              data-testid="project-menu"
+              className="absolute top-full left-0 mt-1.5 w-56 max-h-[calc(100vh-5rem)] flex flex-col bg-white border border-g-border rounded-gmLg shadow-gm-pop z-50 py-1.5 px-1 animate-scale-in origin-top-left"
+            >
               <div ref={projectListRef} className="overflow-y-auto min-h-0">
                 {projects.map((p) => (
                   <div
@@ -710,6 +718,13 @@ function App() {
         </div>
       </header>
 
+      {/* 主界面形态：办公室（默认）/ 工作台（旧三栏，过渡期回退）。
+          ⚠ 三栏分支的内部缩进刻意保持原样未动 —— 1000+ 行文件重排缩进的出错
+          风险大于收益，等三栏按 ADR-011 正式退役时一并清理。 */}
+      {workspaceMode === "office" ? (
+        <OfficeWorkspace onExitToWorkbench={() => setWorkspaceMode("workbench")} />
+      ) : (
+      <>
       {/* Main Content — floating panels on a gray workbench.
           P3：宽屏 = 三栏（Org/Office ｜ Chat 独立中栏 ｜ 详情），可拖拽分栏
           （autoSaveId 持久化栏宽到 localStorage）；窄屏(<1280px) = 两栏 +
@@ -932,6 +947,19 @@ function App() {
         </div>
         </Panel>
       </PanelGroup>
+      </>
+      )}
+
+      {/* 工作台模式下的回办公室入口（办公室模式内已有 HUD 入口） */}
+      {workspaceMode === "workbench" && (
+        <button
+          onClick={() => setWorkspaceMode("office")}
+          className="fixed bottom-5 right-5 z-40 px-3.5 py-2 rounded-full bg-[#394d6a] text-white text-xs font-medium shadow-gm-md hover:bg-[#2f405a] transition-colors"
+          title="切回办公室主界面"
+        >
+          办公室
+        </button>
+      )}
 
       {/* Lazy-loaded dialogs — wrapped in Suspense, fallback=null since they're overlays */}
       <ErrorBoundary label="对话框" fallback={null}>

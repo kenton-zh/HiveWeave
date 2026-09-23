@@ -1,0 +1,116 @@
+/**
+ * 游戏窗口层 —— 与办公室场景**同风格**的窗口皮肤
+ *
+ * 视觉基准：`docs/design-refs/office-main-ui-ref-v1.png`
+ * （3daistudio `edit_image_gpt` 以 `office-scene-bg.png` 为风格参考图生成，2026-09-22）
+ *
+ * ⚠ 关键：场景是**等距高清插画**（KAIROSOFT 平面，平滑阴影/渐变/圆角家具），
+ * **不是像素风** —— 见 `docs/前端设计规格.md` §3 的美术路线裁决（2026-09-22 用户
+ * 认概念稿方向，v1.8 的像素皮肤条款作废）。所以这里刻意不用「深蓝 #1D2B53 标题栏
+ * ＋ 2px 硬边黑框 ＋ 红色方块关闭钮 ＋ 4px 硬偏移阴影」那套，改为与场景同款的
+ * 「柔和圆角 ＋ 大范围柔阴影 ＋ 暖白半透明」。
+ *
+ * 颜色/阴影**全部走 tailwind 令牌**（`g-win-*` / `shadow-gm-window`，定义在
+ * `tailwind.config.js`），不在本文件写裸值 —— 与 §4.1「禁止裸值」一致。
+ * 全部选择器限定在 `.hw-win` 作用域内，不污染应用其余部分。
+ */
+
+/* ── 窗体 ─────────────────────────────────────────────────────── */
+.hw-win.winbox {
+  background: theme("colors.g.win-body");
+  border: 1px solid theme("colors.g.win-border");
+  border-radius: 12px;
+  box-shadow: theme("boxShadow.gm-window");
+  overflow: hidden;
+}
+
+/* ── 标题栏 ───────────────────────────────────────────────────── */
+.hw-win .wb-header {
+  height: 36px;
+  line-height: 36px;
+  background: theme("colors.g.win-header");
+  color: theme("colors.g.win-header-fg");
+}
+
+.hw-win .wb-title {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.hw-win .wb-drag {
+  padding-left: 12px;
+}
+
+/* ── 控制按钮：清掉 WinBox 的背景图图标，改自绘 ────────────────── */
+.hw-win .wb-control * {
+  background-image: none !important;
+  width: 26px;
+  font-size: 12px;
+  line-height: 36px;
+  text-align: center;
+  color: theme("colors.g.win-control");
+}
+
+.hw-win .wb-close {
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  margin: 9px 10px 0 0;
+  border-radius: 5px;
+  background: theme("colors.g.win-close");
+  color: theme("colors.g.bg");
+  font-size: 10px;
+  font-weight: 700;
+}
+.hw-win .wb-close::after {
+  content: "✕";
+}
+.hw-win .wb-close:hover {
+  background: theme("colors.g.win-close-hover");
+}
+
+.hw-win .wb-min::after {
+  content: "—";
+}
+.hw-win .wb-min:hover {
+  background: theme("colors.g.win-control-hover");
+  color: theme("colors.g.bg");
+}
+
+/* 概念稿里窗口只有一个关闭钮；最大化在定尺度视口下没有信息价值 */
+.hw-win .wb-max {
+  display: none;
+}
+
+/* ── 内容区 ───────────────────────────────────────────────────── */
+.hw-win .wb-body {
+  top: 36px;
+  overflow: hidden;
+  background: transparent;
+  /* WinBox 默认 contain:strict 会隔离尺寸计算；面板自带滚动，改 layout 更稳 */
+  contain: layout;
+}
+
+/* ── 与场景色调协调的细滚动条 ──────────────────────────────────── */
+.hw-win .wb-body ::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+.hw-win .wb-body ::-webkit-scrollbar-track {
+  background: transparent;
+}
+.hw-win .wb-body ::-webkit-scrollbar-thumb {
+  background: theme("colors.g.win-scroll");
+  border-radius: 6px;
+}
+.hw-win .wb-body ::-webkit-scrollbar-thumb:hover {
+  background: theme("colors.g.win-scroll-hover");
+}
+
+/* ── 最小化态 ─────────────────────────────────────────────────── */
+.hw-win.min .wb-header {
+  border-radius: 12px;
+}
