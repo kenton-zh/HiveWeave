@@ -74,7 +74,7 @@ describe("MessageBubble round_boundary 渲染（live==persisted）", () => {
 
 /**
  * P0 富文本（2026-09-05）：text 段经 MarkdownText 做 markdown 渲染。
- * 安全基线见 MarkdownText.tsx 头注释 / docs/2026-09-05/chat-rich-text-design.md §3.2：
+ * 安全基线见 MarkdownText.tsx 头注释 / docs/前端设计规格.md §10.1.1：
  * 无 HTML 直通（不装 rehype-raw）、链接/图片协议白名单、外链 noopener。
  */
 describe("MessageBubble text 段 markdown 渲染（P0）", () => {

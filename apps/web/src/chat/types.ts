@@ -36,7 +36,7 @@ export type ContextMarkerKind = "compaction" | "prune";
 
 /**
  * 聊天附件引用（学 DSH ImageAttachmentRef 的字段语义，见
- * docs/2026-09-05/chat-rich-text-design.md §2 P1）：
+ * docs/前端设计规格.md §10.1.3）：
  * - `urlOrId` 是存储句柄（不透明 id 或 URL），**优先于**内联 base64 ——
  *   持久化引用走句柄，避免把字节塞进消息体。
  * - `name` 仅供显示，产出方必须剥掉本地路径成分（DSH types.ts:22-23）。

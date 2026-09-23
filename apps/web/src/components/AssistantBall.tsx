@@ -15,7 +15,7 @@
  *
  * 面板只承载助理对话（用户 2026-09-08 拍板「助理面板里只有助理」）——
  * /api/ball/state 里的项目 CEO 分支此处不消费，CEO 对话走网页端项目
- * 切换器；设计稿 assistant-and-feishu-design.md §10 已同步修订。
+ * 切换器；设计见 docs/前端设计规格.md §10.3。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";

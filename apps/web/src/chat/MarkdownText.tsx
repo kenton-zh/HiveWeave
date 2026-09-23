@@ -5,7 +5,7 @@ import remarkBreaks from "remark-breaks";
 import "./MarkdownText.css";
 
 /**
- * text 段 markdown 渲染（P0，学 DSH 的安全策略，见 docs/2026-09-05/chat-rich-text-design.md）。
+ * text 段 markdown 渲染（P0，学 DSH 的安全策略，见 docs/前端设计规格.md §10.1）。
  *
  * 安全基线（对齐 DSH ui-primitives/markdown/render.tsx 的 Untrusted-output policy）：
  * - 渲染通道是 hast→React（react-markdown），全程无 HTML 字符串解析、无
