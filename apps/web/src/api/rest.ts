@@ -1012,6 +1012,10 @@ export interface BrowseResult {
   }>;
   drives?: string[];
   isRoot?: boolean;
+  /** 后端遍历时因 stat 失败被降级为 size=0 的条目数（前端会提示列表不完整） */
+  skipped?: number;
+  /** 后端遍历中途出错、返回的是**不完整**列表（entries 仍保留已读到的部分） */
+  partial?: boolean;
   error?: string;
 }
 
@@ -1020,6 +1024,30 @@ export async function browseDirectory(path?: string): Promise<BrowseResult> {
   if (path) params.set("path", path);
   const qs = params.toString();
   return fetchJSON(`${BASE}/fs/browse${qs ? "?" + qs : ""}`);
+}
+
+export interface PickFolderNativeResult {
+  /** 后端**能否**弹系统原生选择器（false ⇒ 应回退网页版目录浏览器）。 */
+  available: boolean;
+  /** 已有一个系统选择窗口在等待 —— 调用方应提示用户，不要再叠网页版。 */
+  busy?: boolean;
+  /** 用户选中的**绝对路径**；null = 用户取消。 */
+  path: string | null;
+  reason?: string | null;
+}
+
+/**
+ * 让**后端**弹系统原生文件夹选择器，返回绝对路径。
+ *
+ * 为什么走后端（2026-09-23）：浏览器沙箱下 Web 页面拿不到用户所选目录的绝对路径 ——
+ * `<input webkitdirectory>` 不上报路径，File System Access API（`showDirectoryPicker`）
+ * 只给 `FileSystemDirectoryHandle`（没有 `.path`）。而后端本机进程能直接调系统对话框，
+ * 于是「网页端 + 系统原生外观 + 绝对路径」三者可以同时成立。
+ *
+ * 该请求会一直挂到用户选完/取消（后端线程阻塞），浏览器侧不需要设超时。
+ */
+export async function pickFolderNative(): Promise<PickFolderNativeResult> {
+  return fetchJSON(`${BASE}/fs/pick-folder`, { method: "POST" });
 }
 
 // ---------------------------------------------------------------------------
