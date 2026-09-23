@@ -87,24 +87,33 @@ def _isolate_hiveweave_env(monkeypatch):
 #   所以直接 patch settings **对象本身**：``get_meta_db_path()`` 优先返回
 #   ``self.meta_db_path``（config.py 的显式字段最高优先），与 env 无关。
 #
-# 作用域选 session：只建一次表（全套 1000+ 用例若各建一次库，建表开销会
-# 累加到几十秒）。隔离性相比改造前是**严格改善** —— 之前是所有测试共享
-# **生产库**，现在共享一个一次性的临时库。
-@pytest.fixture(scope="session", autouse=True)
-def _isolate_meta_db(tmp_path_factory):
-    """把 meta DB 钉到会话级临时路径 —— 测试绝不写生产库。"""
+# 作用域选 **function**（2026-09-23 独立审计后从 session 改回）：每个用例一个独立
+# 临时库，消除「测试写的行被后一个用例读到」这条**同类机制** —— 本次事故正是
+# "测试写的一行被产品代码读到"（lifespan 逐项目探针跑到 1192 行）。session 级
+# 共享库只是把受害者从"生产启动 140 秒"换成"某个恰好枚举 projects 的用例"，
+# 属于隐匿的顺序耦合而不是隔离。
+#
+# ⚠ 审计纠错：我原先写"session 只建一次表（省几十秒）"——**那是错的**。
+#   `_close_db_connections_after_test`（function 级 autouse，见下）每个用例后都会
+#   `close_meta_db()` ⇒ `_db = None`、`_migrated = False` ⇒ 下一个碰 meta DB 的
+#   用例照样完整重跑 `META_DB_TABLES` + `META_DB_INDEXES` + `_migrate_meta_schema()`。
+#   建表开销与作用域**无关**，所以"省建表"从来不是选 session 的理由。
+#
+# ⚠ 本隔离的**前提条件**：`_close_db_connections_after_test` 必须存在且保持
+#   function 级 autouse —— 它保证 `_db` 不跨用例存活（否则会出现"`_db` 指向旧库、
+#   settings 指向新库"的世代错配），也保证每用例都是全新库。
+#   同理它还是"undo 早于 close"这条顺序的保障。**不要为了省 1000 次 close 把它
+#   改成 session 级** —— 那会同时打破两条，症状极难查。
+#
+# 守卫：`tests/test_meta_db_isolation.py` 断言测试期的 meta 路径不是生产库 ——
+#   否则这整个夹具被删/改名都不会有任何用例变红（审计 P1：病灶之所以积到 1137 行，
+#   根因就是"在测试里不可观测"）。
+@pytest.fixture(autouse=True)
+def _isolate_meta_db(tmp_path, monkeypatch):
+    """把 meta DB 钉到**本用例**的临时路径 —— 测试绝不写生产库。"""
     from hiveweave.config import settings
 
-    mp = pytest.MonkeyPatch()
-    root = tmp_path_factory.mktemp("meta-db")
-    db = root / "hiveweave.db"
-    mp.setattr(settings, "meta_db_path", str(db), raising=False)
-    # 打印一行现场，便于日后核对"测试到底写了哪个库"（判据是路径，不是感觉）
-    print(f"\n[conftest] meta DB 隔离 → {db}")
-    try:
-        yield db
-    finally:
-        mp.undo()
+    monkeypatch.setattr(settings, "meta_db_path", str(tmp_path / "meta-db.db"))
 
 
 @pytest.fixture(autouse=True)
