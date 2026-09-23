@@ -69,6 +69,44 @@ def _isolate_hiveweave_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+# ── meta DB 隔离（2026-09-23）──────────────────────────────────
+# 病灶：`tests/test_modules_tree.py::_make_project` 与
+# `tests/test_memory_sinking.py::_make_project` 都直接
+# ``INSERT INTO projects``，而 ``meta_db.init_meta_db()`` 取的是
+# ``settings.get_meta_db_path()`` 的**默认值 = 生产库**
+# ``apps/hiveweave-py/data/hiveweave.db``；测试结束只 close 连接、
+# **从不删行** ⇒ 每跑一次 pytest 就往生产库永久插一行。
+# 实测累积到 **1137 行**（"Module Tree Test" 820 + "Memory Sink Test" 312），
+# 后果是后端启动被拖到 **~140 秒**（lifespan 要逐个真实项目跑 ACL 哨兵探针）
+# 且项目列表被测试垃圾淹没。已于 2026-09-23 手工清理（1192 → 55），
+# 本夹具负责「不再长回来」。
+#
+# ⚠ 为什么不用 ``HIVEWEAVE_META_DB_PATH`` 环境变量：上面那个 autouse 的
+#   ``_isolate_hiveweave_env`` 会把**所有** ``HIVEWEAVE_*`` 前缀删掉 ——
+#   env 这条通道是堵死的（这正是"设了 env 也不生效"的原因）。
+#   所以直接 patch settings **对象本身**：``get_meta_db_path()`` 优先返回
+#   ``self.meta_db_path``（config.py 的显式字段最高优先），与 env 无关。
+#
+# 作用域选 session：只建一次表（全套 1000+ 用例若各建一次库，建表开销会
+# 累加到几十秒）。隔离性相比改造前是**严格改善** —— 之前是所有测试共享
+# **生产库**，现在共享一个一次性的临时库。
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_meta_db(tmp_path_factory):
+    """把 meta DB 钉到会话级临时路径 —— 测试绝不写生产库。"""
+    from hiveweave.config import settings
+
+    mp = pytest.MonkeyPatch()
+    root = tmp_path_factory.mktemp("meta-db")
+    db = root / "hiveweave.db"
+    mp.setattr(settings, "meta_db_path", str(db), raising=False)
+    # 打印一行现场，便于日后核对"测试到底写了哪个库"（判据是路径，不是感觉）
+    print(f"\n[conftest] meta DB 隔离 → {db}")
+    try:
+        yield db
+    finally:
+        mp.undo()
+
+
 @pytest.fixture(autouse=True)
 async def _close_db_connections_after_test():
     yield
