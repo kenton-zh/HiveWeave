@@ -73,7 +73,7 @@ async def test_upstream_stream_error_retried_once_then_ok(monkeypatch):
         "hiveweave.agents.agent.compute_backoff",
         lambda attempt, retry_after_ms=None: 0,
     )
-    await agent._run_llm("user says hi", {})
+    await agent._run_llm("user says hi", {}, interrupted_run_id=None)
 
     assert factory.calls == 2  # 首撞 + 重试
     agent._handle_error.assert_not_awaited()
@@ -91,7 +91,7 @@ async def test_non_upstream_error_not_retried(monkeypatch):
     agent = _prepared_agent()
 
     monkeypatch.setattr("hiveweave.agents.agent.Streamer", factory)
-    await agent._run_llm("user says hi", {})
+    await agent._run_llm("user says hi", {}, interrupted_run_id=None)
 
     assert factory.calls == 1  # 不重试
     agent._handle_error.assert_awaited_once()  # 落既有错误治理

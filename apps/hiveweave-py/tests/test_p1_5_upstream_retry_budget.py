@@ -220,15 +220,25 @@ async def test_stale_interrupted_run_is_not_carried_over(p15_env) -> None:
     )
 
 
-# ── F ⭐ 生产者侧守卫：归零点必须**真的**走 helper ───────────────
-# ⚠ 为什么必须单列一条：上面 A–E **全部直接调** `Agent._resume_upstream_attempt`
-#   ⇒ 它们只证明"这个 helper 行为对"，**证不了"归零点用了它"**。把 `agent.py` 的
-#   归零点改回无条件 `= 0`，A–E **一条都不会红**（与 D67-1 的 P1-b 同款空守卫：
-#   只测机制、不测接线）。判据用 **AST**（用户 09-14 钦定：测试守卫禁用文本子串）。
+# ── F / G / H ⭐ 生产者侧守卫：归零点必须**真的**走 helper，且**在同一作用域内** ──
+# ⚠ 为什么必须单列：上面 A–E **全部直接调** `Agent._resume_upstream_attempt`
+#   ⇒ 只证"这个 helper 行为对"，**证不了"归零点用了它"**。把归零点改回无条件
+#   `= 0`，A–E **一条都不会红**（与 D67-1 的 P1-b 同款空守卫：只测机制、不测接线）。
+# 判据用 **AST**（用户 09-14 钦定：测试守卫禁用文本子串）。
+#
+# ⚠⚠ 2026-09-23 线上实锤 —— **本条守卫自己的失效史，必须留痕**：
+#   原 G 只比**全文件行号序**。P1-5 落地时把求值写进了 `chat()`（它在 `_run_llm`
+#   **上方**、行号更小）⇒ 文件序成立、**G 全绿**，可 `_run_llm` 根本看不见那个
+#   局部变量 ⇒ **每个 turn 在首请求前 `NameError`，整个平台停摆**（用户截图 +
+#   dist 日志 `agent.py:1441 in _run_llm`）。那一次 A–H 共 8 条全绿。
+#   ⇒ 教训一：**跨函数的行号序不是时序**。G 现在同时要求"同一函数作用域"。
+#   ⇒ 教训二：唯一**执行** `_run_llm` 的 test_main_loop_retry.py 当时不在末次
+#      回归范围内 ⇒ 新增 H 把那一格职责钉进本条。
+#   ⚠ 可复用判据：**判"两条线接上了"时，先问"这两条线在不在同一个作用域"**；
+#      跨作用域的"先后关系"是文本判据，能骗过守卫（本条即标本）。
 
 
-def test_reset_point_really_calls_the_resume_helper() -> None:
-    """F：`_main_upstream_attempt` 的**赋值点**必须是对 helper 的 await 调用。"""
+def _agent_ast():
     import ast
     import pathlib
 
@@ -236,7 +246,43 @@ def test_reset_point_really_calls_the_resume_helper() -> None:
 
     src = (pathlib.Path(hiveweave.__file__).resolve().parent
            / "agents" / "agent.py")
-    tree = ast.parse(src.read_text(encoding="utf-8"))
+    return ast.parse(src.read_text(encoding="utf-8"))
+
+
+def _enclosing_function(tree, target):
+    """包住 `target` 的**最内层**函数节点（嵌套时取行跨度最小的那个）。"""
+    import ast
+
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(child is target for child in ast.walk(node)):
+                found.append(node)
+    if not found:
+        return None
+    return min(found, key=lambda n: n.end_lineno - n.lineno)
+
+
+def _calls_named(tree, attr: str):
+    """返回属主属性名等于 `attr` 的 **Call 节点**列表。"""
+    import ast
+
+    return [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == attr
+    ]
+
+
+def test_reset_point_really_calls_the_resume_helper() -> None:
+    """F：`_main_upstream_attempt` 的**赋值点**必须是对 helper 的 await 调用。
+
+    ⚠ 这里**不得**再给 `ast.Name`（局部变量）开后门：那个分支正是 2026-09-23
+    那次事故的逃生口 —— 右值写成 `restored_upstream_attempt` 也照样绿，而那个名字
+    在另一个函数里。形态锁死为**内联 await**（右值不许是字面量、也不许是名字）。
+    """
+    import ast
+
+    tree = _agent_ast()
 
     assigns = [
         n for n in ast.walk(tree)
@@ -251,6 +297,17 @@ def test_reset_point_really_calls_the_resume_helper() -> None:
         "（守卫的作废条件必须显式暴露，不能静默恒绿）"
     )
 
+    literals = [ast.dump(n.value)[:80] for n in assigns
+                if isinstance(n.value, ast.Constant)]
+    assert not literals, f"归零点被写死了（归零时机回归）：{literals}"
+
+    bare_names = [n.value.id for n in assigns if isinstance(n.value, ast.Name)]
+    assert not bare_names, (
+        f"归零点的右值是不经内联的裸名字 {bare_names} —— 这正是 2026-09-23 的病灶"
+        f"（`restored_upstream_attempt` 写在 `chat()` 里，`_run_llm` 看不见 ⇒ 每轮"
+        f"NameError）。必须内联 `await self._resume_upstream_attempt(...)`"
+    )
+
     def _is_resume_call(node: ast.AST) -> bool:
         return (
             isinstance(node, ast.Await)
@@ -258,26 +315,11 @@ def test_reset_point_really_calls_the_resume_helper() -> None:
             and getattr(node.value.func, "attr", "") == "_resume_upstream_attempt"
         )
 
-    # 形态二选一：直接 `= await _resume_upstream_attempt(...)`，或赋一个**由它算出的局部**。
-    # ⚠ 无论哪种，**右值都不许是字面量** —— 那正是"退回无条件 `= 0`"的签名。
-    literals = [
-        ast.dump(n.value)[:80] for n in assigns
-        if isinstance(n.value, ast.Constant)
-    ]
-    assert not literals, (
-        f"归零点被写死了（归零时机回归）：{literals}"
+    assert all(_is_resume_call(n.value) for n in assigns), (
+        "归零点的右值不是 `await self._resume_upstream_attempt(...)` —— 形态变了，"
+        "本条守卫需重新表述（不许静默放过）"
     )
-    assert any(_is_resume_call(n.value) for n in assigns) or any(
-        isinstance(n.value, ast.Name) for n in assigns
-    ), "归零点的右值既不是 helper 调用也不是局部变量 —— 形态变了，本条守卫需重新表述"
 
-    # helper **必须存在**（否则上面的"局部变量"来源无从谈起）
-    assert any(
-        isinstance(n, ast.Await)
-        and isinstance(n.value, ast.Call)
-        and getattr(n.value.func, "attr", "") == "_resume_upstream_attempt"
-        for n in ast.walk(tree)
-    ), "全文件找不到 `_resume_upstream_attempt` 的调用 —— 承接被摘掉了"
     # `+= 1` 是 AugAssign、不在上面集合里；显式确认它**仍然存在**（自增点没被删）
     assert any(
         isinstance(n, ast.AugAssign)
@@ -288,40 +330,234 @@ def test_reset_point_really_calls_the_resume_helper() -> None:
 
 
 def test_carry_over_is_evaluated_before_create_run() -> None:
-    """⭐⭐ **时序守卫**（P0 防线）：承接判定必须排在 `create_run` **之前**。
+    """⭐⭐ **时序守卫**（P0 防线）：**给归零点供值的那次** `_resume_upstream_attempt`
+    调用，必须在 `create_run` **之前**，且**在同一个函数作用域内**。
 
-    为什么这条比 F 还重要：`_resume_upstream_attempt` 内部的 `is_latest_run` 问的是
+    两条约束都是踩过坑才加上的，缺一不可：
+
+    * **作用域**（2026-09-23 线上事故）：求值被写进 `chat()`（行号更小、文件序成立）
+      而消费在 `_run_llm` ⇒ 跨函数局部量不可见 ⇒ **每个 turn 首请求前 `NameError`**，
+      平台停摆，而当时 8 条守卫全绿。⇒ **跨函数的行号序不是时序**。
+    * **绑到赋值的右值**（2026-09-23 审计实测 M5）：原先比的是"**存在**一次
+      `_resume_upstream_attempt` 调用排在 `create_run` 之前"。审计构造出一个
+      **不被使用的诱饵调用**放在 `create_run` 前、真赋值挪到其后 ⇒ F/G/H **三条全绿**，
+      而运行期承接恒为 0（静默退回旧的"每轮归零"）。
+      ⇒ **存在性判据必须绑到承重对象上**；"某处有个同名调用"证明不了任何事。
+
+    为什么非要问时序：`_resume_upstream_attempt` 内部的 `is_latest_run` 问的是
     "那条中断 run 是不是本 agent 最后一个 run"。**若在 `create_run` 之后求值**，
-    "最后一个 run"永远是**本轮刚建的那一条** ⇒ 判定**恒 False** ⇒ **承接永不生效**
-    （整个 P1-5 退化成旧的"每轮归零"），而且**行为类测试全绿** —— 因为它们构造的
-    "库里只有那条中断 run"这一状态，在**生产里不可达**（生产那一刻必有本轮的新 run）。
-
-    ⇒ 判据只能用**结构**（AST 行号序），不能用"跑一遍看结果"。
+    "最后一个 run"永远是**本轮刚建的那一条** ⇒ 恒 False ⇒ **承接永不生效**，
+    而且**行为类测试全绿** —— 它们构造的"库里只有那条中断 run"这一状态在生产里
+    **不可达**（生产那一刻必有本轮的新 run）。
     """
     import ast
-    import pathlib
 
-    import hiveweave
+    tree = _agent_ast()
 
-    src = (pathlib.Path(hiveweave.__file__).resolve().parent
-           / "agents" / "agent.py")
-    tree = ast.parse(src.read_text(encoding="utf-8"))
+    assigns = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "_main_upstream_attempt"
+            for t in n.targets
+        )
+    ]
+    assert assigns, "找不到 `_main_upstream_attempt` 的赋值点 —— 本条守卫失去前提"
 
-    resume_lines: list[int] = []
-    create_lines: list[int] = []
-    for n in ast.walk(tree):
-        if not isinstance(n, ast.Call):
-            continue
-        attr = getattr(n.func, "attr", "")
-        if attr == "_resume_upstream_attempt":
-            resume_lines.append(n.lineno)
-        elif attr == "create_run":
-            create_lines.append(n.lineno)
+    # ⭐ 关键：供值者 = **赋值右值里**的那次调用，不是"全文件任意同名调用"。
+    producers = []
+    for a in assigns:
+        inner = a.value.value if isinstance(a.value, ast.Await) else a.value
+        if (isinstance(inner, ast.Call)
+                and getattr(inner.func, "attr", "") == "_resume_upstream_attempt"):
+            producers.append((a, inner))
+    assert producers, (
+        "没有任何一个 `_main_upstream_attempt` 赋值点的右值来自 "
+        "`_resume_upstream_attempt` —— 归零点与 helper 脱钩了（F 会先报形态，"
+        "这里报绑定）"
+    )
 
-    assert resume_lines, "找不到 `_resume_upstream_attempt` 的调用点（被改名/删除了？）"
-    assert create_lines, "找不到 `create_run` 的调用点 —— 本条守卫失去前提"
-    assert min(resume_lines) < min(create_lines), (
-        f"承接判定（行 {min(resume_lines)}）必须排在 `create_run`（行 "
-        f"{min(create_lines)}）**之前** —— 否则 `is_latest_run` 恒 False，"
-        f"承接永不生效（P0，且行为类测试抓不到）"
+    create_calls = _calls_named(tree, "create_run")
+    assert create_calls, "找不到 `create_run` 的调用点 —— 本条守卫失去前提"
+
+    ok = []
+    for a, inner in producers:
+        af = _enclosing_function(tree, a)
+        for c in create_calls:
+            cf = _enclosing_function(tree, c)
+            if af is not None and af is cf and inner.lineno < c.lineno:
+                ok.append((inner, c, af))
+
+    if not ok:
+        detail = []
+        for a, inner in producers:
+            af = _enclosing_function(tree, a)
+            for c in create_calls:
+                cf = _enclosing_function(tree, c)
+                detail.append(
+                    f"供值调用@{inner.lineno} 在 "
+                    f"{af.name if af else '<module>'}() 内；"
+                    f"create_run@{c.lineno} 在 {cf.name if cf else '<module>'}() 内"
+                )
+        raise AssertionError(
+            "给归零点供值的 `_resume_upstream_attempt` 调用**没有**满足"
+            "「同一函数作用域 且 排在 create_run 之前」—— 承接会静默失效"
+            "（要么跨作用域 ⇒ NameError，要么位置在后 ⇒ is_latest_run 恒 False）。"
+            "实况：" + " | ".join(detail)
+        )
+
+
+async def test_reset_point_actually_receives_carried_budget() -> None:
+    """⭐⭐ H（接线**实测**）：真的执行 `_run_llm`，看承接值是否落到计数器上。
+
+    这一格是 F/G 都缺的：A–E 直调 helper（不碰接线）、F/G 只读 AST（不看运行）。
+    只有**真的执行** `_run_llm` 才能区分"名字接上了"与"名字接上了但**值**没过来"。
+    2026-09-23 的 NameError 就是被同型用例（test_main_loop_retry）抓到的。
+
+    ⚠⚠ 为什么 `is_latest_run` 要打**位置敏感**的桩（2026-09-23 审计 M5 之后补）：
+    最初这里把 `is_latest_run` 打桩成**恒 True** ⇒ 它对"求值点在 `create_run`
+    之后"这种错误**完全免疫**（那个形态下 F/G 也绿 ⇒ 三条一起被诱饵骗过）。
+    现在用**行为**复刻生产语义：`create_run` 落库之后，"那条中断 run 是不是最后
+    一个"必然为 False ⇒ 位置错**当即可观测**，不再只能靠 AST 猜。
+
+    双向断言：承接 id ⇒ 落库值；新工作（None）⇒ 0。只断一边的话，"恒定读某处"
+    这类错误接线仍能蒙混过关。
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from tests.test_main_loop_retry import _FakeStreamerFactory, _OK, _prepared_agent
+
+    order: list[str] = []
+
+    def _is_latest(*_a, **_k):
+        order.append("is_latest_run")
+        # 生产语义：本轮 `create_run` 一旦落库，"那条中断 run 是最后一个"即不成立。
+        return "create_run" not in order
+
+    def _create_run(*_a, **_k):
+        order.append("create_run")
+        return "run-new"
+
+    # ── 方向一：承接 ⇒ 起点 = 库里那一行的累计 ──
+    agent = _prepared_agent()
+    # ⚠ `_prepared_agent`（轻量夹具）不含 `_current_activation_id`；而 `create_run`
+    # 的**取参表达式**会先读它 ⇒ 不设则 `create_run` 根本没被调到，
+    # `order` 里就永远没有 `create_run`（H 的前提静默消失）。生产里 __init__ 会设。
+    agent._current_activation_id = None
+    agent._run_ledger.is_latest_run = AsyncMock(side_effect=_is_latest)
+    agent._run_ledger.create_run = AsyncMock(side_effect=_create_run)
+    agent._run_ledger.get_upstream_attempt = AsyncMock(return_value=7)
+    with patch("hiveweave.agents.agent.Streamer",
+               _FakeStreamerFactory([dict(_OK)])):
+        await agent._run_llm("hi", {}, interrupted_run_id="run-interrupted")
+
+    assert "create_run" in order, "夹具没跑到 create_run —— H 的前提没了"
+    assert order.index("is_latest_run") < order.index("create_run"), (
+        f"承接判定被排在 `create_run` 之后：{order} —— is_latest_run 必为 False，"
+        f"承接静默失效（AST 守卫可能被诱饵调用骗过，这条是行为兜底）"
+    )
+    assert agent._main_upstream_attempt == 7, (
+        f"承接值必须真的落到 `_main_upstream_attempt`（实得 "
+        f"{getattr(agent, '_main_upstream_attempt', '<未赋值>')}；作用域断了会 "
+        f"NameError、位置错了这里会是 0）"
+    )
+
+    # ── 方向二：新工作 ⇒ 起点必须是 0（不许被上面的 7 泄漏进来）──
+    order.clear()
+    fresh = _prepared_agent()
+    fresh._current_activation_id = None
+    fresh._run_ledger.is_latest_run = AsyncMock(side_effect=_is_latest)
+    fresh._run_ledger.create_run = AsyncMock(side_effect=_create_run)
+    fresh._run_ledger.get_upstream_attempt = AsyncMock(return_value=7)
+    with patch("hiveweave.agents.agent.Streamer",
+               _FakeStreamerFactory([dict(_OK)])):
+        await fresh._run_llm("hi", {}, interrupted_run_id=None)
+
+    assert fresh._main_upstream_attempt == 0, (
+        f"新工作不得承接 —— 起点必须是 0（实得 {fresh._main_upstream_attempt}）"
+    )
+
+
+async def test_carried_budget_actually_brakes_the_retry() -> None:
+    """⭐ I（承接到**刹车**）：承接来的值必须真的被**重试判据**消费。
+
+    第二轮审计实测：把刹车判据（`agent.py` 那段
+    `… and self._main_upstream_attempt < _MAIN_LOOP_STREAM_RETRIES`）换成**另一个
+    新计数器**（从 0 起）⇒ F/G/H **三条全绿** —— 因为三条都只问"值有没有落到那个
+    属性"，没有一条问"那个属性有没有被用来刹车"。承接算得再准，若不约束重试次数，
+    P1-5 等于没做。
+
+    构造：承接值 = 上限（库里的累计已用尽）⇒ 判据 `值 < 上限` 不成立 ⇒
+    **上游类错误一次都不许重试**。刹车若读别的计数器（起点 0）就会重试一次
+    ⇒ `factory.calls == 2` ⇒ 本格转红。
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from hiveweave.agents.agent import _MAIN_LOOP_STREAM_RETRIES
+    from tests.test_main_loop_retry import (
+        _ERROR_IDLE,
+        _FakeStreamerFactory,
+        _OK,
+        _prepared_agent,
+    )
+
+    agent = _prepared_agent()
+    agent._current_activation_id = None
+    agent._run_ledger.is_latest_run = AsyncMock(return_value=True)
+    agent._run_ledger.get_upstream_attempt = AsyncMock(
+        return_value=_MAIN_LOOP_STREAM_RETRIES
+    )
+    agent._run_ledger.check_budget = AsyncMock(return_value=(False, ""))
+
+    factory = _FakeStreamerFactory([dict(_ERROR_IDLE), dict(_OK)])
+    with patch("hiveweave.agents.agent.Streamer", factory), patch(
+        "hiveweave.llm.retry.compute_backoff",
+        lambda attempt, retry_after_ms=None: 0,
+    ):
+        await agent._run_llm("hi", {}, interrupted_run_id="run-interrupted")
+
+    assert factory.calls == 1, (
+        f"预算已被上一轮用尽 ⇒ 本轮**不许**再重试（实得 {factory.calls} 次）—— "
+        f"若刹车读的不是 `_main_upstream_attempt`，承接就只是个没人看的数字"
+    )
+
+
+async def test_increment_is_persisted_to_the_run_row() -> None:
+    """⭐ J（自增落库）：重试时 `+= 1` 必须**写回本 run 那行**。
+
+    第二轮审计实测：删掉那次 `set_upstream_attempt(...)` 调用 ⇒ F/G/H 加宽集
+    **260 条全绿**（`test_main_loop_retry.py` 的 `_run_ledger` 是 `AsyncMock`，
+    调用被执行但**无任何断言**）⇒ 列恒 NULL、承接恒 0、P1-5 静默退回旧行为。
+    这属于"接了线没人看"，与本次事故同族：**值算对了，但没人验证它落盘**。
+
+    构造：新工作（起点 0）＋ 一次上游类错误 ⇒ 必须重试，且写口被以
+    `(agent_id, 本 run 的 id, 1)` 调用过。`create_run` 返回的 id 由本用例钉住，
+    这样"写到了**别的** run 行上"也会被这条抓住。
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from tests.test_main_loop_retry import (
+        _ERROR_IDLE,
+        _FakeStreamerFactory,
+        _OK,
+        _prepared_agent,
+    )
+
+    agent = _prepared_agent()
+    agent._current_activation_id = None
+    agent._run_ledger.is_latest_run = AsyncMock(return_value=True)
+    agent._run_ledger.get_upstream_attempt = AsyncMock(return_value=0)
+    agent._run_ledger.check_budget = AsyncMock(return_value=(False, ""))
+    agent._run_ledger.create_run = AsyncMock(return_value="run-this-turn")
+
+    factory = _FakeStreamerFactory([dict(_ERROR_IDLE), dict(_OK)])
+    with patch("hiveweave.agents.agent.Streamer", factory), patch(
+        "hiveweave.llm.retry.compute_backoff",
+        lambda attempt, retry_after_ms=None: 0,
+    ):
+        await agent._run_llm("hi", {}, interrupted_run_id=None)
+
+    assert factory.calls == 2, "新工作拿满预算 ⇒ 上游类错误必须重试一次"
+    agent._run_ledger.set_upstream_attempt.assert_awaited_once_with(
+        agent.id, "run-this-turn", 1
     )

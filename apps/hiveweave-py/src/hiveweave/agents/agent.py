@@ -1003,16 +1003,14 @@ class Agent:
             except Exception as e:
                 log.debug("run_ledger.check_interrupted_failed", error=str(e))
 
-            # ⭐⭐ P1-5：承接判定**必须在这里**（本轮的 run 尚未 `create_run`）——
-            # 时序是这条的**承重结构**，不是风格：
-            # `_resume_upstream_attempt` 内部用 `is_latest_run` 判"那条中断 run 是不是
-            # 本 agent 最后一个 run"。若把判定放到 `create_run` **之后**（原实现的位置），
-            # "最后一个 run"就永远是**本轮刚建的那一条** ⇒ 恒 False ⇒ **承接永不生效**，
-            # 整个 P1-5 退化成旧的"每轮归零"（而且 5 条测试全绿 —— 它们构造的状态在生产
-            # 里不可达）。⇒ 只在这里求值一次，下面 `create_run` 之后直接用它。
-            restored_upstream_attempt = await self._resume_upstream_attempt(
-                interrupted_run_id
-            )
+            # ⭐ P1-5：承接判定**不在本函数求值** —— `interrupted_run_id` 只在这里
+            # 派生（它同时要给下面的 `create_activation`），值本身必须在 `_run_llm`
+            # 里、紧贴 `create_run` **之上**求。理由：**跨函数的行号序不是时序**，
+            # 只有同一函数作用域内的先后才是真时序（下面把 id 显式传过去）。
+            # ⚠ 这里曾写成 `restored_upstream_attempt = await …` 存**局部变量** ——
+            # 那是 `chat()` 的局部量，`_run_llm`（另一个函数）看不见它 ⇒ 每轮
+            # `NameError`（2026-09-23 线上实测：所有 agent turn 在首请求前崩）。
+            # 守卫见 tests/test_p1_5_upstream_retry_budget.py 的 F/G/H。
 
             # Create activation record
             trigger = opts.get("trigger") or {}
@@ -1078,8 +1076,12 @@ class Agent:
             self._active_tools = {}
 
             # 启动 LLM task
+            # ⚠ `interrupted_run_id` 必须**显式传参**（P1-5 承接判定的输入）：
+            # 它排在本函数里被派生，求值却在 `_run_llm`（时序承重，见那里的注释）。
             self._llm_task = asyncio.create_task(
-                self._run_llm(message, opts),
+                self._run_llm(
+                    message, opts, interrupted_run_id=interrupted_run_id
+                ),
                 name=f"agent-{self.id}-llm",
             )
 
@@ -1321,10 +1323,20 @@ class Agent:
 
     # ── 内部: LLM 调用 ───────────────────────────────────────
 
-    async def _run_llm(self, message: str, opts: dict) -> None:
+    async def _run_llm(
+        self,
+        message: str,
+        opts: dict,
+        *,
+        interrupted_run_id: str | None,
+    ) -> None:
         """内部: LLM 调用 + tool loop + 空响应重试。作为 asyncio.Task 运行。
 
         对齐 Elixir agent.ex:336 run_llm/2 + handle_info({ref, result})。
+
+        ⚠ `interrupted_run_id` **无默认值**（keyword-only 必填）：P1-5 的承接判定
+        依赖它，允许省略就等于允许"静默退回每轮归零"。缺参时是**当场 TypeError**，
+        不是跑到一半才发现（对比 2026-09-23 那次：名字跨函数不可见 ⇒ 每轮 NameError）。
         """
         current_task = asyncio.current_task()
         # Placeholder created in chat() before this task starts — own it so
@@ -1386,6 +1398,22 @@ class Agent:
                 except Exception:
                     pass
 
+            # ⭐⭐ P1-5（2026-09-22，用户选 **E**）：本轮上游重试预算的**起点**。
+            # 求值点就在这儿 —— **必须在本函数内、且排在紧下面的 `create_run`
+            # 之前**：`_resume_upstream_attempt` 内部的 `is_latest_run` 问的是
+            # "那条中断 run 是不是本 agent **最后一个** run"。若挪到 `create_run`
+            # **之后**，"最后一个 run"永远是**本轮刚建的那一条** ⇒ 恒 False ⇒
+            # **承接永不生效**，整个 P1-5 退化成旧的"每轮归零"（而且行为类测试
+            # 全绿 —— 它们构造的"库里只有那条中断 run"这一状态在生产里**不可达**）。
+            # ⚠⚠ 形态是**内联 await、不经中间变量**：跨函数的局部变量看不见
+            # （2026-09-23 线上 NameError 的根因）；同函数内再套一级变量则让
+            # "接线"只能靠弱判据（原 F 守卫的 `ast.Name` 分支就是那个逃生口）。
+            # 两条守卫（同一作用域 + 行号序）见
+            # tests/test_p1_5_upstream_retry_budget.py 的 F / G。
+            self._main_upstream_attempt = await self._resume_upstream_attempt(
+                interrupted_run_id
+            )
+
             # ── Durable Run Ledger: create run ──
             try:
                 self._current_run_id = await self._run_ledger.create_run(
@@ -1436,9 +1464,7 @@ class Agent:
             # 累计重试没有上界**（实测锚点：本文件原先只有归零 / 自增两处）。
             # 现改为：本次 activation **承接了被中断的 run** ⇒ 续算它那一行的
             # `upstream_retry_attempt`；否则（真正的新工作）才归零。
-            # ⚠⚠ 值在本轮 `create_run` **之前**就算好了（见 `restored_upstream_attempt`
-            # 的注释）—— **不要**改到 create_run 之后来求值，那会让判定恒 False。
-            self._main_upstream_attempt = restored_upstream_attempt
+            # ⇒ 赋值点已上移到上面紧邻 `create_run` 处（时序承重，理由见那一段）。
             while True:
                 # Unified activation budget check — stop before exceeding limits
                 _run_id = getattr(self, "_current_run_id", None)
