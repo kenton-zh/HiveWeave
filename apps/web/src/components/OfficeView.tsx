@@ -13,6 +13,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCommunications, getOrgTree } from "../api";
 import { useAppStore } from "../store";
+import { rememberAgentNames } from "../navigation/agentNames";
+import { openAgentChat } from "../navigation/commands";
 import { OfficeScene } from "./office/OfficeScene";
 import { MAX_VISIBLE_AGENTS } from "./office/constants";
 import type { OfficeAgent, OfficeInteraction, SceneSnapshot } from "./office/types";
@@ -94,6 +96,10 @@ export default function OfficeView() {
     if (event.type === "select-agent") {
       setSelectedAgent(event.agentId);
       setRightPanelTab("chat");
+      // FE-01（UX-01）：点人 = 显式「打开/聚焦」命令，必须在点击处直接发。
+      // 只靠 selectedAgentId 变化的 effect 感知不到同 ID 重复点击（状态没变），
+      // 「点甲→关聊天→再点甲」就得靠这条命令重开聊天。
+      openAgentChat(event.agentId);
     }
   }, [setSelectedAgent, setRightPanelTab]);
 
@@ -204,6 +210,12 @@ export default function OfficeView() {
     };
     sceneRef.current?.setSnapshot(snapshot);
   }, [agents, selectedAgentId, communicatingIds, processingAgents, userPingAgentIds, projectName]);
+
+  // FE-07：成员名展示缓存 —— 窗口标题/固定角标要把 agentId 翻译成人名
+  // （纯展示用途，见 navigation/agentNames.ts 的边界说明）
+  useEffect(() => {
+    rememberAgentNames(agents);
+  }, [agents]);
 
   // ── Render ─────────────────────────────────────────────────────
   return (

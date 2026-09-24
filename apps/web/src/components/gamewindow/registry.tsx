@@ -13,6 +13,7 @@ import { SkeletonList } from "../Skeleton";
 import ChatPanel from "../ChatPanel";
 import OrgTree from "../OrgTree";
 import TokenUsagePanel from "../TokenUsagePanel";
+import AgentPinChip from "./AgentPinChip";
 import type { GameWindowState } from "./store";
 
 // ⚠ 懒加载边界必须与 App.tsx 严格一致：EXE 包体积是硬约束（设计规格 §18.3），
@@ -73,8 +74,19 @@ export function renderGamePanel(win: GameWindowState, ctx: GamePanelContext): Re
         ) : (
           <Missing text="请先选择一个项目" />
         );
-      case "agent":
-        return agentId ? <AgentDetailPanel key={agentKey} agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
+      case "agent": {
+        if (!agentId) return <Missing text="请先选择一个 Agent" />;
+        // FE-07：包一层 relative 承载固定角标（AgentDetailPanel 本体不动 ——
+        // 其编辑草稿保护在面板内部，与窗层 pin 语义正交）。pin 与 key 的自洽：
+        // 固定期 payload.agentId 不变 ⇒ key 稳定 ⇒ 不重挂载（选择他人不换内容）；
+        // 解除后跟随换 payload ⇒ key 变化 ⇒ 面板按新对象重挂载（微信切会话同理）。
+        return (
+          <div className="relative h-full w-full">
+            <AgentDetailPanel key={agentKey} agentId={agentId} />
+            <AgentPinChip agentId={agentId} />
+          </div>
+        );
+      }
       case "logs":
         return agentId ? <WorkLogPanel key={agentKey} agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
       case "monitor":

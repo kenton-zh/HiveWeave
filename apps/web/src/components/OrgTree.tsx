@@ -9,6 +9,7 @@ import { useAppStore, MEETING_ACTIVE_STATUSES, type AgentAlarmInfo } from "../st
 import { getPositionLabel } from "../utils/role-styles";
 import { LIVE_PHASE_LABEL, LIVE_PHASE_STYLE } from "../utils/livePhase";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
+import { openAgentChat } from "../navigation/commands";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -760,6 +761,9 @@ function OrgTree() {
 
   const handleSelect = useCallback((id: string) => {
     setSelectedAgent(id);
+    // 同 ID 重复点击也要聚焦/恢复聊天窗（UX-01）：选中 effect 只认变化，
+    // 这里补发显式命令；办公室窗口层未挂载时命令内部直接 no-op。
+    openAgentChat(id);
     // Auto-switch from Goals tab to Chat tab when an agent is selected
     const currentTab = useAppStore.getState().rightPanelTab;
     if (currentTab === "goals") {

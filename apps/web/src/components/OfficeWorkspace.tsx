@@ -15,6 +15,12 @@
 import { Suspense, useEffect } from "react";
 import { lazyRetry } from "../mainPanel";
 import { useAppStore } from "../store";
+import {
+  followAgentDetail,
+  openAgentChat,
+  openAgentDetailWindow,
+  setOfficeSurfaceActive,
+} from "../navigation/commands";
 import ErrorBoundary from "./ErrorBoundary";
 import { OfficeSkeleton } from "./Skeleton";
 import GameWindowLayer from "./gamewindow/GameWindowLayer";
@@ -54,12 +60,30 @@ export default function OfficeWorkspace({ onExitToWorkbench }: Props) {
   const openWindow = useGameWindowStore((s) => s.open);
   const closeKind = useGameWindowStore((s) => s.closeKind);
 
-  // 选中 agent ⇒ 自动开/聚焦它的聊天窗（蓝图 §11「点电脑 → 聊天窗」）
-  // 注意：open() 对已存在的窗口只发聚焦信号，不会开出第二个。
+  // 窗口层在位信号：workspaceMode==="office" 不在任何 store 里（App 本地
+  // state），由挂载/卸载打点给导航命令（openTask 等据此判断「开了窗有没有层渲染」）
+  useEffect(() => {
+    setOfficeSurfaceActive(true);
+    return () => setOfficeSurfaceActive(false);
+  }, []);
+
+  // FE-01（UX-01）：选中成员 ⇒ 显式「打开/聚焦聊天窗」命令。
+  // 旧实现把开窗挂在 selectedAgentId **变化**上 —— 同一个人重复点击不产生
+  // 状态变化，「点甲→关聊天→再点甲」就像失效了。命令化后语义固定为：
+  // 已开⇒聚焦 / 最小化⇒恢复置顶 / 已关⇒重开 / 换人⇒同窗换内容。
+  // （同 ID 重复点击的显式命令由 OfficeView 场景点击直接发出 —— 那里没有
+  // 状态变化可等，只有显式调用才能触发。）
   useEffect(() => {
     if (!selectedAgentId) return;
-    openWindow("chat", { agentId: selectedAgentId }, "聊天");
-  }, [selectedAgentId, openWindow]);
+    openAgentChat(selectedAgentId);
+  }, [selectedAgentId, openAgentChat]);
+
+  // FE-07（UX-02）：详情窗默认**跟随**当前选中成员（未固定时；窗未开则不开，
+  // 打开走 HUD 显式入口）。固定中由 followAgentDetail 内部拒绝覆盖。
+  useEffect(() => {
+    if (!selectedAgentId) return;
+    followAgentDetail(selectedAgentId);
+  }, [selectedAgentId, followAgentDetail]);
 
   // 切项目 ⇒ 关掉上一项目的 agent 级窗口，避免串项目（同 v4 时间线的清理纪律）
   useEffect(() => {
@@ -72,7 +96,14 @@ export default function OfficeWorkspace({ onExitToWorkbench }: Props) {
   }, [selectedProjectId, closeKind]);
 
   const handleEntry = (e: Entry) => {
-    if (e.kind === "agent" || e.kind === "logs" || e.kind === "monitor") {
+    if (e.kind === "agent") {
+      if (!selectedAgentId) return;
+      // FE-07：详情入口走命令 —— 固定期只聚焦、不覆盖内容（否则
+      // 「固定乙→选中甲→点详情」会静默把窗换成甲，正是 UX-02 要消灭的混淆）
+      openAgentDetailWindow(selectedAgentId);
+      return;
+    }
+    if (e.kind === "logs" || e.kind === "monitor") {
       if (!selectedAgentId) return;
       openWindow(e.kind, { agentId: selectedAgentId }, e.label);
       return;

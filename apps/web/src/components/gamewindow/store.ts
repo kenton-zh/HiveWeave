@@ -146,8 +146,22 @@ interface GameWindowStore {
   windows: GameWindowState[];
   /** id → nonce：递增即请求该窗口置顶（重复 open 时用，不新开窗口） */
   focusSignal: Record<string, number>;
+  /**
+   * FE-07（UX-02）：窗口级固定 —— kind → 被钉住的 agentId。固定后该窗不跟随
+   * 选中变化（内容/payload 不被覆盖）。pin 属于窗口自身：随窗口关闭
+   * （close/closeKind/closeAll）一并清除，不会比窗口活得久。
+   */
+  pinnedAgent: Partial<Record<GameWindowKind, string>>;
 
   open: (kind: GameWindowKind, payload?: GameWindowPayload, title?: string) => void;
+  /**
+   * 换 payload/标题但**不发聚焦信号** —— FE-07「跟随」专用：换内容不抢 z 序、
+   * 不把最小化的窗口拽回来（与 open() 的「聚焦式重开」刻意区分）。
+   * 窗口不存在则忽略；内容与标题都没变则不动（引用稳定，不触发渲染）。
+   */
+  retarget: (kind: GameWindowKind, payload: GameWindowPayload, title?: string) => void;
+  /** 设置/清除某类窗口的固定对象（agentId=null 清除）；无变化则不动 */
+  setAgentPin: (kind: GameWindowKind, agentId: string | null) => void;
   close: (id: string) => void;
   closeAll: () => void;
   /** 关闭某一类窗口的全部实例（如切项目时关掉所有 agent 窗） */
@@ -163,6 +177,7 @@ interface GameWindowStore {
 export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
   windows: [],
   focusSignal: {},
+  pinnedAgent: {},
 
   open: (kind, payload = {}, title) => {
     const id = gameWindowId(kind);
@@ -202,13 +217,43 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
     }));
   },
 
+  retarget: (kind, payload, title) => {
+    const id = gameWindowId(kind);
+    const cur = get().windows.find((w) => w.id === id);
+    if (!cur) return;
+    const payloadChanged =
+      cur.payload.agentId !== payload.agentId || cur.payload.taskId !== payload.taskId;
+    const titleChanged = title !== undefined && title !== cur.title;
+    if (!payloadChanged && !titleChanged) return; // 引用稳定：不触发窗口层重渲染
+    set((s) => ({
+      windows: s.windows.map((w) =>
+        w.id === id ? { ...w, payload, ...(title !== undefined ? { title } : {}) } : w,
+      ),
+    }));
+  },
+
+  setAgentPin: (kind, agentId) =>
+    set((s) => {
+      if (agentId) {
+        if (s.pinnedAgent[kind] === agentId) return s;
+        return { pinnedAgent: { ...s.pinnedAgent, [kind]: agentId } };
+      }
+      return { pinnedAgent: omitPinned(s.pinnedAgent, kind) };
+    }),
+
   close: (id) =>
     set((s) => {
       const { [id]: _drop, ...rest } = s.focusSignal;
-      return { windows: s.windows.filter((w) => w.id !== id), focusSignal: rest };
+      // pin 属于窗口：窗关即解除（§6.3 固定窗不得伪装成下一个对象）
+      const closingKind = s.windows.find((w) => w.id === id)?.kind;
+      return {
+        windows: s.windows.filter((w) => w.id !== id),
+        focusSignal: rest,
+        pinnedAgent: closingKind ? omitPinned(s.pinnedAgent, closingKind) : s.pinnedAgent,
+      };
     }),
 
-  closeAll: () => set({ windows: [], focusSignal: {} }),
+  closeAll: () => set({ windows: [], focusSignal: {}, pinnedAgent: {} }),
 
   closeKind: (kind) =>
     set((s) => {
@@ -218,7 +263,7 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
       for (const [k, v] of Object.entries(s.focusSignal)) {
         if (!removed.has(k)) focusSignal[k] = v;
       }
-      return { windows: keep, focusSignal };
+      return { windows: keep, focusSignal, pinnedAgent: omitPinned(s.pinnedAgent, kind) };
     }),
 
   requestFocus: (id) =>
@@ -260,4 +305,14 @@ function defaultTitle(kind: GameWindowKind): string {
     task: "任务链路",
   };
   return table[kind];
+}
+
+/** 去掉某类窗口的固定标记（FE-07：pin 属于窗口，关窗即解除）；无该键则原样返回 */
+function omitPinned(
+  pinned: Partial<Record<GameWindowKind, string>>,
+  kind: GameWindowKind,
+): Partial<Record<GameWindowKind, string>> {
+  if (!(kind in pinned)) return pinned;
+  const { [kind]: _drop, ...rest } = pinned;
+  return rest;
 }

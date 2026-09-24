@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getProjectGameTime, getTeamActivity } from "../../api";
 import type { TeamActivityQuery } from "../../api";
 import { useAppStore } from "../../store";
+import { openTask } from "../../navigation/commands"; // FE-02：统一任务打开（旧 setSelectedTask 换入）
 import type { ActiveAssignment, TaskSegment, TeamActivityResponse, TeamAgent } from "./types";
 import type { GameTimeAnchor } from "./utils";
 import { statusStyle } from "./utils";
@@ -35,7 +36,6 @@ export default function TeamTimeline() {
   const projectId = useAppStore((s) => s.selectedProjectId);
   const projects = useAppStore((s) => s.projects);
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
-  const setSelectedTask = useAppStore((s) => s.setSelectedTask);
   const timelineVersion = useAppStore((s) => s.timelineVersion);
   const agentHealth = useAppStore((s) => s.agentHealth);
 
@@ -485,7 +485,7 @@ export default function TeamTimeline() {
                   view={view}
                   nowMs={nowMs}
                   zebra={i % 2 === 1}
-                  onSelectTask={setSelectedTask}
+                  onSelectTask={openTask}
                   onHover={handleHover}
                 />
               ))}

@@ -10,13 +10,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listTasks } from "../../api";
 import { useAppStore } from "../../store";
+import { openTask } from "../../navigation/commands"; // FE-02：统一任务打开（旧 setSelectedTask 换入）
 import type { TaskSummary } from "./types";
 import { statusStyle, STRIPED_OVERLAY } from "./utils";
 
 export default function TaskPicker() {
   const projectId = useAppStore((s) => s.selectedProjectId);
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
-  const setSelectedTask = useAppStore((s) => s.setSelectedTask);
 
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [query, setQuery] = useState("");
@@ -72,7 +72,7 @@ export default function TaskPicker() {
   const q = query.trim();
 
   const pick = (id: string) => {
-    setSelectedTask(id);
+    openTask(id);
     setQuery("");
     setOpen(false);
   };
@@ -176,7 +176,7 @@ export default function TaskPicker() {
             当前任务：{selectedTaskId.slice(0, 12)}…
           </span>
           <button
-            onClick={() => setSelectedTask(null)}
+            onClick={() => openTask(null)}
             className="text-g-fg-4 hover:text-g-red transition-colors"
             title="取消选中"
           >
