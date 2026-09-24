@@ -32,7 +32,8 @@ const ConfirmDialog = lazyRetry(() => import("./components/ConfirmDialog"));
 const TimelineView = lazyRetry(() => import("./components/timeline/TimelineView"));
 const TaskTimelinePanel = lazyRetry(() => import("./components/timeline/TaskTimelinePanel"));
 import { useAppStore } from "./store";
-import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, activateProject, deactivateProject, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject, getSocket } from "./api";
+import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject, getSocket } from "./api";
+import ProjectRunControls from "./components/ProjectRunControls";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -91,7 +92,6 @@ function App() {
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
-  const [projectStarting, setProjectStarting] = useState(false);
   // P1 (§5.5b①)：项目设置 —— 外部只读参考目录
   const [showProjectSettings, setShowProjectSettings] = useState(false);
   const [readDirsDraft, setReadDirsDraft] = useState("");
@@ -238,28 +238,8 @@ function App() {
     }).catch(() => {});
   }, []);
 
-  const handleToggleProjectStart = async () => {
-    if (!selectedProjectId || projectStarting) return;
-    setProjectStarting(true);
-    try {
-      const isStarted = currentProject?.isStarted;
-      if (isStarted) {
-        await deactivateProject(selectedProjectId);
-        showToast("已下班，Agent 已暂停", "info");
-      } else {
-        await activateProject(selectedProjectId);
-        showToast("已上班，Agent 已启动", "info");
-      }
-      // 刷新项目列表以获取最新 isStarted 状态
-      const list = await getProjects();
-      setProjects(list);
-    } catch (err) {
-      console.error("Toggle project start failed:", err);
-      showToast("操作失败", "error");
-    } finally {
-      setProjectStarting(false);
-    }
-  };
+  // FE-05（UX-06）：「上班/下班」开关已抽成 ProjectRunControls 共享组件
+  // （单一业务实现），挂载在共用顶栏 + 旧工作台左栏，见下方两处 <ProjectRunControls />。
 
   const currentProject = projects.find((p) => p.id === selectedProjectId);
 
@@ -625,6 +605,9 @@ function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
+          {/* 项目运行开关（FE-05/UX-06）：office / workbench 两种工作区共用的顶栏入口，
+              与旧工作台左栏渲染同一个 ProjectRunControls 实例逻辑 */}
+          <ProjectRunControls className="mr-1" />
           {/* Restart buttons */}
           <div className="flex items-center gap-0.5 bg-g-bg-soft border border-g-border rounded-gm p-0.5">
             <button
@@ -768,27 +751,9 @@ function App() {
               )}
             </div>
 
-            {/* Project-level start/stop button */}
-            {selectedProjectId && (
-              <button
-                onClick={handleToggleProjectStart}
-                disabled={projectStarting}
-                className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full transition-all duration-200 ml-auto active:scale-[0.97] ${
-                  currentProject?.isStarted
-                    ? "bg-g-green-bg text-g-green border border-g-green/20 hover:border-g-green/40"
-                    : "bg-g-bg-soft text-g-fg-3 border border-g-border hover:text-g-fg hover:border-g-border-strong"
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
-                title={currentProject?.isStarted ? "点击下班，暂停该项目所有 Agent" : "点击上班，启动该项目所有 Agent"}
-              >
-                <span className="relative flex w-2 h-2">
-                  {currentProject?.isStarted && (
-                    <span className="absolute inline-flex h-full w-full rounded-full bg-g-green-vivid animate-ping-ring" />
-                  )}
-                  <span className={`relative inline-flex w-2 h-2 rounded-full ${currentProject?.isStarted ? "bg-g-green-vivid" : "bg-g-fg-4"}`} />
-                </span>
-                <span>{projectStarting ? "处理中..." : currentProject?.isStarted ? "上班中" : "已下班"}</span>
-              </button>
-            )}
+            {/* Project-level start/stop button —— FE-05：与顶栏共用 ProjectRunControls，
+                业务实现只有一份（不再在 App 内维护第二套开关逻辑） */}
+            <ProjectRunControls className="ml-auto shrink-0" />
           </div>
           <div className="flex-1 overflow-hidden bg-app-tint">
             <div key={activeView} className="hw-tab-in h-full">
