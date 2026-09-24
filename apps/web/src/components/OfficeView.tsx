@@ -64,6 +64,13 @@ export default function OfficeView() {
   const activeCommunications = useAppStore((s) => s.activeCommunications);
   const setActiveCommunications = useAppStore((s) => s.setActiveCommunications);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
+  const projects = useAppStore((s) => s.projects);
+
+  /** 当前项目显示名 —— 渲染在前台招牌上（弧面弯曲）。 */
+  const projectName = useMemo(
+    () => projects.find((p) => p.id === selectedProjectId)?.name ?? null,
+    [projects, selectedProjectId],
+  );
 
   // ── Local state (from API) ─────────────────────────────────────
   const [roots, setRoots] = useState<OfficeAgent[]>([]);
@@ -193,9 +200,10 @@ export default function OfficeView() {
       communicatingIds,
       processingIds: new Set(processingAgents),
       userPingIds: new Set(userPingAgentIds),
+      projectName,
     };
     sceneRef.current?.setSnapshot(snapshot);
-  }, [agents, selectedAgentId, communicatingIds, processingAgents, userPingAgentIds]);
+  }, [agents, selectedAgentId, communicatingIds, processingAgents, userPingAgentIds, projectName]);
 
   // ── Render ─────────────────────────────────────────────────────
   return (

@@ -38,19 +38,119 @@ import {
   SHEET_LAYOUTS,
   DEV_ANIM_SEQS,
   PURPLE_ANIM_SEQS,
+  HR_FRONTDESK_ANIM_SEQS,
+  frontDeskRoutineState,
   PURPLE_DEMO_ALL_AGENTS,
   FIRST_AGENT_FULL_ANIMATIONS,
   FIRST_AGENT_DEMO_CYCLE_MS,
   FIRST_AGENT_TYPE_MS,
-  FRONTDESK_SET,
+  FRONDESK_SLOT,
   furnitureSet,
+  isFrontDeskSlot,
   deskDepthBase,
   seatPosFor,
   roleSheetUrl,
+  isHrRole,
   type FurniturePiece,
 } from "./constants";
 import { isRoamingFrame, isChatteringFrame } from "./state-machine";
 import { OfficeActor } from "./OfficeActor";
+import { renderFrontSign, FRONT_SIGN_CANVAS } from "./frontSign";
+
+// ── Seat resolution (single source of truth) ──────────────────────
+
+/**
+ * 决定一个 agent 坐哪、以什么姿态落座。
+ *
+ * ⚠ **唯一判定源**：`_syncActors`（建角）与 `_tick`（逐帧驱动）都走这里。
+ * 历史上这两处各写一份，改了一处漏另一处会造成「建角在 A、每帧拽去 B」的
+ * 位置抖动（本仓有前科：声明同源但实际分裂）。新增座位规则只改本函数。
+ *
+ * 优先级（2026-09-23 用户钦定「HR 永远坐前台」）：
+ *  1. **HR → 前台**（硬绑，任何项目、任何 index）。项目无 HR 时前台空着，
+ *     由 `_frontDeskFallbackId` 指定的 0 号角色补位（保证柜台不空，见下方注释）。
+ *  2. 演示路径（`PURPLE_DEMO_ALL_AGENTS`）→ 0 号占前台，其余进工位网格。
+ *  3. 常规 → 按 role 三池分配工位。
+ */
+interface SeatDecision {
+  desk: DeskSlot;
+  variant: "A" | "B";
+  /** 是否坐前台（前台走 A 姿态 + 柜台后固定位，且不参与演示周期切换） */
+  atFrontDesk: boolean;
+}
+
+function resolveSeat(
+  agent: { id: string; role: string },
+  index: number,
+  roster: readonly { id: string; role: string }[],
+  fallbackFrontDeskId: string | null,
+): SeatDecision {
+  // ① HR 硬绑前台
+  if (isHrRole(agent.role)) {
+    return { desk: FRONDESK_SLOT, variant: "A", atFrontDesk: true };
+  }
+  // ② 无 HR ⇒ 由兜底者（0 号）补位，避免柜台空置
+  const hasHr = roster.some((a) => isHrRole(a.role));
+  if (!hasHr && fallbackFrontDeskId === agent.id) {
+    return { desk: FRONDESK_SLOT, variant: "A", atFrontDesk: true };
+  }
+  // ③ 演示路径
+  //    ⚠ 2026-09-23：**必须排除前台**。`purpleDemoSeat(0)` 会把 0 号派到前台，
+  //    而前台已归 HR（或兜底者）——两套逻辑叠加会在柜台后画出**两个人**
+  //    （实测首次截图：HR「天线」与 0 号「潮汐」重叠）。
+  //    故演示路径只用工位网格，前台席位一律跳过。
+  if (PURPLE_DEMO_ALL_AGENTS) {
+    const demoSeat = purpleDemoSeat(index);
+    if (demoSeat.desk.id !== FRONDESK_SLOT.id) {
+      return { ...demoSeat, atFrontDesk: false };
+    }
+    // 0 号本会落前台 ⇒ 改派工位网格（按 index 取，避免与其他人重叠）
+    return {
+      desk: DESKS[index % Math.max(DESKS.length, 1)],
+      variant: "B",
+      atFrontDesk: false,
+    };
+  }
+  // ④ 常规工位
+  return { desk: getDesk(index, agent.role), variant: index % 2 === 0 ? "A" : "B", atFrontDesk: false };
+}
+
+// ── Sheet / animation selection (single source of truth) ──────────
+
+/**
+ * 帧序表按 sheet URL 路由。**唯一判定源** —— 建角与驱动都不要各写一份
+ * if-else（本仓有前科：声明同源但实际分裂，改一处漏另一处 ⇒ 播错帧）。
+ * URL 不在表内（404 回退到 dev）时为 undefined，OfficeActor 自动降级为程序化 body。
+ */
+const ANIM_SEQS_FOR: Record<string, Record<string, number[]> | undefined> = {
+  [ASSET_URLS.AGENT_DEV]: DEV_ANIM_SEQS as Record<string, number[]>,
+  [ASSET_URLS.AGENT_PURPLE]: PURPLE_ANIM_SEQS as Record<string, number[]>,
+  [ASSET_URLS.AGENT_HR_FRONTDESK]: HR_FRONTDESK_ANIM_SEQS as Record<string, number[]>,
+};
+
+/**
+ * 选 sheet。优先级：
+ *  1. **前台席位 → HR 专用正面表**（用户钦定「这个女生的动画只做和前台匹配的」）。
+ *     ⚠ 必须排在演示分支之前：前台可能是 0 号（项目无 HR 时的兜底），
+ *     若先走演示分支会给她套上紫衣**侧视**表 —— 朝向与遮挡片不匹配。
+ *  2. `FIRST_AGENT_FULL_ANIMATIONS` 的 0 号演示 → dev 满帧表。
+ *  3. `PURPLE_DEMO_ALL_AGENTS` 演示 → 紫衣表。
+ *  4. 常规 → 按 role 选表。
+ *
+ * ⚠ 入参 `atFrontDesk` 必须来自 `resolveSeat`，不得在下游另算
+ *   （否则又出现「建角判前台、每帧不判」的漂移）。
+ * ⚠ 「素材是否真的加载成功」由 `_syncActors` 用 `available` 复核，本函数只表达意愿。
+ */
+function pickSheetUrl(
+  agent: { role: string },
+  index: number,
+  atFrontDesk: boolean,
+): string {
+  if (atFrontDesk) return ASSET_URLS.AGENT_HR_FRONTDESK;
+  if (FIRST_AGENT_FULL_ANIMATIONS && index === 0) return ASSET_URLS.AGENT_DEV;
+  if (PURPLE_DEMO_ALL_AGENTS) return ASSET_URLS.AGENT_PURPLE;
+  return roleSheetUrl(agent.role);
+}
 
 // ── Scene ─────────────────────────────────────────────────────────
 
@@ -67,6 +167,12 @@ export class OfficeScene {
    * 因此在 _syncActors 建角时定稿，_tick 直接查表用于落座锚点校正。
    */
   private agentSheetUrl = new Map<string, string>();
+  /**
+   * 项目无 HR 时，坐前台补位的 agent id（= 可见列表的 0 号）。
+   * 在 `_syncActors` 里按当前 roster 定稿，`_tick` 直接读 —— 避免两处各算一次。
+   * 存在 HR 时恒为 null（HR 一定在前台，见 `resolveSeat`）。
+   */
+  private _frontDeskFallbackId: string | null = null;
   private _ready = false;
   private _destroyed = false;
 
@@ -85,7 +191,13 @@ export class OfficeScene {
     communicatingIds: new Set(),
     selectedAgentId: null,
     userPingIds: new Set(),
+    projectName: null,
   };
+
+  /** 前台招牌 sprite（弧面项目名）；null = 素材未就绪 */
+  private _frontSignSprite: PIXI.Sprite | null = null;
+  /** 已渲染的项目名，用于避免每帧重算 canvas */
+  private _frontSignName: string | null = null;
 
   private onInteraction: OfficeInteractionHandler;
 
@@ -109,7 +221,7 @@ export class OfficeScene {
     // agent sheet 的帧切片由 OfficeActor 内部完成（按 SHEET_LAYOUTS 的 cols×rows 切帧），
     // 此处只保留整张 Texture。
     // 旧像素角色表 agent-manager / agent-qa 已于 2026-09-22 删除（美术路线裁决），预载只剩两张高清表
-    for (const url of [ASSET_URLS.AGENT_DEV, ASSET_URLS.AGENT_PURPLE]) {
+    for (const url of [ASSET_URLS.AGENT_DEV, ASSET_URLS.AGENT_PURPLE, ASSET_URLS.AGENT_HR_FRONTDESK]) {
       const sheet = tex[url];
       if (!sheet) continue;
       this.sheetFrames[url] = sheet;
@@ -211,11 +323,13 @@ export class OfficeScene {
 
   // ── State Bridge ──────────────────────────────────────────────
 
-  /** Receive a new snapshot from React. Synchronises actors. */
+  /** Receive a new snapshot from React. Synchronises actors.
+   *  2026-09-23：追加前台招牌重绘 —— 项目名变化时重算弧面文字 canvas。 */
   setSnapshot(snapshot: SceneSnapshot): void {
     this.snapshot = snapshot;
     if (this._ready) {
       this._syncActors();
+      this._refreshFrontSign();
     }
   }
 
@@ -262,33 +376,31 @@ export class OfficeScene {
 
     // Create new actors
     const actorsLayer = this.layers.actors;
+    // 无 HR 时的前台补位者 = 可见列表 0 号（有 HR 时不用，见 resolveSeat）
+    const roster = visible as readonly { id: string; role: string }[];
+    this._frontDeskFallbackId = visible.length > 0 ? visible[0].id : null;
     visible.forEach((agent, index) => {
       if (!this.actorMap.has(agent.id)) {
-        const demoSeat = PURPLE_DEMO_ALL_AGENTS ? purpleDemoSeat(index) : null;
-        const desk = demoSeat
-          ? demoSeat.desk
-          : getDesk(index, agent.role);
-        // 单角色动画演示：索引 0 切回 dev 满帧 sheet（FSM 全状态可播：
-        // 呼吸/坐下/坐姿/打字/起身…），其余角色沿用紫衣 sheet 保持视觉统一。
-        const isDemoAgent = FIRST_AGENT_FULL_ANIMATIONS && index === 0;
-        const wantedUrl = isDemoAgent
-          ? ASSET_URLS.AGENT_DEV
-          : PURPLE_DEMO_ALL_AGENTS
+        const seatDecision = resolveSeat(
+          agent,
+          index,
+          roster,
+          this._frontDeskFallbackId,
+        );
+        const desk = seatDecision.desk;
+        const wanted = pickSheetUrl(agent, index, seatDecision.atFrontDesk);
+        // 实际可用的 URL：素材 404 时按「前台→紫衣→dev」逐级回退。
+        // 帧表/布局一律按**实际** URL 推导（`ANIM_SEQS_FOR` + `SHEET_LAYOUTS`），
+        // 否则会出现「用紫衣的帧号索引 dev 的图」这类静默错配。
+        const sheetUrl =
+          wanted === ASSET_URLS.AGENT_HR_FRONTDESK && !this.sheetFrames[wanted]
             ? ASSET_URLS.AGENT_PURPLE
-            : roleSheetUrl(agent.role);
-        // 实际加载成功的 URL（404 时回退 dev，布局/帧表按实际 URL 推导，避免错配）
-        const sheetUrl = this.sheetFrames[wantedUrl] ? wantedUrl : ASSET_URLS.AGENT_DEV;
+            : this.sheetFrames[wanted]
+              ? wanted
+              : ASSET_URLS.AGENT_DEV;
         const sheetTex = this.sheetFrames[sheetUrl] ?? null;
-        const isPurple = sheetUrl === ASSET_URLS.AGENT_PURPLE;
-        const hasFrameSeqs = sheetUrl === ASSET_URLS.AGENT_DEV || isPurple;
-        // 落座：紫衣演示工位走 B（近侧可见椅，z 在 front 之上）；接待员/演示 0 号走 A。
-        const variant: "A" | "B" = demoSeat
-          ? demoSeat.variant
-          : isPurple || isDemoAgent
-            ? "A"
-            : index % 2 === 0
-              ? "A"
-              : "B";
+        // 落座：前台 A（柜台后）；紫衣演示工位走 B（近侧可见椅，z 在 front 之上）。
+        const variant: "A" | "B" = seatDecision.variant;
         const seat = seatPosFor(sheetUrl, desk, variant);
         this.agentSheetUrl.set(agent.id, sheetUrl);
         const actor = new OfficeActor(
@@ -297,8 +409,8 @@ export class OfficeScene {
             this.onInteraction({ type: "select-agent", agentId: id });
           },
           sheetTex ?? null,
-          hasFrameSeqs ? SHEET_LAYOUTS[sheetUrl] : null,
-          hasFrameSeqs ? (isPurple ? PURPLE_ANIM_SEQS : DEV_ANIM_SEQS) : null,
+          SHEET_LAYOUTS[sheetUrl] ?? null,
+          ANIM_SEQS_FOR[sheetUrl] ?? null,
           // 气泡贴图（SPEECH_BUBBLE）随像素素材一并删除 ⇒ 走 OfficeActor 的程序化气泡
           null,
         );
@@ -320,8 +432,13 @@ export class OfficeScene {
       const actor = this.actorMap.get(agent.id);
       if (!actor) return;
 
-      const demoSeat = PURPLE_DEMO_ALL_AGENTS ? purpleDemoSeat(index) : null;
-      const desk = demoSeat ? demoSeat.desk : getDesk(index, agent.role);
+      const seatDecision = resolveSeat(
+        agent,
+        index,
+        agents as readonly { id: string; role: string }[],
+        this._frontDeskFallbackId,
+      );
+      const desk = seatDecision.desk;
       const sheetUrl = this.agentSheetUrl.get(agent.id) ?? ASSET_URLS.AGENT_DEV;
       const isDemoAgent = FIRST_AGENT_FULL_ANIMATIONS && index === 0;
 
@@ -335,9 +452,24 @@ export class OfficeScene {
       // 2026-09-08：FIRST_AGENT_FULL_ANIMATIONS=false 后 0 号也穿紫衣 v2 sheet
       // （帧 0-3 打字 / 4-7 坐姿呼吸，全坐姿序列），循环对遮挡安全，故
       // 演示周期按 index===0 生效，不再依赖 dev sheet。
-      if (index === 0) {
+      //
+      // 2026-09-23：**前台角色豁免此周期** —— 前台有自己的三态演示
+      // （打字 ↔ 呼吸 ↔ 招手，见 FRONT_DESK_ROUTINE），且 HR 不一定是 0 号，
+      // 两套周期叠加会互相打断。
+      if (index === 0 && !seatDecision.atFrontDesk) {
         processing = now % FIRST_AGENT_DEMO_CYCLE_MS < FIRST_AGENT_TYPE_MS;
         talking = false;
+      }
+
+      // ── 前台 HR 三态值守（用户钦定：打字 + 呼吸 + 抬头招呼客人）────
+      // 判据走 `frontDeskRoutineState`（纯函数，常量里可单测），不在本处内联时间比较。
+      // 语义映射：working → 走打字的 processing；
+      //           idle    → 呼吸（两者都关）；
+      //           talking → 抬手招呼（借 talking 态，同时弹名称气泡「有客人」）。
+      if (seatDecision.atFrontDesk) {
+        const routine = frontDeskRoutineState(now);
+        processing = routine === "working";
+        talking = routine === "talking";
       }
 
       // Determine target position
@@ -345,13 +477,14 @@ export class OfficeScene {
       let ty: number;
       let atDesk = false;
       const purpleDemo = PURPLE_DEMO_ALL_AGENTS;
-      const sitVariant: "A" | "B" = demoSeat
-        ? demoSeat.variant
-        : isDemoAgent || index % 2 === 0
-          ? "A"
-          : "B";
+      const sitVariant: "A" | "B" = seatDecision.variant;
 
-      if (isDemoAgent) {
+      if (seatDecision.atFrontDesk) {
+        const seat = seatPosFor(sheetUrl, desk, sitVariant);
+        tx = seat.x;
+        ty = seat.y;
+        atDesk = true;
+      } else if (isDemoAgent) {
         const seat = seatPosFor(sheetUrl, desk, sitVariant);
         tx = seat.x;
         ty = seat.y;
@@ -387,6 +520,7 @@ export class OfficeScene {
         this.snapshot.selectedAgentId === agent.id,
         atDesk,
         sitVariant,
+        seatDecision.atFrontDesk,
       );
 
       // A 位：z = base-1，被自己的桌面挡腿；B 位：z = base+1，坐在近侧可见椅里
@@ -438,23 +572,42 @@ export class OfficeScene {
   /**
    * 桌套件 sprite（bg 模式专用）：每桌两片。
    * back = 后椅 + 远侧显示器（角色之下）；front = 近侧桌面/前椅（角色之上，只挡腿）。
-   * 白桌面楔必须在 front，不能进 back。前台槽位只有 front 片。
+   * 白桌面楔必须在 front，不能进 back。
    * 深度：back = base-2，A 角色 = base-1，front = base，B 角色 = base+1。
+   *
+   * 2026-09-23：**前台柜台走同一套两层结构**（`FRONDESK_SLOT`）。
+   * 它不在 DESKS 网格里，故单独渲染；素材是**分层两片**（不是单片）——
+   * 单片会把坐进内嵌椅的 HR 整个吞掉（只剩头顶），分层后 HR 夹在
+   * back（椅+显示器+白台面）与 front（木柜面+蓝牌）之间，正确露头、正确挡腿。
+   * zIndex 用 `deskDepthBase` 同口径（柜台底边）；前台在画面前方（world y 最大）
+   * ⇒ 天然压在其他工位 sprites 之上。
    */
   private _drawFurnitureSprites(parent: PIXI.Container): void {
-    for (const desk of DESKS) {
+    for (const desk of [...DESKS, FRONDESK_SLOT]) {
       const set = furnitureSet(desk);
       const base = deskDepthBase(desk);
-      const isFront = set === FRONTDESK_SET;
+      const isFront = isFrontDeskSlot(desk);
       const pieces: [string, FurniturePiece, number][] = [];
       if (set.back) {
-        pieces.push([ASSET_URLS.OFFICE_DESK_BACK, set.back, base - 2]);
+        pieces.push([
+          isFront ? ASSET_URLS.OFFICE_FRONTDESK_BACK : ASSET_URLS.OFFICE_DESK_BACK,
+          set.back,
+          base - 2,
+        ]);
       }
       pieces.push([
-        isFront ? ASSET_URLS.OFFICE_FRONTDESK_SET : ASSET_URLS.OFFICE_DESK_FRONT,
+        isFront ? ASSET_URLS.OFFICE_FRONTDESK_FRONT : ASSET_URLS.OFFICE_DESK_FRONT,
         set.front,
         base,
       ]);
+      // 前台**第三片**：柜台内嵌的黑椅。z = base+2 ⇒ 同时压住角色与木柜面前脸。
+      // 为什么必须独立成层（几何见 constants.FRONTDESK_SET.rearChair 的长注释）：
+      // 椅子与木柜面原本同层（都在 front 片），而柜面上沿 world 548.38 夹在
+      // 角色鞋底 558.0 与椅背顶 511.62 之间 ⇒ 共层时「椅子挡腰腿」与
+      // 「椅背不切头」不可兼得（无解），故拆出第三层。
+      if (isFront) {
+        pieces.push([ASSET_URLS.OFFICE_FRONTDESK_CHAIR, set.front, base + 2]);
+      }
       for (const [url, piece, z] of pieces) {
         const tex = this.tex[url];
         if (!tex) continue;
@@ -467,6 +620,72 @@ export class OfficeScene {
         s.y = desk.y + piece.leftTop.y;
         s.zIndex = z;
         parent.addChild(s);
+      }
+      if (isFront) this._attachFrontSign(parent, desk, base);
+    }
+  }
+
+  /**
+   * 前台招牌：把「弧面项目名」canvas 作为 sprite 精确覆盖在柜台 sprite 上。
+   *
+   * 几何：净牌 canvas 与柜台素材**同一坐标系、同一像素尺寸**（284×158），
+   * 故只要按柜台 sprite 的缩放比整体覆盖即可 —— 招牌与柜台严丝合缝，
+   * 且随柜台一起被场景缩放，无二次重采样。
+   *
+   * zIndex = base + 0.5：压在柜台 sprite 之上、但低于柜台前的角色（B 位 = base+1）。
+   * 前台无 B 位角色，实际恒在最上层，这里留 0.5 只是防止与柜台同 z 时的排序不确定。
+   */
+  private _attachFrontSign(parent: PIXI.Container, desk: DeskSlot, base: number): void {
+    const signTex = this.tex[ASSET_URLS.OFFICE_FRONTDESK_SIGN];
+    if (!signTex) return;
+    const set = furnitureSet(desk);
+    // 净牌 canvas 与柜台素材同尺寸 ⇒ 缩放比一致
+    const scaleX = set.front.w / FRONT_SIGN_CANVAS.w;
+    const scaleY = set.front.h / FRONT_SIGN_CANVAS.h;
+
+    const canvas = renderFrontSign(
+      signTex.source.resource as HTMLImageElement | HTMLCanvasElement,
+      this.snapshot.projectName,
+    );
+    this._frontSignName = this.snapshot.projectName ?? null;
+    const tex = PIXI.Texture.from(canvas);
+    tex.source.scaleMode = "nearest";
+    const s = new PIXI.Sprite(tex);
+    s.width = FRONT_SIGN_CANVAS.w * scaleX;
+    s.height = FRONT_SIGN_CANVAS.h * scaleY;
+    s.x = desk.x + set.front.leftTop.x;
+    s.y = desk.y + set.front.leftTop.y;
+    s.zIndex = base + 0.5;
+    parent.addChild(s);
+    this._frontSignSprite = s;
+  }
+
+  /**
+   * 项目名变化时重绘招牌。仅在值真的变了才重算（canvas 重绘约 145 次 drawImage）。
+   * 材质未就绪时静默跳过 —— 下次 `_drawFurnitureSprites` 会用新名字重建。
+   */
+  private _refreshFrontSign(): void {
+    const sprite = this._frontSignSprite;
+    if (!sprite) return;
+    const name = this.snapshot.projectName ?? null;
+    if (name === this._frontSignName) return;
+    const signTex = this.tex[ASSET_URLS.OFFICE_FRONTDESK_SIGN];
+    if (!signTex) return;
+    const canvas = renderFrontSign(
+      signTex.source.resource as HTMLImageElement | HTMLCanvasElement,
+      name,
+    );
+    const old = sprite.texture;
+    const tex = PIXI.Texture.from(canvas);
+    tex.source.scaleMode = "nearest";
+    sprite.texture = tex;
+    this._frontSignName = name;
+    // 旧纹理是运行时生成的，需显式销毁避免泄漏（PIXI 不会自动回收非 Assets 纹理）
+    if (old && old !== tex) {
+      try {
+        old.destroy(true);
+      } catch {
+        /* ignore：纹理可能仍被其他 sprite 引用 */
       }
     }
   }

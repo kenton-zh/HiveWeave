@@ -32,11 +32,11 @@ const FOOT_ANCHOR_Y = 0.875;
 
 // ── Label Factory ─────────────────────────────────────────────────
 
-/** 名牌排版常量（规格 §4.7：整块 ≤96px、头顶上方 4px） */
-const NAME_FONT_SIZE = 12;
-const ROLE_FONT_SIZE = 10;
-const LABEL_PAD_X = 6;
-const LABEL_PAD_Y = 2;
+/** 名牌排版常量（规格 §4.7：整块 ≤96px、头顶上方 4px；字号 14/12 贴 2026-09 定稿图） */
+const NAME_FONT_SIZE = 14;
+const ROLE_FONT_SIZE = 12;
+const LABEL_PAD_X = 8;
+const LABEL_PAD_Y = 3;
 /** 行间负 gap：正文行高自带上下留白，直接叠放会多出空行，贴紧才像一块名签 */
 const LABEL_LINE_TIGHTEN = 3;
 const LABEL_BG = 0x0f172a;
@@ -49,37 +49,49 @@ const LABEL_BG = 0x0f172a;
  */
 const LABEL_SIDE_SHIFT = 16;
 /**
- * 名牌底板不透明度。0.72 → 0.84（2026-09-23）：底板压在橙色木地板这类亮背景上时，
- * 0.72 会被稀释到"半透明灰"，名牌两行的对比度都被拉低（职位行的 rose/amber 尤甚）。
- * 抬到底板更实 = 两行一起变清，不用给文字加描边（描边会糊 10px 中文笔画）。
+ * 名牌底板不透明度。0.72 → 0.84 → 0.93（2026-09-23）：压在橙木地板上低 alpha 会被
+ * 稀释成"半透明灰"，两行对比度一起掉；定稿图是近实心深底，抬到 0.93 才贴那个观感。
+ * 底板够实 ⇒ 名字行去掉黑描边（描边糊 12px 中文笔画，定稿图也是无描边白字）。
  */
-const LABEL_BG_ALPHA = 0.84;
+const LABEL_BG_ALPHA = 0.93;
 const LABEL_HEAD_GAP = 4;
-/** 名字行上限 72px = 等宽 12px 下「中文 6 字 / 英文 10 字符」的实测宽度 */
+/**
+ * 前台名牌的**额外下压量**（world px，正 = 往下压）。
+ *
+ * 为什么需要（2026-09-23 浏览器实测）：名牌默认挂在「头顶上方 4px」，而头顶是按
+ * **整帧高**算的 —— `-sprite.scale.y × texture.height × FOOT_ANCHOR_Y` ≈ -67.2。
+ * 工位角色在桌子后面，这个高度没问题；但**前台柜台只有世界高 121**，角色坐在柜台后
+ * 时头顶只比柜台台面高约 41 ⇒ 名牌再往上飘 100 就落到**后排工位的桌面上方**，
+ * 实测截到「HR」名牌压在 build-1 桌面上，观感像别人的牌子。
+ *
+ * 压到柜台顶沿上方一点即可：41 - 24 ≈ 17 ⇒ 名牌底边停在柜台上方，与 HR 头顶贴合。
+ */
+const FRONT_LABEL_EXTRA_DROP = 24;
+/** 名字行文字上限 72px（sans 12px 实测宽度；整行另加 GEM+GAP=14 ⇒ 最宽 86） */
 const NAME_MAX_TEXT_W = 72;
-/** 职位行上限 84px = 整块 96 - 左右内边距 12（中英混排的职务更吃宽度，故比名字行放宽） */
+/** 职位行文字上限 84px（整块 96 封顶；长职务仍靠 fitText 截断） */
 const ROLE_MAX_TEXT_W = 84;
+/** 名字行左侧部门菱形宝石（◆）：宽 + 与名字的间距；整行最宽 = 9+5+72 = 86 < 96 不裁字 */
+const GEM_SIZE = 9;
+const GEM_GAP = 5;
+/** 职位行固定浅灰（部门色让给宝石）：比 0x94a3b8 再抬一档，11px 中文在深底上要更亮才不发闷 */
+const LABEL_ROLE_COLOR = 0xb0b9c6;
 
 /**
- * 名牌文字工厂。描边走 `TextStyle.stroke`（Pixi 直接按字形轮廓画硬边），
- * 不用 `BlurFilter`/描边滤镜：滤镜在 100+ 名牌下每帧多一次离屏 pass，
- * 且模糊会把 1px 黑边糊成灰晕，与规格「4 向 1px 硬边、无 blur」相反。
+ * 名牌文字工厂。底板 α=0.93 后名字行不再描边（描边糊中文）；职位行本就不描边。
+ * 若未来要在浅底上加字，描边走 `TextStyle.stroke`（Pixi 按字形轮廓画硬边），
+ * 不用 `BlurFilter`：滤镜在 100+ 名牌下每帧多一次离屏 pass。
  */
-function makeLabel(
-  text: string,
-  size: number,
-  color: number,
-  stroke?: { width: number; color: number },
-): PIXI.Text {
+function makeLabel(text: string, size: number, color: number): PIXI.Text {
   return new PIXI.Text({
     text,
     style: {
-      fontFamily: "monospace",
+      // 中文名牌不用 monospace（CJK 回退字重发虚）；sans 栈贴近定稿图的干净无衬线
+      fontFamily: '"Segoe UI", "Microsoft YaHei", system-ui, sans-serif',
       fontSize: size,
       fill: color,
       fontWeight: "700",
       align: "center",
-      ...(stroke ? { stroke } : {}),
     },
   });
 }
@@ -140,11 +152,11 @@ function roleColor(agent: OfficeAgent): number {
 }
 
 /**
- * 名牌上的职位色：深色主色（尤其兜底的 slate `0x64748b`）落在深色底板上等于看不见
- * ——测试项目 6 个 agent 里 4 个是中文职务/`qa_lead`，全走兜底色，实测那行字糊成一片。
+ * 名牌宝石提亮色（名字行 ◆ 部门色专用）：深色主色（尤其兜底的 slate `0x64748b`）落在深色底板上等于看不见。
  * 按比例放大三通道（保 HSL 的色相与饱和度，只抬亮度），阈值取「最亮通道 ≥200」：
  * amber/blue/red/purple/indigo/yellow/cyan 本来就在阈值上，取值一字不变，
- * 只有兜底的 slate 被抬成浅灰蓝。**只作用于名牌**，角色身体的 accent 仍用原主色。
+ * 只有兜底的 slate 被抬成浅灰蓝。**只作用于名牌宝石**，职位行是固定灰（LABEL_ROLE_COLOR），
+ * 角色身体的 accent 仍用原主色。
  */
 function labelRoleColor(agent: OfficeAgent): number {
   const c = roleColor(agent);
@@ -182,6 +194,8 @@ export class OfficeActor {
   private atDesk = false;
   /** 坐姿朝向（对应场景两种椅子朝向） */
   private sitVariant: "A" | "B" = "A";
+  /** 是否坐前台（前台名牌要额外压低 —— 理由见 FRONT_LABEL_EXTRA_DROP） */
+  private atFrontDesk = false;
   private sitPhase: "standing" | "sitdown" | "sitting" | "getup" = "standing";
   // 程序化回退（缺贴图时）
   private body: PIXI.Graphics | null = null;
@@ -190,6 +204,8 @@ export class OfficeActor {
   private label: PIXI.Container;
   /** 名牌整块高度（两行 + 内边距），构造期量一次用于「头顶上方 4px」定位 */
   private labelHeight = 0;
+  /** 名牌基准 y（构造期定稿）。`setTarget` 在此之上按是否前台加偏移。 */
+  private _labelBaseY = 0;
   private bubble: PIXI.Container;
   private bubbleDots = new PIXI.Graphics();
 
@@ -272,6 +288,7 @@ export class OfficeActor {
       ? -Math.abs(this.sprite.scale.y) * this.sprite.texture.height * FOOT_ANCHOR_Y
       : -33;
     this.label.y = headTop - LABEL_HEAD_GAP - this.labelHeight;
+    this._labelBaseY = this.label.y;
     this.bubble.visible = false;
 
     // Listen for state transitions (e.g. bubble pop animation)
@@ -290,11 +307,13 @@ export class OfficeActor {
     selected: boolean,
     atDesk = false,
     sitVariant: "A" | "B" = "A",
+    atFrontDesk = false,
   ): void {
     this.target = { x, y };
     this._selected = selected;
     this.atDesk = atDesk;
     this.sitVariant = sitVariant;
+    this.atFrontDesk = atFrontDesk;
 
     const output = this.fsm.evaluate(input);
     this.bubble.visible = output.showBubble;
@@ -304,8 +323,16 @@ export class OfficeActor {
     this.label.scale.set(selected ? 1.08 : 1);
     // 名牌按座位朝向向外偏，避免与邻座名牌重叠（理由见 LABEL_SIDE_SHIFT）。
     // 只在取值变化时赋值：这是一帧一次的 setTarget，不是构造期，避免无谓的 transform 记号。
-    const sideShift = sitVariant === "B" ? LABEL_SIDE_SHIFT : -LABEL_SIDE_SHIFT;
+    // ⚠ 前台不参与横向外偏：柜台前无邻座，偏出去反而压到旁边工位的桌面上。
+    const sideShift = this.atFrontDesk
+      ? 0
+      : sitVariant === "B"
+        ? LABEL_SIDE_SHIFT
+        : -LABEL_SIDE_SHIFT;
     if (this.label.x !== sideShift) this.label.x = sideShift;
+    // 前台额外下压（理由见 FRONT_LABEL_EXTRA_DROP）
+    const labelY = this._labelBaseY + (this.atFrontDesk ? FRONT_LABEL_EXTRA_DROP : 0);
+    if (this.label.y !== labelY) this.label.y = labelY;
     const a = stateAlpha(output.visual);
     if (this.body) this.body.alpha = a;
     if (this.face) this.face.alpha = a;
@@ -506,35 +533,50 @@ export class OfficeActor {
   // ── Private ───────────────────────────────────────────────────
 
   /**
-   * 两行名牌：名字（12px 白字 + 1px 黑描边）+ 职位（10px，role 主色）。
+   * 两行名牌：名字行（◆部门宝石 + 12px 白字无描边）+ 职位（11px 固定浅灰）。
    * **只在构造期建一次** —— Pixi Text 自带纹理缓存，只要不重设 `.text` 就不重上传纹理；
    * 名牌随小人走位时更新的是容器 transform，代价接近 0。
-   * 深色圆角底板保留：role 主色里有 amber/yellow/cyan 这类浅色，落在地板或玻璃墙前
-   * 单靠描边仍会糊；底板同时把两行括成一块，读起来是一个人的名签而不是两条标签。
+   * 深色圆角底板（α=0.93 近实心）撑对比 ⇒ 名字行不再描边（描边糊中文，定稿图亦无）。
+   * 部门色只上宝石（labelRoleColor 抬亮，避免兜底 slate 在深底上隐形）；
+   * 职位行固定浅灰 —— 与设计定稿一致（色在 ◆，字在灰）。
    */
   private _buildLabel(name: string, role: string): PIXI.Container {
     const c = new PIXI.Container();
-    const nameText = makeLabel(name, NAME_FONT_SIZE, 0xf8fafc, { width: 1, color: 0x000000 });
-    // 职位行**不加描边**（2026-09-23 审计后回退我先加的那版）：10px 中文叠 1px 描边会糊笔画，
-    // 且两行权重失衡。真因是底板只有 72% 不透明、压在橙色木地板上被稀释 ⇒ 抬底板不透明度
-    // （LABEL_BG_ALPHA）一行同时修好两行的对比度，比"两行都加描边"干净。
-    const roleText = makeLabel(roleDisplayName(role), ROLE_FONT_SIZE, labelRoleColor(this.agent));
+    const nameText = makeLabel(name, NAME_FONT_SIZE, 0xf8fafc);
+    const roleText = makeLabel(roleDisplayName(role), ROLE_FONT_SIZE, LABEL_ROLE_COLOR);
     fitText(nameText, NAME_MAX_TEXT_W);
     fitText(roleText, ROLE_MAX_TEXT_W);
-    nameText.anchor.set(0.5, 0);
+    // 名字行 = 宝石 + 间距 + 文字，整组水平居中；职位行相对底板居中
+    const nameRowW = GEM_SIZE + GEM_GAP + nameText.width;
+    nameText.anchor.set(0, 0);
     roleText.anchor.set(0.5, 0);
     nameText.y = LABEL_PAD_Y;
     roleText.y = nameText.y + nameText.height - LABEL_LINE_TIGHTEN;
 
-    const innerW = Math.max(nameText.width, roleText.width);
+    const gem = new PIXI.Graphics();
+    const hs = GEM_SIZE / 2;
+    gem.moveTo(hs, 0);
+    gem.lineTo(0, hs);
+    gem.lineTo(-hs, 0);
+    gem.lineTo(0, -hs);
+    gem.closePath();
+    gem.fill(labelRoleColor(this.agent));
+    const rowX = -nameRowW / 2;
+    gem.x = rowX + hs;
+    gem.y = nameText.y + nameText.height / 2;
+    nameText.x = rowX + GEM_SIZE + GEM_GAP;
+
+    const innerW = Math.max(nameRowW, roleText.width);
     const w = Math.min(96, innerW + LABEL_PAD_X * 2);
     const h = roleText.y + roleText.height + LABEL_PAD_Y;
     const bg = new PIXI.Graphics();
-    bg.roundRect(-w / 2, 0, w, h, 7);
+    bg.roundRect(-w / 2, 0, w, h, 8);
     bg.fill({ color: LABEL_BG, alpha: LABEL_BG_ALPHA });
+    // 定稿图有发丝描边：1px 冷灰把牌子从木地板/隔板上“描”出来，远看轮廓更定型
+    bg.stroke({ width: 1, color: 0x64748b, alpha: 0.95 });
 
     this.labelHeight = h;
-    c.addChild(bg, nameText, roleText);
+    c.addChild(bg, gem, nameText, roleText);
     return c;
   }
 

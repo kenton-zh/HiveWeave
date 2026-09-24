@@ -106,6 +106,11 @@ export interface SceneSnapshot {
   communicatingIds: Set<string>;
   selectedAgentId: string | null;
   userPingIds: Set<string>;
+  /**
+   * 当前项目显示名 —— 渲染在前台柜台招牌上（弧面弯曲，见 frontSign.ts）。
+   * null/空串时回退品牌名。仅当值变化时触发重绘（避免每帧重算 canvas）。
+   */
+  projectName: string | null;
 }
 
 // ── Interaction Events (PixiJS → React bridge) ────────────────────
