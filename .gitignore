@@ -32,7 +32,10 @@ Thumbs.db
 # `server.out.log.1`，不加这条每代备份都会变成未跟踪文件、并混进 OCR 审计。
 *.log.[0-9]*
 npm-debug.log*
+# ⚠ 同族的第二处（2026-09-24 实证）：`tasks/*.output` 匹配不到 `x.output.1`，
+# `tasks/backend-20260923-171729.output.1` 就是这样浮成未跟踪文件的。
 tasks/*.output
+tasks/*.output.*
 
 # Docker
 .docker/
@@ -80,6 +83,10 @@ _t.txt
 _inspect*.js
 _inspect*.py
 tasks/_diag_*
+# scripts 下的**下划线前缀** = 一次性探针（mock 形状 / 落点标定 / 截图），跑完即弃。
+# ⚠ 用结构性规则而不是继续补后缀：上面那串 `_probe*.py` / `_fix*.mjs` 逐条列举的
+# 写法只覆盖已见过的后缀 —— 2026-09-24 就是 `.mjs` 探针（5 个）漏网浮成未跟踪的。
+apps/web/scripts/_*
 
 # Chat history exports (other projects)
 *_chat_history.json
@@ -218,6 +225,18 @@ docs/platform-issue-research/
 # —— 搬迁动机：public/ 下一切都会进 dist/EXE，这里才是「不让中间产物进包」的根治（原先只靠构建脚本 /XF 止血）
 assets/art/office/working/
 
+# 同一精神，但针对**没搬走、仍留在 public/ 下**的那类：`public/` 会被原样拷进
+# dist ⇒ 备份图与"仅作对照"的拆分中间产物在 public/ 下裸放的后果是
+# **既不进 git 又会进 EXE**（两道防线同时失效）。
+# ⚠ 下面 5 条与 `vite.config.ts::ARTIFACT_PATTERNS` **逐条对应** —— 加一条要两处都加。
+#   2026-09-24 复查：此前只有 `.bak.png` 一条，`*.patched.png` / `*.pre-lama*.png`
+#   侧只在构建侧拦（.gitignore 侧漏），`.pre-lama2).bak.png` 由 `*.bak.png` 覆盖、不另列。
+*.bak.png
+*.patched.png
+*.pre-lama.png
+*.pre-lama2.png
+*-nofurniture.png
+
 # Local AI memory backups (AI_MEMORY.local.md 已 ignore，备份同精神)
 AI_MEMORY.local.md.bak*
 
@@ -241,3 +260,26 @@ tasks/create-*-payload.json
 # 随本机 ComfyUI 版本变（09-10 那轮 2.4MB/1410 节点已删过一次、09-16 又出现 ⇒ 按名字防复发）。
 # 需查节点参数时看 skills/comfyui-sprite-sheet/SKILL.md 的 GET /object_info，别把快照提交进来。
 object_info.json
+
+# 前台（frontdesk）提取/生成轮的工作目录（2026-09-23）—— 合计 28 MB 的探针帧、
+# alpha 原图、sweep 采样与 H3 样片。**只 ignore 产物，脚本与 prompt 入库**：
+# `.py` + `prompt_*.txt` 是"这张图怎么来的"的再生路径（constants.ts 直接引用了
+# `split_frontdesk_layers.py` / `split_chair_piece.py` / `build_front_sheet.band_align`），
+# 而产物一条命令可重跑 ⇒ 按 `.gitignore` 既有口径（脚本入库、快照不入库）分开处理。
+# ⚠ 判据是**命名**不是"是不是 json/png"：带 `_` 前缀（`_sign_quad.json` / `_asset_*.png`）
+#   判为探针中间数据；而无前缀的 `frontdesk_layers.json` / `sign_curve.json` 是
+#   `split_frontdesk_layers.py` / `sign_name.py` 的**标定参数存档**（FRONT_SIGN 数值即源于此）
+#   ⇒ 随脚本人库，故这里不写 `*.json`。
+tasks/frontdesk-extract/*.png
+tasks/frontdesk-extract/_*.json
+tasks/hr-frontdesk/**/*.png
+# ⚠ 反选必须排在**忽略规则之后**（gitignore 是"后匹配者胜"，写前面等于没写 ——
+#   2026-09-24 首版就写错了，`git check-ignore` 实测仍是 IGNORED 才发现）。
+# ⚠ 反选对象：`ref/hr-girl-front.png` 是**来源裁件**（不是产物）—— `constants.ts` 的
+#   `AGENT_HR_FRONTDESK` 注释明文引用它（148×531），且 `resheet_qwen.py` /
+#   `sweep_shots.py` 的 `--image` 默认值就是它；其上游立绘表不在仓内 ⇒
+#   不跟进库会**断掉溯源链**（2026-09-24 审计发现，原规则把整个 ref/ 一锅端了）。
+!tasks/hr-frontdesk/ref/hr-girl-front.png
+tasks/hr-frontdesk/**/*.mp4
+tasks/hr-frontdesk/**/_*.json
+tasks/hr-frontdesk/runs/sweep/

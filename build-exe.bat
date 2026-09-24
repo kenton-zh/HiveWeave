@@ -436,7 +436,7 @@ if exist "%OUT%\web" (
   echo WEB DIR PURGE FAILED: %OUT%\web 仍在（被占用？）
   exit /b 1
 )
-robocopy apps\web\dist "%OUT%\web" /MIR /NFL /NDL /NJH /NJS /XF *.bak.png *.patched.png >> "%OUT%\build-assets.log" 2>&1
+robocopy apps\web\dist "%OUT%\web" /MIR /NFL /NDL /NJH /NJS /XF *.bak.png *.patched.png *.pre-lama.png *.pre-lama2.png *-nofurniture.png >> "%OUT%\build-assets.log" 2>&1
 if errorlevel 8 exit /b 1
 REM 出厂门禁：确认中间产物确实没进产物（防 /XF 被误删/写错后静默放行）。
 REM
@@ -460,19 +460,28 @@ REM     源存在 + 有匹配 ⇒ **rc=1**  ⇒ 中止（就是「中间产物�
 REM     源不存在/不可访问 ⇒ **rc=16** ⇒ 中止（异常态，fail loud 是安全侧）
 REM   故判据为 `if errorlevel 1`：rc>=1 一律中止。它把 rc=16 也归入中止，
 REM   这是**有意的**——源目录都读不到时不该继续出包。
-REM ⚠ 必须同时列两种模式（见洞③）：`*.bak.png *.patched.png`。
+REM ⚠ 必须把**全部**产物命名都列上（见洞③的成因：当时只列了两种）：
+REM   `*.bak.png *.patched.png *.pre-lama.png *.pre-lama2.png *-nofurniture.png`
+REM   这五条与 `apps/web/vite.config.ts::ARTIFACT_PATTERNS` 逐条对应 ——
+REM   **改一边必须改另一边**（本文件与那处是不同层次的防线，见 vite.config.ts 注释）。
+REM ⚠ 2026-09-24 实测：`*-nofurniture.png` 当时三处都没登记，结果
+REM   `office-frontdesk-front-nofurniture.png`（54634 B）确实躺进了
+REM   `apps\desktop\dist\HiveWeave\web\office-assets\` —— 门禁是绿的，
+REM   因为它的模式表里根本没有这个名字。**这就是洞③的复发**。
+REM   教训：门禁只保证「模式表里列的名没进包」，不保证「产物没进包」；
+REM   模式表本身漏项时，门禁会给出**假绿**。新增产物命名时先问「模式表更新了吗」。
 REM ⚠ `/L` 的目标目录参数只是占位（/L 下绝不创建/写入），用 %TEMP% 下
 REM   不存在的路径即可，不会污染磁盘；但**源路径必须真实存在**，
 REM   否则撞 rc=16 误判（本次调试踩过：POSIX 路径 /tmp/x 会被解析成
 REM   D:\tmp\x 而报「错误 3 系统找不到指定的路径」）。
-robocopy "%OUT%\web" "%TEMP%\hw_gate_nonexistent" /L /S /NJH /NJS /NS /NC /FP /NDL *.bak.png *.patched.png >nul 2>&1
+robocopy "%OUT%\web" "%TEMP%\hw_gate_nonexistent" /L /S /NJH /NJS /NS /NC /FP /NDL *.bak.png *.patched.png *.pre-lama.png *.pre-lama2.png *-nofurniture.png >nul 2>&1
 if errorlevel 1 (
   REM 注：此 echo 文案刻意全用全角括号/无括号 —— 块内 echo 里的
   REM 半角括号必须转义且极易写错，本文件历史上已被括号坑过两次
   REM （见顶部 MEASURED NOTES），故不引入转义括号。
   echo ARTIFACT GATE FAILED: 美术中间产物进了产物目录，或产物 web/ 不可读
   echo   下面列出被检出的文件，请检查 /XF 是否失效：
-  robocopy "%OUT%\web" "%TEMP%\hw_gate_nonexistent" /L /S /NJH /NJS /NS /NC /FP /NDL *.bak.png *.patched.png 2>nul
+  robocopy "%OUT%\web" "%TEMP%\hw_gate_nonexistent" /L /S /NJH /NJS /NS /NC /FP /NDL *.bak.png *.patched.png *.pre-lama.png *.pre-lama2.png *-nofurniture.png 2>nul
   exit /b 1
 )
 if not exist "%OUT%\bin" mkdir "%OUT%\bin"
