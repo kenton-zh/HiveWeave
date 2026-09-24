@@ -221,6 +221,8 @@ export const ASSET_URLS = {
   /** 前台柜台的**分层**两片（2026-09-23）：back = 内嵌黑椅 + 双显示器 + 白台面（角色之下）；
    *  front = 木柜面前脸 + 蓝牌 + 接地阴影（角色之上，挡腿）。切割脚本见
    *  `tasks/frontdesk-extract/split_frontdesk_layers.py`（两片 alpha 之和 == 原图）。
+   *  ⚠ `tasks/` **本地工作目录，未入库**（2026-09-24 起，见 `.gitignore`）——本文件其余
+   *  对 `tasks/…` 的引用同此，clone 下来的仓里没有这些脚本，别去找。
    *  ⚠ `OFFICE_FRONTDESK_SET` 单片版本**仍保留**作回退/对照，但运行时不再使用。 */
   OFFICE_FRONTDESK_BACK: "/office-assets/office-frontdesk-back.png",
   OFFICE_FRONTDESK_FRONT: "/office-assets/office-frontdesk-front.png",
@@ -273,7 +275,7 @@ export const ASSET_URLS = {
    *
    *  ── 素材身份（硬绑，用户钦定「横数第二个白衣女孩，每个项目都是 HR」）──
    *  参考图 = 立绘表 `bf746083-…png` 第一行第二列「白衣女孩」，
-   *  裁件 `tasks/hr-frontdesk/ref/hr-girl-front.png`（148×531）。
+   *  裁件 `tasks/hr-frontdesk/ref/hr-girl-front.png`（148×531，本地工作文件，未入库）。
    *  ⚠ 与紫衣女孩**不是同一角色** —— 不要把两张 sheet 合并或互相回退。 */
   AGENT_HR_FRONTDESK: "/office-assets/agent-hr-frontdesk-sheet.png?v=h3v1",
 } as const;

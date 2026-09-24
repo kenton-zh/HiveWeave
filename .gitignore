@@ -240,6 +240,22 @@ assets/art/office/working/
 # Local AI memory backups (AI_MEMORY.local.md 已 ignore，备份同精神)
 AI_MEMORY.local.md.bak*
 
+# ── tasks/ —— **整个目录不入库**（2026-09-24 用户钦定）────────────────────
+# 用户口径：「云仓库只放**项目必要的代码和资源**，开发过程文件不要」。
+# 依据与证据：
+#   · 它是美术加工 / 取证 / 一次性对照脚本的**工作区**。实测**无任何引用**：
+#     `grep -rnE "(from|import) +tasks\.|../tasks/|tasks/[a-z_]+\.py"` 在
+#     `apps/**`、`scripts/`、`.github/` 全为 0 命中（命中的都是 `services/tasks/`
+#     `tools/tasks/` 这类**模块路径**，不是本目录）。
+#   · 2026-09-24 之前已入库 49 个（09-06 曾钦定「复用管线入库」）+ 本轮新增 27 个，
+#     共 76 个 ⇒ 本次一并移出：`git rm -r --cached tasks/`（**只动索引，磁盘文件全保留**）。
+#   · ⚠ 代价（已就地处置）：`constants.ts` 注释引用过
+#     `tasks/frontdesk-extract/split_*.py` / `tasks/hr-frontdesk/ref/hr-girl-front.png`
+#     作为再生路径 ⇒ 那几处已标注「本地工作文件，未入库」，不再假装它随仓发布。
+#   · 下面各条细规则在整目录移出后**成为冗余**，保留作历史判据记录（别急着删，
+#     它们记录了 `.output.1` 轮转、`_desk_debug/` 等坑的成因）。
+/tasks/
+
 # tasks 工作产物：冻结 DB 快照 / 调试图目录 / tar 中转包 / 内联 three.js 的超大自检文件 / 提交信息草稿
 tasks/_desk_debug/
 tasks/_v45_snap/

@@ -5,7 +5,8 @@
  *   柜台蓝牌是弧形（随柜台圆柱面弯曲），平面文字盖上去必假，
  *   必须沿弧面逐列弯曲才能与画风一体。
  *
- * 算法（与离线标定脚本 `tasks/frontdesk-extract/sign_name.py` 同源，
+ * 算法（与离线标定脚本 `tasks/frontdesk-extract/sign_name.py` 同源 —— 该目录是本地工作区、
+ * 未入库（见 `.gitignore`），仓里拿不到脚本，曲线参数唯一权威就是下面这个 import，
  * 曲线参数唯一权威 = `constants.ts` 的 `FRONT_SIGN`）：
  *   1. 把项目名画成一张**水平**文字画布（展平坐标系）
  *   2. 逐列把该画布的像素拉伸到 `frontSignHeight(x)` 的高度，
