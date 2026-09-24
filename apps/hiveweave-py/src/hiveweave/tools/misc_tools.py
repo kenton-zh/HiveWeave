@@ -226,6 +226,206 @@ def _parse_branch_list(branch_out: str) -> list[str]:
     return out
 
 
+def _strip_one_relocation_suffix(name: str) -> str:
+    """剥掉**一层** relocation 后缀（``A461-b`` → ``A461``）。
+
+    后缀清单来自 ``constants._RELOCATION_SUFFIXES`` 常量（与 `paths`/`file`
+    同源），**不手写枚举/正则**。只剥一层 —— ``A461-bb`` 不是别名后缀，
+    不得继续剥成 ``A461``。无后缀/会剥成空串时原样返回。
+    """
+    from hiveweave.services.git_worktree.constants import _RELOCATION_SUFFIXES
+
+    s = (name or "").strip()
+    for suf in _RELOCATION_SUFFIXES:
+        if suf and len(s) > len(suf) and s.endswith(suf):
+            return s[: -len(suf)]
+    return s
+
+
+async def _resolve_branch_by_worktree_binding(
+    workspace_path: str, branch_name: str, caller_short_id: str | None
+) -> tuple[str | None, list[str]]:
+    """按 ``git worktree list --porcelain`` 的**绑定**解析分支。
+
+    porcelain 发布 ``worktree <path>`` ↔ ``branch refs/heads/<name>`` 的绑定
+    关系；worktree **目录别名**（如 ``A461-b``，带 relocation 后缀）下的真实
+    分支由绑定给出，**不按名字猜**。命中两式：
+
+      ① worktree 目录基名 == 入参
+         —— 覆盖 ``A461-b`` / ``A463-b`` 这种目录别名（须**精确**匹配该别名，
+            不剥后缀去凑别的目录，见 F4）；
+      ② 绑定分支的任务段（``hw/<sid>/<name>`` 的 ``<name>``）经 ``_slugify``
+         归一后 == 入参经 ``_slugify`` 归一 —— 覆盖 coordinator 按任务名
+         （含空格/斜杠写法）合并 executor 分支的场景（F3）。
+
+    ⚠ F2：只认 ``hw/*`` 绑定分支 —— 主 worktree / ``main`` / 任何非 ``hw/*``
+    分支**永不**成为候选（否则 ``basename == 仓目录名`` 会解析出 ``main``，
+    下游 ``merged_short`` 为空却继续，走到义务结算的无范围兜底）。
+
+    返回 ``(唯一分支 | None, 命中分支列表)``：恰 1 条 → ``(branch, [branch])``；
+    ≥2 条 → ``(None, matches)``（调用方按「歧义」报错）；0 条 / git 失败 →
+    ``(None, [])``。命中集内若**恰有**一条属于调用者 short_id，则优先取它
+    （保留既有「调用者自有分支优先」行为）。
+    """
+    from hiveweave.services.git_worktree import _git, _parse_worktree_porcelain
+    from hiveweave.services.git_worktree.naming import _slugify, parse_hw_branch
+
+    target = (branch_name or "").strip()
+    if not target:
+        return None, []
+    ok, raw = await _git(["worktree", "list", "--porcelain"], workspace_path)
+    if not ok:
+        return None, []
+    target_slug = _slugify(target)
+    hits: list[str] = []
+    for entry in _parse_worktree_porcelain(raw or ""):
+        branch = (entry.get("branch") or "").strip()
+        sid, _tid = parse_hw_branch(branch)
+        if not sid:
+            # 主 worktree / detached / 任何非 hw/* 分支 —— 不是 agent 分支，
+            # 永不作为合并目标（F2）。
+            continue
+        basename = Path(str(entry.get("path") or "")).name
+        tail = branch[len("hw/"):].split("/", 1)[-1]
+        matched = basename == target or _slugify(tail) == target_slug
+        if matched and branch not in hits:
+            hits.append(branch)
+    if len(hits) > 1 and caller_short_id:
+        own = [
+            b
+            for b in hits
+            if parse_hw_branch(b)[0].upper() == str(caller_short_id).upper()
+        ]
+        if len(own) == 1:
+            return own[0], hits
+    if len(hits) == 1:
+        return hits[0], hits
+    return None, hits
+
+
+async def _porcelain_branches_for_basename(
+    workspace_path: str, basename: str
+) -> list[str]:
+    """porcelain 里目录基名 == ``basename`` 的 worktree 所绑定的 ``hw/*`` 分支。
+
+    用于 F4 的「别名自身 worktree 缺失」判定：若该 short id 另有已注册
+    worktree（基名 == 剥后缀后的短号），说明别名指向的是**别的**树 ⇒ 报候选
+    而不是静默改选那棵树的分支。
+    """
+    from hiveweave.services.git_worktree import _git, _parse_worktree_porcelain
+    from hiveweave.services.git_worktree.naming import parse_hw_branch
+
+    if not basename:
+        return []
+    ok, raw = await _git(["worktree", "list", "--porcelain"], workspace_path)
+    if not ok:
+        return []
+    out: list[str] = []
+    for entry in _parse_worktree_porcelain(raw or ""):
+        branch = (entry.get("branch") or "").strip()
+        if not parse_hw_branch(branch)[0]:
+            continue
+        if Path(str(entry.get("path") or "")).name == basename and branch not in out:
+            out.append(branch)
+    return out
+
+
+async def _resolve_short_id_merge(
+    workspace_path: str, short_id: str, target_branch: str
+) -> tuple[list[str], ToolResult | None]:
+    """短号 ``hw/<short_id>/*`` 分支枚举 + 零匹配幂等/报错判定。
+
+    返回 ``(branches, early)``。``early`` 非 None 时调用方**直接返回**它
+    （「本次分支已合入 main」成功态，或「查无分支」错误态）；否则
+    ``branches`` 为命中列表（≥1 条，调用方用 ``branches[0]``，>1 条时在回执
+    里列出余项）。
+    """
+    from hiveweave.services.git_worktree import _git
+
+    ok, branch_out = await _git(
+        ["branch", "--list", f"hw/{short_id}/*"], workspace_path
+    )
+    branches = _parse_branch_list(branch_out)
+    if branches:
+        return branches, None
+    # F13b（平台修复计划 2026-08-30）：分支查找零匹配 ≠ 冲突，也 ≠ 必须出错
+    # —— 分支可能已在上次 merge 后被清理，但 main 已经包含它。幂等重入直接
+    # 给成功态（r4：两个 Agent 各踩一次 "No worktree branch found" 才弄清
+    # 不是冲突）。
+    _candidate = f"hw/{short_id}"
+    _is_ancestor, _anc = await _git(
+        ["merge-base", "--is-ancestor", _candidate, target_branch],
+        workspace_path,
+    )
+    if _is_ancestor:
+        # ref 还在且已是 target 祖先 ⇒ 真·已合并（rc=0 无输出的语义就在这里）。
+        _already = True
+    else:
+        # ref 已删：退而按 merge commit 历史判定（P2 边界审计：
+        # --fixed-strings 字面匹配，防分支名含正则元字符误判）。
+        #
+        # ⚠ F1（2026-09-24 审计）：`git log --grep` 在**没有任何匹配**时仍
+        # rc=0 且输出为空；`_git` 以 returncode==0 判成功 ⇒ **绝不能单独用
+        # rc 判「已合并」**。否则任意不存在的分支（`Z999-b` / `Z999`）都会
+        # 假成功 `already_merged` —— 恰好违反「真不存在的分支仍拒」判据。
+        # 判据 = 输出里确实解析出**一条 merge commit 行**（`<sha> <subject>`）。
+        #
+        # ⚠ A（2026-09-24 审计）：拼 `_candidate = hw/<sid>` 去 grep 是**死路**
+        # —— 平台分支恒为 `hw/<sid>/<name>`（`compute_branch_name`：`work` 或
+        # `t-<8hex>`，见 naming.py），**从不**产生两段的 `hw/<sid>`；真实 merge
+        # subject 是 `Merge branch 'hw/A500/work'`，其字面**不含**子串
+        # `Merge branch 'hw/A500'`（`A500` 之后是 `/` 不是 `'`）。于是「短号
+        # 重入」黑盒失败，而「全名重入」成功 —— 同一 merge 事件两个相反结论。
+        # 修法：两条固定串 `--grep`（git 默认 **OR**），覆盖两种真实尾段：
+        #   - `Merge branch 'hw/<sid>'`    —— 一级分支（兼容存量手写 subject）
+        #   - `Merge branch 'hw/<sid>/`    —— 真实形态 `work`/`t-<8hex>`
+        #
+        # ⚠ 注意第二条**不带**收尾单引号：真实 subject 在 `/` 之后还有
+        # `work'`，若写成 `…/<sid>/'`（多一个 `'`）则字面不匹配 —— 正是这个
+        # off-by-one 让「短号重入」继续走死路。模式必须止于 `/`。
+        ok_log, log_out = await _git(
+            ["log", "-1", "--oneline", "--merges", "--fixed-strings",
+             f"--grep=Merge branch '{_candidate}'",
+             f"--grep=Merge branch '{_candidate}/"],
+            workspace_path,
+        )
+        _already = bool(
+            ok_log and re.match(r"^[0-9a-f]{7,}\s", (log_out or "").strip())
+        )
+    if _already:
+        # TEST_DSH_62 P5/L8：outcome token + 与服务层 merge_by_branch 幂等
+        # 重入回执（service_merge.py）收敛为同一句文案，两处「已合并」变体
+        # 只留这一份。
+        return [], ToolResult.ok(
+            f"outcome=already_merged: Branch {_candidate} was already merged "
+            f"into {target_branch} by a prior merge — idempotent success. "
+            "Nothing to do; the worktree branch was cleaned up. Do not call "
+            "git_worktree_merge again for this branch."
+        )
+    # T2.1: 分支查找零匹配 ≠ 冲突 —— 对照组（task_name 零匹配路径）从不拼
+    # 冲突提示，这里此前却无条件拼 MERGE_CONFLICT_HINT，把 coordinator 引导
+    # 去 rework 不存在的冲突。改用专属 hint。
+    #
+    # F1/F5（2026-09-24 审计）：零匹配是**拒绝**，必须与「真已合并」可区分，
+    # 且错误里要给可用分支清单 + 恢复 route（别名形状的阳性对照就靠这条）。
+    from hiveweave.services.worktree_review import BRANCH_LOOKUP_FAILED_HINT
+
+    ok_all, out_all = await _git(["branch", "--list", "hw/*/*"], workspace_path)
+    all_branches = _parse_branch_list(out_all)
+    listing = (
+        "Available worktree branches:\n"
+        + "\n".join(f"  - {b}" for b in all_branches)
+        if all_branches
+        else "No hw/*/* worktree branches exist."
+    )
+    return [], ToolResult.err(
+        f"No worktree branch found for agent {short_id}. Pass the worktree "
+        f"directory alias (e.g. 'A461-b'), the full branch name "
+        f"(hw/<shortId>/<name>), or a different shortId.\n\n"
+        f"{listing}\n\n{BRANCH_LOOKUP_FAILED_HINT}"
+    )
+
+
 class GitWorktreeMergeParams(BaseModel):
     """Parameters for git_worktree_merge tool."""
 
@@ -233,7 +433,14 @@ class GitWorktreeMergeParams(BaseModel):
 
     branch_name: str = Field(
         alias="branchName",
-        description="Branch/task name of the worktree to merge.",
+        description=(
+            "Branch to merge. Accepts EITHER the full branch name "
+            "(hw/<shortId>/<name>), OR the worktree directory alias "
+            "(e.g. 'A461-b'), OR the task name. An alias resolves to the "
+            "branch actually bound to that worktree via git worktree list; "
+            "a task name is matched (slug-normalised) against the bound "
+            "branch's task segment."
+        ),
         json_schema_extra={
             "aliases": ["branchName", "branch_name", "branch", "name", "taskName", "task_name", "task"]
         },
@@ -679,6 +886,8 @@ async def _settle_merge_obligations_after_merge(
 @tool(
     "git_worktree_merge",
     "Merge a worktree branch into main and remove the worktree. "
+    "branchName accepts EITHER the full branch name (hw/<shortId>/<name>), "
+    "OR the worktree directory alias (e.g. 'A461-b'), OR the task name. "
     "Pass taskId for an exact hit on the stable branch "
     "hw/<shortId>/t-<taskId[:8]>. "
     "On conflict: main merge is aborted; rework the executor to rebase/merge "
@@ -693,14 +902,22 @@ async def git_worktree_merge_tool(
     """Merge a git worktree branch back into main and remove the worktree.
 
     Bug G fix: 支持架构师合并其他 agent 的 worktree。
-    branch_name 解析顺序：
-    - task_id 提供时（P0 稳定命名）— 按契约算 hw/<sid>/t-<taskid8>
-      精确命中；未命中回落下列 legacy 路径
-    - "hw/..." 完整分支名 — 直接使用
-    - short_id (如 "A066") — 查找该 agent 的分支
-    - task_name (如 "后端工程师" / "feat-x") — 先查调用者自己的分支；
-      查不到再全局搜索 hw/*/<name>，唯一匹配则合并，
-      零匹配/多匹配则报错并列出候选分支（不再静默拼调用者前缀）。
+    branch_name 解析顺序（三段；一律**先解出真实分支**再合并，不按名字猜）：
+    - task_id 提供时（P0 稳定命名）— 按契约算 hw/<sid>/t-<taskid8> 精确命中
+    - "hw/..." 完整分支名 — **透传**给服务层直接用（不在工具层预判存在性：
+      ref 消失既可能是「从没存在」也可能是「已合并并清理」，二者同形，须由
+      服务层的 merge 历史区分，见 N1）
+    - short_id（如 "A066"）— 枚举该 agent 的 hw/<sid>/* 分支；零匹配时用
+      main 的 merge 提交历史判「已合并并清理」→ 幂等成功，否则报错并列候选
+    - task_name（如 "后端工程师" / "feat-x"）或 worktree **目录别名**
+      （如 "A461-b"）— 走**权威源** `git worktree list --porcelain` 的绑定：
+      目录基名精确 == 入参，或绑定分支任务段经 `_slugify` 归一 == 入参归一
+      （任务名含空格/斜杠也能命中）；命中多条时若恰有一条属于调用者则优先，
+      否则报歧义并列候选。**前提**：该 worktree 必须仍在 porcelain 里注册
+      —— 已拆除的 worktree 没有绑定，此时才回退：「至多剥一层」relocation
+      后缀（`_RELOCATION_SUFFIXES`）得到短号，交回上面的 short_id 路径。
+      两者都没命中则报错，并给出可用分支清单 + 恢复 route（别名 / 全名 /
+      短号三选一），不再静默拼调用者前缀。
     """
     from hiveweave.services.git_worktree import GitWorktreeService
 
@@ -773,6 +990,18 @@ async def git_worktree_merge_tool(
 
         merge_call = _do_merge
     elif branch_name.startswith("hw/"):
+        # 全名**透传**：直接把 `hw/<sid>/<name>` 交给服务层，不在此处猜。
+        #
+        # N1 决策（2026-09-24 审计）：**不在此处加「分支必须存在」的前置校验**。
+        # 理由（结构性）：`hw/<sid>/<name>` 的 ref 消失有**两种**来源 ——
+        #   ① 从来没存在过（应当拒绝）；
+        #   ② 已经 merge 并被清理（F13b 幂等重入，**必须**成功 `already_merged`）。
+        # 二者在 ref 层面**同形**，此处无法区分（`merge-base --is-ancestor` 对
+        # 不存在的 ref 一律 128）。若在此拦掉「ref 不存在」，就会连同 ② 一起
+        # 杀掉 —— 正是 A 回归所钉的真实生命周期（merge → 清 worktree → 删分支
+        # → 传全名必须幂等成功）。故判据下沉到**唯一能区分二者的地方**：
+        # 服务层用 main 的 merge 提交历史（真解析出一条 merge 行）判定，
+        # 见 `service_merge.merge_by_branch` 的 N1 修复。
         merged_branch = branch_name
         from hiveweave.tools.task_tools import parse_short_id_from_branch
 
@@ -788,54 +1017,11 @@ async def git_worktree_merge_tool(
         # 严格 short_id 形状（字母+数字，如 "A066"）— 查找该 agent 的分支。
         # 注意：不能用 isalnum() —— CJK 字符也算 alnum，短中文任务名
         # （如"后端工程师"）会被误判成 short_id。
-        from hiveweave.services.git_worktree import _git
-        ok, branch_out = await _git(
-            ["branch", "--list", f"hw/{branch_name}/*"],
-            workspace_path
+        branches, early = await _resolve_short_id_merge(
+            workspace_path, branch_name, target_branch
         )
-        branches = _parse_branch_list(branch_out)
-        if not branches:
-            # F13b（平台修复计划 2026-08-30）：分支查找零匹配 ≠ 冲突，也
-            # ≠ 必须出错 —— 分支可能已在上次 merge 后被清理，但 main 已经
-            # 包含它。幂等重入直接给成功态（r4：两个 Agent 各踩一次
-            # "No worktree branch found" 才弄清不是冲突）。
-            # 前缀纪律：branch_name 是 short_id（本分支）→ 拼 hw/<sid>；
-            # 已带 hw/ 前缀则直接用（防 hw/hw/ 双拼）。
-            _candidate = branch_name if str(branch_name).startswith("hw/") else (
-                f"hw/{branch_name}"
-            )
-            _already, _anc = await _git(
-                ["merge-base", "--is-ancestor", _candidate, target_branch],
-                workspace_path,
-            )
-            if not _already:
-                # ref 已删：退而按 merge commit 历史判定（P2 边界审计：
-                # --fixed-strings 字面匹配，防分支名含正则元字符误判）
-                _already, _anc = await _git(
-                    ["log", "-1", "--oneline", "--merges", "--fixed-strings",
-                     f"--grep=Merge branch '{_candidate}'"],
-                    workspace_path,
-                )
-            if _already:
-                # TEST_DSH_62 P5/L8：outcome token + 与服务层
-                # merge_by_branch 幂等重入回执（service_merge.py）收敛为
-                # 同一句文案，两处「已合并」变体只留这一份。
-                return ToolResult.ok(
-                    f"outcome=already_merged: Branch {_candidate} was "
-                    f"already merged into {target_branch} by a prior "
-                    "merge — idempotent success. Nothing to do; the "
-                    "worktree branch was cleaned up. Do not call "
-                    "git_worktree_merge again for this branch."
-                )
-            # T2.1: 分支查找零匹配 ≠ 冲突 —— 对照组（task_name 零匹配路径）
-            # 从不拼冲突提示，这里此前却无条件拼 MERGE_CONFLICT_HINT，把
-            # coordinator 引导去 rework 不存在的冲突。改用专属 hint。
-            from hiveweave.services.worktree_review import BRANCH_LOOKUP_FAILED_HINT
-
-            return ToolResult.err(
-                f"No worktree branch found for agent {branch_name}\n\n"
-                f"{BRANCH_LOOKUP_FAILED_HINT}"
-            )
+        if early is not None:
+            return early
         merged_short = branch_name
         merged_branch = branches[0]
 
@@ -853,47 +1039,83 @@ async def git_worktree_merge_tool(
 
         merge_call = _do_merge
     else:
-        # task_name — 先按原行为查调用者自己的分支；查不到则全局搜索
-        # hw/*/<slug>（coordinator 按名字合并 executor 分支的场景）。
-        # 旧行为：静默用调用者 short_id 拼前缀 → coordinator 传 executor 的
-        # 分支名时必然找错（井字棋实测：解析成 hw/A001/feat-tictactoe-a004）。
-        from hiveweave.services.git_worktree import _git, _slugify
+        # task_name / worktree 目录别名 —— 先走**权威源**（porcelain 绑定）。
+        #
+        # P1 🔁#4（2026-09-24）：`git worktree list --porcelain` 发布
+        # `worktree <path>` ↔ `branch refs/heads/<name>` 绑定；`A461-b` 这种
+        # 目录别名（relocation 后缀）的真实分支由绑定给出，**不按名字猜**。
+        # 此前这里把别名 `_slugify` 后拼 `hw/<caller>/<slug>`、再 glob
+        # `hw/*/<slug>` —— 对 `A461-b`/`A463-b` 必然 0 命中并报
+        # 「No worktree branch found matching 'A461-b'」（21:11:34 ×2 /
+        # 23:59:39 实测三次），而 porcelain 早已发布
+        # `worktree …/A461-b` ↔ `branch refs/heads/hw/A461/work`。
+        from hiveweave.services.git_worktree import _git
 
-        slug = _slugify(branch_name)
-        caller_branch = f"hw/{caller_short_id}/{slug}"
-        ok_c, out_c = await _git(
-            ["branch", "--list", caller_branch], workspace_path
+        porcelain_branch, porcelain_matches = (
+            await _resolve_branch_by_worktree_binding(
+                workspace_path, branch_name, caller_short_id
+            )
         )
-        caller_exists = bool(ok_c and caller_branch in (out_c or ""))
+        if porcelain_branch:
+            merged_branch = porcelain_branch
+            from hiveweave.tools.task_tools import parse_short_id_from_branch
 
-        if caller_exists:
-            merged_short = caller_short_id
-            merged_branch = caller_branch
+            merged_short = parse_short_id_from_branch(porcelain_branch)
 
             async def _do_merge() -> dict:
-                return await gwt.merge(
-                    workspace_path, caller_short_id, str(branch_name),
-                    target_branch,
+                return await gwt.merge_by_branch(
+                    workspace_path, porcelain_branch, target_branch
                 )
 
             merge_call = _do_merge
-        else:
-            ok_g, out_g = await _git(
-                ["branch", "--list", f"hw/*/{slug}"], workspace_path
+        elif len(porcelain_matches) > 1:
+            return ToolResult.err(
+                f"Ambiguous branch name '{branch_name}' matches "
+                f"{len(porcelain_matches)} branches — pass the full name "
+                f"(hw/<shortId>/<name>) instead:\n"
+                + "\n".join(f"  - {m}" for m in porcelain_matches)
             )
-            matches = _parse_branch_list(out_g)
-            if len(matches) == 1:
-                merged_branch = matches[0]
-                from hiveweave.tools.task_tools import (
-                    parse_short_id_from_branch,
+        else:
+            # 回退（有界）：porcelain 无绑定时，**至多剥一层** relocation
+            # 后缀 —— `A461-b` → 短号 `A461`（后缀清单来自
+            # `_RELOCATION_SUFFIXES` 常量，不手写枚举/正则），交回既有的
+            # 短号查找 `hw/<sid>/*` 重新解析。
+            alias_short = _strip_one_relocation_suffix(branch_name)
+            if alias_short != branch_name and _SHORT_ID_RE.fullmatch(alias_short):
+                # F4（2026-09-24 审计）：别名**自身** worktree 缺失时，不得静默
+                # 改选同 short id 下的**别的**分支。若该短号另有已注册
+                # worktree（如目录 `A461` 绑定 `hw/A461/decoy`，而调用方传
+                # `A461-b`），说明别名指向的是**别的**树 ⇒ 报候选让调用者选。
+                near = await _porcelain_branches_for_basename(
+                    workspace_path, alias_short
                 )
-
-                merged_short = parse_short_id_from_branch(matches[0])
+                if near:
+                    return ToolResult.err(
+                        f"No worktree '{branch_name}' found, but short id "
+                        f"{alias_short} is bound to a different worktree. "
+                        f"Pass the worktree directory alias, the full branch "
+                        f"name (hw/<shortId>/<name>), or a different shortId:\n"
+                        + "\n".join(f"  - {b}" for b in near)
+                    )
+                branches, early = await _resolve_short_id_merge(
+                    workspace_path, alias_short, target_branch
+                )
+                if early is not None:
+                    return early
+                merged_short = alias_short
+                merged_branch = branches[0]
 
                 async def _do_merge() -> dict:
-                    return await gwt.merge_by_branch(
-                        workspace_path, matches[0], target_branch
+                    result = await gwt.merge_by_branch(
+                        workspace_path, branches[0], target_branch
                     )
+                    if result.get("success") and len(branches) > 1:
+                        remaining = branches[1:]
+                        result["message"] = (
+                            f"Merged {branches[0]}. "
+                            f"Remaining branches: {remaining}"
+                        )
+                    return result
 
                 merge_call = _do_merge
             else:
@@ -907,17 +1129,27 @@ async def git_worktree_merge_tool(
                     if all_branches
                     else "No hw/*/* worktree branches exist."
                 )
-                if len(matches) > 1:
-                    return ToolResult.err(
-                        f"Ambiguous branch name '{branch_name}' matches "
-                        f"{len(matches)} branches — pass the full name "
-                        f"(hw/<shortId>/<name>) instead:\n"
-                        + "\n".join(f"  - {m}" for m in matches)
-                    )
+                # F5（2026-09-24 审计）：零匹配是**拒绝**，必须给恢复 route
+                # （别名 / 全分支名 / 短号三选一），否则调用者无从纠正。
                 return ToolResult.err(
                     f"No worktree branch found matching '{branch_name}' "
-                    f"(tried '{caller_branch}' and 'hw/*/{slug}').\n\n{listing}"
+                    f"(no porcelain worktree binding and no task-name match). "
+                    f"Pass the worktree directory alias (e.g. 'A461-b'), the "
+                    f"full branch name (hw/<shortId>/<name>), or the agent "
+                    f"shortId instead.\n\n{listing}"
                 )
+
+    # ── F2 目标纪律：合并目标必须是有 hw/ 命名空间的 agent worktree 分支 ──
+    # 主 worktree / main / 任何非 hw/* 分支永不成为目标。堵住「merged_short
+    # 为空却继续」的路：否则义务结算会走 fulfill_by_owner(short_id=None)
+    # 的无范围兜底，可能清掉调用者名下全部 pending merge 义务。
+    if merged_branch is not None and not str(merged_branch).startswith("hw/"):
+        return ToolResult.err(
+            f"Refusing to merge '{merged_branch}': the resolved target is not "
+            f"an agent worktree branch (expected hw/<shortId>/<name>). Pass "
+            f"the worktree directory alias (e.g. 'A461-b') or the full branch "
+            f"name."
+        )
 
     # ── 自有分支合并门：合并调用者自己 short_id 的分支须异人 approved ──
     gate_err = None

@@ -1457,7 +1457,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "never wait for them.)"
         ),
         "properties": {
-            "branchName": {"type": "string", "aliases": ["branch_name", "branch", "name"]},
+            "branchName": {
+                "type": "string",
+                "aliases": ["branch_name", "branch", "name"],
+                "description": (
+                    "Branch to merge. Accepts EITHER the full branch name "
+                    "(hw/<shortId>/<name>), OR the worktree directory alias "
+                    "(e.g. 'A461-b'), OR the task name. An alias resolves to "
+                    "the branch actually bound to that worktree via git "
+                    "worktree list; a task name is matched (slug-normalised) "
+                    "against the bound branch's task segment."
+                ),
+            },
             "targetBranch": {"type": "string", "aliases": ["target_branch", "target"]},
             "taskId": {
                 "type": "string",

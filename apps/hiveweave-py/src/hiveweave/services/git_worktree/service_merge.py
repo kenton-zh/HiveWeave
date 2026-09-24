@@ -880,17 +880,33 @@ class MergeMixin:
                 workspace_path,
             )
         else:
-            # P2（边界审计 2026-08-30）：--grep 用 --fixed-strings 字面匹配
-            # —— 分支名含正则元字符（. [ ] + 等）时，基本正则模式会误命中
-            # 其他分支的 merge 消息（false-positive → 跳过真实 merge、工作
-            # 丢失），或 `[` 不配对让 grep 报错。fixed-strings 只看字面。
-            ok_anc, _anc_out = await _git(
+            # N1（2026-09-24 审计，P1）：`git log --grep` 在**无任何匹配**时同样
+            # 返回 rc=0 且输出为空，而 `_git` 以 returncode==0 判成功 ⇒
+            # **绝不能单独用 rc 判「已合并」**。此前这里 `if not ok_anc:` 只在
+            # rc≠0 时才兜底，于是任意不存在的 `hw/...`（`hw/A462` /
+            # `hw/Z999/anything` / 退化形态 `hw/`、`hw//`）都假成功
+            # `already_merged`，并**继续走义务结算**（审计实测 settle_awaits=1
+            # —— 一次假成功还替调用者清掉了 merge 义务）。这些输入经工具层
+            # `hw/` 前缀**透传**直达本函数，绕开了工具层已修的
+            # `_resolve_short_id_merge`，所以根因必须在这里一并封掉。
+            #
+            # 判据 = 输出里确实解析出**一条 merge commit 行**（`<sha> <subject>`），
+            # 与工具层 `_resolve_short_id_merge`（F1）同一纪律、同一正则。
+            # `--fixed-strings`：分支名含正则元字符（. [ ] + 等）时只作字面
+            # 匹配 —— 既不误命中别的分支的 merge 消息（false-positive 会跳过
+            # 真实 merge、丢工作），也不会因 `[` 不配对让 grep 报错。
+            ok_log, log_out = await _git(
                 ["log", "-1", "--oneline", "--merges", "--fixed-strings",
                  f"--grep=Merge branch '{branch}'"],
                 workspace_path,
             )
+            ok_anc = bool(
+                ok_log and re.match(r"^[0-9a-f]{7,}\s", (log_out or "").strip())
+            )
             if not ok_anc:
-                # main 或分支在不同命名（legacy slug）时 grepmatch 兜底空态
+                # 兜底仅覆盖 legacy slug / 同名 tag 等「ref 查不到但确实是祖先」
+                # 的边角：`--is-ancestor` 的 rc **本身就是答案**（0=祖先），
+                # 分支不存在时返回 128 ⇒ 不会创造假成功。
                 ok_anc, _anc_out = await _git(
                     ["merge-base", "--is-ancestor", branch, target_branch],
                     workspace_path,
