@@ -274,6 +274,26 @@ async def _refuse_project_root_write(
         return None
 
 
+def format_invalid_args_detail(violations: list[dict[str, Any]] | None) -> str:
+    """把**结构化**违规清单渲染进模型可见的 `error` 文本（H6②）。
+
+    口径（见 `execute_registered_tool` 内注释）：落库 / 进模型可见面的只有
+    `error` 文本；`invalidArgs` 目前只供进程内消费方。本函数是两者之间的桥：
+    按方括号路径（如 `patches[0].filePath`）逐条点名，让模型知道**哪一条**
+    数组项错了，而不是只看到 pydantic 原生单句（点号形态 `patches.0.filePath`）。
+
+    只呈现违规清单里既有的 `path` / `message` —— 不做任何 expected-vs-provided
+    的取值比对。无违规时返回 `''`（既有文案一字不动）。
+    """
+    if not violations:
+        return ""
+    listed = "; ".join(
+        f"{v.get('path', '<unknown>')}: {v.get('message', '')}".rstrip()
+        for v in violations
+    )
+    return f" Invalid items: {listed}."
+
+
 async def execute_registered_tool(
     tool_name: str,
     raw_args: dict[str, Any],
@@ -316,10 +336,14 @@ async def execute_registered_tool(
                 expected = f" Expected parameters: {props}."
         except Exception:
             pass
+        # H6②：把逐项违规（方括号路径 + message）追加进 `error` 文本，让模型
+        # 能看到**具体哪条**数组项错了，而不是只有 pydantic 的原生单句；既有
+        # 句子与 expected/received 一字不动（其他测试按子串断言）。
         return ToolResult.err(
             f"Parameter error in '{tool_name}': {error}.{expected} "
             f"You provided these parameters: {received_keys}. "
-            f"Check the parameter names and make sure all required fields are included.",
+            f"Check the parameter names and make sure all required fields are included."
+            f"{format_invalid_args_detail(violations)}",
             # P2-1：结构化违规清单（`path` 为方括号形态，如 files[0].path）。
             # ⚠ 口径：**落库/进模型可见面的只有 `error` 文本**（点号形态
             # `files.0.path`，见 streaming 的 excerpt 取 result_content/error）；

@@ -90,9 +90,12 @@ class TestSchemaCodeParity:
         from hiveweave.tools.executor import TOOL_PARAM_SCHEMAS
 
         items = TOOL_PARAM_SCHEMAS["apply_patch"]["properties"]["patches"]["items"]
-        assert not items.get("required"), (
+        # H6① 之后 `items.required` 变成 ["filePath"]（与 pydantic 侧
+        # PatchItem.file_path 必填一致）；本测试只钉「op 不得被标成 required」
+        # 这一条，故按 `op` 判定，而不是笼统的「required 必须为空」。
+        assert "op" not in (items.get("required") or []), (
             "apply_patch 数组项的 op 已由 _infer_op 推断（真的可选），"
-            "schema 不得再宣称 required —— 契约两面必须一致"
+            "schema 不得再宣称 op required —— 契约两面必须一致"
         )
 
     def test_llm_schema_documents_inference(self):

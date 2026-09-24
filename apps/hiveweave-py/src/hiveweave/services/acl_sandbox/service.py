@@ -836,7 +836,7 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
             raise SandboxUnavailableError(
                 f"worktree gitdir 指针不是文件（或已被删除/替换成目录）：{wt_git}"
                 f" —— 平台在该 worktree 的 git 会去读非平台指定的 gitdir，"
-                f"拒绝继续执行 agent 命令（fixqueue #2「A1」）")
+                f"拒绝继续执行 agent 命令")
         expected = os.path.join(git_dir, "worktrees", os.path.basename(boundary))
         if not _points_at(wt_git, expected):
             raise SandboxUnavailableError(

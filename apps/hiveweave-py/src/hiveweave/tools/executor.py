@@ -610,6 +610,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                         "newString": {"type": "string", "description": "For update: literal replacement. Empty string deletes the match."},
                         "content": {"type": "string", "description": "For add: full file content"},
                     },
+                    # H6①：数组项的 `filePath` 在 pydantic 侧（PatchItem.file_path）
+                    # 是必填、无默认值 ⇒ 模型可见面必须如实标注 required，与代码
+                    # 强制面一致（同居 precedent：attest_doc_review.files）。
+                    # 刻意**不含 `op`**：op 由 patch.py::_infer_op 推断、真的可选，
+                    # 标进 required 就是新的不一致（既有测试钉死）。
+                    "required": ["filePath"],
                 },
                 "description": "Array of patch operations",
             },

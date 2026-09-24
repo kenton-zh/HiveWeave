@@ -350,6 +350,63 @@ _HEAD_ALIASES = {
     "shoot": "screenshot",
 }
 
+# agent-browser subcommand vocabulary. Two sources, one authority:
+#   · the vendored agent-browser README — the **authoritative** top-level command
+#     set (goto/snapshot/click/…). `test_vocabulary_is_superset_of_vendored_readme_
+#     commands` parses that README and asserts this table ⊇ it, so the table cannot
+#     silently drift from upstream (README is the source of truth, not this list);
+#   · gstack-style head aliases (`_HEAD_ALIASES`) plus a few gstack-only names
+#     (`download`/`viewport`/`set_viewport`) the README does not list.
+# Used ONLY to flag a *second* subcommand inside one browse argv (see
+# `_multi_subcommand_tokens`); it is not a gate on which commands exist.
+_AB_SUBCOMMANDS = frozenset({
+    *_HEAD_ALIASES,
+    *_HEAD_ALIASES.values(),
+    "a11y", "addinitscript", "auth", "back", "batch", "chat", "check", "click",
+    "clipboard", "close", "connect", "console", "cookies", "dashboard", "dblclick",
+    "device", "dialog", "diff", "doctor", "drag", "errors", "eval", "fill", "find",
+    "focus", "forward", "frame", "get", "highlight", "hover", "inspect", "install",
+    "is", "keyboard", "keydown", "keyup", "mcp", "mouse", "network", "open", "pdf",
+    "plugin", "press", "profiler", "profiles", "pushstate", "react", "read",
+    "reload", "removeinitscript", "screenshot", "scroll", "scrollintoview",
+    "select", "session", "set", "skills", "snapshot", "state", "storage", "stream",
+    "tab", "trace", "type", "uncheck", "upgrade", "upload", "vitals", "wait",
+    "window",
+    # gstack-only names (kept for existing callers; absent from the README).
+    "download", "set_viewport", "viewport",
+})
+
+#: README-documented **two-level** commands — ``(head, child)`` — whose child is
+#: itself a top-level name in `_AB_SUBCOMMANDS` (``cookies set``, ``keyboard type``,
+#: ``set viewport`` …). These are a *single* browse command, so a bare child token
+#: must NOT count as a second subcommand. This is exactly the collision surface the
+#: rule in `_multi_subcommand_tokens` must exclude; it is derived from the same
+#: README parser that guards `_AB_SUBCOMMANDS`
+#: (`test_two_level_forms_match_vendored_readme`) rather than being maintained as a
+#: second hand-written vocabulary.
+_AB_TWO_LEVEL_COMMANDS = frozenset({
+    ("clipboard", "read"),
+    ("cookies", "set"),
+    ("diff", "screenshot"),
+    ("diff", "snapshot"),
+    ("keyboard", "type"),
+    ("react", "inspect"),
+    ("set", "device"),
+    ("set", "viewport"),
+    ("skills", "get"),
+    ("storage", "session"),
+    ("tab", "close"),
+})
+#: Prescription for a browse call that carries a second subcommand. Platform
+#: contract: one browse call = one subcommand (the CLI reads only ``argv[0]``).
+MULTI_SUBCOMMAND_HINT = (
+    "browse runs exactly ONE subcommand per call: a later token ({extra}) is a "
+    "second subcommand, so its output would be dropped and you would reuse a "
+    "stale ref. 一条 browse 只跑一个子命令；要批处理请分多次调用（每步单独取结果）。"
+    'Example: browse(args=["goto","http://127.0.0.1:3000"]) then '
+    'browse(args=["snapshot","-i"]).'
+)
+
 # Session recycle: close the current agent-browser daemon; the next command
 # respawns via AGENT_BROWSER_SESSION=hiveweave-<agent_id>.
 BROWSE_RESTART_OK = (
@@ -501,6 +558,40 @@ def _subcommand_of(argv: list[str]) -> str:
     command from this, never from ``argv[0]``/``mapped[0]``."""
     a = _strip_chrom_prefix(argv)
     return (a[0] or "").lower().replace("-", "_") if a else ""
+
+
+def _multi_subcommand_tokens(argv: list[str]) -> list[str]:
+    """Later tokens that are a *second* browse subcommand (else ``[]``).
+
+    Structural criterion, not a text guess: after peeling a leading ``--args``
+    passthrough, ``stripped[0]`` is the head; a later *bare-word* token counts as
+    a second subcommand only when it is a top-level command (``_AB_SUBCOMMANDS``)
+    **and is not a child of the head** (``_AB_TWO_LEVEL_COMMANDS``). The
+    parent/child exclusion is what keeps legitimate two-level calls such as
+    ``cookies set --domain x`` / ``keyboard type hello`` / ``set viewport 390 844``
+    from being flagged. Only bare words qualify (``str.isidentifier``), so values
+    never match: URLs (``http://x``), selectors (``text=Close``), flags (``-i``)
+    and paths (``evidence/a.png``) are not identifiers. Returns ``[]`` when the
+    head itself is not a known subcommand.
+    """
+    stripped = _strip_chrom_prefix(argv)
+    if len(stripped) < 2:
+        return []
+    head = str(stripped[0] or "").lower().replace("-", "_")
+    if head not in _AB_SUBCOMMANDS:
+        return []
+    out: list[str] = []
+    for tok in stripped[1:]:
+        t = str(tok)
+        key = t.lower()
+        if (
+            t.isidentifier()
+            and key in _AB_SUBCOMMANDS
+            and (head, key) not in _AB_TWO_LEVEL_COMMANDS
+            and t not in out
+        ):
+            out.append(t)
+    return out
 
 
 def top_level_await_rewrite(argv: list[str], stderr: str) -> str | None:
@@ -1403,6 +1494,10 @@ def _contract_snapshot_output(
     "Drive a real Chromium browser via agent-browser (goto/click/fill/snapshot/"
     "screenshot/viewport/console/network/js/eval). Use js/eval for canvas MouseEvent "
     "injection when snapshot refs are insufficient. "
+    "CLI contract: only the first argv token runs — "
+    'args=["goto",url,"snapshot"] runs goto and DROPS snapshot, so you then reuse '
+    "a stale ref. Never chain subcommands in one args; send one call per step "
+    "(goto, then snapshot in a separate call). "
     "Prefer lookup_dev_server / start_dev_server for the app URL first. "
     "EVAL CONTRACT (read before writing js/eval): the script is evaluated in a "
     "NON-async scope — top-level `await` is a SyntaxError (not a flake; it "
@@ -1438,6 +1533,20 @@ async def browse_tool(
             'browse requires args or command. Example: '
             'args=["goto","http://127.0.0.1:3000"]'
         )
+    # Advisory, NOT a gate. The CLI runs only ``argv[0]`` and silently drops the
+    # rest, so a later subcommand token is worth flagging — but a *legitimate*
+    # single command whose argument happens to be a command word (e.g.
+    # ``cookies set --domain x``, ``keyboard type hello``, ``set viewport 390 844``)
+    # must still run; `_multi_subcommand_tokens` excludes those two-level forms via
+    # ``_AB_TWO_LEVEL_COMMANDS``. Execution stays byte-for-byte identical; the hint
+    # is appended to the success text (see ``multi_subcommand_note``), which also
+    # restores reachability of the cookies/profile soft guard below.
+    extra_subs = _multi_subcommand_tokens(argv)
+    multi_subcommand_note = (
+        "\n\n" + MULTI_SUBCOMMAND_HINT.format(extra=", ".join(extra_subs))
+        if extra_subs
+        else ""
+    )
     argv = ensure_screenshot_argv(argv, agent_id)
 
     if _is_viewport_command(argv):
@@ -1466,7 +1575,9 @@ async def browse_tool(
         # hangs on close, so restart must not depend on it. The next browse
         # command respawns a fresh session.
         recycle_note = await _hard_recycle_browser()
-        return ToolResult.ok(f"{BROWSE_RESTART_OK} [{recycle_note}]")
+        return ToolResult.ok(
+            f"{BROWSE_RESTART_OK} [{recycle_note}]{multi_subcommand_note}"
+        )
     try:
         code, stdout, stderr = await browse_exec(
             argv, workspace, timeout_sec=params.timeout_sec or 60, agent_id=agent_id
@@ -1525,6 +1636,8 @@ async def browse_tool(
         out = f"{out}\n--- stderr ---\n{stderr}"
     if viewport_note:
         out = f"{out}\n[{viewport_note}]"
+    # Advisory (never a rejection): appended to every success return below.
+    out = f"{out}{multi_subcommand_note}"
 
     if _is_viewport_command(argv):
         return ToolResult.ok(out)

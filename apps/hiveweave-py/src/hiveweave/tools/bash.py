@@ -762,15 +762,67 @@ def _maybe_append_node_isolation_hint(command: str, error_msg: str) -> str:
     return error_msg + NODE_TEST_ISOLATION_NOTE
 
 
+# ── 内联多行脚本的转义失败 ⇒ 落盘后再跑（处方）────────────────────
+#
+# 失败签名（实测两类）：把**多行脚本**内联进 `node -e "<…>"`，shell 重新转义时
+# 折行被破坏 ⇒
+#   · 宿主为 pwsh：`ParserError`（引号/换行没被正确转义）；
+#   · 内联脚本落到 V8：`Unterminated regexp literal`（`/` 后被折断的正则）。
+# 这两条此前**没有任何处方**，agent 只会反复改引号/换行重试，白烧轮次。
+#
+# 判据做成**模块级** `re.compile` 常量（与 `_TEST_CMD_RE` / `_NODE_TEST_CMD_RE`
+# / `_SPAWN_EPERM_RE` 同形）：处方链的既有形态就是模块级常量，行内 `re.search`
+# 是与兄弟函数不一致的**异形**（旧注释自称"与 heredoc 处方同形"是错的 —— 上面
+# 几条全是模块级常量）。
+# ⚠ 这两个名字会落进 `tests/test_text_judge_ratchet.py` 的 regex 档扫描面
+# （模块级 `re.compile` 常量、名字不在基线）⇒ 首次新增必须显式登记，不得擅自改基线。
+_INLINE_NODE_EVAL_RE = re.compile(
+    # 内联 `node -e` / `node --eval`（词尾边界，避免 `-experimental` 之类误命中）。
+    r"\bnode\b[^\n|;&]*\s-{1,2}e(?:val)?(?![\w-])",
+    re.IGNORECASE,
+)
+_INLINE_EVAL_ESCAPE_ERR_RE = re.compile(
+    # 转义失败签名：V8 的 Unterminated (regexp|regular expression) 或 pwsh ParserError。
+    r"unterminated\s+(?:regexp|regular\s+expression)|\bParserError\b",
+    re.IGNORECASE,
+)
+INLINE_EVAL_NOTE = (
+    "\n\n[Inline script escaping] A multi-line script was passed inline to "
+    "`-e`/`--eval` and the shell re-escaped it (Unterminated regexp literal / "
+    "ParserError). Do NOT inline multi-line scripts. Fix: write the script to a "
+    "file with write_file, then run `node <file>` (for a pwsh script, "
+    "`pwsh -File <file.ps1>`). 跨行脚本别内联 -e：write_file 落盘后再 node <file>。"
+)
+
+
+def _maybe_append_inline_eval_hint(command: str, error_msg: str) -> str:
+    """内联 `-e` 多行脚本 + 转义失败签名 ⇒ 追加"落盘后再跑"的处方。
+
+    与 `_maybe_append_node_isolation_hint` 同形：只用两个**观测**事实
+    （命令里有内联 node -e + 输出里有转义失败签名），是 advisory、不是门禁。
+    """
+    if not command or not error_msg:
+        return error_msg
+    if not _INLINE_NODE_EVAL_RE.search(command):
+        return error_msg
+    if not _INLINE_EVAL_ESCAPE_ERR_RE.search(error_msg):
+        return error_msg
+    return error_msg + INLINE_EVAL_NOTE
+
+
 def _maybe_append_test_hints(command: str, error_msg: str) -> str:
-    """测试类失败的提示**唯一链**（顺序：可写锚点 → node 管道边界）。
+    """shell 失败后的处方**唯一链**（顺序：可写锚点 → node 管道边界 → 内联脚本）。
 
     ⚠ 链只能有一份：两个调用点（`execute_bash` / `run_command` 的错误出口）都走
     这里 —— 否则加第三条提示时又会长成"每处各列一份清单"（本仓在事实位白名单上
-    栽过两次）。
+    栽过两次）。链首命名沿用 `_maybe_append_test_hints`（历史名，勿重命名以免
+    牵动调用点与守卫），实际承载**全部** shell 失败处方。
     """
-    return _maybe_append_node_isolation_hint(
-        command, _maybe_append_test_anchor_hint(command, error_msg)
+    return _maybe_append_inline_eval_hint(
+        command,
+        _maybe_append_node_isolation_hint(
+            command, _maybe_append_test_anchor_hint(command, error_msg)
+        ),
     )
 
 
