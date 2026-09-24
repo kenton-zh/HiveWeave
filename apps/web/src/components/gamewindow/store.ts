@@ -107,10 +107,18 @@ function writeGeomCache(id: string, geom: GameWindowGeometry) {
 
 // ── 工具 ──────────────────────────────────────────────────────────
 
-/** 窗口 id：带 payload 的按 payload 区分（每个 agent 一个 chat 窗），否则单例 */
-export function gameWindowId(kind: GameWindowKind, payload: GameWindowPayload = {}): string {
-  if (payload.agentId) return `${kind}:${payload.agentId}`;
-  if (payload.taskId) return `${kind}:${payload.taskId}`;
+/**
+ * 窗口 id。
+ *
+ * **单例策略（2026-09-23 用户钦定「像微信一样」）**：每个 kind 全局只存在一个窗口，
+ * id 恒为 `kind` —— 点不同的人**不再各开一窗**，而是在同一个窗口里**切换内容**
+ * （`open()` 覆盖 payload ⇒ `registry` 用新的 `agentId` 重渲染面板；`ChatPanel` 的
+ * 加载 effect 依赖 `agentId`，会自行重载该会话）。
+ *
+ * 此前按 payload 分窗（`chat:agent-42`）⇒ 连点 3 个人就叠出 3 个「聊天」窗（用户实拍为证）。
+ * 副作用（正向）：几何/置顶信号都以 kind 为键 ⇒ 同一个面板的位置稳定，不再级联错位。
+ */
+export function gameWindowId(kind: GameWindowKind): string {
   return kind;
 }
 
@@ -157,11 +165,24 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
   focusSignal: {},
 
   open: (kind, payload = {}, title) => {
-    const id = gameWindowId(kind, payload);
+    const id = gameWindowId(kind);
     const existing = get().windows.find((w) => w.id === id);
 
     if (existing) {
-      // 已存在 ⇒ 不新开，只发聚焦信号（GameWindow 收到后置顶 + 从最小化恢复）
+      // 已存在 ⇒ 不新开，而是**切换内容**（微信式：同一个面板换会话）：
+      // ① 覆盖 payload（面板据此重渲染，如 chat 换 agent）
+      // ② 标题只在调用方显式传入且变化时更新（避免调用方不传 title 时把标题清掉）
+      // ③ 发聚焦信号：GameWindow 收到后置顶 + 从最小化恢复
+      const payloadChanged =
+        existing.payload.agentId !== payload.agentId || existing.payload.taskId !== payload.taskId;
+      const titleChanged = title !== undefined && title !== existing.title;
+      if (payloadChanged || titleChanged) {
+        set((s) => ({
+          windows: s.windows.map((w) =>
+            w.id === id ? { ...w, payload, ...(title !== undefined ? { title } : {}) } : w,
+          ),
+        }));
+      }
       set((s) => ({ focusSignal: { ...s.focusSignal, [id]: (s.focusSignal[id] ?? 0) + 1 } }));
       return;
     }

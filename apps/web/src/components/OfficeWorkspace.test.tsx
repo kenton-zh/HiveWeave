@@ -7,6 +7,8 @@
  *   1. **选中 agent ⇒ 自动打开该 agent 的聊天窗**（用户明确要求的核心交互：
  *      「点击某个人就能弹出和那个人的聊天面板」）
  *   2. **重复选中同一 agent 不重复开窗**，只发聚焦信号（否则每点一次多一个窗）
+ *   3. **切人到人等「共用一个面板、窗口内切换内容」**（用户 2026-09-23 钦定「像微信一样」）
+ *      —— 窗口 id 恒为 kind，换人只覆盖 payload，**不再叠出第二个聊天窗**
  *
  * ⚠ 刻意 mock 掉 OfficeView（PixiJS，jsdom 跑不了 WebGL）与 GameWindowLayer
  * （会 new WinBox 操作真实 DOM）。本测试验的是**接线**，不是渲染 —— 窗口渲染
@@ -54,7 +56,7 @@ describe("OfficeWorkspace —— 选中 agent 自动开聊天窗", () => {
       useAppStore.setState({ selectedAgentId: "agent-42" });
     });
     await waitFor(() => expect(windows()).toHaveLength(1));
-    const nonceAfterFirst = useGameWindowStore.getState().focusSignal["chat:agent-42"];
+    const nonceAfterFirst = useGameWindowStore.getState().focusSignal["chat"];
 
     // 再点同一个人：应当只 bump 聚焦信号，窗口数不变
     act(() => {
@@ -65,27 +67,28 @@ describe("OfficeWorkspace —— 选中 agent 自动开聊天窗", () => {
     });
 
     await waitFor(() => {
-      expect(useGameWindowStore.getState().focusSignal["chat:agent-42"]).toBeGreaterThan(
+      expect(useGameWindowStore.getState().focusSignal["chat"]).toBeGreaterThan(
         nonceAfterFirst,
       );
     });
     expect(windows()).toHaveLength(1);
   });
 
-  it("切换到另一个 agent 会开出第二个 chat 窗（互不干扰）", async () => {
+  it("切换到另一个 agent 复用同一个 chat 窗（微信式：窗口内换内容）", async () => {
     render(<OfficeWorkspace onExitToWorkbench={() => {}} />);
 
     act(() => {
       useAppStore.setState({ selectedAgentId: "agent-A" });
     });
     await waitFor(() => expect(windows()).toHaveLength(1));
+    expect(windows()[0].payload.agentId).toBe("agent-A");
 
     act(() => {
       useAppStore.setState({ selectedAgentId: "agent-B" });
     });
-    await waitFor(() => expect(windows()).toHaveLength(2));
-
-    const ids = windows().map((w) => w.payload.agentId).sort();
-    expect(ids).toEqual(["agent-A", "agent-B"]);
+    // 关键断言：窗口**不增加**，而是同一个窗口的内容换成 agent-B
+    await waitFor(() => expect(windows()[0].payload.agentId).toBe("agent-B"));
+    expect(windows()).toHaveLength(1);
+    expect(windows()[0].kind).toBe("chat");
   });
 });

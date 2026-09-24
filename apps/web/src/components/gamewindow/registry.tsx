@@ -42,11 +42,18 @@ export function renderGamePanel(win: GameWindowState, ctx: GamePanelContext): Re
   const agentId = win.payload.agentId ?? null;
   const taskId = win.payload.taskId ?? null;
 
+  // ⚠ 窗口是**单例**（同一 kind 只有一个窗，见 store 的 gameWindowId），所以"换人"是
+  // **同一个组件实例换 props**。带 agentId 的面板必须挂 `key={agentId}` —— 否则面板内部
+  // 按 agent 初始化的状态（会话视图 / 头部信息 / 滚动锚）不会跟着换，
+  // 表现为「窗口没多开，但内容还是上一个人的」（2026-09-23 实测踩到）。
+  // 语义上也更对：切换会话本就该重置该视图的本地态（微信同理）。
+  const agentKey = agentId ?? "none";
+
   const body = ((): ReactNode => {
     switch (win.kind) {
       case "chat":
         return agentId ? (
-          <ChatPanel agentId={agentId} hidden={false} />
+          <ChatPanel key={agentKey} agentId={agentId} hidden={false} />
         ) : (
           <Missing text="请先选择一个 Agent" />
         );
@@ -67,11 +74,11 @@ export function renderGamePanel(win: GameWindowState, ctx: GamePanelContext): Re
           <Missing text="请先选择一个项目" />
         );
       case "agent":
-        return agentId ? <AgentDetailPanel agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
+        return agentId ? <AgentDetailPanel key={agentKey} agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
       case "logs":
-        return agentId ? <WorkLogPanel agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
+        return agentId ? <WorkLogPanel key={agentKey} agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
       case "monitor":
-        return agentId ? <MonitorPanel agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
+        return agentId ? <MonitorPanel key={agentKey} agentId={agentId} /> : <Missing text="请先选择一个 Agent" />;
       case "debug":
         return <DebugPanel />;
       case "task":
