@@ -92,6 +92,13 @@ async def _spawn_closed_verify(
         # #11：判定改读 `kind`（标题只作展示）⇒ 造 VERIFY 任务必须显式写它
         kind="verify",
     )
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门；本文件
+    # 测的是效率报表不是 criteria 门 ⇒ fixture 走显式批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, tid, COORD)
     await ts.claim_task(pid, tid, claimer)  # created → claimed（写 claimed_at + 事件）
     await ts.start_task(pid, tid)
     await ts.submit_task(pid, tid, evidence={"verdict": "PASS"})
@@ -179,6 +186,11 @@ async def test_reassign_counts_both_segments(task_env):
         pid, "VERIFY: rework", "v", creator_id=COORD, source="system",
         kind="verify",
     )
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, tid, COORD)  # P0-3 批准事实位
     await ts.claim_task(pid, tid, EXEC1)
     await ts.reassign_task(
         pid, tid, new_assignee_id=EXEC2, reassigned_by=COORD, reason="stall"

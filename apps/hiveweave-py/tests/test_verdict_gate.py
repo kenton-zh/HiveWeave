@@ -33,6 +33,13 @@ async def _mk_verify_running(ts: TaskService, pid: str) -> str:
         tags=["verify", "mandatory"],
         source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门；本文件
+    # 测的是 verdict 路由不是 criteria 门 ⇒ fixture 走显式批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     # 单测会在同一 project DB 里并行建多条 VERIFY 行——绕过单飞串行化锁
     # （平台运行时由 _nudge_one_verify_task 持锁 claim，测试不走该路径）。
     await ts.claim_task(pid, verify_id, EXEC, bypass_verify_serialize=True)
@@ -366,6 +373,12 @@ async def _mk_verify_running_for(ts: TaskService, pid: str, agent: str) -> str:
         tags=["verify", "mandatory"],
         source="system",
         kind=VERIFY_KIND)
+    # 同 _mk_verify_running：E5 用例也会走 approve ⇒ 批准事实位（P0-3）。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     await ts.claim_task(pid, verify_id, agent, bypass_verify_serialize=True)
     await ts.start_task(pid, verify_id)
     assert (await ts.get_task(pid, verify_id))["status"] == "running"

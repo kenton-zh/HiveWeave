@@ -49,6 +49,13 @@ async def test_verify_created_not_actionable_pre_merge(task_env):
         tags=["verify", "mandatory"],
         source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 close 门（verify pump 会
+    # 关它）；本文件测的是 obligations/pump 不是 criteria 门 ⇒ 批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     obs = await ts.get_actionable_obligations(pid, EXEC)
     ids = [t["id"] for t in obs]
     assert verify_id not in ids
@@ -531,6 +538,13 @@ async def _make_verify(pid, ts, title="UI"):
         tags=["verify", "mandatory"],
         source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门（本 helper
+    # 的 VERIFY 会被 approve）；本文件测的是 pump/义务不是 criteria 门。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     return verify_id
 
 

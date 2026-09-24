@@ -120,6 +120,12 @@ DOOM_LOOP_TOOL_LIMITS: dict[str, int] = {
     # 每轮强制出口 — 被出口闸门拒收后必须重试；同参指纹才计数
     # （井字棋实测：CEO 首条指令即撞 doom，无任何正常输出）
     "commit_turn": 8,
+    # TEST_DSH_70 P0-2：门禁按设计拒收的合法重试 —— submit_task 被
+    # coverage/attestation 门连续拒收是 gate_reject（流程回执，见
+    # GATE_REJECT_STALL_LIMIT），不是模型空转；通用容忍 3 会让 doom 先于
+    # stall 收口触顶误杀（run 9910ce3d 被 PermanentError 杀实证）。限额与
+    # gate_reject 维度对齐，不新建事实位。
+    "submit_task": GATE_REJECT_STALL_LIMIT,
     # 幂等写入 — 中容忍，覆盖写入无害但不应无限重复
     "write_file": 8,
     "save_charter": 8,

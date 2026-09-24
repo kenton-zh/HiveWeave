@@ -22,6 +22,7 @@ from .db import (
 )
 from .errors import MergeRequiredError
 from .verify import VerificationCaseService  # noqa: F401
+from .verify_criteria_gate import assert_verify_criteria_or_approval
 
 log = structlog.get_logger(__name__)
 
@@ -57,13 +58,23 @@ class CloseMixin:
         still close — that fail-open path is gone (TEST20 P0-A / N1).
 
         ``skip_merge_gate`` is for ledger hygiene migrations only
-        (e.g. ``migrate_orphan_approved``).
+        (e.g. ``migrate_orphan_approved``); it also skips the TEST_DSH_70
+        P0-3 VERIFY empty-criteria gate (migrations, not agents, drive it).
+
+        Raises:
+            ValueError: VERIFY 任务 criteria 为空且无显式批准事实行
+                （TEST_DSH_70 P0-3 关单前查 criteria 历史 —— 防「先建带
+                criteria 再 strip」与存量空单）。
         """
         task_id = await self.require_task_id(project_id, task_id)
 
         task = await self.get_task(project_id, task_id)
         if task and not self._is_verify_task(task) and not skip_merge_gate:
             await self._enforce_merge_on_close(project_id, task)
+        # TEST_DSH_70 P0-3：VERIFY 关单前查 criteria —— 空清单 = coverage 门
+        # 失去适用对象 = 合规绕过终验；须非空或有 allowEmptyCriteria 批准事实。
+        if not skip_merge_gate:
+            await assert_verify_criteria_or_approval(project_id, task)
 
         await self._transition(
             project_id, task_id, "closed", reason_code=reason_code

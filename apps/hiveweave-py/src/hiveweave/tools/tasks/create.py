@@ -124,6 +124,20 @@ class CreateTaskParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["milestoneVerify", "milestone_verify"]},
     )
+    allow_empty_criteria: bool = Field(
+        default=False,
+        alias="allowEmptyCriteria",
+        description=(
+            "Coordinator/CEO explicit approval to mint a VERIFY task with an "
+            "EMPTY acceptance_criteria list. The approval is recorded as an "
+            "auditable task event (empty_criteria_approved, with your agent "
+            "id) and is later required to approve/close that task. Normal "
+            "path: pass a real acceptanceCriteria list instead."
+        ),
+        json_schema_extra={
+            "aliases": ["allowEmptyCriteria", "allow_empty_criteria"]
+        },
+    )
 
     @field_validator(
         "acceptance_criteria", "depends_on", "expected_modules", "tags",
@@ -323,6 +337,20 @@ async def create_task_tool(
             title = ensure_verify_display_prefix(title)
             kind = VERIFY_KIND
             source = "system"
+            # TEST_DSH_70 P0-3：VERIFY 建单空 acceptance_criteria = coverage
+            # 门失去适用对象 = 合规绕过终验（第 6 张空清单单一次通过终验的
+            # 实证）⇒ 硬拒；确需空清单须显式 allowEmptyCriteria 批准位，
+            # 批准事实落 task_events 审计（建单成功后写入，见下方）。
+            from hiveweave.services.tasks.verify_criteria_gate import (
+                verify_creation_criteria_error,
+            )
+
+            _criteria_err = verify_creation_criteria_error(
+                criteria=params.acceptance_criteria,
+                allow_empty=params.allow_empty_criteria,
+            )
+            if _criteria_err:
+                return ToolResult.err(_criteria_err)
         task_id = await ts.create_task(
             project_id=project_id,
             title=title,
@@ -341,6 +369,29 @@ async def create_task_tool(
             policy_id=policy_id,
             kind=kind,
         )
+        # TEST_DSH_70 P0-3：空清单 VERIFY 的显式批准事实落 task_events 审计
+        # （approve/close 侧以此放行；无此事实行的空清单 VERIFY 过不了关单门）。
+        # ⚠ 用 milestone_verify 判定（kind==VERIFY_KIND ⇔ 它；且 VERIFY_KIND
+        # 只在上方分支内 import，复用/普通路径上该名字未绑定）。
+        empty_criteria_note = ""
+        if params.milestone_verify:
+            from hiveweave.services.tasks.verify_criteria_gate import (
+                record_empty_criteria_approval,
+                verify_criteria_is_empty,
+            )
+
+            if params.allow_empty_criteria and verify_criteria_is_empty(
+                params.acceptance_criteria
+            ):
+                await record_empty_criteria_approval(
+                    project_id, task_id, agent_id, title=params.title
+                )
+                empty_criteria_note = (
+                    " ⚠ empty acceptance_criteria APPROVED by you"
+                    " (allowEmptyCriteria=true) — recorded as audit event"
+                    " empty_criteria_approved; this fact is required to"
+                    " approve/close the task later."
+                )
         task = await ts.get_task(project_id, task_id)
         st = (task or {}).get("status") or "created"
         if st == "blocked":
@@ -395,7 +446,7 @@ async def create_task_tool(
         plane_note = f" ⚠ {_plane_reason}" if _plane_reason else ""
         return ToolResult.ok(
             f"Task created (id={task_id}, {note}): {title}"
-            f"{force_note}{deps_note}{dod_hint}{qa_note}{plane_note}",
+            f"{force_note}{deps_note}{dod_hint}{empty_criteria_note}{qa_note}{plane_note}",
             task_id=task_id,
             status=st,
         )

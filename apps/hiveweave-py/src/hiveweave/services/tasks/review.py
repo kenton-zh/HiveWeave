@@ -99,6 +99,11 @@ class ReviewMixin:
         if decision not in ("approve", "rework"):
             raise ValueError(
                 f"Invalid decision: {decision} (expected 'approve' or 'rework')")
+        # TEST_DSH_70 P1-2：评审给出决定 = 门曾放行一轮 ⇒ 门禁连拒计数清零
+        # （返修后 agent 拿到 fresh 反馈，不应背着旧连拒计数撞两次就升级）。
+        from .gate_reject_guard import reset_gate_rejections
+
+        reset_gate_rejections(project_id, task_id)
 
         # 取现有 evidence 以便合并 feedback（不覆盖已提交的 evidence）
         rows = await _query(project_id,
@@ -161,6 +166,13 @@ class ReviewMixin:
             # reviewing → approved
             # P0-3 观测补丁：approve 事件 payload 落评审意见（rework 路径
             # 本就带 detail=feedback，这里补对称，task.approved 不再是空壳）
+            # TEST_DSH_70 P0-3：VERIFY 通过（approve）前查 criteria —— 空清单
+            # 且无显式批准事实行 ⇒ 拒绝（approve 是终验「通过」的动作点；
+            # 后续 _close_verify_and_parent 的 close 由同一判据兜底）。
+            from .verify_criteria_gate import assert_verify_criteria_or_approval
+
+            _review_task = await self.get_task(project_id, task_id)
+            await assert_verify_criteria_or_approval(project_id, _review_task)
             await self._transition(project_id, task_id, "approved",
                                    actor_id=reviewer_id,
                                    detail=((feedback or "").strip()[:500]

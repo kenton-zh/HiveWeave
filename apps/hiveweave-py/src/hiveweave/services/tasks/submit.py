@@ -11,8 +11,8 @@ import structlog
 from .db import _conn, _ensure_schema, _execute, _execute_tx, _query
 from .acceptance import (
     acceptance_coverage_kinds,
-    format_acceptance_coverage_error,
-    uncovered_acceptance_items_verified,
+    assess_acceptance_coverage_verified,
+    format_acceptance_coverage_verdict,
 )
 from .verify import normalize_verdict, verdict_evidence_gaps
 
@@ -60,7 +60,9 @@ class SubmitMixin:
             # 缺覆盖 → 拒绝并列出缺哪几条 + 处方。清单为空的任务不受影响；
             # check_evidence_verifiable 的 VERIFY 跳过保持不动。
             _cov_kinds = await acceptance_coverage_kinds(task)
-            gaps = await uncovered_acceptance_items_verified(
+            # TEST_DSH_70 P0-1a：三态评估（未声明/形状错/未核验），回执按态
+            # 分解 + 逐条凭证绑定诊断；P1-2：waiver 在门内对齐主门消费。
+            _coverage = await assess_acceptance_coverage_verified(
                 project_id,
                 task_id,
                 task.get("acceptance_criteria"),
@@ -68,11 +70,11 @@ class SubmitMixin:
                 expected_agent_id=str(task.get("assignee_id") or "") or None,
                 kinds=_cov_kinds,
             )
-            if gaps:
+            if _coverage.has_gaps:
                 # F1：处方必须按本任务 policy 渲染 kind（否则 agent 照抄
                 # `test_run` 示例 → 撞 attestation 门）。
                 raise ValueError(
-                    format_acceptance_coverage_error(gaps, _cov_kinds)
+                    format_acceptance_coverage_verdict(_coverage, _cov_kinds)
                 )
             # E5 断流收口纪律：降级中提交 verdict=FAIL 属「waiver 型就地
             # 收口」——必须续跑重验或升级 coordinator，不许抢在续跑前
@@ -209,6 +211,11 @@ class SubmitMixin:
 
         await self._transition(project_id, task_id, "submitted",
                                actor_id=(task or {}).get("assignee_id"))
+        # TEST_DSH_70 P1-2：提交成功 ⇒ 门禁连拒计数清零（只有「连续」被拒
+        # 才累计；出口护栏见 services/tasks/gate_reject_guard.py）。
+        from .gate_reject_guard import reset_gate_rejections
+
+        reset_gate_rejections(project_id, task_id)
         if isinstance(evidence, dict) and "merged_by" not in evidence:
             rows0 = await _query(
                 project_id, "SELECT evidence FROM tasks WHERE id = ?", [task_id]

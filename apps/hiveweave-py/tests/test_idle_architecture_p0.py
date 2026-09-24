@@ -213,6 +213,13 @@ async def test_verify_approve_closes_parent(task_env):
         tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门；本文件
+    # 测的是 idle/审批架构不是 criteria 门 ⇒ fixture 走显式批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(

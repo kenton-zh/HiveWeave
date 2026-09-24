@@ -640,8 +640,8 @@ async def _submit_preflight(
     if is_verify:
         from hiveweave.services.tasks.acceptance import (
             acceptance_coverage_kinds,
-            format_acceptance_coverage_error,
-            uncovered_acceptance_items_verified,
+            assess_acceptance_coverage_verified,
+            format_acceptance_coverage_verdict,
         )
         from hiveweave.services.tasks.verify import verdict_evidence_gaps
 
@@ -654,7 +654,9 @@ async def _submit_preflight(
                 ),
             })
         _cov_kinds = await acceptance_coverage_kinds(task)
-        _uncovered = await uncovered_acceptance_items_verified(
+        # TEST_DSH_70 P0-1a：三态评估（未声明/形状错/未核验），回执按态分解
+        # + 逐条凭证绑定诊断；P1-2：waiver 在门内对齐主门消费（形状错除外）。
+        _coverage = await assess_acceptance_coverage_verified(
             project_id,
             task_id,
             task.get("acceptance_criteria"),
@@ -662,12 +664,12 @@ async def _submit_preflight(
             expected_agent_id=agent_id,
             kinds=_cov_kinds,
         )
-        if _uncovered:
+        if _coverage.has_gaps:
             issues.append({
                 "code": "acceptance_coverage",
                 # F1：处方按本任务 policy 渲染 kind（防照抄 test_run 示例）。
-                "message": format_acceptance_coverage_error(
-                    _uncovered, _cov_kinds
+                "message": format_acceptance_coverage_verdict(
+                    _coverage, _cov_kinds
                 ),
             })
 
@@ -1159,6 +1161,18 @@ async def submit_task_tool(
                 f"- [{i['code']}] {i['message']}"
                 for i in preflight["issues"][1:]
             )
+        # TEST_DSH_70 P1-2 活性出口：同一任务连续被门拒 N 次 ⇒ 自动
+        # blocked(wait_kind=external) 升级，不再无限拉锯（37 连拒 110′ 实证）。
+        try:
+            from hiveweave.services.tasks.gate_reject_guard import (
+                escalate_if_gate_reject_loop,
+            )
+
+            msg += await escalate_if_gate_reject_loop(
+                project_id, task, error_text=msg
+            )
+        except Exception as _esc_e:  # noqa: BLE001 — 出口护栏不改变拒绝本身
+            log.debug("gate_reject_escalation_failed", error=str(_esc_e))
         return ToolResult.err(msg)
 
     evidence: dict[str, Any] = preflight["evidence"]

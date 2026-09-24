@@ -172,6 +172,19 @@ class UpdateTaskStatusParams(BaseModel):
         json_schema_extra={"aliases": ["wakeAt", "wake_at"]},
     )
 
+    @field_validator("wake_at", mode="before")
+    @classmethod
+    def _normalize_empty_wake_at(cls, v: Any) -> Any:
+        """TEST_DSH_70 P1-2：``wakeAt=''`` 归一为 None。
+
+        空串不是合法时间，此前撞「not a parseable ISO-8601…」硬拒（放大终局
+        拉锯）。语义上「传了空串」=「没传」；归一后 ``has_meta`` 等判读也
+        不会把空串当成「声明了出口」。
+        """
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
     @field_validator("depends_on_task_ids", mode="before")
     @classmethod
     def _coerce_dep_ids(cls, v: Any) -> Any:

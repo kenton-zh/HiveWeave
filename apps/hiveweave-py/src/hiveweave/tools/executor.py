@@ -1362,6 +1362,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "milestone QA task. Not per-leaf merge."
                 ),
             },
+            "allowEmptyCriteria": {
+                "type": "boolean",
+                "aliases": ["allow_empty_criteria"],
+                "description": (
+                    "Coordinator/CEO only, with milestoneVerify=true: explicit "
+                    "approval to mint the VERIFY task with an EMPTY "
+                    "acceptanceCriteria list. Recorded as an auditable event "
+                    "(empty_criteria_approved) that is later required to "
+                    "approve/close that task. Normal path: pass a real "
+                    "acceptanceCriteria list."
+                ),
+            },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1653,6 +1665,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": (
                     "Coordinator/CEO: mint a MAIN-serialized VERIFY: "
                     "milestone QA task."
+                ),
+            },
+            "allowEmptyCriteria": {
+                "type": "boolean",
+                "aliases": ["allow_empty_criteria"],
+                "description": (
+                    "Coordinator/CEO only, with milestoneVerify=true: explicit "
+                    "approval to mint the VERIFY task with an EMPTY "
+                    "acceptanceCriteria list. Recorded as an auditable event "
+                    "(empty_criteria_approved) that is later required to "
+                    "approve/close that task. Normal path: pass "
+                    "acceptanceCriteria."
                 ),
             },
         },

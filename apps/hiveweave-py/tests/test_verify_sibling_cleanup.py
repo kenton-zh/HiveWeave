@@ -46,6 +46,13 @@ async def _setup(parent_title: str, verify_ok_title: str, pid: str, ts) -> str:
         # 任务 ⇒ 起点 claimed，close_task 直连会 Illegal transition。
         kind=VERIFY_KIND,
     )
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 close 门；本文件测的是
+    # sibling 清扫不是 criteria 门 ⇒ fixture 走显式批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)
     await ts.close_task(pid, verify_ok)
     return parent_id
 
@@ -79,6 +86,11 @@ async def test_cleanup_spares_plain_verify_tagged_impl_tasks(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
 
@@ -105,6 +117,11 @@ async def test_cleanup_spares_different_verify_target(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, other)
@@ -130,6 +147,11 @@ async def test_cleanup_spares_in_flight_duplicate(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup_running)
@@ -153,6 +175,11 @@ async def test_cleanup_archives_inactive_true_duplicate(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup)
@@ -176,6 +203,11 @@ async def test_cleanup_archives_numbered_duplicate(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     t = await ts.get_task(pid, dup)
@@ -211,6 +243,11 @@ async def test_cleanup_spares_rework_duplicate(task_env):
         assignee_id=EXEC, parent_task_id=parent_id, tags=["verify"],
         source="system",
         kind=VERIFY_KIND)
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_ok, COORD)  # P0-3
     await ts.close_task(pid, verify_ok)
     await ts._close_sibling_verify_tasks(pid, parent_id, except_id=verify_ok)
     # review rework 是瞬态（reviewing → rework → running）

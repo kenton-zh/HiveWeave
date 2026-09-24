@@ -255,6 +255,13 @@ async def _mk_reviewing_verify_task(env) -> str:
         creator_id=CREATOR, assignee_id=EXEC,
         source="system", kind=VERIFY_KIND,
     )
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门；本文件
+    # 测的是 approve 回执不是 criteria 门 ⇒ fixture 走显式批准事实位。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, tid, CREATOR)
     await ts.claim_task(pid, tid, EXEC)
     await ts.start_task(pid, tid)
     await ts.submit_task(
