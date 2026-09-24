@@ -134,14 +134,19 @@ async def pending_for_project(projectId: str = Query(...)) -> dict:
 
 @router.post("/requests/{request_id}/respond")
 async def respond_request(request_id: str, body: RespondBody) -> dict:
-    """响应审批请求。"""
-    await approval_service.resolve_request(
+    """响应审批请求。
+
+    FE-08：返回明确状态 —— status="resolved"（本次完成）或
+    "already_resolved"（重复提交 no-op，天然幂等）。重复提交仍返回
+    ok=True：语义上该请求已终结，第二次提交不产生任何副作用。
+    """
+    status = await approval_service.resolve_request(
         request_id=request_id,
         approved=body.approved,
         remember=body.remember,
         user_note=body.userNote or "",
     )
-    return {"ok": True, "requestId": request_id}
+    return {"ok": True, "requestId": request_id, "status": status}
 
 
 @router.post("/respond")
@@ -155,13 +160,13 @@ async def respond_request_compat(body: RespondBodyCompat) -> dict:
     注意：必须定义在 /{agent_id} 路由之前，否则 "respond" 会被 {agent_id} 捕获。
     """
     request_id = body.requestId
-    await approval_service.resolve_request(
+    status = await approval_service.resolve_request(
         request_id=request_id,
         approved=body.approved,
         remember=body.remember,
         user_note=body.userNote or "",
     )
-    return {"ok": True, "requestId": request_id}
+    return {"ok": True, "requestId": request_id, "status": status}
 
 
 # ── 前端 RESTful 路径参数兼容路由 ─────────────────────────────

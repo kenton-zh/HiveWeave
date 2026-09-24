@@ -128,8 +128,26 @@ describe('api.ts REST helpers', () => {
     expect(result).toEqual(raw)
   })
 
-  it('getPendingApprovals: 解包 data.requests 数组，请求 GET /api/permissions/pending/{agentId}', async () => {
+  it('getPendingApprovals: 解包 data.requests 并归一 snake_case 真实载荷（FE-08）', async () => {
+    // 真实后端载荷是 snake_case（SQLite 列名透传）—— 不用理想化 camelCase mock。
+    // 字段形状与后端契约测试 test_approval_pending_dto_contract.py 一致。
     const requests = [
+      {
+        id: 'r1',
+        agent_id: 'a1',
+        tool_name: 'bash',
+        tool_arguments: '{}',
+        description: 'run',
+        status: 'pending',
+        created_at: 1,
+      },
+    ]
+    mockFetch.mockResolvedValueOnce(jsonResponse({ requests }))
+
+    const result = await getPendingApprovals('a1')
+
+    // 归一层输出 camelCase DTO
+    expect(result).toEqual([
       {
         id: 'r1',
         agentId: 'a1',
@@ -138,13 +156,10 @@ describe('api.ts REST helpers', () => {
         description: 'run',
         status: 'pending',
         createdAt: 1,
+        malformed: false,
+        missingFields: [],
       },
-    ]
-    mockFetch.mockResolvedValueOnce(jsonResponse({ requests }))
-
-    const result = await getPendingApprovals('a1')
-
-    expect(result).toEqual(requests)
+    ])
     expect(mockFetch.mock.calls[0][0]).toBe('/api/permissions/pending/a1')
   })
 

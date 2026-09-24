@@ -237,8 +237,15 @@ class ApprovalService:
         approved: bool,
         remember: bool = False,
         user_note: str | None = None,
-    ) -> None:
-        """Resolve a pending permission request (called by API controller)."""
+    ) -> str:
+        """Resolve a pending permission request (called by API controller).
+
+        返回明确状态（FE-08：处理成功返回明确状态 + 重复提交幂等）：
+        - "resolved" —— 本次调用完成了 resolve（DB 行更新 + future 置结果）
+        - "already_resolved" —— 该请求已不在内存 _pending（已 resolve 过 /
+          已超时 / 进程重启后未被 restore），本次为 no-op：不重复写 DB、
+          不改状态，重复提交天然幂等。
+        """
         entry = self._pending.get(request_id)
         now = int(time.time() * 1000)
         status = "approved" if approved else "rejected"
@@ -257,8 +264,9 @@ class ApprovalService:
                 )
             self._pending.pop(request_id, None)
             logger.info("approval.resolved", request_id=request_id, status=status)
-        else:
-            logger.warning("approval.not_in_pending", request_id=request_id)
+            return "resolved"
+        logger.warning("approval.not_in_pending", request_id=request_id)
+        return "already_resolved"
 
     async def get_pending_requests(self, agent_id: str) -> list[dict]:
         """Get pending permission requests for an agent."""

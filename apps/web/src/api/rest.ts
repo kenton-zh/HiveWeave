@@ -454,9 +454,45 @@ export async function getHealth() {
 }
 
 // ---------------------------------------------------------------------------
-// Approvals
+// Approvals (FE-08 / SR-05: 审批 DTO 归一)
 // ---------------------------------------------------------------------------
 
+/**
+ * [FE-08 / SR-05] 后端 approval_service 待审批查询返回的**原始行**形状。
+ *
+ * 权威侧取舍：后端保持 snake_case（FastAPI 惯例 + SQLite 列名经 `dict(r)`
+ * 原样透传，API 层不做改名），**本文件是唯一的 snake→camel 归一点** ——
+ * 组件与 store 只消费归一后的 `PendingApproval`，不再各自猜字段名。
+ *
+ * `PENDING_APPROVAL_SOURCE_FIELDS` 与后端契约测试
+ * `apps/hiveweave-py/tests/test_approval_pending_dto_contract.py::PENDING_APPROVAL_FIELDS`
+ * 及归一单测 `apps/web/src/api/approvals.test.ts` 三处**逐字一致**：
+ * 后端改 SELECT 列 ⇒ 后端契约测试红；归一层期望漂移 ⇒ 前端单测红。
+ */
+export const PENDING_APPROVAL_SOURCE_FIELDS = [
+  "id",
+  "agent_id",
+  "tool_name",
+  "tool_arguments",
+  "description",
+  "status",
+  "created_at",
+] as const;
+
+export type PendingApprovalSourceField = (typeof PENDING_APPROVAL_SOURCE_FIELDS)[number];
+
+/** 后端原始行（snake_case）。字段宽松（unknown）：载荷漂移由归一层运行时判定，不用类型假装它没发生。 */
+export interface PendingApprovalRecord {
+  id?: unknown;
+  agent_id?: unknown;
+  tool_name?: unknown;
+  tool_arguments?: unknown;
+  description?: unknown;
+  status?: unknown;
+  created_at?: unknown;
+}
+
+/** 归一后的审批 DTO —— 组件 / store 只消费这个。 */
 export interface PendingApproval {
   id: string;
   agentId: string;
@@ -465,28 +501,97 @@ export interface PendingApproval {
   description: string;
   status: string;
   createdAt: number;
+  /**
+   * true = 关键字段（id / agent_id / tool_name）缺失的畸形条目。
+   * 条目**仍返回且可见**（ApprovalDialog 显示「数据异常」占位），
+   * 绝不静默丢弃、更不把缺字段当成「没有待办」。
+   * 归一层（normalizePendingApproval）**必填输出**；声明为可选是为了让
+   * 手工构造的字面量（store 测试等旧消费方）保持结构兼容。
+   */
+  malformed?: boolean;
+  /** malformed 时缺失的后端源字段名（PENDING_APPROVAL_SOURCE_FIELDS 子集）。 */
+  missingFields?: PendingApprovalSourceField[];
+}
+
+/** 关键字段：缺失 ⇒ 条目标记畸形（可见占位），而不是被静默消费成 undefined。 */
+const PENDING_APPROVAL_KEY_FIELDS: PendingApprovalSourceField[] = [
+  "id",
+  "agent_id",
+  "tool_name",
+];
+
+function _isBlank(v: unknown): boolean {
+  return v === null || v === undefined || (typeof v === "string" && v.trim() === "");
+}
+
+function _asString(v: unknown, fallback: string): string {
+  return typeof v === "string" ? v : fallback;
+}
+
+/** 单条归一：snake_case 原始行 → camelCase DTO（含关键字段存在性校验）。 */
+export function normalizePendingApproval(raw: unknown, index = 0): PendingApproval {
+  const rec: PendingApprovalRecord =
+    raw !== null && typeof raw === "object" ? (raw as PendingApprovalRecord) : {};
+  const missingFields = PENDING_APPROVAL_KEY_FIELDS.filter((f) => _isBlank(rec[f]));
+  const rawId = typeof rec.id === "string" ? rec.id : "";
+  return {
+    // 缺 id 时合成稳定占位 key（仅作 React key；不可用于 respond —— 用 malformed 判定）
+    id: rawId || `malformed-${index}`,
+    agentId: _asString(rec.agent_id, ""),
+    toolName: _asString(rec.tool_name, ""),
+    toolArguments: _asString(rec.tool_arguments, "{}"),
+    description: _asString(rec.description, ""),
+    status: _asString(rec.status, "unknown"),
+    createdAt: typeof rec.created_at === "number" ? rec.created_at : 0,
+    malformed: missingFields.length > 0,
+    missingFields,
+  };
+}
+
+/** 解包响应包络。包络不合法 ⇒ 抛错让调用方看见，而不是把故障伪装成「没有待办」。 */
+function _unwrapPendingApprovals(data: unknown): unknown[] {
+  if (Array.isArray(data)) return data; // 防御：裸数组包络
+  if (
+    data !== null &&
+    typeof data === "object" &&
+    Array.isArray((data as { requests?: unknown }).requests)
+  ) {
+    return (data as { requests: unknown[] }).requests;
+  }
+  throw new Error("Unexpected pending-approvals envelope: {requests: [...]} expected");
+}
+
+/** 列表归一：每条独立校验，畸形条目保留可见，不因个别坏行丢弃整列表。 */
+export function normalizePendingApprovals(data: unknown): PendingApproval[] {
+  return _unwrapPendingApprovals(data).map((raw, i) => normalizePendingApproval(raw, i));
 }
 
 /** Get pending approval requests for a single agent. */
 export async function getPendingApprovals(agentId: string): Promise<PendingApproval[]> {
-  const data = await fetchJSON<{ requests: PendingApproval[] }>(`${BASE}/permissions/pending/${agentId}`);
-  return data.requests || [];
+  return normalizePendingApprovals(
+    await fetchJSON<unknown>(`${BASE}/permissions/pending/${agentId}`),
+  );
 }
 
 /** Get all pending approval requests for a project. */
 export async function getProjectPendingApprovals(projectId: string): Promise<PendingApproval[]> {
-  const data = await fetchJSON<{ requests: PendingApproval[] }>(`${BASE}/permissions/pending/project/${projectId}`);
-  return data.requests || [];
+  return normalizePendingApprovals(
+    await fetchJSON<unknown>(`${BASE}/permissions/pending/project/${projectId}`),
+  );
 }
 
-/** Respond (approve/reject) to a pending approval request. */
+/**
+ * Respond (approve/reject) to a pending approval request.
+ * 后端返回明确状态（FE-08）：status="resolved"（本次完成）或
+ * "already_resolved"（重复提交 no-op，天然幂等 —— 重复提交仍 ok:true）。
+ */
 export async function respondToApproval(
   requestId: string,
   approved: boolean,
   remember: boolean = false,
   userNote?: string,
   projectId?: string
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<{ ok: boolean; status?: "resolved" | "already_resolved"; reason?: string }> {
   return fetchJSON(`${BASE}/permissions/respond`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
