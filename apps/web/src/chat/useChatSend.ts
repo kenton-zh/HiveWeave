@@ -3,26 +3,31 @@ import {
   useRef,
   useEffect,
   useCallback,
+  useMemo,
   type MutableRefObject,
   type Dispatch,
   type SetStateAction,
 } from "react";
-import { streamChat, joinAgentChannel, pushInsert } from "../api";
+import { streamChat, joinAgentChannel, pushInsert, getChatMessages } from "../api";
 import { mergeDeltaContent } from "../utils/mergeDelta";
 import { useAppStore } from "../store";
 import type { ChatMessage, StreamDraft } from "./types";
-import { appendToolCallSegment, applyToolResult, beginStreamRound, parseToolUsePayload, settledMessageHasSegments } from "./messageUtils";
+import {
+  enqueuePending,
+  entriesForAgent,
+  hasQueuedForAgent,
+  hasSendableContent,
+  normalizeProjectId,
+  takeNextQueued,
+  useQueueStore,
+  type PendingMessage,
+} from "./queueStore";
+import { notifyRunEnded, registerRun, requestStop, unregisterRun } from "./stopRegistry";
+import { appendToolCallSegment, applyToolResult, beginStreamRound, mapDbToChatMessages, parseToolUsePayload, settledMessageHasSegments } from "./messageUtils";
 
 type UpdateStreamDraft = (
   updater: StreamDraft | null | ((prev: StreamDraft | null) => StreamDraft | null)
 ) => void;
-
-/**
- * Queue entries are tagged with their intended recipient. ChatPanel is NOT
- * remounted on agent switch (stable key), so an untagged queue would drain
- * agent A's parked messages into agent B's chat the moment B is viewed idle.
- */
-type QueuedMessage = { agentId: string; text: string };
 
 /**
  * Send / queue / stop — preserves streamChat's abort handle on streamAbortRef.
@@ -59,7 +64,6 @@ export function useChatSend(opts: {
 
   const [input, setInput] = useState("");
   const [images, setImages] = useState<string[]>([]);
-  const [queuedCount, setQueuedCount] = useState(0);
   const [retryInfo, setRetryInfo] = useState<{
     attempt: number;
     maxRetries: number;
@@ -68,7 +72,18 @@ export function useChatSend(opts: {
   const [showApprovalDialog, setShowApprovalDialog] = useState(false);
   const [pendingApprovalTool, setPendingApprovalTool] = useState<string | null>(null);
 
-  const pendingQueueRef = useRef<QueuedMessage[]>([]);
+  // 队列唯一事实源在 queueStore（模块级，projectId+agentId 键控）——组件
+  // 重挂（registry 以 key=agentId 重建）不丢队列。zustand v5 裸选择器必须
+  // 返回稳定引用：entries 原样订阅，过滤放 useMemo；projectId 归一化成
+  // 字符串（原始值选择器，引用稳定）。
+  const projectId = useAppStore((s) => normalizeProjectId(s.selectedProjectId));
+  const allQueueEntries = useQueueStore((s) => s.entries);
+  const queueEntries = useMemo(
+    () => entriesForAgent(allQueueEntries, projectId, agentId),
+    [allQueueEntries, projectId, agentId]
+  );
+  /** 当前在飞的 turn 对应的队列条目（排队投递/插话才有；直接发送无条目）。 */
+  const activeEntryIdRef = useRef<string | null>(null);
   const autoSendRef = useRef(false);
   const handleSendRef = useRef<() => void>(() => {});
   const sendingLockRef = useRef(false);
@@ -85,20 +100,16 @@ export function useChatSend(opts: {
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
   const pendingInitialMessage = useAppStore((s) => s.pendingInitialMessage);
 
-  /** Queued-count banner reflects the VIEWED agent only. */
-  const syncQueuedCount = useCallback(() => {
-    const current = activeAgentIdRef.current;
-    setQueuedCount(
-      current ? pendingQueueRef.current.filter((e) => e.agentId === current).length : 0
-    );
-  }, [activeAgentIdRef]);
-
-  /** Remove and return the first queued entry for `id` (entries may be interleaved). */
-  const shiftQueuedFor = useCallback((id: string): QueuedMessage | undefined => {
-    const idx = pendingQueueRef.current.findIndex((e) => e.agentId === id);
-    if (idx < 0) return undefined;
-    return pendingQueueRef.current.splice(idx, 1)[0];
-  }, []);
+  /** 当前 turn 的队列条目落定：接受/失败只作用于本条，不碰其他排队。 */
+  const settleActiveEntry = useCallback(
+    (entryId: string | null, outcome: "accepted" | "failed", errorMessage?: string) => {
+      if (!entryId) return;
+      const store = useQueueStore.getState();
+      if (outcome === "accepted") store.markAccepted(entryId);
+      else store.markFailed(entryId, errorMessage || "发送失败");
+    },
+    []
+  );
 
   const addImages = useCallback((files: FileList | File[]) => {
     const readers: Promise<string>[] = [];
@@ -150,50 +161,87 @@ export function useChatSend(opts: {
 
   const handleSend = useCallback(() => {
     if (!agentId) return;
+    const text = input.trim();
+    const attachments = images.slice(); // 附件快照绑定本条消息（SR-07/T-05）
 
-    if (!autoSendRef.current && sendingLockRef.current) {
-      if (input.trim()) {
-        pendingQueueRef.current.push({ agentId, text: input.trim() });
+    if (!autoSendRef.current) {
+      // 统一校验（SR-06，仅用户主动发送）：有正文**或**有附件即合法
+      //（支持纯图片，后端接受空正文 + images）。发送按钮 disabled 用同一
+      // 判据，两端一致。drain（autoSend）路径由队列包自带内容，不校验输入框。
+      if (!hasSendableContent(text, attachments)) return;
+      if (sendingLockRef.current) {
+        // 忙线 → 完整消息包入列（模块级 store，不随组件销毁丢失），
+        // 成功入列后才清输入框与附件（SR-08 同款时序）。
+        enqueuePending({
+          projectId,
+          agentId,
+          text,
+          attachments,
+          mode: "normal",
+        });
         setInput("");
-        syncQueuedCount();
-      }
-      return;
-    }
-
-    let messageText: string;
-    if (autoSendRef.current) {
-      autoSendRef.current = false;
-      messageText = shiftQueuedFor(agentId)?.text || "";
-      syncQueuedCount();
-    } else {
-      if (!input.trim()) return;
-      messageText = input.trim();
-      setInput("");
-      if (isStreaming || isAgentProcessing) {
-        pendingQueueRef.current.push({ agentId, text: messageText });
-        syncQueuedCount();
+        setImages([]);
         return;
       }
     }
 
-    if (!messageText) return;
+    let messageText: string;
+    let messageImages: string[];
+    let activeEntryId: string | null = null;
+    if (autoSendRef.current) {
+      // drain：取出本 agent 最早一条 queued-local（原子置 sending），附件
+      // 用包内快照——绝不回读当前输入框，也绝不改投当前选中成员。
+      autoSendRef.current = false;
+      const entry = takeNextQueued(projectId, agentId);
+      if (!entry) return;
+      messageText = entry.text;
+      messageImages = entry.attachments;
+      activeEntryId = entry.clientMessageId;
+      activeEntryIdRef.current = entry.clientMessageId;
+    } else {
+      messageText = text;
+      messageImages = attachments;
+      setInput("");
+      setImages([]);
+      if (isStreaming || isAgentProcessing) {
+        enqueuePending({
+          projectId,
+          agentId,
+          text,
+          attachments,
+          mode: "normal",
+        });
+        return;
+      }
+      activeEntryIdRef.current = null;
+    }
 
     sendingLockRef.current = true;
 
-    const sendingImages = images;
-    setImages([]);
+    const sendingImages = messageImages;
 
     const sendingForAgentId = agentId;
     const isActiveSession = () => activeAgentIdRef.current === sendingForAgentId;
+    let activeRunId: string | null = null;
     const clearStreamAbort = () => {
       // Stream finished (or abandoned): drop cancel handle so agent switch /
       // remount cannot push a stale WS "cancel" into a later turn (TEST6).
+      // 停止注册表条目同步注销（切走再切回后点「停止」靠注册表存活，
+      // run 收口必须清掉，否则残留条目会指向已结束的轮次）。
       streamAbortRef.current = null;
+      if (activeRunId) unregisterRun(sendingForAgentId, activeRunId);
     };
     const releaseLockAndFinish = () => {
       sendingLockRef.current = false;
+      activeEntryIdRef.current = null;
       clearStreamAbort();
-      if (pendingQueueRef.current.some((e) => e.agentId === sendingForAgentId)) {
+      if (
+        useQueueStore
+          .getState()
+          .entries.some(
+            (e) => e.agentId === sendingForAgentId && e.state === "queued-local"
+          )
+      ) {
         // If the user switched chats within the 300ms window, leave the entry
         // parked — the drain effect will send it when its own chat is viewed.
         setTimeout(() => {
@@ -215,6 +263,7 @@ export function useChatSend(opts: {
     if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
     responseTimeoutRef.current = setTimeout(() => {
       if (!isActiveSession()) return;
+      settleActiveEntry(activeEntryId, "failed", "响应超时，未获服务器确认");
       setIsStreaming(false);
       updateStreamDraft(null);
       updateProcessingAgent(sendingForAgentId, false);
@@ -239,6 +288,7 @@ export function useChatSend(opts: {
           id: optimisticUserId,
           role: "user" as const,
           content: messageText,
+          images: sendingImages.length ? sendingImages : undefined,
           timestamp: Date.now(),
           isBackground: false,
           isRead: true,
@@ -267,6 +317,9 @@ export function useChatSend(opts: {
           try {
             const parsed = JSON.parse(event.data);
             if (parsed.role === "user" && parsed.id) {
+              // 服务器已持久化本条用户消息 = 该队列条目 accepted 的权威 ack
+              //（§14.4：accepted 只代表接收成功，不代表任务执行完成）。
+              settleActiveEntry(activeEntryId, "accepted");
               setMessages((prev) => {
                 const without = prev.filter((m) => m.id !== optimisticUserId);
                 if (without.some((m) => m.id === parsed.id)) return without;
@@ -276,6 +329,7 @@ export function useChatSend(opts: {
                     id: parsed.id,
                     role: "user" as const,
                     content: messageText,
+                    images: sendingImages.length ? sendingImages : undefined,
                     timestamp: Date.now(),
                     isBackground: false,
                     isRead: true,
@@ -494,6 +548,10 @@ export function useChatSend(opts: {
           loadMessagesFromDb(sendingForAgentId);
         } else if (event.type === "done") {
           setThinkingElapsed(null);
+          // turn 权威收口：若停止在途 → 确认「已停止」（§14.5 后端确认）。
+          if (sendingForAgentId) notifyRunEnded(sendingForAgentId, activeRunId);
+          // message_id ack 可能早于 done 已落定；此处兜底补一次（幂等）。
+          settleActiveEntry(activeEntryId, "accepted");
           console.log(
             `[SSE] done — total text events: ${_dbgTextCount}, elapsed: ${_dbgFirstText ? (performance.now() - _dbgFirstText).toFixed(0) : "N/A"}ms`
           );
@@ -569,19 +627,31 @@ export function useChatSend(opts: {
             responseTimeoutRef.current = null;
           }
           if (sendingForAgentId) updateProcessingAgent(sendingForAgentId, false);
-          setInput(messageText);
-          updateStreamDraft(null);
-          setIsStreaming(false);
-          setRetryInfo(null);
-          pendingQueueRef.current = pendingQueueRef.current.filter(
-            (e) => e.agentId !== sendingForAgentId
-          );
-          syncQueuedCount();
-          autoSendRef.current = false;
-          sendingLockRef.current = false;
-          clearStreamAbort();
+          // 忙线拒绝：本条消息落 failed 保留原文可重试（SR-08），其余排队
+          // 条目不再整体清空（旧行为会把该成员整条队列抹掉）。
+          if (activeEntryId) {
+            settleActiveEntry(activeEntryId, "failed", "成员忙，消息未被接受，可重试");
+            updateStreamDraft(null);
+            setIsStreaming(false);
+            setRetryInfo(null);
+            autoSendRef.current = false;
+            sendingLockRef.current = false;
+            clearStreamAbort();
+            activeEntryIdRef.current = null;
+          } else {
+            // 直接发送（无队列条目）被拒 → 退回输入框，不静默丢失。
+            setInput(messageText);
+            setImages(sendingImages);
+            updateStreamDraft(null);
+            setIsStreaming(false);
+            setRetryInfo(null);
+            sendingLockRef.current = false;
+            clearStreamAbort();
+          }
         } else if (event.type === "error") {
           setThinkingElapsed(null);
+          // turn 错误收口：与 done 同款确认「已停止」（停止在途时）。
+          if (sendingForAgentId) notifyRunEnded(sendingForAgentId, activeRunId);
           if (responseTimeoutRef.current) {
             clearTimeout(responseTimeoutRef.current);
             responseTimeoutRef.current = null;
@@ -598,6 +668,22 @@ export function useChatSend(opts: {
             const sessionMsgs =
               (useAppStore.getState().chatSessions[sendingForAgentId] as ChatMessage[] | undefined) ??
               [];
+            // 条目仍在 sending（message_id ack 未到就收到 error）：后端在
+            // agent.chat() 前必落库用户消息，用 DB 内容核对裁决——正文在 =
+            // 已送达（补 accepted）；不在 = 投递未确认，落 failed 保原文可重试。
+            if (activeEntryId) {
+              const store = useQueueStore.getState();
+              const entry = store.entries.find((e) => e.clientMessageId === activeEntryId);
+              if (entry && entry.state === "sending") {
+                const persisted =
+                  ok &&
+                  sessionMsgs.some(
+                    (m) => m.role === "user" && m.content === messageText
+                  );
+                if (persisted) store.markAccepted(activeEntryId);
+                else store.markFailed(activeEntryId, "未能确认送达，可重试");
+              }
+            }
             const hasSegments = ok && settledMessageHasSegments(sessionMsgs, erroredId);
             if (hasSegments) {
               updateStreamDraft((prev) => (prev && prev.assistantId !== erroredId ? prev : null));
@@ -613,12 +699,15 @@ export function useChatSend(opts: {
       }
     );
     streamAbortRef.current = abortStream;
+    // 停止注册表（模块级）：切走再切回后仍能对准本轮 cancel（§14.5）。
+    activeRunId = registerRun(sendingForAgentId, abortStream);
   }, [
     agentId,
     input,
     images,
     isStreaming,
     isAgentProcessing,
+    projectId,
     refreshOrgTree,
     loadMessagesFromDb,
     activeAgentIdRef,
@@ -629,8 +718,7 @@ export function useChatSend(opts: {
     setThinkingElapsed,
     updateProcessingAgent,
     stickToBottomRef,
-    syncQueuedCount,
-    shiftQueuedFor,
+    settleActiveEntry,
   ]);
 
   handleSendRef.current = handleSend;
@@ -647,42 +735,143 @@ export function useChatSend(opts: {
     void joinAgentChannel(sendingForAgentId).finally(() => {
       if (activeAgentIdRef.current !== sendingForAgentId) return;
       autoSendRef.current = true;
-      pendingQueueRef.current.push({ agentId: sendingForAgentId, text: message });
+      enqueuePending({
+        projectId,
+        agentId: sendingForAgentId,
+        text: message,
+        attachments: [],
+        mode: "normal",
+      });
       handleSendRef.current();
     });
-  }, [pendingInitialMessage, agentId, activeAgentIdRef]);
-
-  // Queued-count banner is per-agent — recompute when switching chats.
-  useEffect(() => {
-    syncQueuedCount();
-  }, [agentId, syncQueuedCount]);
+  }, [pendingInitialMessage, agentId, activeAgentIdRef, projectId]);
 
   // Drain queued messages when the VIEWED agent becomes idle. Entries for
   // other agents stay parked until their own chat is viewed and idle —
   // a message queued for agent A must never auto-send to agent B on switch.
+  // Queue lives in the module store: this effect also re-fires when entries
+  // change（重试把 failed 翻回 queued-local 时能接上）。sendingLock 在飞时
+  // 不重复 drain —— 同空闲窗口的下一条由 done 的 300ms 重发接力（旧契约），
+  // 避免把多条排队背靠背全部打出。
   useEffect(() => {
     if (!agentId || isStreaming || isAgentProcessing) return;
-    if (!pendingQueueRef.current.some((e) => e.agentId === agentId)) return;
+    if (sendingLockRef.current) return;
+    if (!hasQueuedForAgent(queueEntries, projectId, agentId)) return;
     autoSendRef.current = true;
     handleSend();
-  }, [agentId, isStreaming, isAgentProcessing, handleSend]);
+  }, [agentId, isStreaming, isAgentProcessing, handleSend, queueEntries, projectId]);
 
   // 插话：AI 工作期间把消息直接注入运行中 turn 的 next-step 窗口，不排队。
+  // SR-08：消息先以 sending 态入列（文本/附件已快照绑定），确认后才算成功；
+  // 失败保留原文与附件在队列面板可重试。后端把插话落库为 user 消息，以
+  // DB 内容核对作为「服务器已接收」的确认（不提前宣布成功）。
+  const attemptInterrupt = useCallback(
+    (entry: PendingMessage) => {
+      const agent = entry.agentId;
+      try {
+        pushInsert(agent, entry.text, entry.attachments.length ? entry.attachments : undefined);
+      } catch (err) {
+        useQueueStore
+          .getState()
+          .markFailed(entry.clientMessageId, err instanceof Error ? err.message : "插话发送失败");
+        return;
+      }
+      let settled = false;
+      // persisted 直接作为裁决入参：DB 里查到同文 user 消息 = 服务器已接收。
+      const check = (persisted: boolean) => {
+        if (settled) return;
+        const cur = useQueueStore
+          .getState()
+          .entries.find((e) => e.clientMessageId === entry.clientMessageId);
+        if (!cur || cur.state !== "sending") {
+          settled = true;
+          return;
+        }
+        if (persisted) {
+          settled = true;
+          useQueueStore.getState().markAccepted(entry.clientMessageId);
+        }
+      };
+      const persistedInDb = async (): Promise<boolean> => {
+        try {
+          const dbMessages = await getChatMessages(agent);
+          if (!Array.isArray(dbMessages)) return false;
+          return mapDbToChatMessages(dbMessages).some(
+            (m) => m.role === "user" && m.content === entry.text,
+          );
+        } catch {
+          return false;
+        }
+      };
+      const reload = () => {
+        // DB 核对不依赖当前激活会话：用户切走不代表插话没送达（切走后
+        // loadMessagesFromDb 内部会守卫 no-op），改用裸拉取裁决，激活时
+        // 顺带刷新会话视图。
+        if (activeAgentIdRef.current === agent) {
+          loadMessagesFromDb(agent).then(async (ok) => {
+            check(ok && (await persistedInDb()));
+          });
+        } else {
+          persistedInDb().then(check);
+        }
+      };
+      window.setTimeout(reload, 300);
+      window.setTimeout(reload, 1500);
+      window.setTimeout(() => {
+        if (settled) return;
+        const cur = useQueueStore
+          .getState()
+          .entries.find((e) => e.clientMessageId === entry.clientMessageId);
+        if (cur && cur.state === "sending") {
+          useQueueStore
+            .getState()
+            .markFailed(entry.clientMessageId, "插话未获服务器确认，可重试");
+        }
+      }, 10_000);
+    },
+    [activeAgentIdRef, loadMessagesFromDb]
+  );
+
   const handleInsert = useCallback(() => {
     if (!agentId) return;
-    if (!input.trim()) return;
     const text = input.trim();
-    const sendingImages = images;
+    const attachments = images.slice();
+    if (!hasSendableContent(text, attachments)) return;
+    // 先入列（文本/附件快照绑定），入列成功后才清输入框——失败可从队列面板重试。
+    const entry = enqueuePending({
+      projectId,
+      agentId,
+      text,
+      attachments,
+      mode: "interrupt",
+      initialState: "sending",
+    });
     setInput("");
     setImages([]);
-    pushInsert(agentId, text, sendingImages.length ? sendingImages : undefined);
-    // 后端落库 user 消息后 reload，插入消息即时上屏。
-    setTimeout(() => {
-      if (activeAgentIdRef.current === agentId) {
-        loadMessagesFromDb(agentId);
+    attemptInterrupt(entry);
+  }, [agentId, input, images, projectId, attemptInterrupt]);
+
+  /** 队列面板「重试」：插话原地重发；普通消息翻回 queued-local 交给 drain。 */
+  const retryQueued = useCallback(
+    (clientMessageId: string) => {
+      const entry = useQueueStore
+        .getState()
+        .entries.find((e) => e.clientMessageId === clientMessageId);
+      if (!entry || entry.state !== "failed") return;
+      if (entry.mode === "interrupt") {
+        useQueueStore.getState().markSending(clientMessageId);
+        attemptInterrupt({ ...entry, state: "sending", errorMessage: undefined });
+      } else {
+        useQueueStore.getState().requeue(clientMessageId);
       }
-    }, 300);
-  }, [agentId, input, images, loadMessagesFromDb]);
+    },
+    [attemptInterrupt]
+  );
+
+  /** 队列面板「取消/移除」：queued-local=取消未发消息；accepted=仅移除记录（不撤回）。 */
+  const cancelQueued = useCallback((clientMessageId: string) => {
+    useQueueStore.getState().remove(clientMessageId);
+  }, []);
 
   /** 输入框 auto-grow：内容撑高到 MAX 封顶后内部滚动，参考 deepseek-harness 的 composer。 */
   const autoResizeTextarea = useCallback(() => {
@@ -736,25 +925,29 @@ export function useChatSend(opts: {
   };
 
   const handleStop = useCallback(() => {
-    streamAbortRef.current?.();
+    if (!agentId) return;
+    // 停止请求带 agentId 走模块级注册表（§14.5）：不依赖当前页面是不是
+    // 最初发起流的页面——切走再切回，cancel 仍投到该 agent 当前存活的
+    // channel。「正在停止」立即置位；「已停止」只等后端确认（done/error
+    // 事件或 processing 权威回读），超时转 uncertain + 可重试，这里绝不
+    // 提前宣布成功，也不做本地乐观清场（draft/流式态由 done/error 收口）。
+    requestStop(agentId);
+    // 本地句柄立即作废：后续 cancel 一律走 ws 层当前存活 channel 的
+    // push("cancel")，不再碰陈旧 abort 闭包（它会误删被动订阅 handler）。
     streamAbortRef.current = null;
-    abortControllerRef.current?.abort();
-    setIsStreaming(false);
-    updateStreamDraft(null);
-    setRetryInfo(null);
-    if (responseTimeoutRef.current) clearTimeout(responseTimeoutRef.current);
-    if (agentId) updateProcessingAgent(agentId, false);
-    if (pendingQueueRef.current.some((e) => e.agentId === agentId)) {
-      pendingQueueRef.current = pendingQueueRef.current.filter((e) => e.agentId !== agentId);
-      syncQueuedCount();
-    }
-  }, [agentId, setIsStreaming, updateStreamDraft, updateProcessingAgent, syncQueuedCount]);
+    // 停的对象是「本轮执行轮次」（§8.7）：该成员仍在本地暂存的排队条目随
+    // 停止取消，避免停止后 idle 又被 drain 自动拉起新 turn；已 accepted 的
+    // 不动（cancelled 不能假装撤销已送达的消息，§14.4）。
+    useQueueStore.getState().removeQueuedLocalsForAgent(projectId, agentId);
+  }, [agentId, projectId]);
 
   return {
     input,
     setInput,
     images,
-    queuedCount,
+    setImages,
+    /** 本成员的队列条目（queueStore 订阅）——唯一事实源，面板直接渲染。 */
+    queueEntries,
     retryInfo,
     setRetryInfo,
     showApprovalDialog,
@@ -772,6 +965,9 @@ export function useChatSend(opts: {
     handleInsert,
     handleStop,
     handleKeyDown,
+    /** 队列面板动作：重试 / 取消（accepted 仅移除记录）。 */
+    retryQueued,
+    cancelQueued,
     streamAbortRef,
     abortControllerRef,
     responseTimeoutRef,

@@ -12,10 +12,30 @@ import { useStreamDraft } from "../chat/useStreamDraft";
 import { useChatMessages } from "../chat/useChatMessages";
 import { useChatSend } from "../chat/useChatSend";
 import { useAgentChannelLifecycle } from "../chat/useAgentChannelLifecycle";
+import { PendingQueuePanel } from "../chat/PendingQueuePanel";
+import { consumeReloadLossNotice, hasSendableContent } from "../chat/queueStore";
+import { confirmStopped, useStopPhase, type StopPhase } from "../chat/stopRegistry";
+
+/** 停止按钮按相位取文案/样式（§8.7：停止 → 正在停止 → 已停止/停止未确认·重试）。 */
+const STOP_LABEL: Record<StopPhase, string> = {
+  none: "停止",
+  stopping: "停止中…",
+  uncertain: "停止未确认，重试",
+  stopped: "已停止",
+};
+const STOP_CLASS: Record<StopPhase, string> = {
+  none: "bg-white border-g-border text-g-fg-2 hover:text-g-red hover:border-g-red/40 hover:bg-g-red-bg/50 disabled:opacity-30",
+  stopping: "bg-g-bg-soft border-g-yellow/50 text-g-yellow",
+  uncertain: "bg-g-red-bg border-g-red/40 text-g-red hover:bg-g-red/10",
+  stopped: "bg-g-green-bg border-g-green/40 text-g-green",
+};
 
 function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boolean }) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [thinkingElapsed, setThinkingElapsed] = useState<number | null>(null);
+  // 刷新丢失一次性提示（§8.5 第 7 条）：上一页面会话有未发完的排队消息时，
+  // 模块级 queueStore 的 sessionStorage 标记会告知 —— 不做静默丢失。
+  const [reloadLostNotice] = useState(() => consumeReloadLossNotice());
   const activeAgentIdRef = useRef<string | null>(agentId);
   activeAgentIdRef.current = agentId;
 
@@ -88,9 +108,9 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     stickToBottomRef,
   });
 
-  // Send queue is per-agent (entries tagged in useChatSend): switching chats
-  // parks the previous agent's queued messages instead of clearing or draining
-  // them into the newly viewed agent. queuedCount syncs inside useChatSend.
+  // Send queue lives in the module-level queueStore (keyed projectId+agentId):
+  // entries survive the key=agentId remount on chat switch. PendingQueuePanel
+  // below renders them straight from the store (queueStore.ts 是唯一事实源).
 
   useAgentChannelLifecycle({
     agentId,
@@ -102,6 +122,17 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     setIsStreaming,
     setRetryInfo: sendApi.setRetryInfo,
   });
+
+  // 停止确认（§14.5）：「已停止」只来自后端侧信号。useChatSend 的 done/error
+  // 是快路径；这里用权威 processing 状态回读兜底 —— 停止在途且该 agent 已
+  // 不在 processing（含切走再切回的场景）→ 确认收口，不提前宣布成功。
+  const stopPhase = useStopPhase(agentId);
+  useEffect(() => {
+    if (!agentId) return;
+    if (stopPhase !== "stopping" && stopPhase !== "uncertain") return;
+    if (isStreaming || isAgentProcessing) return;
+    confirmStopped(agentId);
+  }, [agentId, stopPhase, isStreaming, isAgentProcessing]);
 
   // #11 兜底对账：phoenix 重连窗口内发布的流事件会永久丢失，此前只有
   // 发消息（useChatSend 里的 loadMessagesFromDb）才会全量补显——用户看到
@@ -320,7 +351,6 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     input,
     setInput,
     images,
-    queuedCount,
     retryInfo,
     showApprovalDialog,
     setShowApprovalDialog,
@@ -337,7 +367,15 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     handleInsert,
     handleStop,
     handleKeyDown,
+    retryQueued,
+    cancelQueued,
   } = sendApi;
+
+  // 停止按钮三态（§8.7）：停止 → 正在停止 → 已停止/停止未确认·重试。
+  // 文案/样式按相位查表（避免嵌套三元）。
+  const stopLabel = STOP_LABEL[stopPhase];
+  const stopIdle =
+    !isStreaming && !isAgentProcessing && stopPhase !== "uncertain" && stopPhase !== "stopped";
 
   // ── 团队开会状态条（docs/spec/team-meeting.md §前端）──────────
   // WS meeting_updated 驱动 store.activeMeeting；REST 仅在挂载/切项目时
@@ -685,14 +723,24 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             ))}
           </div>
         )}
-        {queuedCount > 0 && (
-          <p className="flex items-center gap-1.5 w-fit text-xs text-g-yellow bg-g-yellow-bg border border-g-yellow/50 rounded-full px-3 py-1 mb-2">
+        {reloadLostNotice && (
+          <p
+            data-testid="queue-reload-lost"
+            className="flex items-center gap-1.5 w-fit text-xs text-g-yellow bg-g-yellow-bg border border-g-yellow/50 rounded-gm px-3 py-1.5 mb-2"
+          >
             <svg className="w-3 h-3 text-g-yellow-vivid" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l2 2m6-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4.99a2 2 0 00-3.5 0L3.16 16.25A2 2 0 005 19z" />
             </svg>
-            已排队 {queuedCount} 条消息，将在当前回复完成后自动发送
+            页面刷新，未发送的排队消息已丢失
           </p>
         )}
+        <PendingQueuePanel
+          projectId={selectedProjectId}
+          agentId={agentId}
+          agentName={agentInfo?.name}
+          onRetry={retryQueued}
+          onCancel={cancelQueued}
+        />
         <div className="flex items-end gap-2">
           <input
             type="file"
@@ -739,7 +787,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           {(isStreaming || isAgentProcessing) && (
             <button
               onClick={handleInsert}
-              disabled={!input.trim()}
+              disabled={!hasSendableContent(input, images)}
               className="px-4 py-2.5 bg-g-bg-soft border border-g-blue/40 text-g-blue hover:bg-g-blue/10 rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
               title="立即插入对话，不等待当前工作完成"
             >
@@ -748,17 +796,26 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           )}
           <button
             onClick={handleSend}
-            disabled={!input.trim() && images.length === 0}
+            disabled={!hasSendableContent(input, images)}
             className="px-5 py-2.5 bg-g-blue hover:bg-g-blue text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
             发送
           </button>
           <button
             onClick={handleStop}
-            disabled={!isStreaming}
-            className="px-5 py-2.5 bg-white border border-g-border text-g-fg-2 hover:text-g-red hover:border-g-red/40 hover:bg-g-red-bg/50 rounded-gm text-sm font-medium shadow-gm-sm transition-all active:scale-95 disabled:opacity-30 disabled:cursor-not-allowed disabled:shadow-none"
+            disabled={stopIdle || stopPhase === "stopping" || stopPhase === "stopped"}
+            data-testid="stop-button"
+            className={
+              "px-5 py-2.5 rounded-gm text-sm font-medium shadow-gm-sm transition-all active:scale-95 disabled:cursor-not-allowed disabled:shadow-none border " +
+              STOP_CLASS[stopPhase]
+            }
+            title={
+              stopPhase === "uncertain"
+                ? "上一次停止请求未获后端确认，点击重试"
+                : "停止当前执行轮次"
+            }
           >
-            停止
+            {stopLabel}
           </button>
         </div>
       </div>

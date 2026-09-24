@@ -2,14 +2,28 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useRef } from "react";
 import { useChatSend } from "./useChatSend";
-import { streamChat } from "../api";
+import { streamChat, pushInsert, getChatMessages } from "../api";
 import { useAppStore } from "../store";
+import { __resetQueueStoreForTests, useQueueStore } from "./queueStore";
+import {
+  __resetStopRegistryForTests,
+  confirmStopped,
+  getStopPhase,
+} from "./stopRegistry";
 import type { ChatMessage, StreamDraft } from "./types";
 import type { ChatEvent } from "../api/ws";
+
+const hoisted = vi.hoisted(() => ({
+  /** 模拟 ws 层 Socket.channels：stopRegistry 的 cancel 投递面。 */
+  channels: [] as Array<{ topic: string; push: ReturnType<typeof vi.fn> }>,
+}));
 
 vi.mock("../api", () => ({
   streamChat: vi.fn(() => ({ abort: vi.fn() })),
   joinAgentChannel: vi.fn(() => Promise.resolve()),
+  pushInsert: vi.fn(),
+  getChatMessages: vi.fn(async () => []),
+  getSocket: vi.fn(() => ({ channels: hoisted.channels })),
 }));
 
 type HarnessProps = {
@@ -44,65 +58,67 @@ function useHarness(props: HarnessProps) {
   });
 }
 
-describe("useChatSend — per-agent send queue", () => {
+function resetModules() {
+  __resetQueueStoreForTests();
+  __resetStopRegistryForTests();
+  hoisted.channels.length = 0;
+  useAppStore.getState().clearChatSessions();
+}
+
+describe("useChatSend — 模块级队列（FE-03：T-04/T-05/SR-06/SR-07/SR-08）", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.mocked(streamChat).mockClear();
+    vi.mocked(pushInsert).mockClear();
+    vi.mocked(getChatMessages).mockClear();
+    vi.mocked(getChatMessages).mockResolvedValue([] as never);
+    resetModules();
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    resetModules();
   });
 
-  it("never auto-sends a queued message to a different agent after switching chats", () => {
-    const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
+  it("T-04: 甲排队 → 组件重挂（registry key=agentId 重建）→ 队列完整且接收人仍是甲", () => {
+    const first = renderHook((p: HarnessProps) => useHarness(p), {
       initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
     });
 
-    // Agent A is busy → message is parked in the queue.
-    act(() => result.current.setInput("把团队扩散一下"));
-    act(() => result.current.handleSend());
+    // 甲运行中 → 补充要求入列（不入流）。
+    act(() => first.result.current.setInput("补充要求"));
+    act(() => first.result.current.handleSend());
     expect(streamChat).not.toHaveBeenCalled();
-    expect(result.current.queuedCount).toBe(1);
+    expect(useQueueStore.getState().entries).toHaveLength(1);
+    expect(useQueueStore.getState().entries[0]).toMatchObject({
+      agentId: "A",
+      text: "补充要求",
+      state: "queued-local",
+      mode: "normal",
+    });
 
-    // Switch to idle agent B — the old bug drained A's queue into B here.
-    rerender({ agentId: "B", isStreaming: false, isAgentProcessing: false });
+    // 模拟 registry 的 key=agentId 重建：卸载后全新 hook 实例切到乙。
+    first.unmount();
+    const second = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "B", isStreaming: false, isAgentProcessing: false },
+    });
+    // 队列不随组件销毁丢失；也绝不投给乙。
+    expect(useQueueStore.getState().entries).toHaveLength(1);
     expect(streamChat).not.toHaveBeenCalled();
-    // Banner counts only the viewed agent's entries.
-    expect(result.current.queuedCount).toBe(0);
 
-    // Switch back to A, now idle → the parked message drains to A only.
-    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
+    // 切回甲（又一个新实例）且甲空闲 → drain 出队，接收人仍是甲。
+    second.unmount();
+    renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+    });
     expect(streamChat).toHaveBeenCalledTimes(1);
     expect(vi.mocked(streamChat).mock.calls[0][0]).toBe("A");
-    expect(vi.mocked(streamChat).mock.calls[0][1]).toBe("把团队扩散一下");
-    expect(result.current.queuedCount).toBe(0);
+    expect(vi.mocked(streamChat).mock.calls[0][1]).toBe("补充要求");
+    // 出队即占位：条目进入 sending，不再被二次投递。
+    expect(useQueueStore.getState().entries[0].state).toBe("sending");
   });
 
-  it("handleStop clears only the viewed agent's queued entries", () => {
-    const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
-      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
-    });
-
-    // Park one message for A (busy) and one for B (busy).
-    act(() => result.current.setInput("msg for A"));
-    act(() => result.current.handleSend());
-    rerender({ agentId: "B", isStreaming: true, isAgentProcessing: true });
-    act(() => result.current.setInput("msg for B"));
-    act(() => result.current.handleSend());
-    expect(result.current.queuedCount).toBe(1);
-    expect(streamChat).not.toHaveBeenCalled();
-
-    // Stop on B clears B's entry only; A's entry stays parked.
-    act(() => result.current.handleStop());
-    expect(result.current.queuedCount).toBe(0);
-
-    rerender({ agentId: "A", isStreaming: true, isAgentProcessing: true });
-    expect(result.current.queuedCount).toBe(1);
-    expect(streamChat).not.toHaveBeenCalled();
-  });
-
-  it("delayed resend timer stays parked when the user switched chats within 300ms", () => {
+  it("T-05/SR-07: 两条不同附件的排队消息互不串，附件绑定当条消息", () => {
     let onEvent: (event: ChatEvent) => void = () => {};
     vi.mocked(streamChat).mockImplementation((_id, _msg, _imgs, cb) => {
       onEvent = cb;
@@ -110,37 +126,246 @@ describe("useChatSend — per-agent send queue", () => {
     });
 
     const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
-      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
     });
 
-    // First message sends immediately; a second one is parked while A streams.
-    act(() => result.current.setInput("first"));
+    act(() => result.current.setInput("第一条"));
+    act(() => result.current.setImages(["data:image/png;base64,AAA"]));
     act(() => result.current.handleSend());
-    expect(streamChat).toHaveBeenCalledTimes(1);
-    rerender({ agentId: "A", isStreaming: true, isAgentProcessing: true });
-    act(() => result.current.setInput("second"));
-    act(() => result.current.handleSend());
-    expect(result.current.queuedCount).toBe(1);
+    // 入列成功才清输入框与附件（快照绑定当条消息，不再挂在输入框上）。
+    expect(result.current.input).toBe("");
+    expect(result.current.images).toEqual([]);
 
-    // A's stream completes → 300ms resend timer armed; user switches to B.
+    act(() => result.current.setInput("第二条"));
+    act(() => result.current.setImages(["data:image/png;base64,BBB"]));
+    act(() => result.current.handleSend());
+
+    const entries = useQueueStore.getState().entries;
+    expect(entries).toHaveLength(2);
+    expect(entries[0].attachments).toEqual(["data:image/png;base64,AAA"]);
+    expect(entries[1].attachments).toEqual(["data:image/png;base64,BBB"]);
+
+    // 甲空闲 → drain 第一条；done 后 300ms 重发第二条，附件各随各的消息。
+    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
+    expect(streamChat).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(streamChat).mock.calls[0][2]).toEqual(["data:image/png;base64,AAA"]);
+
     act(() => onEvent({ type: "done", data: "" }));
-    rerender({ agentId: "B", isStreaming: false, isAgentProcessing: false });
     act(() => {
       vi.advanceTimersByTime(400);
     });
-    expect(streamChat).toHaveBeenCalledTimes(1);
-
-    // Back on idle A, the parked message drains to A.
-    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
     expect(streamChat).toHaveBeenCalledTimes(2);
     expect(vi.mocked(streamChat).mock.calls[1][0]).toBe("A");
-    expect(vi.mocked(streamChat).mock.calls[1][1]).toBe("second");
+    expect(vi.mocked(streamChat).mock.calls[1][1]).toBe("第二条");
+    expect(vi.mocked(streamChat).mock.calls[1][2]).toEqual(["data:image/png;base64,BBB"]);
+  });
+
+  it("SR-06: 纯图片消息可发送（统一校验：有正文或有附件即合法）", () => {
+    const { result } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+    });
+    act(() => result.current.setImages(["data:image/png;base64,IMG"]));
+    act(() => result.current.handleSend());
+    expect(streamChat).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(streamChat).mock.calls[0][2]).toEqual(["data:image/png;base64,IMG"]);
+  });
+
+  it("SR-06: 空正文且无附件不发送（两端一致拒绝）", () => {
+    const { result } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+    });
+    act(() => result.current.setInput("   "));
+    act(() => result.current.handleSend());
+    expect(streamChat).not.toHaveBeenCalled();
+    expect(useQueueStore.getState().entries).toHaveLength(0);
+  });
+
+  it("取消：移除 queued-local 后不再被 drain", () => {
+    const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+    act(() => result.current.setInput("将被取消"));
+    act(() => result.current.handleSend());
+    const id = useQueueStore.getState().entries[0].clientMessageId;
+
+    act(() => result.current.cancelQueued(id));
+    expect(useQueueStore.getState().entries).toHaveLength(0);
+
+    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
+    expect(streamChat).not.toHaveBeenCalled();
+  });
+
+  it("重试：failed 普通消息翻回 queued-local 并被 drain 重新投递", () => {
+    const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+    act(() => result.current.setInput("要重试的"));
+    act(() => result.current.handleSend());
+    const id = useQueueStore.getState().entries[0].clientMessageId;
+
+    // 模拟之前发送失败留下的 failed 条目。
+    act(() => {
+      useQueueStore.setState({
+        entries: [{ ...useQueueStore.getState().entries[0], state: "failed", errorMessage: "超时" }],
+      });
+    });
+
+    act(() => result.current.retryQueued(id));
+    expect(useQueueStore.getState().entries[0].state).toBe("queued-local");
+
+    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
+    expect(streamChat).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(streamChat).mock.calls[0][1]).toBe("要重试的");
+  });
+
+  it("停止本轮：清掉该成员 queued-local；accepted 不动（不假装撤回已送达消息）", () => {
+    const { result } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+    act(() => result.current.setInput("本地暂存"));
+    act(() => result.current.handleSend());
+    act(() => {
+      useQueueStore.getState().enqueue({
+        projectId: "",
+        agentId: "A",
+        text: "已在服务器",
+        attachments: [],
+        mode: "normal",
+        initialState: "accepted",
+      });
+    });
+
+    act(() => result.current.handleStop());
+    const states = useQueueStore.getState().entries.map((e) => e.state);
+    expect(states).toEqual(["accepted"]);
+  });
+
+  it("T-12: 切走再切回后点停止，cancel 投到该 agent 当前存活 channel 且进入停止状态机", () => {
+    hoisted.channels.push({ topic: "agent:A", push: vi.fn() });
+
+    // 第一次实例：发送消息（注册 run）。
+    const first = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+    });
+    act(() => first.result.current.setInput("go"));
+    act(() => first.result.current.handleSend());
+    expect(streamChat).toHaveBeenCalledTimes(1);
+
+    // 切走（卸载 → useAgentChannelLifecycle 清本地句柄）再切回（新实例）。
+    first.unmount();
+    const second = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+    // 本地 streamAbortRef 已被生命周期清理；停止必须仍命中注册表条目。
+    expect(second.result.current.streamAbortRef.current).toBeNull();
+
+    act(() => second.result.current.handleStop());
+    expect(hoisted.channels[0].push).toHaveBeenCalledWith("cancel", {});
+    expect(getStopPhase("A")).toBe("stopping");
+
+    // 后端确认（done 事件）→ 「已停止」；确认前不得提前宣布。
+    expect(getStopPhase("A")).not.toBe("stopped");
+    const onEvent = vi.mocked(streamChat).mock.calls[0][3];
+    act(() => onEvent({ type: "done", data: "" }));
+    act(() => {
+      vi.advanceTimersByTime(800); // 最短确认驻留
+    });
+    expect(getStopPhase("A")).toBe("stopped");
+  });
+
+  it("停止超时未确认 → uncertain（不提前宣布成功），可再次点击重试", () => {
+    hoisted.channels.push({ topic: "agent:A", push: vi.fn() });
+    const { result } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: false, isAgentProcessing: false },
+    });
+    act(() => result.current.setInput("go"));
+    act(() => result.current.handleSend());
+    act(() => result.current.handleStop());
+    expect(getStopPhase("A")).toBe("stopping");
+
+    act(() => {
+      vi.advanceTimersByTime(15_000);
+    });
+    expect(getStopPhase("A")).toBe("uncertain");
+
+    // 重试：新的停止请求回到 stopping。
+    act(() => result.current.handleStop());
+    expect(getStopPhase("A")).toBe("stopping");
+    expect(hoisted.channels[0].push).toHaveBeenCalledTimes(2);
+    // 后端确认到达（processing 回读 / done 事件）→ 最短驻留后「已停止」。
+    act(() => confirmStopped("A"));
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(getStopPhase("A")).toBe("stopped");
+  });
+
+  it("SR-08: 插话先入列再清输入；未获确认 10s 转 failed 保留原文；重试成功转 accepted", async () => {
+    const { result } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+
+    act(() => result.current.setInput("插话内容"));
+    act(() => result.current.setImages(["data:image/png;base64,IMG1"]));
+    act(() => result.current.handleInsert());
+    expect(pushInsert).toHaveBeenCalledWith("A", "插话内容", ["data:image/png;base64,IMG1"]);
+    expect(result.current.input).toBe("");
+    expect(result.current.images).toEqual([]);
+    expect(useQueueStore.getState().entries[0]).toMatchObject({
+      agentId: "A",
+      mode: "interrupt",
+      state: "sending",
+    });
+
+    // DB 始终没有该内容 → 10s 超时转 failed（文本保留在队列面板可重试）。
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+    });
+    expect(useQueueStore.getState().entries[0].state).toBe("failed");
+    expect(useQueueStore.getState().entries[0].text).toBe("插话内容");
+
+    // 重试：这次 DB 里有内容（后端已落库）→ accepted。
+    vi.mocked(getChatMessages).mockClear();
+    vi.mocked(getChatMessages).mockResolvedValue([
+      { id: "u1", role: "user", content: "插话内容" },
+    ] as never);
+    const id = useQueueStore.getState().entries[0].clientMessageId;
+    act(() => result.current.retryQueued(id));
+    expect(pushInsert).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(useQueueStore.getState().entries[0].state).toBe("accepted");
+  });
+
+  it("保留旧契约：切到空闲乙时不 drain 甲的排队；甲的条目只等甲的会话", () => {
+    const { result, rerender } = renderHook((p: HarnessProps) => useHarness(p), {
+      initialProps: { agentId: "A", isStreaming: true, isAgentProcessing: true },
+    });
+    act(() => result.current.setInput("把团队扩散一下"));
+    act(() => result.current.handleSend());
+    expect(streamChat).not.toHaveBeenCalled();
+
+    rerender({ agentId: "B", isStreaming: false, isAgentProcessing: false });
+    expect(streamChat).not.toHaveBeenCalled();
+
+    rerender({ agentId: "A", isStreaming: false, isAgentProcessing: false });
+    expect(streamChat).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(streamChat).mock.calls[0][0]).toBe("A");
   });
 });
 
 describe("useChatSend — round_start", () => {
   beforeEach(() => {
     vi.mocked(streamChat).mockClear();
+    resetModules();
+  });
+
+  afterEach(() => {
+    resetModules();
   });
 
   it("keeps prior narration/tool chips and appends a round_boundary segment", () => {
@@ -291,11 +516,13 @@ describe("useChatSend — done 收口 gate（TEST_DSH_44 Bug#1）", () => {
     vi.useFakeTimers();
     useAppStore.getState().clearChatSessions();
     vi.mocked(streamChat).mockClear();
+    resetModules();
   });
 
   afterEach(() => {
     vi.useRealTimers();
     useAppStore.getState().clearChatSessions();
+    resetModules();
   });
 
   it("done 时快照无 segments → draft 保留 persisted 不清空（重试耗尽也不坍缩）", async () => {

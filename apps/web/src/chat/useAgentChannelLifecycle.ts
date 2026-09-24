@@ -49,7 +49,11 @@ export function useAgentChannelLifecycle(opts: {
   // Manage WebSocket channel + local UI lifecycle when agentId changes.
   // BUG-034 / TEST6: do NOT call streamAbortRef (pushes WS "cancel") on switch —
   // leaveAgentChannel also skips cancel. Switching agents must not kill a
-  // background / trigger resume turn. Explicit Stop still goes through handleStop.
+  // background / trigger resume turn. Explicit Stop still goes through handleStop,
+  // which routes through the module-level stop registry (stopRegistry.ts): the
+  // local refs cleared here are per-instance stale handles only; the registry
+  // entry (agentId → run) survives switch/remount so Stop still lands on the
+  // right run after switching away and back (§14.5 / T-12).
   useEffect(() => {
     return () => {
       if (agentId) {
