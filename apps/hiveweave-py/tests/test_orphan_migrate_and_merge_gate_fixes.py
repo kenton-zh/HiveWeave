@@ -226,6 +226,13 @@ async def test_verify_parent_close_failure_notifies_creator(task_env):
         creator_id=COORD, assignee_id=EXEC,
         parent_task_id=parent_id, source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve 门；本测试测的是
+    # 父任务关闭失败的通知路径，不是 criteria 门 ⇒ 批准事实位放行。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, verify_id, COORD)
     await ts.claim_task(pid, verify_id, EXEC)
     await ts.start_task(pid, verify_id)
     await ts.submit_task(

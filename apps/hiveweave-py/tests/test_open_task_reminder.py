@@ -246,6 +246,13 @@ async def test_verify_approve_auto_closes(env):
         tags=["verify", "mandatory"],
         source="system",
         kind=VERIFY_KIND)
+    # TEST_DSH_70 P0-3 后空 criteria VERIFY 过不了 approve/close 门；本测试
+    # 测的是 approve 自动关单与提醒，不是 criteria 门 ⇒ 批准事实位放行。
+    from hiveweave.services.tasks.verify_criteria_gate import (
+        record_empty_criteria_approval,
+    )
+
+    await record_empty_criteria_approval(pid, tid, AGENT_C)
     await ts.claim_task(pid, tid, AGENT_A)
     await ts.start_task(pid, tid)
     await ts.submit_task(
