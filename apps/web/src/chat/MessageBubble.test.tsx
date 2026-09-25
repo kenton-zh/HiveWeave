@@ -372,3 +372,98 @@ describe("MessageBubble 文件卡片（P1-②）：clipboard 缺失环境", () =
     expect(container.querySelector("[data-file-chip]")).not.toBeNull();
   });
 });
+
+describe("MessageBubble 工具事件条（FE-13 §10.1.4：默认收起 + 流式当前工具自动展开）", () => {
+  const runningTool = {
+    tool: "search_files",
+    input: { pattern: "useChat" },
+    status: "running" as const,
+  };
+
+  it("持久化消息：工具行默认收起（无 pre），点击行头才展开参数", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([
+          { type: "tool_call", tool: { ...runningTool, status: "ok", result: "src/a.ts" } },
+        ])}
+      />,
+    );
+    expect(container.querySelector('[data-tool-row="search_files"]')).not.toBeNull();
+    expect(container.querySelector("pre")).toBeNull();
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.querySelector("pre")?.textContent).toContain("pattern");
+  });
+
+  it("流式中 running 工具自动展开参数，无需点击", () => {
+    const { container } = render(
+      <MessageBubble
+        msg={mkMsg([{ type: "tool_call", tool: { ...runningTool } }], { isStreaming: true })}
+      />,
+    );
+    expect(container.querySelector("pre")?.textContent).toContain("pattern");
+  });
+
+  it("工具完成即自动收回：running→ok 重渲染后详情收起", () => {
+    const { container, rerender } = render(
+      <MessageBubble
+        msg={mkMsg([{ type: "tool_call", tool: { ...runningTool } }], { isStreaming: true })}
+      />,
+    );
+    expect(container.querySelector("pre")).not.toBeNull();
+    rerender(
+      <MessageBubble
+        msg={mkMsg(
+          [{ type: "tool_call", tool: { ...runningTool, status: "ok", result: "src/a.ts" } }],
+          { isStreaming: true },
+        )}
+      />,
+    );
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("非流式残留 running 状态（僵尸快照）不自动展开", () => {
+    const { container } = render(
+      <MessageBubble msg={mkMsg([{ type: "tool_call", tool: { ...runningTool } }])} />,
+    );
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("用户手动收起后保持收起：running 期间的后续更新不再自动弹开", () => {
+    const { container, rerender } = render(
+      <MessageBubble
+        msg={mkMsg([{ type: "tool_call", tool: { ...runningTool } }], { isStreaming: true })}
+      />,
+    );
+    expect(container.querySelector("pre")).not.toBeNull();
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.querySelector("pre")).toBeNull();
+    // 等价一次 draft 更新的重渲染：pinned 关闭优先于 autoOpen
+    rerender(
+      <MessageBubble
+        msg={mkMsg([{ type: "tool_call", tool: { ...runningTool } }], { isStreaming: true })}
+      />,
+    );
+    expect(container.querySelector("pre")).toBeNull();
+  });
+
+  it("用户手动展开的工具在完成后保持展开（用户意图优先于自动收回）", () => {
+    const { container, rerender } = render(
+      <MessageBubble
+        msg={mkMsg([{ type: "tool_call", tool: { ...runningTool, status: "ok", result: "src/a.ts" } }])}
+      />,
+    );
+    expect(container.querySelector("pre")).toBeNull();
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.querySelector("pre")).not.toBeNull();
+    rerender(
+      <MessageBubble
+        msg={mkMsg([
+          { type: "tool_call", tool: { ...runningTool, status: "ok", result: "src/a.ts\nsrc/b.ts" } },
+        ])}
+      />,
+    );
+    // 详情含入参 + 结果两个 <pre>；结果 pre 必须带上重渲染后的新内容
+    const pres = Array.from(container.querySelectorAll("pre"));
+    expect(pres.some((p) => p.textContent?.includes("src/b.ts"))).toBe(true);
+  });
+});

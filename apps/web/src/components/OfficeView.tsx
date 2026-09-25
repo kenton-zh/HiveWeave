@@ -17,6 +17,7 @@ import { rememberAgentNames } from "../navigation/agentNames";
 import { openAgentChat } from "../navigation/commands";
 import { OfficeScene } from "./office/OfficeScene";
 import { MAX_VISIBLE_AGENTS } from "./office/constants";
+import { OnboardingHint } from "./OnboardingHint";
 import type { OfficeAgent, OfficeInteraction, SceneSnapshot } from "./office/types";
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -78,6 +79,8 @@ export default function OfficeView() {
   const [roots, setRoots] = useState<OfficeAgent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // FE-19：新手引导卡片开启中 → 藏起同角的氛围提示，避免左下角两块浮层打架
+  const [hintOpen, setHintOpen] = useState(false);
 
   // ── Derived data ───────────────────────────────────────────────
   const agents = useMemo(() => flattenAgents(roots), [roots]);
@@ -245,8 +248,15 @@ export default function OfficeView() {
         </div>
       )}
       {!error && !loading && agents.length > 0 && (
-        <div className="absolute bottom-2 left-2 z-10 rounded-full bg-white/65 backdrop-blur-sm border border-g-border px-2.5 py-1 shadow-gm-sm pointer-events-none">
-          <span className="text-[10px] text-g-fg-4">点击小人打开对话</span>
+        <div className="absolute bottom-2 left-2 z-10 flex items-center gap-1.5">
+          {/* FE-19 新手引导（§8.8）挂载点：场景左下角。关闭态收成一枚
+              「? 新手引导」小药丸 = 帮助重开入口；卡片非模态、不挡场景操作。 */}
+          <OnboardingHint onOpenChange={setHintOpen} />
+          {!hintOpen && (
+            <div className="rounded-full bg-white/65 backdrop-blur-sm border border-g-border px-2.5 py-1 shadow-gm-sm pointer-events-none">
+              <span className="text-[10px] text-g-fg-4">点击小人打开对话</span>
+            </div>
+          )}
         </div>
       )}
       {!error && loading && agents.length === 0 && (

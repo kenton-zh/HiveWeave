@@ -4,7 +4,7 @@ import { useAppStore, MEETING_ACTIVE_STATUSES } from "../store";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
-import { roleLabels, statusLabels } from "../chat/constants";
+import { roleLabels, statusLabels, composerSendLabel, ENQUEUE_HINT, INSERT_HINT, STOP_LABEL } from "../chat/constants";
 import { getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
 import { livePhaseLabel } from "../utils/livePhase";
 import { MessageBubble, ChatMotionStyles } from "../chat/MessageBubble";
@@ -16,13 +16,7 @@ import { PendingQueuePanel } from "../chat/PendingQueuePanel";
 import { consumeReloadLossNotice, hasSendableContent } from "../chat/queueStore";
 import { confirmStopped, useStopPhase, type StopPhase } from "../chat/stopRegistry";
 
-/** 停止按钮按相位取文案/样式（§8.7：停止 → 正在停止 → 已停止/停止未确认·重试）。 */
-const STOP_LABEL: Record<StopPhase, string> = {
-  none: "停止",
-  stopping: "停止中…",
-  uncertain: "停止未确认，重试",
-  stopped: "已停止",
-};
+/** 停止按钮相位样式（文案表 STOP_LABEL 在 chat/constants，与测试同源）。 */
 const STOP_CLASS: Record<StopPhase, string> = {
   none: "bg-white border-g-border text-g-fg-2 hover:text-g-red hover:border-g-red/40 hover:bg-g-red-bg/50 disabled:opacity-30",
   stopping: "bg-g-bg-soft border-g-yellow/50 text-g-yellow",
@@ -789,17 +783,20 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
               onClick={handleInsert}
               disabled={!hasSendableContent(input, images)}
               className="px-4 py-2.5 bg-g-bg-soft border border-g-blue/40 text-g-blue hover:bg-g-blue/10 rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
-              title="立即插入对话，不等待当前工作完成"
+              title={INSERT_HINT}
             >
-              插入
+              插话
             </button>
           )}
+          {/* FE-13 微文案（§10.1.5）：忙线点击发送实际入队（useChatSend），
+              主操作文案如实显示「加入队列」并说明生效时机。 */}
           <button
             onClick={handleSend}
             disabled={!hasSendableContent(input, images)}
+            title={isStreaming || isAgentProcessing ? ENQUEUE_HINT : undefined}
             className="px-5 py-2.5 bg-g-blue hover:bg-g-blue text-white rounded-gm text-sm font-medium shadow-gm-sm transition-all hover:shadow-gm active:scale-95 disabled:opacity-40 disabled:shadow-none"
           >
-            发送
+            {composerSendLabel(isStreaming || isAgentProcessing)}
           </button>
           <button
             onClick={handleStop}

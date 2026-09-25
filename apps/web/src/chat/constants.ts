@@ -1,3 +1,5 @@
+import type { StopPhase } from "./stopRegistry";
+
 /**
  * Visual-only motion tokens. Inlined as a <style> tag because index.css
  * is owned by another workstream — keep these scoped with the `hw-` prefix.
@@ -113,5 +115,36 @@ export const statusLabels: Record<string, { text: string; color: string }> = {
   working: { text: "Working", color: "text-g-green" },
   error: { text: "Error", color: "text-g-red" },
   waiting: { text: "Waiting", color: "text-g-yellow" },
+};
+
+// ── 输入区文案（FE-13 微文案 / §10.1.5 发送状态矩阵）────────────────
+
+/**
+ * 主操作文案按成员状态区分（§10.1.5）：空闲 =「发送」；运行中 =
+ * 「加入队列」——useChatSend.handleSend 在忙线时把消息包入待发队列
+ * （queueStore），按钮必须如实叫加入队列，不谎称发送。
+ */
+export function composerSendLabel(busy: boolean): "发送" | "加入队列" {
+  return busy ? "加入队列" : "发送";
+}
+
+/** 忙线主按钮旁的生效时机说明（§4.2：非默认行为不靠用户猜）。 */
+export const ENQUEUE_HINT = "成员正在运行：消息将加入队列，当前回复完成后自动发送";
+
+/** 「插话」按钮的生效时机说明（§10.1.5/B16：插话 ≠ 排队，不承诺打断工具）。 */
+export const INSERT_HINT =
+  "插话会尽快进入当前轮次可接收输入的时机，不等待当前回复完成；不承诺打断正在执行的工具，后端若降级为排队会在队列面板同步显示";
+
+// ── 停止按钮相位文案（FE-13 微文案 / §10.1.6 停止分层）──────────────
+
+/**
+ * 停止按钮按相位取文案（状态机见 chat/stopRegistry，此处只管呈现层）：
+ * 静默态点名作用对象 =「本轮执行轮次」，不再裸叫「停止」（§4.7 微文案表）。
+ */
+export const STOP_LABEL: Record<StopPhase, string> = {
+  none: "停止本轮",
+  stopping: "停止中…",
+  uncertain: "停止未确认，重试",
+  stopped: "已停止",
 };
 
