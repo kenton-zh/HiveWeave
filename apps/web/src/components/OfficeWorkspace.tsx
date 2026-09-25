@@ -3,8 +3,9 @@
  *
  * 结构（自下而上）：
  *   ① 底层   PixiJS OfficeScene 全屏铺满（懒加载，pixi.js ~1MB 不进主 chunk）
- *   ② 覆盖   HUD 工具条（面板入口 + 回工作台）
- *   ③ 浮窗   GameWindowLayer —— Chat / 组织树 / 时间线 / 目标 / 详情…
+ *   ② 覆盖   HUD 工具条（面板入口 + 待我处理 + 回工作台）
+ *   ③ 浮层   待我处理聚合面板（FE-14，内嵌抽屉，开合由本组件本地 state 管）
+ *   ④ 浮窗   GameWindowLayer —— Chat / 组织树 / 时间线 / 目标 / 详情…
  *
  * 与旧三栏的关系：**工作台（三栏）保留为可回退形态**（过渡期）。验证稳定后
  * 按 ADR-011 迁移第 2 步把三栏退役、`react-resizable-panels` 下线。
@@ -12,7 +13,7 @@
  * 注意：本组件**不实现**项目级「上班/下班」—— 该按钮留在 App header，
  * 避免在两处重复维护同一份 activate/deactivate 逻辑。
  */
-import { Suspense, useEffect } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { lazyRetry } from "../mainPanel";
 import { useAppStore } from "../store";
 import {
@@ -25,6 +26,7 @@ import ErrorBoundary from "./ErrorBoundary";
 import { OfficeSkeleton } from "./Skeleton";
 import GameWindowLayer from "./gamewindow/GameWindowLayer";
 import { useGameWindowStore, type GameWindowKind } from "./gamewindow/store";
+import PendingPanel from "./pending/PendingPanel";
 
 const OfficeView = lazyRetry(() => import("./OfficeView"));
 
@@ -59,6 +61,9 @@ export default function OfficeWorkspace({ onExitToWorkbench }: Props) {
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
   const openWindow = useGameWindowStore((s) => s.open);
   const closeKind = useGameWindowStore((s) => s.closeKind);
+  // FE-14：待我处理面板开合 + HUD 徽标计数（数据轮询在 PendingPanel 内部）
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [pendingTotal, setPendingTotal] = useState(0);
 
   // 窗口层在位信号：workspaceMode==="office" 不在任何 store 里（App 本地
   // state），由挂载/卸载打点给导航命令（openTask 等据此判断「开了窗有没有层渲染」）
@@ -129,8 +134,8 @@ export default function OfficeWorkspace({ onExitToWorkbench }: Props) {
         </ErrorBoundary>
       </div>
 
-      {/* ② HUD 工具条 */}
-      <div className="absolute top-0 left-0 right-0 z-20 flex items-center gap-1.5 px-3 py-2 bg-[#10131a]/78 backdrop-blur-[2px] border-b border-black/40">
+      {/* ② HUD 工具条。FE-11：底盘用 g-hud 令牌（替代裸值 bg-[#10131a]/78） */}
+      <div className="absolute top-0 left-0 right-0 z-20 flex items-center gap-1.5 px-3 py-2 bg-g-hud backdrop-blur-[2px] border-b border-black/40">
         <span className="text-[11px] font-semibold tracking-wider text-white/55 mr-1.5 select-none">
           OFFICE
         </span>
@@ -152,16 +157,44 @@ export default function OfficeWorkspace({ onExitToWorkbench }: Props) {
           );
         })}
 
+        {/* FE-14：待我处理聚合入口（徽标 = 未处理总数，0 时不显示） */}
+        <button
+          onClick={() => setPendingOpen((v) => !v)}
+          className={`ml-auto flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md transition-colors ${
+            pendingOpen
+              ? "text-white bg-white/16"
+              : "text-white/80 bg-white/8 hover:bg-white/16 hover:text-white"
+          }`}
+          title="查看所有等待你处理的事项（提问 / 授权 / 验收 / 提醒）"
+        >
+          待我处理
+          {pendingTotal > 0 && (
+            <span
+              data-testid="pending-hud-badge"
+              className="min-w-[1.1rem] px-1 py-px text-center text-[10px] leading-4 font-semibold rounded-full bg-g-red text-white"
+            >
+              {pendingTotal > 99 ? "99+" : pendingTotal}
+            </span>
+          )}
+        </button>
+
         <button
           onClick={onExitToWorkbench}
-          className="ml-auto text-[11px] px-2.5 py-1 rounded-md text-white/70 bg-white/8 hover:bg-white/16 hover:text-white transition-colors"
+          className="text-[11px] px-2.5 py-1 rounded-md text-white/70 bg-white/8 hover:bg-white/16 hover:text-white transition-colors"
           title="切回三栏工作台（过渡期回退手段）"
         >
           工作台
         </button>
       </div>
 
-      {/* ③ 窗口层（浮在最上） */}
+      {/* ③ 待我处理面板（FE-14：内嵌浮层，非游戏窗 —— registry 不在本次改动名下） */}
+      <PendingPanel
+        open={pendingOpen}
+        onClose={() => setPendingOpen(false)}
+        onTotalChange={setPendingTotal}
+      />
+
+      {/* ④ 窗口层（浮在最上） */}
       <GameWindowLayer />
     </div>
   );
