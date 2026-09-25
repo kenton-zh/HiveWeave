@@ -13,6 +13,12 @@
  * 颜色/阴影**全部走 tailwind 令牌**（`g-win-*` / `shadow-gm-window`，定义在
  * `tailwind.config.js`），不在本文件写裸值 —— 与 §4.1「禁止裸值」一致。
  * 全部选择器限定在 `.hw-win` 作用域内，不污染应用其余部分。
+ *
+ * FE-11（2026-09-25）：分层基调落地 —— chrome 转暖（标题栏/描边/控制钮/滚动条，
+ * 令牌值见 tailwind.config.js §4.3 表）；关闭钮中性化；聚焦窗轻边框；
+ * 文本密集窗实底正文（`hw-win-solid`，类由 GameWindow.tsx 按 kind 挂）。
+ * ⚠ 标题栏高度仍为 36px 且 `.wb-body` 的 top 同为 36px —— 改其一必须同步另一个
+ * （§4.5.7 几何联动），同时核对 GameWindow.tsx 头注释里的最小化几何判据。
  */
 
 /* ── 窗体 ─────────────────────────────────────────────────────── */
@@ -22,6 +28,19 @@
   border-radius: 12px;
   box-shadow: theme("boxShadow.gm-window");
   overflow: hidden;
+}
+
+/* FE-11：文本密集窗（chat / agent 详情 / logs / task）正文底色高不透明，
+   地板家具不再透出（设计规格 §4.5「窗口外观统一」第 2 条）。
+   类由 GameWindow.tsx 按 kind 挂载（hw-win-solid），非文本窗维持暖白 97%。 */
+.hw-win.winbox.hw-win-solid {
+  background: theme("colors.g.win-body-solid");
+}
+
+/* FE-11：聚焦窗轻边框 + 标题状态（§4.5 第 5 条 —— 只做轻强化，不做大面积发光）。
+   winbox 在窗口获得焦点时给根元素挂 `focus` 类（winbox.js:935）。 */
+.hw-win.winbox.focus {
+  border-color: theme("colors.g.win-border-focus");
 }
 
 /* ── 标题栏 ───────────────────────────────────────────────────── */
@@ -38,6 +57,11 @@
   font-weight: 600;
   letter-spacing: 0.07em;
   text-transform: uppercase;
+  /* FE-11 标题状态：非聚焦窗标题轻微降档，聚焦窗（.focus）满亮度 */
+  opacity: 0.85;
+}
+.hw-win.focus .wb-title {
+  opacity: 1;
 }
 
 .hw-win .wb-drag {
@@ -54,14 +78,18 @@
   color: theme("colors.g.win-control");
 }
 
+/* FE-11（§4.5 第 3 条）：关闭钮中性化 —— 中性描边图标 + 悬停再显底色；
+   红色只留危险操作（g-win-close 令牌保留给未来的危险关闭，此处不再使用）。
+   外框仍 18×18（含 1px 描边），标题栏 36px 几何不变。 */
 .hw-win .wb-close {
   width: 18px;
   height: 18px;
-  line-height: 18px;
+  line-height: 16px;
   margin: 9px 10px 0 0;
   border-radius: 5px;
-  background: theme("colors.g.win-close");
-  color: theme("colors.g.bg");
+  border: 1px solid theme("colors.g.win-control");
+  background: transparent;
+  color: theme("colors.g.win-header-fg");
   font-size: 10px;
   font-weight: 700;
 }
@@ -69,7 +97,8 @@
   content: "✕";
 }
 .hw-win .wb-close:hover {
-  background: theme("colors.g.win-close-hover");
+  background: theme("colors.g.win-control-hover");
+  border-color: theme("colors.g.win-header-fg");
 }
 
 .hw-win .wb-min::after {

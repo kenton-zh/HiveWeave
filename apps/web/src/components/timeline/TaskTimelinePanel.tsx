@@ -21,6 +21,8 @@ import {
   realDayKey,
   statusStyle,
 } from "./utils";
+import { copyText } from "./delivery";
+import DeliveryCard from "./DeliveryCard";
 
 // ── 游戏日分组 ─────────────────────────────────────────────────
 
@@ -105,28 +107,6 @@ function Skeleton() {
 }
 
 // ── 元信息卡 ───────────────────────────────────────────────────
-
-/** 复制任务链路为 Markdown（v4 §5.5.2），clipboard API + textarea 兜底。 */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      const ok = document.execCommand("copy");
-      document.body.removeChild(ta);
-      return ok;
-    } catch {
-      return false;
-    }
-  }
-}
 
 function MetaCard({
   data,
@@ -382,6 +362,8 @@ export default function TaskTimelinePanel() {
       ) : data ? (
         <>
           <MetaCard data={data} anchor={anchor} />
+          {/* FE-15：固定交付与产物摘要（§9.5，验收 T-24 安全红线） */}
+          <DeliveryCard data={data} />
           {data.truncated && (
             <div className="px-4 py-1.5 text-[11px] text-g-yellow bg-g-yellow-bg border-b border-g-border">
               事件超出预算，仅保留最新部分 —— 窗口最早的事件可能缺失

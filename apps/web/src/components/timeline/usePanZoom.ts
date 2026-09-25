@@ -10,6 +10,12 @@
  * 几何注意：泳道左侧有固定标签列（labelWidth），段百分比定位在
  * 「时间区」（容器宽 − labelWidth）内。zoomAt/拖拽的换算必须排除
  * 标签列，否则锚点漂移、拖拽跟随速度错误。
+ *
+ * 缩放语义（FE-10 / SR-02，方案 §10.4）：zoomAt/zoomBy 的 factor 是
+ * **放大倍率** —— factor > 1 = 放大（同一任务条占更大屏宽，可见时间
+ * 跨度变为原来的 1/factor），factor < 1 = 缩小（跨度变大）。
+ * 内部换算 newSpan = span / factor，历史遗留的「factor 乘跨度」口径
+ * 已废弃（旧口径下「+」按钮实际在缩小画面，方向相反）。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -24,9 +30,12 @@ export interface TimeViewport {
 export interface PanZoomApi {
   view: TimeViewport;
   setView: (v: TimeViewport) => void;
-  /** 以某客户端 X 坐标为锚点缩放（wheel 用） */
+  /**
+   * 以某客户端 X 坐标为锚点缩放（wheel 用）：保持锚点下的时刻不动。
+   * factor 为放大倍率（>1 放大 / <1 缩小，见文件头注释）。
+   */
   zoomAt: (clientX: number, factor: number) => void;
-  /** 缩放（以时间区中心为锚） */
+  /** 缩放（以时间区中心为锚，不含成员标签列）。factor 同上。 */
   zoomBy: (factor: number) => void;
   /** 平移/缩放后窗口终点贴近 now 时吸附（保持 live 语义） */
   jumpToNow: () => void;
@@ -36,12 +45,22 @@ export interface PanZoomApi {
     onPointerMove: (e: React.PointerEvent) => void;
     onPointerUp: (e: React.PointerEvent) => void;
     onPointerCancel: (e: React.PointerEvent) => void;
+    /** 捕获段点击抑制：拖动结束后的 click 不下发给任务段（防误开任务） */
+    onClickCapture: (e: React.MouseEvent) => void;
   };
 }
 
 const MIN_SPAN_MS = 5 * 60 * 1000; // 最小 5 分钟
 const MAX_SPAN_MS = 45 * 24 * 3600 * 1000; // 最大 45 天
 const SNAP_NOW_MS = 60 * 1000; // until 距 now 小于 1 分钟 → 视为 live
+
+/** 按钮/滚轮统一步进（放大倍率口径）。缩小 = 1/放大，保证往返对称。 */
+export const ZOOM_STEP_IN = 1.25;
+export const ZOOM_STEP_OUT = 1 / ZOOM_STEP_IN;
+export const WHEEL_STEP_IN = 1.12;
+export const WHEEL_STEP_OUT = 1 / WHEEL_STEP_IN;
+/** 拖动超过该位移（px）才算真拖动，结束后的 click 被抑制 */
+const DRAG_CLICK_SLOP_PX = 3;
 
 export function clampSpan(spanMs: number): number {
   return Math.max(MIN_SPAN_MS, Math.min(MAX_SPAN_MS, spanMs));
@@ -67,25 +86,34 @@ export function usePanZoom(opts: {
 
   const [view, setViewRaw] = useState<TimeViewport>(initial);
   const [isDragging, setIsDragging] = useState(false);
-  const dragRef = useRef<{ startX: number; since: number; until: number } | null>(null);
+  const dragRef = useRef<{
+    startX: number;
+    since: number;
+    until: number;
+    /** 位移超过 slop ⇒ 真拖动，pointerup 后的 click 会被抑制 */
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
 
   const setView = useCallback((v: TimeViewport) => {
     const span = clampSpan(v.until - v.since);
     setViewRaw({ since: v.since, until: v.since + span });
   }, []);
 
-  /** clientX → 锚点缩放：保持光标下的时刻不动（仅时间区参与换算） */
+  /** clientX → 锚点缩放：保持光标下的时刻不动（仅时间区参与换算）。
+   *  factor 为放大倍率：newSpan = span / factor（>1 放大 ⇒ 跨度变小）。 */
   const zoomAt = useCallback(
     (clientX: number, factor: number) => {
       const el = containerRef.current;
-      if (!el) return;
+      // factor <= 0 / 非有限坐标直接拒绝：NaN 一旦进 view 会毒化全部换算
+      if (!el || !(factor > 0) || !Number.isFinite(clientX)) return;
       const rect = el.getBoundingClientRect();
       const laneW = Math.max(1, rect.width - labelWidth);
       const ratio = Math.max(0, Math.min(1, (clientX - rect.left - labelWidth) / laneW));
       setViewRaw((prev) => {
         const span = prev.until - prev.since;
         const anchorTs = prev.since + span * ratio;
-        const newSpan = clampSpan(span * factor);
+        const newSpan = clampSpan(span / factor);
         return {
           since: anchorTs - newSpan * ratio,
           until: anchorTs + newSpan * (1 - ratio),
@@ -116,6 +144,7 @@ export function usePanZoom(opts: {
 
   // Wheel 缩放（non-passive 才能 preventDefault）— 与 OrgTree 同款挂法。
   // containerReady 入依赖：首次渲染若处于骨架屏（容器未挂载），数据到达后补挂。
+  // 滚轮以光标下时间为锚点（zoomAt）；向下滚 = 缩小（跨度变大）。
   useEffect(() => {
     const el = containerRef.current;
     if (!el || !containerReady) return;
@@ -123,7 +152,7 @@ export function usePanZoom(opts: {
       // 垂直滚轮交给原生纵向滚动（泳道多时），只有 ctrl/横向才缩放
       if (!e.ctrlKey && Math.abs(e.deltaX) < Math.abs(e.deltaY)) return;
       e.preventDefault();
-      zoomAt(e.clientX, e.deltaY > 0 ? 1.12 : 0.9);
+      zoomAt(e.clientX, e.deltaY > 0 ? WHEEL_STEP_OUT : WHEEL_STEP_IN);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -131,11 +160,13 @@ export function usePanZoom(opts: {
 
   // 指针拖拽平移（只取 X；纵向交给原生滚动）
   const onPointerDown = useCallback((e: React.PointerEvent) => {
+    suppressClickRef.current = false; // 新按下作废上一轮遗留的抑制
     if ((e.target as HTMLElement).closest("[data-interactive]")) return;
     dragRef.current = {
       startX: e.clientX,
       since: view.since,
       until: view.until,
+      moved: false,
     };
     setIsDragging(true);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -145,6 +176,7 @@ export function usePanZoom(opts: {
     const d = dragRef.current;
     const el = containerRef.current;
     if (!d || !el) return;
+    if (Math.abs(e.clientX - d.startX) > DRAG_CLICK_SLOP_PX) d.moved = true;
     const width = Math.max(1, el.clientWidth - labelWidth); // 时间区宽度
     const span = d.until - d.since;
     const deltaMs = ((e.clientX - d.startX) / width) * span;
@@ -152,6 +184,9 @@ export function usePanZoom(opts: {
   }, [containerRef, labelWidth]);
 
   const endDrag = useCallback(() => {
+    // 真拖动结束后抑制紧随的 click（§10.4：拖动结束不误开任务）；
+    // click 不来的场景由下一次 pointerdown 复位兜底。
+    if (dragRef.current?.moved) suppressClickRef.current = true;
     dragRef.current = null;
     setIsDragging(false);
   }, []);
@@ -171,8 +206,17 @@ export function usePanZoom(opts: {
 
   // pointer cancel 不做吸附，只复位拖拽态（否则 dragRef 卡死 → 无按键也平移）
   const onPointerCancel = useCallback(() => {
-    endDrag();
+    endDrag(); // 先清拖拽态（其间会把 suppress 置 true）
+    suppressClickRef.current = false; // cancel 后没有 click，别让抑制漏到下次点击
   }, [endDrag]);
+
+  // 捕获段拦截：刚结束真拖动的那次 click 不下发给任务段按钮
+  const onClickCapture = useCallback((e: React.MouseEvent) => {
+    if (!suppressClickRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    suppressClickRef.current = false;
+  }, []);
 
   return {
     view,
@@ -181,7 +225,7 @@ export function usePanZoom(opts: {
     zoomBy,
     jumpToNow,
     isDragging,
-    bind: { onPointerDown, onPointerMove, onPointerUp, onPointerCancel },
+    bind: { onPointerDown, onPointerMove, onPointerUp, onPointerCancel, onClickCapture },
   };
 }
 

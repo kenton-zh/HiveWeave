@@ -15,7 +15,7 @@ import { openTask } from "../../navigation/commands"; // FE-02：统一任务打
 import type { ActiveAssignment, TaskSegment, TeamActivityResponse, TeamAgent } from "./types";
 import type { GameTimeAnchor } from "./utils";
 import { statusStyle } from "./utils";
-import { clampSpan, isLiveWindow, usePanZoom } from "./usePanZoom";
+import { clampSpan, isLiveWindow, usePanZoom, ZOOM_STEP_IN, ZOOM_STEP_OUT } from "./usePanZoom";
 import type { TimeViewport } from "./usePanZoom";
 import { parseDeepLink, useDeepLinkWriter } from "./useDeepLink";
 import TimeAxis, { dayBoundaries } from "./TimeAxis";
@@ -347,17 +347,18 @@ export default function TeamTimeline() {
             ))}
           </div>
           <div className="flex items-center gap-0.5">
+            {/* SR-02：factor 是放大倍率 —— zoomBy(>1) ⇒ 可见跨度变小 = 放大 */}
             <button
-              onClick={() => pan.zoomBy(1.25)}
+              onClick={() => pan.zoomBy(ZOOM_STEP_IN)}
               className="w-6 h-6 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
-              title="放大"
+              title="放大（可见时间跨度变小）"
             >
               +
             </button>
             <button
-              onClick={() => pan.zoomBy(0.8)}
+              onClick={() => pan.zoomBy(ZOOM_STEP_OUT)}
               className="w-6 h-6 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors text-sm"
-              title="缩小"
+              title="缩小（可见时间跨度变大）"
             >
               −
             </button>

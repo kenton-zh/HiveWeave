@@ -74,6 +74,18 @@ declare module "winbox/src/js/winbox.js" {
     restore(): WinBoxInstance;
     addClass(name: string): WinBoxInstance;
     removeClass(name: string): WinBoxInstance;
+    /**
+     * 标题栏控制区（`.wb-control`）加自定义按钮（winbox.js:1293）。
+     * FE-16 专注入口用它插入标题栏（index=childNodes 序号，插在关闭钮之前）。
+     */
+    addControl(control: {
+      class?: string;
+      image?: string;
+      click?: (this: HTMLElement, event: MouseEvent, winbox: WinBoxInstance) => void;
+      index?: number;
+    }): WinBoxInstance;
+    /** 按类名移除 addControl 加的按钮（winbox.js:1317） */
+    removeControl(classname: string): WinBoxInstance;
   }
 
   export interface WinBoxConstructor {

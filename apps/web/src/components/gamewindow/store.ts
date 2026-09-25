@@ -10,6 +10,13 @@
  *
  * z 序**不由本 store 管理** —— 交给 WinBox 自身的点击置顶行为，本 store 只保留
  * 一个"请求聚焦"的信号（同一窗口重复打开时置顶，而不是开第二个）。
+ *
+ * FE-16（2026-09-25，设计规格 §8.5 C1 裁决）：停靠 / 浮动 / 专注是**同一窗口的
+ * 三种几何状态**，不各自维护业务数据 ——
+ *   停靠 = 成员级面板首次打开且无历史几何时的默认几何预设（右缘 400 宽）；
+ *   浮动 = 用户拖过即写几何记忆（GEOM_KEY），历史优先于预设；
+ *   专注 = 占满主工作区（focusModeId），进出只改几何、内容不重挂载；
+ *   一键归位（resetLayout）= 清几何记忆 + 按类型重落预设，业务状态不动。
  */
 import { create } from "zustand";
 
@@ -46,6 +53,8 @@ export interface GameWindowState {
   title: string;
   payload: GameWindowPayload;
   geom: GameWindowGeometry;
+  /** WinBox 最小化态回写（onminimize/onrestore）——「已打开面板菜单」的显示字段，非业务状态 */
+  minimized: boolean;
 }
 
 // ── 常量 ──────────────────────────────────────────────────────────
@@ -76,6 +85,23 @@ const TOP_INSET = 94;
 
 const GEOM_KEY = "hw-gamewin-geom";
 
+// ── FE-16 停靠 / 专注常量（设计规格 §8.5，2026-09-24 C1 裁决）────────────
+// 停靠 = winbox 默认几何预设，**不引入 DOM 侧栏**；停靠/浮动/专注是同一窗口的
+// 三种几何状态，不各自维护业务数据。
+
+/** 停靠位宽度：成员级面板（chat/agent/logs/monitor）首次打开的预设 */
+const DOCK_WIDTH = 400;
+/** 成员级面板 kinds —— 停靠预设适用面（§8.5 表；org/timeline 等主视图载体不强行停靠） */
+const DOCKED_KINDS: ReadonlySet<GameWindowKind> = new Set(["chat", "agent", "logs", "monitor"]);
+
+/** winbox 构造参数同款下限（GameWindow.tsx minwidth/minheight）——裁剪不得低于它 */
+const MIN_WIN_W = 300;
+const MIN_WIN_H = 220;
+/** winbox 标题栏高度（gamewindow.css `.wb-header`，36px；改其一须同步另一个） */
+const WINBOX_HEADER_H = 36;
+/** 窗口边界裁剪后标题栏仍需可见的最小像素（§6.3：标题栏/关闭钮必须可达） */
+const MIN_VISIBLE = 120;
+
 // ── 几何持久化（容错：localStorage 不可用时静默降级为纯内存）────────
 
 function readGeomCache(): Record<string, GameWindowGeometry> {
@@ -90,19 +116,59 @@ function readGeomCache(): Record<string, GameWindowGeometry> {
 }
 
 let geomWriteTimer: ReturnType<typeof setTimeout> | null = null;
+/** 去抖期间挂起的最后一次几何写（关窗 flush 用） */
+let pendingGeomWrite: { id: string; geom: GameWindowGeometry } | null = null;
+
+/** 把一条几何写进记忆表（write 与 flush 共用的落盘逻辑） */
+function persistGeomEntry(id: string, geom: GameWindowGeometry) {
+  try {
+    const cache = readGeomCache();
+    cache[id] = geom;
+    localStorage.setItem(GEOM_KEY, JSON.stringify(cache));
+  } catch {
+    /* 忽略：隐私模式 / 配额超限 */
+  }
+}
 
 function writeGeomCache(id: string, geom: GameWindowGeometry) {
   if (geomWriteTimer) clearTimeout(geomWriteTimer);
+  pendingGeomWrite = { id, geom };
   // 去抖 300ms：拖拽过程中 onmove 会高频触发，不能每次都序列化整表
   geomWriteTimer = setTimeout(() => {
-    try {
-      const cache = readGeomCache();
-      cache[id] = geom;
-      localStorage.setItem(GEOM_KEY, JSON.stringify(cache));
-    } catch {
-      /* 忽略：隐私模式 / 配额超限 */
-    }
+    geomWriteTimer = null;
+    const pending = pendingGeomWrite;
+    pendingGeomWrite = null;
+    if (!pending) return;
+    persistGeomEntry(pending.id, pending.geom);
   }, 300);
+}
+
+/** 立即落盘挂起的几何写。关窗时调用：关窗不应再等 300ms（否则关窗前的最后一拖
+ *  会丢记忆），也避免与一键归位的 clearGeomCache 产生「清完又被挂起写复活」的竞争。 */
+function flushGeomWrite() {
+  const pending = pendingGeomWrite;
+  pendingGeomWrite = null;
+  if (geomWriteTimer) {
+    clearTimeout(geomWriteTimer);
+    geomWriteTimer = null;
+  }
+  if (!pending) return;
+  persistGeomEntry(pending.id, pending.geom);
+}
+
+/** 清空全部几何记忆（FE-16 一键归位）。⚠ 必须先取消挂起写——否则归位后
+ *  300ms 内挂着的旧几何写回会「复活」已删除的记忆（rc=0 式假清空）。 */
+function clearGeomCache() {
+  pendingGeomWrite = null;
+  if (geomWriteTimer) {
+    clearTimeout(geomWriteTimer);
+    geomWriteTimer = null;
+  }
+  try {
+    localStorage.removeItem(GEOM_KEY);
+  } catch {
+    /* 忽略：隐私模式 */
+  }
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────
@@ -122,22 +188,96 @@ export function gameWindowId(kind: GameWindowKind): string {
   return kind;
 }
 
-/** 计算新窗口的落点：优先用历史几何，否则按当前窗口数级联偏移 */
-function nextGeometry(kind: GameWindowKind, id: string, cascadeIndex: number): GameWindowGeometry {
-  const { w, h } = DEFAULT_SIZE[kind];
-  const cached = readGeomCache()[id];
-  if (cached && typeof cached.x === "number" && typeof cached.w === "number") {
-    return { ...cached };
-  }
-  const step = (cascadeIndex % CASCADE_WRAP) * CASCADE_STEP;
-  const vw = typeof window === "undefined" ? 1440 : window.innerWidth;
-  const vh = typeof window === "undefined" ? 900 : window.innerHeight;
+/** 当前视口尺寸（SSR/测试环境兜底 1440×900） */
+function viewportSize(): { vw: number; vh: number } {
+  if (typeof window === "undefined") return { vw: 1440, vh: 900 };
+  return { vw: window.innerWidth, vh: window.innerHeight };
+}
+
+/**
+ * 视口边界裁剪（FE-16 · §6.3「窗口恢复与边界」）。
+ *
+ * 恢复历史几何 / 持久化几何时调用，保证：
+ * ① 尺寸不小于 winbox 下限、不超出视口（大屏记忆在小屏打开时收进来，T-18）；
+ * ② 标题栏与关闭钮可达 —— y 不出上下边（标题栏 36px 始终在视口内），
+ *    x 保证窗口右缘（控制钮所在端）不滑出视口右/左边界；
+ * ③ 高度按最终 y 再收一次，收进视口可用区；⚠ 受 MIN_WIN_H 下限保护，
+ *    极矮视口（可用高 < MIN_WIN_H + 边距）下底缘仍可能越界——下限优先，
+ *    不牺牲「标题栏可达」这一 §6.3 真不变式（批2-4 集成审计 low #4）。
+ *
+ * 停靠 / 专注 / 级联预设都是按当前视口算出的，经过本函数值不变（幂等）。
+ */
+export function clampToViewport(
+  geom: GameWindowGeometry,
+  vw: number = viewportSize().vw,
+  vh: number = viewportSize().vh,
+): GameWindowGeometry {
+  const w = Math.min(Math.max(geom.w, MIN_WIN_W), Math.max(MIN_WIN_W, vw - 2 * MARGIN));
+  const x = Math.min(Math.max(geom.x, MIN_VISIBLE - w), Math.max(MIN_VISIBLE - w, vw - w));
+  const y = Math.min(Math.max(geom.y, 0), Math.max(0, vh - WINBOX_HEADER_H));
+  const h = Math.min(
+    Math.max(geom.h, MIN_WIN_H),
+    Math.max(MIN_WIN_H, Math.min(vh - MARGIN, vh - y - MARGIN)),
+  );
   return {
+    x: Math.round(x),
+    y: Math.round(y),
+    w: Math.round(w),
+    h: Math.round(h),
+  };
+}
+
+/** 停靠几何（§8.5）：右侧 400 宽、贴顶栏下、高度吃满工作区 */
+function dockedGeometry(): GameWindowGeometry {
+  const { vw, vh } = viewportSize();
+  return clampToViewport({
+    x: vw - DOCK_WIDTH - MARGIN,
+    y: TOP_INSET,
+    w: DOCK_WIDTH,
+    h: vh - TOP_INSET - MARGIN,
+  });
+}
+
+/** 专注几何（§8.5）：占满主工作区（视口 − App header − HUD 顶栏），非全屏 */
+function focusGeometry(): GameWindowGeometry {
+  const { vw, vh } = viewportSize();
+  return clampToViewport({
+    x: MARGIN,
+    y: TOP_INSET,
+    w: vw - 2 * MARGIN,
+    h: vh - TOP_INSET - MARGIN,
+  });
+}
+
+/**
+ * 计算新窗口的落点：
+ * ① 有历史几何 ⇒ 裁剪后沿用（历史优先于预设，用户拖过的位置记忆接管）；
+ * ② 无历史 + 成员级面板 ⇒ **停靠预设**（§8.5；首次默认值，非强制吸附）；
+ * ③ 其余（组织/时间线等主视图载体）⇒ 按窗口数级联偏移的居中默认。
+ */
+function nextGeometry(kind: GameWindowKind, id: string, cascadeIndex: number): GameWindowGeometry {
+  const cached = readGeomCache()[id];
+  // 四个字段齐且是有限数才可信（旧版本/手改的脏缓存防线：NaN 进 winbox 会把窗口摆丢）
+  const cachedValid =
+    cached != null &&
+    [cached.x, cached.y, cached.w, cached.h].every(
+      (n) => typeof n === "number" && Number.isFinite(n),
+    );
+  if (cachedValid) {
+    return clampToViewport(cached);
+  }
+  if (DOCKED_KINDS.has(kind)) {
+    return dockedGeometry();
+  }
+  const { w, h } = DEFAULT_SIZE[kind];
+  const step = (cascadeIndex % CASCADE_WRAP) * CASCADE_STEP;
+  const { vw, vh } = viewportSize();
+  return clampToViewport({
     x: Math.max(MARGIN, Math.round(vw * 0.5 - w * 0.5) + step),
     y: Math.max(TOP_INSET, Math.round(TOP_INSET + (vh - TOP_INSET - h) / 2) + step),
     w,
     h,
-  };
+  });
 }
 
 // ── Store ─────────────────────────────────────────────────────────
@@ -152,6 +292,15 @@ interface GameWindowStore {
    * （close/closeKind/closeAll）一并清除，不会比窗口活得久。
    */
   pinnedAgent: Partial<Record<GameWindowKind, string>>;
+  /**
+   * FE-16 专注模式：正处于「占满主工作区」几何的窗口 id（同时最多一个）。
+   * 进入/退出只改几何，面板不重挂载（§8.5 规则 4）；业务数据不在此处。
+   */
+  focusModeId: string | null;
+  /** 进入专注前的几何（id → geom），退出专注时恢复；与 focusModeId 同生命周期 */
+  preFocusGeom: Record<string, GameWindowGeometry>;
+  /** 一键归位 nonce：递增即请求所有 GameWindow 把 WinBox 几何同步为 store 现值 */
+  layoutResetNonce: number;
 
   open: (kind: GameWindowKind, payload?: GameWindowPayload, title?: string) => void;
   /**
@@ -172,12 +321,33 @@ interface GameWindowStore {
   setTitle: (id: string, title: string) => void;
   /** 已打开则返回 id（供调用方判断），供 UI 反馈用 */
   isOpen: (id: string) => boolean;
+  /**
+   * FE-16 进入专注：当前几何存入 preFocusGeom，窗口几何改为占满主工作区，
+   * 并发聚焦信号（最小化时恢复 + 置顶）。另一窗已专注则先退出它（互斥）。
+   * 不改 payload/标题/pin —— 内容不重挂载（key 稳定）。
+   */
+  enterFocus: (id: string) => void;
+  /** FE-16 退出专注：恢复进入前几何并发聚焦信号（最小化态也能拉回） */
+  exitFocus: (id: string) => void;
+  /** FE-16 专注开关（标题栏按钮入口） */
+  toggleFocus: (id: string) => void;
+  /** WinBox 最小化态回写（onminimize/onrestore），供「已打开面板菜单」显示 */
+  setMinimized: (id: string, minimized: boolean) => void;
+  /**
+   * FE-16 一键归位（§8.5 规则 2）：清所有窗口几何记忆（localStorage + 防抖写）
+   * 并按类型重新落预设/默认（成员级 = 停靠位，其余 = 居中默认）。
+   * ⚠ 只重置布局 —— payload/标题/队列/pin 等业务与会话状态一律不动。
+   */
+  resetLayout: () => void;
 }
 
 export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
   windows: [],
   focusSignal: {},
   pinnedAgent: {},
+  focusModeId: null,
+  preFocusGeom: {},
+  layoutResetNonce: 0,
 
   open: (kind, payload = {}, title) => {
     const id = gameWindowId(kind);
@@ -211,6 +381,7 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
           title: title ?? defaultTitle(kind),
           payload,
           geom: nextGeometry(kind, id, s.windows.length),
+          minimized: false,
         },
       ],
       focusSignal: { ...s.focusSignal, [id]: (s.focusSignal[id] ?? 0) + 1 },
@@ -241,21 +412,32 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
       return { pinnedAgent: omitPinned(s.pinnedAgent, kind) };
     }),
 
-  close: (id) =>
+  close: (id) => {
+    // 挂起的几何写立即落盘（关窗丢最后一拖的记忆 = 几何记忆接管失效）
+    flushGeomWrite();
     set((s) => {
       const { [id]: _drop, ...rest } = s.focusSignal;
       // pin 属于窗口：窗关即解除（§6.3 固定窗不得伪装成下一个对象）
       const closingKind = s.windows.find((w) => w.id === id)?.kind;
+      // 专注态随窗口关闭一并退出（preFocusGeom 同步清理，不比窗口活得久）
+      const { [id]: _dropPre, ...restPreFocus } = s.preFocusGeom;
       return {
         windows: s.windows.filter((w) => w.id !== id),
         focusSignal: rest,
         pinnedAgent: closingKind ? omitPinned(s.pinnedAgent, closingKind) : s.pinnedAgent,
+        focusModeId: s.focusModeId === id ? null : s.focusModeId,
+        preFocusGeom: restPreFocus,
       };
-    }),
+    });
+  },
 
-  closeAll: () => set({ windows: [], focusSignal: {}, pinnedAgent: {} }),
+  closeAll: () => {
+    flushGeomWrite();
+    set({ windows: [], focusSignal: {}, pinnedAgent: {}, focusModeId: null, preFocusGeom: {} });
+  },
 
-  closeKind: (kind) =>
+  closeKind: (kind) => {
+    flushGeomWrite();
     set((s) => {
       const keep = s.windows.filter((w) => w.kind !== kind);
       const removed = new Set(s.windows.filter((w) => w.kind === kind).map((w) => w.id));
@@ -263,8 +445,19 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
       for (const [k, v] of Object.entries(s.focusSignal)) {
         if (!removed.has(k)) focusSignal[k] = v;
       }
-      return { windows: keep, focusSignal, pinnedAgent: omitPinned(s.pinnedAgent, kind) };
-    }),
+      const preFocusGeom: Record<string, GameWindowGeometry> = {};
+      for (const [k, v] of Object.entries(s.preFocusGeom)) {
+        if (!removed.has(k)) preFocusGeom[k] = v;
+      }
+      return {
+        windows: keep,
+        focusSignal,
+        pinnedAgent: omitPinned(s.pinnedAgent, kind),
+        focusModeId: s.focusModeId != null && removed.has(s.focusModeId) ? null : s.focusModeId,
+        preFocusGeom,
+      };
+    });
+  },
 
   requestFocus: (id) =>
     set((s) =>
@@ -274,9 +467,14 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
     ),
 
   setGeometry: (id, patch) => {
+    // 专注期间几何由专注状态接管：用户拖拽 / WinBox 编程式回调都不写入
+    // （否则专注几何会被覆盖、退出时也无法恢复进入前的几何）
+    if (get().focusModeId === id) return;
     const cur = get().windows.find((w) => w.id === id);
     if (!cur) return;
-    const geom = { ...cur.geom, ...patch };
+    // §6.3：持久化前做视口边界裁剪 —— 越界几何（拖出屏外 / 大屏记忆）自动拉回，
+    // 保证标题栏/关闭钮在小屏下仍可达。裁剪值与现值一致则不写（防 WinBox 回环）。
+    const geom = clampToViewport({ ...cur.geom, ...patch });
     if (geom.x === cur.geom.x && geom.y === cur.geom.y && geom.w === cur.geom.w && geom.h === cur.geom.h) {
       return; // 值未变则不写（WinBox 的 onmove 会重复回调同值）
     }
@@ -288,10 +486,79 @@ export const useGameWindowStore = create<GameWindowStore>((set, get) => ({
     set((s) => ({ windows: s.windows.map((w) => (w.id === id ? { ...w, title } : w)) })),
 
   isOpen: (id) => get().windows.some((w) => w.id === id),
+
+  enterFocus: (id) => {
+    if (get().focusModeId === id) return;
+    const cur = get().windows.find((w) => w.id === id);
+    if (!cur) return;
+    set((s) => {
+      const preFocusGeom = { ...s.preFocusGeom };
+      let windows = s.windows;
+      // 互斥：另一窗已专注 ⇒ 先恢复它进入前的几何（同一时刻只占一个主工作区）
+      if (s.focusModeId && s.focusModeId !== id) {
+        const prevId = s.focusModeId;
+        const saved = preFocusGeom[prevId];
+        if (saved) {
+          windows = windows.map((w) => (w.id === prevId ? { ...w, geom: saved } : w));
+        }
+        delete preFocusGeom[prevId];
+      }
+      return {
+        windows: windows.map((w) => (w.id === id ? { ...w, geom: focusGeometry() } : w)),
+        focusModeId: id,
+        preFocusGeom: { ...preFocusGeom, [id]: cur.geom },
+        // 聚焦信号：最小化的窗先恢复、且置顶（GameWindow 收到后 restore+focus）
+        focusSignal: { ...s.focusSignal, [id]: (s.focusSignal[id] ?? 0) + 1 },
+      };
+    });
+  },
+
+  exitFocus: (id) => {
+    if (get().focusModeId !== id) return;
+    set((s) => {
+      const saved = s.preFocusGeom[id];
+      const { [id]: _drop, ...restPreFocus } = s.preFocusGeom;
+      return {
+        focusModeId: null,
+        preFocusGeom: restPreFocus,
+        windows: saved
+          ? s.windows.map((w) => (w.id === id ? { ...w, geom: saved } : w))
+          : s.windows,
+        // 聚焦信号：专注期间若被最小化，退出时也拉回（restore+focus）
+        focusSignal: { ...s.focusSignal, [id]: (s.focusSignal[id] ?? 0) + 1 },
+      };
+    });
+  },
+
+  toggleFocus: (id) => {
+    if (get().focusModeId === id) get().exitFocus(id);
+    else get().enterFocus(id);
+  },
+
+  setMinimized: (id, minimized) =>
+    set((s) => ({
+      windows: s.windows.map((w) =>
+        w.id === id ? (w.minimized === minimized ? w : { ...w, minimized }) : w,
+      ),
+    })),
+
+  resetLayout: () => {
+    clearGeomCache();
+    set((s) => ({
+      windows: s.windows.map((w, i) => ({
+        ...w,
+        geom: nextGeometry(w.kind, w.id, i),
+        minimized: false, // 归位 = 布局复位，最小化窗一并拉回可视区
+      })),
+      focusModeId: null,
+      preFocusGeom: {},
+      layoutResetNonce: s.layoutResetNonce + 1,
+    }));
+  },
 }));
 
-/** 默认标题（payload 相关标题由调用方传入，如「聊天 · 折纸」） */
-function defaultTitle(kind: GameWindowKind): string {
+/** 默认标题（payload 相关标题由调用方传入，如「聊天 · 折纸」）；也是「已打开面板菜单」的种类名 */
+export function defaultTitle(kind: GameWindowKind): string {
   const table: Record<GameWindowKind, string> = {
     chat: "聊天",
     org: "组织树",

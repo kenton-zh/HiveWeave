@@ -4,6 +4,14 @@
 
 /* ── Base ── */
 @layer base {
+  /* FE-17 焦点环令牌：全局可见焦点统一由变量驱动（设计规格 §4.2 / §8.7）。
+     ⛔ 禁止用 outline:none 裸删键盘焦点提示；确需自绘环（ring-*）必须同样可见。 */
+  :root {
+    --hw-focus-ring: rgba(79, 70, 229, 0.5);
+    --hw-focus-ring-inverse: rgba(255, 255, 255, 0.85);
+    --hw-focus-ring-offset: 2px;
+  }
+
   * {
     @apply border-g-border;
   }
@@ -66,10 +74,11 @@
 
   /* Unified keyboard focus ring.
      P1-2（2026-09-18）：去掉 border-radius:4px —— 它覆盖元素自身圆角，
-     在 rounded-gmLg 卡片上画出 4px 方环；彩色实心底上的环改反色（见下）。 */
+     在 rounded-gmLg 卡片上画出 4px 方环；彩色实心底上的环改反色（见下）。
+     FE-17：颜色/偏移改走 :root 焦点环令牌。 */
   :focus-visible {
-    outline: 2px solid rgba(79, 70, 229, 0.5);
-    outline-offset: 2px;
+    outline: 2px solid var(--hw-focus-ring);
+    outline-offset: var(--hw-focus-ring-offset);
   }
 
   /* 彩色实心底上的焦点环反色（indigo 环在 indigo 底上不可见） */
@@ -77,7 +86,7 @@
   .bg-g-red:focus-visible,
   .bg-g-green:focus-visible,
   .bg-g-purple:focus-visible {
-    outline-color: rgba(255, 255, 255, 0.85);
+    outline-color: var(--hw-focus-ring-inverse);
   }
 
   /* P1-1：可点击性手型（Tailwind preflight 中 button 不继承 cursor）。
@@ -88,7 +97,15 @@
     cursor: pointer;
   }
 
-  /* Respect reduced-motion preferences */
+  /* FE-20：reduced-motion 全局兜底（设计规格 §4.9 / §8.7，全程沿用本块，不另立）。
+     目标 = 关永动/位移动画、保留状态可理解：
+     - animation-duration→0.01ms + iteration-count→1：pulse-soft / ping-ring /
+       shimmer 等永动 keyframes 播一帧即停在终态（`both` 填充保证可见性）；
+     - transition-duration→0.01ms + delay→0：hover/开合瞬时到位，状态变化仍可见；
+     - scroll-behavior:auto：平滑滚动改即时跳转。
+     ⚠ §4.9 禁令五条中的「表格行尺寸动画（width/height/top/left）」是**创作纪律**，
+     不能靠媒体查询覆盖 —— 新增动效只允许 transform/opacity（见 tailwind.config.js
+     时长令牌注释）；TSX 内 JS 驱动的动画（走位/粒子）不受本块约束，须组件侧自查。 */
   @media (prefers-reduced-motion: reduce) {
     *,
     *::before,
@@ -96,6 +113,7 @@
       animation-duration: 0.01ms !important;
       animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;
+      transition-delay: 0ms !important;
       scroll-behavior: auto !important;
     }
   }
@@ -231,4 +249,68 @@
     background-image: radial-gradient(circle, #dde0e9 1px, transparent 1px);
     background-size: 22px 22px;
   }
+}
+
+/* ── FE-17 响应式：容器查询 4 段（设计规格 §16.3 · v2.12 B8 已裁）───────────
+   判据 = **容器可用宽度**，不按设备宽度 —— 浮窗/面板被拖窄时同样分段响应
+   （与栏宽拖动联动）。断点四段：≥1440 / 1024–1439 / 768–1023 / ≤767。
+   办公室场景显示尺寸固定，不参与响应式缩放（§2.3 · R3-b）。
+
+   用法（组件侧落地时，本任务只建骨架不做具体适配）：
+     1) 给响应区域的根元素挂 `.hw-cq` 类 ⇒ 它成为命名容器 `hw-region`；
+     2) 区域内任意深度用 `var(--hw-region-*)` 分支，或在对应 @container 段内写规则；
+     3) 分段值经 `.hw-cq` 的直接子元素下发（@container 只能改容器**后代**，
+        自定义属性靠继承到达深层组件）。
+
+   ⚠ 抽屉/单列的**具体规则落点**见各段注释锚点 —— 待组件适配任务逐个解开。 */
+:root {
+  /* ⚠ 断点权威数值（OCR 评审 2026-09-25）：@container 条件**不支持 var()**，
+     下方四处条件的 px 值是硬拷贝 —— 改这里的值必须同步改对应 @container 条件。 */
+  --hw-cq-wide: 1440px; /* ≥1440：场景 + 停靠面板全量展示 */
+  --hw-cq-md: 1024px; /* 1024–1439：缩减导航密度，成员面板按需展开 */
+  --hw-cq-sm: 768px; /* 768–1023：主视图优先；详情改抽屉/覆盖面板 */
+  /* ≤767：单列（任务/成员列表）优先，办公室可切换浏览；核心操作仍可达 */
+
+  /* 分段模式变量（区域根默认 = 全量展示，由下方 @container 按段覆盖） */
+  --hw-region-mode: full; /* full | compact | drawer | single-column */
+  --hw-region-gutter: 24px;
+}
+
+/* 成为命名容器的工具类：挂上后内部按**该元素**的可用宽度分段 */
+.hw-cq {
+  container-type: inline-size;
+  container-name: hw-region;
+}
+
+@container hw-region (min-width: 1440px) {
+  .hw-cq > * {
+    --hw-region-mode: full;
+    --hw-region-gutter: 24px;
+  }
+}
+@container hw-region (min-width: 1024px) and (max-width: 1439.98px) {
+  .hw-cq > * {
+    --hw-region-mode: compact;
+    --hw-region-gutter: 16px;
+  }
+  /* 锚点（缩减导航密度 / 成员面板按需展开）—— 组件适配任务落地 */
+}
+@container hw-region (min-width: 768px) and (max-width: 1023.98px) {
+  .hw-cq > * {
+    --hw-region-mode: drawer;
+    --hw-region-gutter: 12px;
+  }
+  /* 锚点（详情改抽屉/覆盖面板）示意 —— 落地时对目标组件解开：
+     .hw-detail-panel {
+       position: absolute; inset-block: 0; right: 0;
+       width: min(400px, 90%);
+       box-shadow: theme("boxShadow.gm-pop");
+     } */
+}
+@container hw-region (max-width: 767.98px) {
+  .hw-cq > * {
+    --hw-region-mode: single-column;
+    --hw-region-gutter: 8px;
+  }
+  /* 锚点（单列任务/成员列表、核心操作可达）—— 组件适配任务落地 */
 }
