@@ -114,7 +114,7 @@ async def test_auto_repair_husk_success(tmp_path, monkeypatch):
             new=AsyncMock(return_value=(True, "added")),
         ) as git,
     ):
-        err = await gwt._auto_repair_husk(
+        err, _diag = await gwt._auto_repair_husk(
             str(tmp_path), "A023", str(husk), branch
         )
     assert err is None
@@ -140,7 +140,7 @@ async def test_auto_repair_husk_locked_dir_returns_error(tmp_path):
             new=AsyncMock(return_value=(True, "")),
         ),
     ):
-        err = await gwt._auto_repair_husk(
+        err, _diag = await gwt._auto_repair_husk(
             str(tmp_path), "A023", str(husk), "hw/A023/work"
         )
     assert err is not None
@@ -163,7 +163,7 @@ async def test_auto_repair_husk_git_add_failure_returns_error(tmp_path):
             new=AsyncMock(return_value=(False, "fatal: branch in use")),
         ),
     ):
-        err = await gwt._auto_repair_husk(
+        err, _diag = await gwt._auto_repair_husk(
             str(tmp_path), "A023", str(husk), "hw/A023/work"
         )
     assert err is not None

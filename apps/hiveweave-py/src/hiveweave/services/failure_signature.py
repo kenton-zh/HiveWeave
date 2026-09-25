@@ -547,6 +547,16 @@ async def record_failure_signature(
                     else SOLUTION_STATUS_NONE
                 ),
             )
+            # TEST_DSH_70 P2-1 verified 回填：状态位以**正文行**为权威。
+            # 历史分叉条目（有「已验证解法:」行但状态位停在 none —— prev 继承
+            # 会把 stale 的 none 压住上面的 setdefault）在 rehit 时就地修复，
+            # hint 随后才能按 verified 广播解法而不是空态。单一判据 =
+            # _content_derived_status（与 hint 读侧同一函数）。
+            _derived_status = _content_derived_status(
+                (m.get("content") or "") if isinstance(m, dict) else ""
+            )
+            if _derived_status:
+                metadata["solution_status"] = _derived_status
         else:
             # #16-② 状态位显式落 ``none``：机检口径是
             # ``content LIKE '%已验证解法:%' AND solution_status != 'verified'``
@@ -608,32 +618,34 @@ async def record_failure_signature(
         }
 
 
-async def known_signature_hint(
+async def known_signature_notice(
     project_id: str | None,
     error: str | None,
     agent_id: str | None = None,
     tool_name: str | None = None,
-) -> str | None:
-    """同项目共享空间里是否已有该失败签名 —— 供工具调用前置检查注入。
+) -> tuple[str, str] | None:
+    """同项目共享空间里是否已有该失败签名的**可广播提示**。
 
-    Returns ``"[shared fix] …"`` 提示文案或 None（未命中/不可用/缺工具名）。
-    命中且条目 ``solution_status == "verified"`` 时，「已验证解法:」行的解法
-    文本**直接拼进提示**（P7 断链1：签名池对 Agent 不可达，指路去"读共享
-    空间"是发不出去的指令）。
+    Returns ``(提示文案, 广播档位)`` 或 None（未命中/无解法/不可用/缺工具名）。
+    档位 ∈ ``NOTICE_TIER_SOLUTION``（verified，拼解法原文）/
+    ``NOTICE_TIER_RETRIED_OK``（retried_ok，中性提示）。
+
+    **TEST_DSH_70 P2-1（R7 广播空态定案）行为变更**：
+    - **无解法时不广播** —— ``solution_status == none`` 的条目（纯镜子，
+      47/50）返回 None，不再广播「暂无已验证解法」空态（41 条空态广播 =
+      token 噪声，"你刚撞过 + 换路"已由 SELF REPEAT 提示覆盖）。
+    - **有已验证解法时回填** —— 定位判据除 metadata 状态位外，用
+      ``_content_derived_status`` 从**正文行**推导权威档位：历史分叉条目
+      （有解法行、状态位 none）不再被空态吞掉。
+    - verified ⇒ 解法原文直接拼进提示（P7 断链1：签名池对 Agent 不可达，
+      指路去"读共享空间"是发不出去的指令）；retried_ok ⇒ 中性提示
+      （回声不冒充已验证解法）。
 
     **定位判据（TEST_DSH_64 #2，2026-09-19）**：metadata ``(signature,
-    tool_name)`` 元组精确等值（``_entry_matches``）—— 取代 ``sig[:48]``
-    前缀子串探测。前缀塌缩（两条不同错误共享前 48 字符）会把 A 工具条目的
-    解法串投给 B 工具的撞坑者（hint 此前**无工具门**，是串投的最后一环）。
-    ``tool_name`` 缺失时**直接不广播**（无法构成条目身份，宁可沉默也不按
-    子串乱串；54 轮已定位的倒车形态，禁）。
+    tool_name)`` 元组精确等值（``_entry_matches``）。``tool_name`` 缺失时
+    **直接不广播**（无法构成条目身份，宁可沉默也不按子串乱串）。
 
-    **自指抑制（2026-09-01，s3-clone_06）→ 显式空态（#2-4）**：F10 的 hook
-    是「先写签名、后取提示」——命中的条目可能是自己刚写的镜子。旧实现对此
-    返回 None；现改为：verified ⇒ 带解法；retried_ok ⇒ 中性提示「同参重试
-    曾成功」（回声不冒充已验证解法）；其余（含镜子条目）⇒ 显式空态
-    「该签名暂无已验证解法」—— 不再 None、不再指路读一个读不到的池子。
-    只读、best-effort —— 查询失败仅返回 None，绝不阻断工具执行。
+    best-effort —— 查询失败仅返回 None，绝不阻断工具执行。
     """
     if not project_id:
         return None
@@ -662,13 +674,15 @@ async def known_signature_hint(
             if not _entry_matches(sig, tool, m.get("metadata")):
                 continue
             content = m.get("content") or ""
-            # TEST_DSH_62 P7 断链1（2026-09-18）+ TEST_DSH_64 #2-3/#2-4
-            # （2026-09-19）：解法携带按 metadata.solution_status 门控 ——
-            # 只对 ``verified`` 生效；``retried_ok``（同参重试回声）不冒充
-            # 已验证解法，给中性提示；其余给显式空态（不再 None、不再指路
-            # 读池子 ——「先读它」是对 Agent 不可达的指令）。
-            status = str((m.get("metadata") or {}).get("solution_status")
-                         or SOLUTION_STATUS_NONE)
+            # 解法携带按 metadata.solution_status 门控（TEST_DSH_62 P7 断链1
+            # / TEST_DSH_64 #2-3），**但正文行推导优先**（P2-1）：历史分叉
+            # 条目（有解法行、状态位 none/缺失）按正文拿到应有档位，不再
+            # 广播空态。单一判据 = _content_derived_status（与 record 写侧
+            # 同一函数，分叉在写侧 rehit 时就地修复，读侧兜底）。
+            status = _content_derived_status(content) or str(
+                (m.get("metadata") or {}).get("solution_status")
+                or SOLUTION_STATUS_NONE
+            )
             if status == SOLUTION_STATUS_VERIFIED:
                 for _ln in content.splitlines():
                     if not _ln.startswith(_SOLUTION_LINE_PREFIX):
@@ -678,25 +692,26 @@ async def known_signature_hint(
                         return (
                             "[shared fix] 团队已有该失败签名的已验证解法: "
                             f"{_sol}\n"
-                            "（同写法原样重试无效，按上行解法换路执行。）"
+                            "（同写法原样重试无效，按上行解法换路执行。）",
+                            NOTICE_TIER_SOLUTION,
                         )
-                # verified 但解法行缺失/为空（分叉脏数据）→ 落到空态，不广播。
+                # verified 但解法行缺失/为空（分叉脏数据）→ 落到空态分支。
             elif status == SOLUTION_STATUS_RETRIED_OK:
                 return (
                     "[shared fix] 同参重试曾成功：此前有 Agent 以完全相同参数"
                     "重试成功（说明环境/代码已变化，非参数问题）—— 可先原样"
-                    "重试一次；若再失败请换路执行。"
+                    "重试一次；若再失败请换路执行。",
+                    NOTICE_TIER_RETRY_ECHO,
                 )
+            # 其余（none / verified 但解法行缺失）＝ 无解法 ⇒ 不广播
+            # （P2-1：空态广播是 token 噪声，不再发）。
             log.debug(
                 "failure_signature.hint_no_verified_solution",
                 agent_id=(agent_id or "")[:12],
                 sig=sig[:60],
                 solution_status=status,
             )
-            return (
-                "[shared fix] 该失败签名已有共享条目，但暂无已验证解法 —— "
-                "同一写法原样重试无效，请换路执行。"
-            )
+            return None
         # 0-4（审计 M2）：未命中此前**完全静默** —— 而"算法变更导致老条目不可达"
         # 与"这个失败确实是新的"在日志上长得一样，无从分辨。
         # 这里只在**项目里确实存在签名条目**时留痕，并降到 debug：
@@ -716,6 +731,19 @@ async def known_signature_hint(
         return None
     except Exception:
         return None
+
+
+async def known_signature_hint(
+    project_id: str | None,
+    error: str | None,
+    agent_id: str | None = None,
+    tool_name: str | None = None,
+) -> str | None:
+    """只取提示文案的薄包装（身份/档位契约见 ``known_signature_notice``）。"""
+    notice = await known_signature_notice(
+        project_id, error, agent_id=agent_id, tool_name=tool_name
+    )
+    return notice[0] if notice else None
 
 
 def attribution_of(result: dict) -> str:
@@ -858,6 +886,46 @@ def _has_retry_echo_line(content: str) -> bool:
         if line.startswith(_RETRY_ECHO_LINE_PREFIX):
             return True
     return False
+
+
+# ── TEST_DSH_70 P2-1（R7 签名广播空态）：正文推导状态 + 广播档位 ──────────
+#
+# 病（三线定案 2026-09-25）：50 条签名 none 47 / retried_ok 3 / verified 0，
+# hint 只在 verified 时拼解法 ⇒ 广播出去的是「暂无已验证解法」空态（41 条、
+# 29 条砸向一人）。定案修法：**无解法时不广播** + **有已验证解法时回填
+# solution_status**（别再广播空态）+ 显式幂等键 + 节流。
+#
+# 「有已验证解法」的判定必须**单一权威**：机检不变式「有『已验证解法:』行
+# ⇒ 状态位 verified」在旧写入路径下会分叉（历史条目有解法行、状态位停在
+# none —— 47 条 none 里就有这种），分叉条目读侧若只信 metadata 就会继续
+# 广播空态。故读写两侧统一用本函数**从正文行推导**权威状态，分叉就地修复。
+
+
+def _content_derived_status(content: str) -> str | None:
+    """从条目**正文行**推导解法状态（verified 回填的单一判据）。
+
+    优先级：「已验证解法:」行（非空）⇒ ``verified``；否则「同参重试:」
+    回声行 ⇒ ``retried_ok``；都没有 ⇒ ``None``（调用方落到 none）。
+    record 写侧与 hint 读侧**必须共用本函数**（同一事实两处判是本仓一等
+    缺陷）—— 写侧用它修复分叉条目的状态位，读侧用它决定广播档位。
+    """
+    saw_echo = False
+    for line in (content or "").splitlines():
+        if line.startswith(_SOLUTION_LINE_PREFIX):
+            if line.split(":", 1)[1].strip():
+                return SOLUTION_STATUS_VERIFIED
+            continue
+        if line.startswith(_RETRY_ECHO_LINE_PREFIX):
+            saw_echo = True
+    return SOLUTION_STATUS_RETRIED_OK if saw_echo else None
+
+
+#: 广播档位 —— 节流键的组成部分（executor 侧显式幂等键用）。
+#: 同 (接收人, 签名, 工具, 档位) 未变 ⇒ 不重复广播（inbox 幂等键去重）；
+#: 档位升级（none → retried_ok → verified）⇒ 新键 ⇒ 允许把升级后的解法
+#: 再广播一次。档位不进键会让「先拿到回声提示的人永远看不到后来的真解法」。
+NOTICE_TIER_SOLUTION = "solution"
+NOTICE_TIER_RETRY_ECHO = "retry-echo"
 
 
 def _first_line_matches_tool(first_line: str, tool_name: str) -> bool:

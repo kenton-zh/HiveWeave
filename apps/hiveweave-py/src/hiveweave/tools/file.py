@@ -1143,6 +1143,86 @@ async def write_file(
             "error": None}
 
 
+# ── 目录 miss 的场景化 hint（TEST_DSH_70 P2-9③）────────────────────
+# 病：目录 miss 的回落 hint 是 READ_MISS_HINT —— 讲的是 .hiveweave/shared/
+# 跨树查找，对 tests/src 这类普通目录完全不相干（71 轮实测 13 次目录 miss
+# 全部贴错场景）。修：miss 时**枚举最近存在祖先下实际存在的目录**（限流
+# 前 5 个）+ 相似名猜测 + 按场景说清「本树没有」，不再讲无关的跨树故事。
+_LIST_MISS_SIBLING_LIMIT = 5
+
+
+def _list_miss_hint(missing: Path, root: str | None) -> str:
+    """构造目录 miss 的枚举式 hint（不抛错、不泄露绝对路径）。"""
+    parts: list[str] = []
+    root_resolved = Path(root).resolve() if root else None
+    # 1) 自下而上找最近的**存在**祖先（深度护栏 8 层，防异常深路径空转）。
+    nearest: Path | None = None
+    cur = missing
+    for _ in range(8):
+        try:
+            if cur.is_dir():
+                nearest = cur
+                break
+        except OSError:
+            pass
+        nxt = cur.parent
+        if str(nxt) == str(cur):
+            break
+        if root_resolved is not None and not _inside_any(nxt, [root_resolved]):
+            break
+        cur = nxt
+    if nearest is not None:
+        try:
+            siblings = sorted(
+                (e for e in nearest.iterdir() if e.is_dir()),
+                key=lambda e: e.name.lower(),
+            )
+        except OSError:
+            siblings = []
+        miss_name = missing.name.lower()
+        case_matches = [
+            s.name for s in siblings if s.name.lower() == miss_name
+        ]
+        similar = [
+            s.name for s in siblings
+            if s.name.lower() != miss_name
+            and min(len(s.name), len(missing.name)) >= 3
+            and (
+                s.name.lower().startswith(miss_name)
+                or miss_name.startswith(s.name.lower())
+            )
+        ]
+        names = [s.name for s in siblings if s.name not in case_matches]
+        if nearest == root_resolved:
+            where = "project root"
+        else:
+            try:
+                where = str(nearest.relative_to(root_resolved)).replace("\\", "/")
+            except (ValueError, OSError):
+                where = nearest.name
+        if names:
+            shown = names[:_LIST_MISS_SIBLING_LIMIT]
+            ell = " …" if len(names) > _LIST_MISS_SIBLING_LIMIT else ""
+            parts.append(
+                f"Existing directories under {where}: "
+                + ", ".join(shown) + ell
+            )
+        if case_matches:
+            parts.append(
+                "Name differs only by case: " + ", ".join(case_matches[:3])
+            )
+        if similar:
+            parts.append(
+                "Possible name match: " + ", ".join(similar[:3])
+            )
+    # 2) 场景口径：只对本树下结论（本函数只 stat 了这一棵树），并给对动作。
+    parts.append(
+        f"The directory does not exist in this tree ({tree_tag(str(missing))}) "
+        "—— 先 list_files 看清实际结构再拼路径，不要凭记忆猜。"
+    )
+    return " " + " — ".join(parts)
+
+
 async def list_files(
     path: str,
     workspace_path: str,
@@ -1255,7 +1335,13 @@ async def list_files(
                         "error": f"Error: Sandbox violation — {path} "
                                  "resolves outside project"}
         if not p.exists():
-            shared_hint = miss_hint_for(_subdir or "", _tried_tags) or READ_MISS_HINT
+            # P2-9③：普通目录 miss 用**枚举式** hint（同级实际目录 + 相似名
+            # + 本树口径）；.hiveweave/shared|reports 等**平台共享子目录**的
+            # miss 仍走各自的策略话术（那里跨树故事是场景对的）。
+            if _subdir is not None:
+                shared_hint = miss_hint_for(_subdir, _tried_tags) or READ_MISS_HINT
+            else:
+                shared_hint = _list_miss_hint(p, root)
             return {"success": False, "output": "",
                     "error": f"Error: Directory not found: {path}."
                              f"{shared_hint}"}

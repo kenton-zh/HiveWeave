@@ -906,7 +906,9 @@ async def test_hint_carries_solution_line_text(space):
     assert "改用 pwsh -Command ls 重试" in hint  # 解法原文逐字在场
     assert "先读它" not in hint
 
-    # verified 行+位齐全才携带：缺状态位的脏条目（历史遗留）不给解法
+    # verified 行在场 ⇒ **正文为权威**（TEST_DSH_70 P2-1 verified 回填）：
+    # 缺状态位的脏条目（历史遗留分叉）按正文推导出 verified 并携带解法，
+    # 不再被空态吞掉。
     dirty = dict(space.rows[0])
     dirty = {**dirty, "metadata": {**dirty["metadata"]}}
     del dirty["metadata"]["solution_status"]
@@ -914,17 +916,17 @@ async def test_hint_carries_solution_line_text(space):
     hint_dirty = await fs.known_signature_hint(
         "proj", _ERROR, agent_id="agent-B", tool_name="bash"
     )
-    assert hint_dirty and "已验证解法:" not in hint_dirty
-    assert "暂无已验证解法" in hint_dirty
+    assert hint_dirty and "改用 pwsh -Command ls 重试" in hint_dirty
 
 
 @pytest.mark.asyncio
 async def test_hint_without_solution_line_drops_unreachable_instruction(space):
-    """无解法行（仅实质根因）⇒ 显式空态，不发「先读它」这类不可执行指令。
+    """无解法行（仅实质根因）⇒ **不广播**（P2-1：无解法不发任何 shared-fix）。
 
-    ⚠️ **行为变更（TEST_DSH_64 #2-4，2026-09-19，有意）**：旧实现走
-    _signature_has_solution 的②支给中性提示、镜子条目返回 None；新实现
-    统一为显式空态「该签名暂无已验证解法」（不再 None、不再指路读池子）。
+    ⚠️ **行为变更两度**：TEST_DSH_64 #2-4（2026-09-19）曾统一为显式空态
+    「该签名暂无已验证解法」；TEST_DSH_70 P2-1（2026-09-25 定案）实测该
+    空态广播 41 条（29 条砸向同一人）= token 噪声，改回**无解法不广播**
+    （None）——「你刚撞过 + 换路」由 SELF REPEAT 提示覆盖。
     """
     sig = fs.signature_of(_ERROR)
     content = (
@@ -952,9 +954,7 @@ async def test_hint_without_solution_line_drops_unreachable_instruction(space):
     hint = await fs.known_signature_hint(
         "proj", _ERROR, agent_id="agent-B", tool_name="bash"
     )
-    assert hint and "[shared fix]" in hint
-    assert "先读它" not in hint
-    assert "暂无已验证解法" in hint
+    assert hint is None, "无解法条目不得广播空态"
 
 
 # ── TEST_DSH_62 P7 断链2：self-repeat 键不含 run_id ──────

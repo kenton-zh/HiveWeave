@@ -199,6 +199,25 @@ _UNTRACKED_FILE_LINE_RE = re.compile(r"^\t(.+)$", re.MULTILINE)
 # create() last-resort suffixes when canonical path is locked (WinError 32).
 _RELOCATION_SUFFIXES = ("-b", "-c", "-d")
 
+# ── TEST_DSH_70 P2-4：worktree husk 具名恢复码 ─────────────────────────
+# 病（2026-09-25 三线定案）：husk 自愈失败只回泛化报错（"Device busy"），
+# 无机检身份、无持锁者信息、无迁移回写 —— A469 现场 auto-repair failed
+# 持续 ≥90min，靠 4 次 rebuild 迁树掩盖，每次都像"平台在修"实际什么都没修。
+# 「修不了就别宣称在修」：失败必须落**具名恢复码**（可 grep、可断言），
+# 并随附持锁者探针结果。判据看**状态**不看 rc —— git/文件系统删除失败
+# 只在 stderr / 目录仍在，不抛 rc≠0。
+WT_HUSK_REPAIR_REFUSED = "WT_HUSK_REPAIR_REFUSED"
+"""拒绝删除：目标不是本项目 .hiveweave/worktrees/ 下的绑定目录。"""
+WT_HUSK_REPAIR_REGAINED = "WT_HUSK_REPAIR_REGAINED"
+"""删除窗口内目录重新拿到 .git（并发 worktree add 复活）—— 已是活树。"""
+WT_HUSK_REPAIR_RM_LOCKED = "WT_HUSK_REPAIR_RM_LOCKED"
+"""删除失败：目录仍存在（被进程锁住 / Device busy）。附持锁者探针结果。"""
+WT_HUSK_REPAIR_ADD_FAILED = "WT_HUSK_REPAIR_ADD_FAILED"
+"""删除成功但 git worktree add 重建失败。附 git stderr 摘要。"""
+WT_STALE_PATH_RELOCATED = "WT_STALE_PATH_RELOCATED"
+"""create 侧旧路径锁死迁到 -b/-c/-d：**原树已废弃**，新路径生效（迁移回写）。"""
+
+
 # ── 冲突标记扫描 (merge 成功后 main 树残留检测) ─────────────
 # 行首锚定 <<<<<<< / >>>>>>> (标准 git conflict marker, 7 字符)。
 # 故意不含 ^={7} — 一行等号同时是 setext 标题下划线, 误报率高。

@@ -177,9 +177,9 @@ async def test_prefix_collapse_hint_does_not_carry_foreign_solution(space):
     hint_b = await fs.known_signature_hint(
         "proj", _ERROR_B, agent_id="agent-B", tool_name="bash"
     )
-    assert hint_b is not None and "[shared fix]" in hint_b
-    assert "alpha-worker 的旧构建目录" not in hint_b  # 别条的解法不串投
-    assert "暂无已验证解法" in hint_b  # B 条目自己的空态
+    # TEST_DSH_70 P2-1：无解法条目**不再广播空态**（返回 None），更不会串投
+    assert hint_b is None
+    assert "alpha-worker 的旧构建目录" not in (hint_b or "")  # 别条的解法不串投
     # 对照组：撞 A 错误的人**应该**拿到解法（定位没被误伤）
     hint_a = await fs.known_signature_hint(
         "proj", _ERROR_A, agent_id="agent-C", tool_name="bash"
@@ -372,20 +372,23 @@ async def test_verified_solution_not_downgraded_by_late_echo(space):
     assert row["metadata"]["solution_status"] == fs.SOLUTION_STATUS_VERIFIED
 
 
-# ── ④ 空态文案 ───────────────────────────────────────────────────────
+# ── ④ 无解法不广播（TEST_DSH_70 P2-1 行为变更）───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_hint_returns_explicit_empty_state_not_none(space):
-    """④ 命中条目但无 verified 解法 ⇒ 显式空态（不再 None/不再指路读池子）。"""
+async def test_hint_returns_none_for_no_solution_entry(space):
+    """④ 命中条目但无 verified 解法 ⇒ **不广播**（P2-1：空态 = token 噪声）。
+
+    ⚠️ **行为变更（TEST_DSH_70 P2-1，2026-09-25，定案）**：TEST_DSH_64 #2-4
+    的显式空态「该签名暂无已验证解法」实测广播 41 条、29 条砸向同一人，
+    定案为**无解法时不广播**（"你刚撞过 + 换路"由 SELF REPEAT 提示覆盖）。
+    """
     sig = fs.signature_of(_ERROR_A)
     _seed_row(space, sig, "bash")  # status=none，纯镜子条目
     hint = await fs.known_signature_hint(
         "proj", _ERROR_A, agent_id="agent-B", tool_name="bash"
     )
-    assert hint is not None, "空态必须显式返回，不得 None"
-    assert "暂无已验证解法" in hint
-    assert "先读它" not in hint  # 不发不可执行指令
+    assert hint is None, "无解法条目必须返回 None，不得广播空态"
 
 
 @pytest.mark.asyncio

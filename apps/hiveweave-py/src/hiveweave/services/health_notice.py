@@ -60,6 +60,11 @@ log = structlog.get_logger(__name__)
 KIND_SELF_REPEAT = "SELF_REPEAT"
 KIND_REPEAT_REJECTION = "REPEAT_REJECTION"
 KIND_ORG_ESCALATION = "ORG_ESCALATION"
+# TEST_DSH_70 P2-1：shared-fix 解法广播独立成类（此前与 SELF REPEAT 合并
+# 成一条 KIND_SELF_REPEAT，正文里嵌 "#N / X 分钟前" 时变字段 ⇒ 内容哈希
+# 幂等键逐条不同，47 条通知去重全失效）。拆开后解法广播走**显式幂等键**
+# （签名 id，非正文哈希），节流才有抓手。
+KIND_SHARED_FIX = "SHARED_FIX"
 
 #: 单条提示长度上限（inbox 正文不该被提示撑爆；超出截断并留痕）。
 _MAX_BODY_CHARS = 2000
@@ -80,6 +85,7 @@ async def deliver_notice(
     kind: str,
     project_id: str | None = None,
     wake: bool = True,
+    idempotency_key: str | None = None,
 ) -> bool:
     """把平台提示投递到该 agent 的**独立 inbox 通道**。
 
@@ -89,6 +95,13 @@ async def deliver_notice(
     ``wake=True``（默认）让提示能启动一次 LLM turn：提示的价值在于被读到，
     静默落库等于没发。但**调用方在 turn 内**（工具执行中）投递时可能希望
     只落库、由当前 turn 的下一轮自然看到 —— 那种场景传 ``wake=False``。
+
+    ``idempotency_key``（TEST_DSH_70 P2-1）：**显式**幂等键 —— 键存在时
+    inbox 按 ``(to_agent_id, idempotency_key)`` 去重（"同 anchor 只提醒
+    一次"契约，与 ship_nudge / verify_spawn 同门）。不传则 inbox 落
+    **正文哈希**键 —— 正文里只要有一个时变字段（"#N"、"X 分钟前"），
+    每条通知字节都不同 ⇒ 去重全失效（47 条签名通知逐条落库的根因）。
+    正文会随时间变化、但业务上要求节流的调用方**必须**传这个键。
     """
     body = (text or "").strip()
     if not body:
@@ -107,6 +120,7 @@ async def deliver_notice(
             message_type=PLATFORM_NOTICE_MESSAGE_TYPE,
             wake=wake,
             trusted_platform=True,
+            idempotency_key=idempotency_key or None,
         )
         log.info(
             "health_notice.delivered",

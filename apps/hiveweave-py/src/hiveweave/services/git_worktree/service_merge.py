@@ -20,6 +20,10 @@ from .constants import (
     _WT_LIST_RE,
     _create_locks,
     _create_locks_guard,
+    WT_HUSK_REPAIR_REFUSED,
+    WT_HUSK_REPAIR_REGAINED,
+    WT_HUSK_REPAIR_RM_LOCKED,
+    WT_HUSK_REPAIR_ADD_FAILED,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
 from .service_lifecycle import _surface_husk_left
@@ -237,7 +241,7 @@ class MergeMixin:
         short_id: str,
         path: str,
         branch: str,
-    ) -> str | None:
+    ) -> tuple[str | None, dict]:
         """Husk（目录无 .git）自动修复：停进程 → 删空壳 → 重新注册 worktree。
 
         2026-08-11 A023 事故：D3 预条件检测到 husk 只报 "Trigger worktree
@@ -245,17 +249,37 @@ class MergeMixin:
         add`` 绕圈（CEO 反复撞 husk 40 分钟）。分支存在时这里直接重建到
         规范路径 —— 与磐石手动做的事等价，但平台自动完成。
 
-        Returns None on success, or an error message on failure.
+        **TEST_DSH_70 P2-4（「修不了就别宣称在修」）**：修复失败返回
+        ``(具名恢复码 + 可操作文案, 诊断)``——失败不再是泛化 "Device busy"：
+        - **具名恢复码**（``WT_HUSK_REPAIR_*``，constants.py）：可 grep、
+          可断言，回执与日志同名，杜绝"auto-repair failed 持续 ≥90min
+          却每次看起来像在修"的观测黑洞；
+        - **持锁者探针**：删除失败时列出平台注册表内仍存活的持锁嫌疑
+          （pid/port/cwd），让"杀谁"变成可执行动作；
+        - **锁死契约接线**：本路径会 rmtree 绑定目录并 ``git worktree add``
+          （写 ``.git/worktrees/<name>/`` 元数据）——按 AGENTS.md git/ACL
+          锁死契约，先 ``unlock_git_lockdown`` 再动手。
+
+        Returns ``(None, {"code": None})`` on success, or
+        ``(error message with named recovery code, diagnostics)`` on failure.
         """
+        diagnostics: dict = {"code": None, "holders": []}
         # 文件系统审计 F2：repair 会 rmtree —— path 必须是本项目
         # .hiveweave/worktrees/ 下的绑定目录（DB workspace_path 损坏时
         # _resolve_effective_worktree_path 可能返回任意路径；husk 无 .git
         # 绕过了 DB 分支的 binding 校验，这里必须兜底）。
         if not _worktree_binding_under_project(path, workspace_path):
+            diagnostics["code"] = WT_HUSK_REPAIR_REFUSED
+            log.warning(
+                "git_worktree.merge_husk_repair_refused",
+                short_id=short_id, path=path,
+                recovery_code=WT_HUSK_REPAIR_REFUSED,
+            )
             return (
-                f"auto-repair refused: {path} is not a binding under this "
+                f"[{WT_HUSK_REPAIR_REFUSED}] {path} is not a binding under this "
                 f"project's .hiveweave/worktrees/ — refusing to delete it. "
-                f"Fix the agent's workspace_path first."
+                f"Fix the agent's workspace_path first.",
+                diagnostics,
             )
         try:
             from hiveweave.services.process_registry import (
@@ -265,31 +289,85 @@ class MergeMixin:
             stop_processes_for_worktree(path)
         except Exception:
             pass
+        # AGENTS.md git/ACL 锁死契约：删/移 .git 附近路径前必须解锁（本路径
+        # 随后还会 git worktree add 写 .git/worktrees/ 元数据）。与
+        # service_lifecycle 的两处 worktree remove 接线同款（best-effort，
+        # 失败只留痕——真实判据是下面的目录状态与 git 退出状态）。
         try:
-            shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
+            from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
+
+            unlock_git_lockdown(workspace_path)
+        except Exception as exc:  # noqa: BLE001 — 解锁失败不挡修复，留痕即可
+            log.debug(
+                "git_worktree.merge_husk_repair_unlock_failed",
+                root=workspace_path, error=str(exc),
+            )
+        shutil.rmtree(path, ignore_errors=True)
         # 并发窗口二次 stat：stop 进程期间可能已有并发 add 复活该目录
         if Path(path).exists() and _has_git(path):
+            diagnostics["code"] = WT_HUSK_REPAIR_REGAINED
+            log.info(
+                "git_worktree.merge_husk_repair_regained",
+                short_id=short_id, path=path,
+                recovery_code=WT_HUSK_REPAIR_REGAINED,
+            )
             return (
-                f"auto-repair skipped: {path} regained .git during repair "
+                f"[{WT_HUSK_REPAIR_REGAINED}] {path} regained .git during repair "
                 f"(concurrent worktree add) — it is a live tree now, "
-                f"retry the merge."
+                f"retry the merge.",
+                diagnostics,
             )
         if Path(path).exists():
+            # 持锁者探针（P2-4）：泛化 "Device busy" 换成"谁还活着"。
+            try:
+                from hiveweave.services.process_registry import (
+                    probe_processes_for_worktree,
+                )
+
+                diagnostics["holders"] = probe_processes_for_worktree(path)
+            except Exception as exc:  # noqa: BLE001 — 探针 best-effort
+                log.debug(
+                    "git_worktree.merge_husk_probe_failed", error=str(exc)
+                )
+            diagnostics["code"] = WT_HUSK_REPAIR_RM_LOCKED
+            holder_txt = ""
+            if diagnostics["holders"]:
+                holder_txt = " Registered holders still alive: " + "; ".join(
+                    f"pid={h['pid']} port={h['port']} cwd={h['cwd']}"
+                    for h in diagnostics["holders"][:5]
+                )
+            log.error(
+                "git_worktree.merge_husk_repair_rm_locked",
+                short_id=short_id, path=path,
+                recovery_code=WT_HUSK_REPAIR_RM_LOCKED,
+                holders=diagnostics["holders"],
+            )
             return (
-                f"auto-repair failed: could not remove husk directory {path} "
-                f"(locked by a process — Device busy). Move it aside or kill "
-                f"the holding process, then retry."
+                f"[{WT_HUSK_REPAIR_RM_LOCKED}] could not remove husk directory "
+                f"{path} (locked by a process — Device busy). This merge-side "
+                f"auto-repair did NOT succeed and stops here — background "
+                f"reconcile keeps retrying the removal, but the tree stays "
+                f"corrupted until the holder is gone."
+                f"{holder_txt} Kill the holding process (or move the directory "
+                f"aside manually), then retry.",
+                diagnostics,
             )
         ok, out = await _git(
             ["worktree", "add", path.replace("\\", "/"), branch],
             workspace_path,
         )
         if not ok:
+            diagnostics["code"] = WT_HUSK_REPAIR_ADD_FAILED
+            log.error(
+                "git_worktree.merge_husk_repair_add_failed",
+                short_id=short_id, path=path, branch=branch,
+                recovery_code=WT_HUSK_REPAIR_ADD_FAILED,
+                error=(out or "").strip()[:200],
+            )
             return (
-                f"auto-repair failed: git worktree add {path} {branch} "
-                f"failed: {out.strip()[:200]}"
+                f"[{WT_HUSK_REPAIR_ADD_FAILED}] git worktree add {path} {branch} "
+                f"failed: {out.strip()[:200]}",
+                diagnostics,
             )
         log.info(
             "git_worktree.merge_husk_auto_repaired",
@@ -297,7 +375,7 @@ class MergeMixin:
             path=path,
             branch=branch,
         )
-        return None
+        return None, diagnostics
 
     async def _validate_merge_preconditions(
         self, workspace_path: str, short_id: str, branch: str,
@@ -365,8 +443,9 @@ class MergeMixin:
                     short_id=short_id, path=path, branch=branch,
                 )
                 # 2026-08-11 A023 事故：husk 自动修复（分支存在时重建到规范
-                # 路径），修复成功重跑本函数继续校验；失败返回可操作错误。
-                repair_err = await self._auto_repair_husk(
+                # 路径），修复成功重跑本函数继续校验；失败返回具名恢复码 +
+                # 持锁者探针结果（P2-4：修不了就别宣称在修）。
+                repair_err, repair_diag = await self._auto_repair_husk(
                     workspace_path, short_id, path, branch
                 )
                 if repair_err is None:
@@ -380,6 +459,8 @@ class MergeMixin:
                 return {
                     "success": False,
                     "reason": "precondition_failed",
+                    "recovery_code": repair_diag.get("code"),
+                    "holders": repair_diag.get("holders") or [],
                     "message": (
                         f"Merge precondition failed: worktree directory for "
                         f"{short_id} has no .git (husk detected at {path}). "

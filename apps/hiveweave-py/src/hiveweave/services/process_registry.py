@@ -1132,6 +1132,40 @@ def lookup_by_project(project_id: str) -> list[ProcessRecord]:
         return [r for r in _registry.values() if r.project_id == project_id]
 
 
+def probe_processes_for_worktree(worktree_path: str) -> list[dict]:
+    """**只读探针**：注册表内 cwd 在 *worktree_path* 下且进程仍存活的记录。
+
+    TEST_DSH_70 P2-4「持锁者探针」：husk 自愈删除失败（Windows Device busy）
+    时，泛化报错只说"被进程锁住"，不说**是谁**。本探针把平台已知的持锁嫌疑
+    （登记在册、cwd 落在该树内、PID 仍存活）列出来，随具名恢复码一起上报，
+    让"杀谁/挪哪"变成可执行动作。**不杀任何进程** —— 杀进程是
+    ``stop_processes_for_worktree`` 的职责，探针只负责观测。
+    """
+    hydrate_registry()
+    norm_wt = os.path.normcase(os.path.normpath(worktree_path))
+    norm_wt_sep = norm_wt + os.sep  # prefix with separator to avoid A003 matching A0031
+    holders: list[dict] = []
+    with _REGISTRY_LOCK:
+        for rec in _registry.values():
+            cwd = rec.cwd or ""
+            if not cwd:
+                continue
+            norm_cwd = os.path.normcase(os.path.normpath(cwd))
+            if norm_cwd != norm_wt and not norm_cwd.startswith(norm_wt_sep):
+                continue
+            if not _is_pid_alive(rec.pid):
+                continue
+            holders.append(
+                {
+                    "pid": rec.pid,
+                    "port": rec.port,
+                    "cwd": cwd,
+                    "command": (rec.command or "")[:120],
+                }
+            )
+    return holders
+
+
 def stop_process_by_port(project_id: str, port: int) -> dict:
     """Stop registry records for THIS project+port only.
 

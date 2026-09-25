@@ -57,6 +57,11 @@ class ProjectCreate(BaseModel):
     charterConstraints: str | None = None
     userInvolvement: str | None = None
     orgPattern: str | None = None
+    # TEST_DSH_70 P2-5 兼容别名：前端（api/rest.ts createProject）发的是
+    # ``orgParadigm``，pydantic 不认就静默丢弃 ⇒ 76 库 org_paradigm 全 'solo'
+    # （前端根本写不进去）。接受别名并归一到 orgPattern；行为消费者仍为零
+    # （仅创建时落库 + 响应序列化回读），如实维持"只存不用"现状。
+    orgParadigm: str | None = None
     operatorName: str | None = None
     language: str | None = None
     # P1 (§5.5b①)：外部只读参考目录（仅读工具生效，不授予任何写）
@@ -115,7 +120,9 @@ def _build_charter_dict(body: ProjectCreate) -> dict:
         "goals": goals,
         "constraints": body.charterConstraints or "",
         "userInvolvement": body.userInvolvement or "medium",
-        "orgPattern": body.orgPattern or "solo",
+        # P2-5 兼容别名：orgParadigm（前端键名）→ orgPattern（后端键名）。
+        # 显式 orgPattern 优先；两者都缺才落 'solo'。
+        "orgPattern": body.orgPattern or body.orgParadigm or "solo",
         "operatorName": body.operatorName or "operator",
     }
 

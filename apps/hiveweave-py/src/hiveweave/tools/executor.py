@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,7 @@ from hiveweave.services.charter import CharterService
 from hiveweave.services.health_notice import (
     KIND_ORG_ESCALATION,
     KIND_SELF_REPEAT,
-    combine_pending_text,
+    KIND_SHARED_FIX,
     deliver_notice,
 )
 from hiveweave.services.inbox import InboxService
@@ -3027,7 +3028,7 @@ async def _f10_result_hooks(
     try:
         from hiveweave.db.meta import get_agent_project_id
         from hiveweave.services.failure_signature import (
-            known_signature_hint,
+            known_signature_notice,
             note_distinct_hitter,
             record_failure_signature,
         )
@@ -3101,36 +3102,59 @@ async def _f10_result_hooks(
         # 此前两类提示都 `result["error"] +=` —— 工具回执于是对"工具返回了
         # 什么"撒谎（DSH 设计笔记 2026-07-08-repeat-tool-guard.md:58 明确
         # 否决），且与真错误同格 ⇒ 被习得性跳读（R7 恶化项的机制）。
-        # 现在合并成 **一条** platform_notice 投递；`error` 字段只保留真错误。
-        _notice_parts: list[str] = []
+        # 现在走 platform_notice 独立投递；`error` 字段只保留真错误。
+        # TEST_DSH_70 P2-1：**拆成两条、各带显式幂等键** —— 此前两类合并成
+        # 一条正文（嵌 "#N" 与 "X 分钟前" 时变字段），inbox 落正文哈希键 ⇒
+        # 47 条通知逐条字节不同、去重全失效（正文时变字段击败幂等键）。
+        # 签名 id（复用写侧带回的 rec["sig"]，带 root 归一）是稳定身份。
+        _rec_sig = (
+            rec.get("sig") if isinstance(rec, dict) else None
+        ) or ""
+        _sig_id16 = (
+            hashlib.sha256(_rec_sig.encode("utf-8", errors="replace")).hexdigest()[:16]
+            if _rec_sig
+            else ""
+        )
         if preexisting:
             # tool_name 传参（TEST_DSH_64 #2-5 二元组门）：hint 的条目定位 =
             # (signature, tool_name) 元组精确等值 —— 没有工具名它宁可不广播，
             # 也不按签名子串乱串。
-            hint = await known_signature_hint(
+            notice = await known_signature_notice(
                 project_id, error, agent_id=agent_id, tool_name=tool_name
             )
-            if hint:
-                _notice_parts.append(hint)
+            if notice:
+                _hint_text, _tier = notice
+                # 节流（P2-1 ③）：同 (接收人, 签名, 工具, 档位) 未变 ⇒
+                # inbox 幂等键不变 ⇒ 不重复广播；条目升级（回声 → 真解法）
+                # 档位变化 ⇒ 新键 ⇒ 升级后的解法仍能广播一次。
+                await deliver_notice(
+                    agent_id,
+                    _hint_text,
+                    kind=KIND_SHARED_FIX,
+                    project_id=project_id,
+                    wake=False,
+                    idempotency_key=(
+                        f"sigfix|{agent_id}|{tool_name}|{_sig_id16}|{_tier}"
+                    ),
+                )
         # TEST_DSH_47 #6：同签名即时去重 —— 首撞者被抑制 shared-fix
         # 提示是正确的，但复撞时至少要告诉它"自己刚撞过"。
         # （sig 同样复用写侧带回的那份 —— 本去重是进程内自比，换签名来源
         # 会自我不一致。键不含 run_id（P7 断链2），跨 run 复撞同样命中。）
-        _self_note = _note_self_repeat_hit(
-            agent_id, tool_name, rec.get("sig") if isinstance(rec, dict) else None
-        )
+        # 节流（P2-1 ③）：正文嵌 "#N / X 分钟前" 逐条不同，正文哈希键必然
+        # 失效 ⇒ 显式键 + 600s 时间桶：同桶至多落一条，跨桶允许新提醒。
+        _self_note = _note_self_repeat_hit(agent_id, tool_name, _rec_sig or None)
         if _self_note:
-            _notice_parts.append(_self_note)
-        _notice_text = combine_pending_text(*_notice_parts)
-        if _notice_text:
-            # wake=False：本提示由**当前 turn 的下一轮**自然读到（此刻正在
-            # 工具执行中，再唤醒一次只会打断当前 turn）。落库即有 id，可重放。
+            _bucket = int(time.time() // _LAST_SEEN_SIG_WINDOW_S)
             await deliver_notice(
                 agent_id,
-                _notice_text,
+                _self_note,
                 kind=KIND_SELF_REPEAT,
                 project_id=project_id,
                 wake=False,
+                idempotency_key=(
+                    f"sigself|{agent_id}|{tool_name}|{_sig_id16}|{_bucket}"
+                ),
             )
         # #16-③ 组织级升级：撞到者并入 distinct_hitters，精确命中 3/5/8
         # 档时向**该 agent** 投递一条组织级信号（诊断「N 人各撞一遍却无

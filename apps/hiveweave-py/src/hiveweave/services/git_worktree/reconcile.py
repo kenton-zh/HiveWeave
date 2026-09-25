@@ -16,6 +16,7 @@ from .constants import (
     _IN_FLIGHT_AFTER_MERGE_STATUSES,
     _PROTECT_TASK_STATUSES,
     _TASK_BRANCH_RE,
+    WT_HUSK_REPAIR_RM_LOCKED,
 )
 from .git_cmd import _current_branch, _git, _resolve_base_branch
 from .naming import compute_branch_name
@@ -40,11 +41,13 @@ def _rmtree_husk(
     source: str,
     recheck_git: bool = True,
 ) -> None:
-    """Husk 目录删除：先停内部进程 → rmtree → 失败计数重试 + 告警。
+    """Husk 目录删除：先停内部进程 → 解锁 → rmtree → 失败计数重试 + 具名恢复码。
 
     ``shutil.rmtree(ignore_errors=True)`` 在 Windows 文件锁下静默失败；
     失败目录跨轮次重试（下次 reconcile 再试），连续 ``_HUSK_RETRY_MAX``
-    次仍失败则 log.error（持久 husk 需要人工介入）。
+    次仍失败则落**具名恢复码** ``WT_HUSK_REPAIR_RM_LOCKED``（TEST_DSH_70
+    P2-4「修不了就别宣称在修」）+ 持锁者探针结果 —— 判据是**目录仍在**
+    （状态），不是 rmtree 的 rc。
 
     ``recheck_git``（并发审计 F1）：仅对**调用时无 .git 的 husk**场景开启
     —— stop 进程的窗口里另一协程可能已完成 git worktree add（.git 刚写
@@ -59,6 +62,19 @@ def _rmtree_husk(
         stop_processes_for_worktree(str(child))
     except Exception:
         pass
+    # AGENTS.md git/ACL 锁死契约：删/移 .git 附近路径前必须解锁
+    # （husk 本体无 .git，但它承载的 worktree 元数据在
+    # <root>/.git/worktrees/<sid>/，prune/add 都会动到）。best-effort，
+    # 失败只留痕 —— 真实判据是下面的目录状态。
+    try:
+        from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
+
+        unlock_git_lockdown(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — 解锁失败不挡清理，留痕即可
+        log.debug(
+            "git_worktree.reconcile_unlock_failed",
+            root=workspace_path, error=str(exc),
+        )
     if recheck_git and (child / ".git").exists():
         log.info(
             "git_worktree.reconcile_husk_revived_skip",
@@ -83,12 +99,25 @@ def _rmtree_husk(
         report.setdefault("errors", []).append(
             f"failed to remove husk dir: {child} (attempt {n}/{_HUSK_RETRY_MAX})"
         )
-        if n == _HUSK_RETRY_MAX:
+        if n >= _HUSK_RETRY_MAX:
+            # 持锁者探针（P2-4）：列出平台注册表内仍存活的持锁嫌疑，
+            # 泛化 "Device busy" 变成"杀谁"的可执行动作。
+            holders: list[dict] = []
+            try:
+                from hiveweave.services.process_registry import (
+                    probe_processes_for_worktree,
+                )
+
+                holders = probe_processes_for_worktree(str(child))
+            except Exception as exc:  # noqa: BLE001 — 探针 best-effort
+                log.debug("git_worktree.reconcile_probe_failed", error=str(exc))
             log.error(
                 "git_worktree.reconcile_husk_persistent",
                 workspace=workspace_path,
                 dir=str(child),
                 attempts=n,
+                recovery_code=WT_HUSK_REPAIR_RM_LOCKED,
+                holders=holders,
                 hint="Directory locked by a process (Device busy). Kill the "
                 "holding process or move the directory aside manually.",
             )
@@ -139,8 +168,14 @@ async def _log_worktree_rebuild_event(
     reason: str,
     original: str,
     path: str,
+    original_deprecated: bool = False,
 ) -> None:
-    """Fire-and-forget audit when stale path fallback/reuse occurs (TEST21 M11)."""
+    """Fire-and-forget audit when stale path fallback/reuse occurs (TEST21 M11).
+
+    ``original_deprecated``（TEST_DSH_70 P2-4「迁移回写」）：迁移不是修复
+    —— 原树锁死废弃、新路径生效，这个事实位必须随事件落库，否则 4 次
+    rebuild 看起来像 4 次"平台在修"，实际原树 husk 一直没清掉。
+    """
     agent_id = await _agent_id_for_short_id(workspace_path, short_id)
     if not agent_id:
         return
@@ -169,6 +204,7 @@ async def _log_worktree_rebuild_event(
                 "original": original,
                 "path": path,
                 "head": head,
+                "original_deprecated": bool(original_deprecated),
             },
         )
     except Exception as e:

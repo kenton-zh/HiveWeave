@@ -65,6 +65,8 @@ _SHELL_DIALECT_SECTION = f"""## Shell 方言（Windows 宿主：pwsh — 先看�
 {_rejected_commands_inline()}
 
 - 另有这些**结构性**写法也不行：`cat > file << 'EOF'`（heredoc——多行内容改用 here-string `@'…'@ | 命令` 或 write_file 写临时文件）/ `echo`（写文件）/ `cmd1; cmd2` 串接 / `VAR=value cmd`（bash 环境变量前缀）
+- ⚠ **判外部命令成败一律看 `$LASTEXITCODE`，绝不写 `if (<命令>)`**（TEST_DSH_70 实锤：`if (git cat-file -e …)` 在 pwsh 下取的是**命令的 stdout**——git 静默成功/失败都无输出 ⇒ 条件恒假，据此误判「文件未入库」）。等价处方：先跑命令，下一步判 `$LASTEXITCODE -eq 0`。例：`git cat-file -e "vendor/three.min.js"; if ($LASTEXITCODE -eq 0) {{ … }} else {{ … }}`；或 `$ok = ($LASTEXITCODE -eq 0)` 存下再判。bash 的 `if cmd; then` 直译到 pwsh 全是这一类坑。cmdlet（`Test-Path` / `Get-ChildItem` 等）返回的是对象、可直接 `if`，不受此坑影响
+- ⚠ **归因口径：命令执行了但退出码非 0（测试挂 / 编译错 / 断言失败）= command_failed，不是方言问题**——修被测对象，别当方言改写命令、也别按方言问题上报；方言问题只指「命令根本没按你写的语义执行」（前置拒绝 / 同名不同义 / 成败判定语义陷阱）
 - ⚠ **同名不同义最危险**：`sort` 会落到 `system32\\sort.exe`（不认 `-u`，**静默排错**）；`find` 会落到 `system32\\find.exe`（**查字符串，不是查文件**）。这两个不报错但结果错，务必换用 pwsh 写法。
 - ⚠ **`cp` / `mv` / `rm` / `mkdir` 不在上表也不算安全**：pwsh 里它们是 `Copy-Item` 等的别名，本身能用，但**带 unix 短 flag 就会失败**（`cp -r` / `rm -rf` / `mkdir -p`）——用 `Copy-Item -Recurse` / `Remove-Item -Recurse` / `New-Item -ItemType Directory -Force`。
 - 改用：列目录 `Get-ChildItem -Force`；读文件 `Get-Content x -Tail 100`；写文件用 **write_file / apply_patch 工具**（不要用 shell 写）；输出 `Write-Host`；串接用 `;`（PowerShell 语义确认过再用）或分多次调用；筛选 `Select-Object -First 20` / `Select-String`；计数 `Measure-Object -Line`
