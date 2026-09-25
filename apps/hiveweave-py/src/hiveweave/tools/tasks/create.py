@@ -12,6 +12,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.param_shapes import coerce_list_param
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
 
@@ -145,7 +146,9 @@ class CreateTaskParams(BaseModel):
     )
     @classmethod
     def _coerce_list_fields(cls, v: Any) -> Any:
-        return _coerce_to_list(v)
+        # TEST_DSH_70 P1-6：平台级入参归一 —— {"item": […]} 群体单键形态
+        # 解包（实测 create_task 1 条）；多键 dict 禁展平（fail-closed）。
+        return coerce_list_param(v)
 
 
 @tool(

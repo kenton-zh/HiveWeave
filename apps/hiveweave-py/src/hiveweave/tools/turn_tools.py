@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -12,8 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from hiveweave.tools.helpers import coerce_to_list
 from hiveweave.tools.base import tool
 from hiveweave.tools.result import ToolResult
+from hiveweave.services.param_shapes import unwrap_single_key_group
 from hiveweave.services.turn_result import (
     TURN_RESULT_SCHEMA_VERSION,
+    WaitingKind,
+    WaitingOnItem,
     parse_turn_result,
     validate_phase_fields,
 )
@@ -43,6 +46,13 @@ async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
             project_id = getattr(ctx, "project_id", None)
         if project_id:
             lessons = tr.extensions.get("lessons")
+            if isinstance(lessons, dict):
+                # TEST_DSH_70 P1-6：群体单键形态 {"item": […]} 解包 —— 实测
+                # 71 轮 lessons 全场 0 行的根因之一（上游静默丢弃）。多键
+                # dict 不展平（歧义），保持 fail-closed。
+                inner = unwrap_single_key_group(lessons)
+                if inner is not None:
+                    lessons = inner
             if isinstance(lessons, list):
                 svc = LessonService()
                 for item in lessons:
@@ -60,11 +70,84 @@ async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
                         fix=item.get("fix"),
                         source_summary=tr.summary,
                     )
-    except Exception:
-        pass  # fail-open: lesson archiving never blocks turn exit
+            elif lessons is not None:
+                # 非法形状不许静默丢：lessons 声明了却没归档，下游会把
+                # 「查不到」当成「没有」（实测 memories scope='lesson' 0 行
+                # 而平台零告警）。落结构化日志 + telemetry 事件留痕。
+                log.warning(
+                    "turn_lessons_unsupported_shape",
+                    agent_id=agent_id,
+                    shape=type(lessons).__name__,
+                )
+                try:
+                    from hiveweave.services.telemetry import telemetry
+
+                    telemetry.emit(
+                        "turn_lessons_unsupported_shape",
+                        {"agent_id": agent_id, "shape": type(lessons).__name__},
+                    )
+                except Exception:
+                    log.debug(
+                        "turn_lessons_shape_telemetry_emit_failed",
+                        agent_id=agent_id,
+                    )
+    except Exception as e:
+        # TEST_DSH_70 P1-6：裸 except 落事件 —— fail-open 保留（lesson 归档
+        # 绝不阻断 turn exit），但失败必须可观测，不许静默吞。
+        log.warning(
+            "turn_lessons_archive_failed",
+            agent_id=agent_id,
+            error=str(e),
+        )
+        try:
+            from hiveweave.services.telemetry import telemetry
+
+            telemetry.emit(
+                "turn_lessons_archive_failed",
+                {"agent_id": agent_id, "error": str(e)[:200]},
+            )
+        except Exception:
+            log.debug(
+                "turn_lessons_archive_telemetry_emit_failed", agent_id=agent_id
+            )
 
 
 # ── commit_turn ──────────────────────────────────────────
+
+# TEST_DSH_70 P1-6：合法等待 kind 集与 turn_result.WaitingKind 单源（get_args
+# 解 Literal，改 Literal 这里自动跟随）。
+_LEGAL_WAIT_KINDS: frozenset[str] = frozenset(get_args(WaitingKind))
+
+
+def _waiting_on_shape_errors(waiting_on: list[Any]) -> list[str]:
+    """waiting/blocked 声明的等待条目逐条体检（纯函数，无 I/O）。
+
+    返回人类可读的病因列表；空列表 = 形状合法。旧路径（wait_contract
+    replace_waits）对空 ref 条目是静默跳过 —— 这里在工具入口显式拒绝。
+    """
+    errors: list[str] = []
+    for i, w in enumerate(waiting_on or [], 1):
+        if isinstance(w, WaitingOnItem):
+            kind_raw = w.kind
+            ref = str(w.ref or "").strip()
+        elif isinstance(w, dict):
+            kind_raw = w.get("kind")
+            ref = str(w.get("ref") or "").strip()
+        else:
+            errors.append(
+                f"waiting_on[{i}] must be an object {{kind, ref}}, "
+                f"got {type(w).__name__}"
+            )
+            continue
+        kind = str(kind_raw or "").strip().lower()
+        if kind not in _LEGAL_WAIT_KINDS:
+            errors.append(
+                f"waiting_on[{i}].kind={kind_raw!r} is not a legal kind "
+                f"(legal: {'|'.join(sorted(_LEGAL_WAIT_KINDS))})"
+            )
+        if not ref:
+            errors.append(f"waiting_on[{i}].ref is empty")
+    return errors
 
 
 # TEST18 P0-4: in_progress 圈数止损 — commit_turn(in_progress) 不触发 exit
@@ -73,6 +156,34 @@ async def _archive_turn_lessons(agent_id: str, tr: Any, ctx: Any) -> None:
 _IN_PROGRESS_LIMIT = 5
 _IN_PROGRESS_WINDOW_MS = 90_000
 _in_progress_counts: dict[str, list[float]] = {}
+
+
+def _coerce_wait_item(it: Any) -> Any:
+    """单个 waiting_on 条目归一（TEST_DSH_70 P1-6，纯函数）。
+
+    - 裸字符串 → ``{"kind": "task", "ref": <str>}``（空白串 → ``None``）；
+    - 群体单键 dict（``{"item": […]}`` / ``{"item": "x"}``）→ 解包；内层
+      list/tuple 时返回**条目列表**（调用方摊平），内层 str 与顶层裸串同
+      口径归一成 task 等待；
+    - 其余（合法 ``{kind, ref}`` 或非法形状）原样返回，交
+      WaitingOnItem/pydantic 或 ``_waiting_on_shape_errors`` 判定。
+    """
+    if isinstance(it, str):
+        ref = it.strip()
+        return {"kind": "task", "ref": ref} if ref else None
+    if isinstance(it, dict):
+        inner = unwrap_single_key_group(it)
+        if inner is None:
+            return it
+        if isinstance(inner, (list, tuple)):
+            return [
+                x
+                for x in (_coerce_wait_item(m) for m in inner)
+                if x is not None
+            ]
+        ref = str(inner).strip()
+        return {"kind": "task", "ref": ref} if ref else None
+    return it
 
 
 class CommitTurnParams(BaseModel):
@@ -126,12 +237,31 @@ class CommitTurnParams(BaseModel):
         schema 要 list[dict]，旧路径直接报 "valid list" 不点名病因。归一：
         单字符串 → 单条 task 等待；dict 补成单元素列表。归一失败才原样
         交给 pydantic 报错（错误文案由既有路径给）。
+
+        TEST_DSH_70 P1-6：``{"item": […]}`` 群体单键形态（实测 67 条）在
+        此解包 —— 恰一键且值 str/list/tuple 才解（多键 dict 仍是单条等待
+        项，交 WaitingOnItem 校验拒绝）；list 内裸字符串同样按 task 等待
+        归一（与顶层裸串口径一致）。
         """
         if isinstance(v, str):
             ref = v.strip()
             return [{"kind": "task", "ref": ref}] if ref else None
         if isinstance(v, dict):
-            return [v]
+            out = _coerce_wait_item(v)
+            if out is None:
+                return None
+            return out if isinstance(out, list) else [out]
+        if isinstance(v, (list, tuple)):
+            items: list[Any] = []
+            for it in v:
+                out = _coerce_wait_item(it)
+                if out is None:
+                    continue
+                if isinstance(out, list):
+                    items.extend(out)
+                else:
+                    items.append(out)
+            return items
         return v
 
 
@@ -156,6 +286,26 @@ async def commit_turn_tool(
         "result": params.result if params.result is not None else {},
         "extensions": params.extensions if params.extensions is not None else {},
     }
+
+    # TEST_DSH_70 P1-6：waitingOn 非法条目拒绝（wait_contract.py 旧路径对
+    # 空 ref 是静默 continue ⇒ 等待未登记而出口校验放行，agent 以为挂上了
+    # 等待实际永远等不到唤醒）。在 parse 之前按条目显式拒绝并说明合法形态，
+    # 不让 pydantic 的 literal_error 裸报；kind 合法集与 turn_result.WaitingKind
+    # 单源。raw 里的条目是归一后的 dict（WaitingOnItem 由 pydantic 保证 kind/ref）。
+    if params.phase in ("waiting", "blocked"):
+        wait_shape_errors = _waiting_on_shape_errors(raw["waiting_on"])
+        if wait_shape_errors:
+            # kind 清单从 _LEGAL_WAIT_KINDS 动态拼——静态枚举会与
+            # turn_result.WaitingKind 漂移（批2-4 集成审计 low #7）
+            kinds = "|".join(sorted(_LEGAL_WAIT_KINDS))
+            return ToolResult.err(
+                "commit_turn rejected: illegal waiting_on — "
+                + "; ".join(wait_shape_errors)
+                + f". Legal shape: waiting_on=[{{kind: {kinds}, "
+                "ref: \"<non-empty id>\"}}]. A wait with an "
+                "empty ref can never be registered or woken."
+            )
+
     try:
         tr = parse_turn_result(raw)
     except Exception as e:

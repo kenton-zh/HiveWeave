@@ -25,6 +25,7 @@ from .constants import (
     _create_locks_guard,
     is_generated_path,
     is_regenerable_path,
+    WT_STALE_PATH_RELOCATED,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
 from .git_cmd import (
@@ -115,6 +116,34 @@ from .porcelain import (
 
 log = structlog.get_logger(__name__)
 from .reconcile import _log_worktree_rebuild_event
+
+
+def _lockfile_rename_note(files: list[str], short_id: str) -> str:
+    """TEST_DSH_70 P1-4：改名保留通道接上 lockfile 路的回执附注（纯函数）。
+
+    checkpoint 把 ``GENERATED_FILES``（lockfile）从提交里剥离；旧回执的
+    「改名保留为证据」建议只挂在 regen_stripped（tsbuildinfo 等）上，
+    lockfile 路从未被提及 —— 报告定案「改名保留通道没接 lockfile 路」。
+    本附注补上：改名保留的完整做法 + 诚实声明（平台不重生成有效
+    lockfile，钉的权威是 MAIN 上已提交的 blob，语义修复须本机
+    ``npm install`` / ``pnpm install``；后端不起 node）。
+    剥离清单里含 lockfile 才返回文本，否则空串（不打扰普通剥离）。
+    """
+    renamed_lockfiles = [
+        f for f in files or []
+        if f.replace("\\", "/").rsplit("/", 1)[-1] in GENERATED_FILES
+    ]
+    if not renamed_lockfiles:
+        return ""
+    return (
+        f" NOTE: lockfile(s) {', '.join(renamed_lockfiles[:3])} were "
+        f"stripped from this commit. To keep one as evidence, rename it "
+        f"with your short_id prefix (e.g. {short_id}-lockfile-evidence.txt) "
+        f"and checkpoint again — renaming only preserves the evidence copy; "
+        f"the platform does NOT regenerate a valid lockfile. The committed "
+        f"blob on MAIN is the pinned authority; run `npm install` / `pnpm "
+        f"install` locally if you need a semantically fresh one."
+    )
 
 
 class CreateMixin:
@@ -247,17 +276,61 @@ playwright-report/
         # 对 untracked 生效，所以必须**在下面的 add -A 之前**调用。
         await self._ensure_gitignore_entries(workspace_path)
 
-# P1-1: .gitattributes — lockfile union merge strategy.
+# P1-1: .gitattributes — lockfile union merge strategy + EOL 钉住（P1-4）。
         # package-lock.json conflicts are 100% predictable (every executor
-        # runs npm install); union + post-merge regenerate eliminates rework.
+        # runs npm install); union merge avoids the textual conflict markers.
+        # ⚠ TEST_DSH_70 P1-4（诚实化）：平台**没有** post-merge 自动重生成
+        # lockfile 的实现，也不该由后端起 node —— union 只保证合并不炸，
+        # 语义修复靠 agent 本机 npm/pnpm install。钉住的权威是 blob。
         gitattributes_path = Path(workspace_path) / ".gitattributes"
         if not gitattributes_path.exists():
             gitattributes_content = """\
 # HiveWeave P1-1: generated files use union merge (no content conflicts).
-# Post-merge regeneration (npm install / pnpm install) fixes semantics.
+# NOTE (TEST_DSH_70 P1-4): the platform does NOT auto-regenerate lockfiles
+# post-merge — union only avoids conflict markers; the committed blob is
+# the pinned authority. If you need a semantically fresh lockfile, run
+# `npm install` / `pnpm install` yourself (the backend will not spawn node).
 package-lock.json merge=union
 pnpm-lock.yaml merge=union
 yarn.lock merge=union
+
+# ── P1-4: EOL 钉住（-text = 不做任何 EOL 归一/改写）──────────────
+# Git-for-Windows 的 autocrlf（system gitconfig）会在 checkout 时把文本
+# 文件改写成 CRLF —— 实测 CRLF 链 ≈70′ + 1 轮终验作废。只钉「内容敏感、
+# 不该被 EOL 改写」的关键产物，文本源码不全锁（最小防污染面）。
+# lockfiles：与平台 GENERATED_FILES 判定源同集 —— 换行即全量 diff、
+# 且是钉依赖树的权威 blob。
+package-lock.json -text
+pnpm-lock.yaml -text
+yarn.lock -text
+Pipfile.lock -text
+poetry.lock -text
+composer.lock -text
+Gemfile.lock -text
+# 二进制产物（误被当文本做 EOL 转换 = 文件损坏）：
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.ico -text
+*.webp -text
+*.avif -text
+*.pdf -text
+*.zip -text
+*.gz -text
+*.7z -text
+*.woff -text
+*.woff2 -text
+*.ttf -text
+*.otf -text
+*.eot -text
+# 图纸/设计稿类（导出格式为二进制或含哈希校验，EOL 改写即失效）：
+*.drawio -text
+*.excalidraw -text
+*.sketch -text
+*.fig -text
+*.psd -text
+*.ai -text
 
 # HiveWeave workspace shared docs: shared/ 契约用 binary (双方改动即冲突,
 # 拒绝静默拼接成自相矛盾的规格); drafts/handoffs 是 append-only 日志,
@@ -891,6 +964,34 @@ yarn.lock merge=union
         #    add fails with "is a missing but registered worktree" until prune.
         # Always prune when the target is not a valid worktree.
         relocated = False  # P0-3: flag for caller to notify agent
+        relocated_from: str | None = None  # TEST_DSH_70 P2-4 迁移回写
+
+        def _note_relocation(result: dict) -> dict:
+            """迁移回写（TEST_DSH_70 P2-4）：relocated 事实位进成功回执。
+
+            此前 ``relocated`` 只置位不消费（"flag for caller to notify agent"
+            是假宣称——org_tools 的 hire 路径等**不走 ensure.py 重定位通知**的
+            调用方什么都收不到）。迁移不是修复：原树锁死废弃、新路径生效，
+            这个事实必须跟着回执走（事件侧回写见 ``_log_worktree_rebuild_event``
+            的 ``original_deprecated``）。
+            """
+            if not relocated:
+                return result
+            out = {
+                **result,
+                "relocated": True,
+                "previous_path": relocated_from,
+                "recovery_code": WT_STALE_PATH_RELOCATED,
+            }
+            out["message"] = (
+                f"{result.get('message') or 'Worktree ready.'} "
+                f"[{WT_STALE_PATH_RELOCATED}] original tree {relocated_from} "
+                f"was locked/unrecoverable and is DEPRECATED — the live tree "
+                f"is now {path}. Do not write to the old path; the platform "
+                f"may clean it up."
+            )
+            return out
+
         if Path(path).exists():
             # P0-3: stop dev servers that may lock files (WinError 32 root cause)
             try:
@@ -922,12 +1023,14 @@ yarn.lock merge=union
                             )
                             path = alt
                             relocated = True
+                            relocated_from = original_path
                             await _log_worktree_rebuild_event(
                                 workspace_path,
                                 short_id,
                                 reason="stale_path_reuse_existing",
                                 original=original_path,
                                 path=alt,
+                                original_deprecated=True,
                             )
                             break
                         if not Path(alt).exists():
@@ -938,12 +1041,14 @@ yarn.lock merge=union
                             )
                             path = alt
                             relocated = True
+                            relocated_from = original_path
                             await _log_worktree_rebuild_event(
                                 workspace_path,
                                 short_id,
                                 reason="stale_path_fallback",
                                 original=original_path,
                                 path=alt,
+                                original_deprecated=True,
                             )
                             break
                     else:
@@ -978,7 +1083,7 @@ yarn.lock merge=union
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base="existing-branch")
                 await self._materialize_shared_dir(path)
-                return {
+                return _note_relocation({
                     "success": True,
                     "path": path,
                     "branch": branch,
@@ -986,7 +1091,7 @@ yarn.lock merge=union
                         f"Worktree ready. Name evidence files with {short_id}- "
                         f"prefix to avoid merge collisions."
                     ),
-                }
+                })
             last_error = out
             # Path-exists race: clear husk and retry attach once
             err_l = (out or "").lower()
@@ -1003,7 +1108,7 @@ yarn.lock merge=union
                         branch=branch,
                     )
                     await self._materialize_shared_dir(path)
-                    return {
+                    return _note_relocation({
                         "success": True,
                         "path": path,
                         "branch": branch,
@@ -1011,7 +1116,7 @@ yarn.lock merge=union
                             f"Worktree ready. Name evidence files with "
                             f"{short_id}- prefix to avoid merge collisions."
                         ),
-                    }
+                    })
                 last_error = out2 or out
             # Fall through: branch may be checked out elsewhere; try -B paths
         else:
@@ -1033,7 +1138,7 @@ yarn.lock merge=union
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base=base_branch)
                 await self._materialize_shared_dir(path)
-                return {
+                return _note_relocation({
                     "success": True,
                     "path": path,
                     "branch": branch,
@@ -1041,7 +1146,7 @@ yarn.lock merge=union
                         f"Worktree ready. Name evidence files with {short_id}- "
                         f"prefix to avoid merge collisions."
                     ),
-                }
+                })
             last_error = out
             # branch_exists detection can miss (format/race); -b then fails with
             # "a branch named X already exists" — or path husk left → clear + attach.
@@ -1059,7 +1164,7 @@ yarn.lock merge=union
                         branch=branch,
                     )
                     await self._materialize_shared_dir(path)
-                    return {
+                    return _note_relocation({
                         "success": True,
                         "path": path,
                         "branch": branch,
@@ -1067,7 +1172,7 @@ yarn.lock merge=union
                             f"Worktree ready (attached existing branch). "
                             f"Name evidence files with {short_id}- prefix."
                         ),
-                    }
+                    })
                 last_error = out_att or out
 
         # Final heal: another path may have created a valid tree during races
@@ -1080,13 +1185,13 @@ yarn.lock merge=union
                 branch=actual or branch,
                 prior_error=last_error,
             )
-            return {
+            return _note_relocation({
                 "success": True,
                 "path": path,
                 "branch": actual or branch,
                 "message": "worktree healthy after create race",
                 "cleared_error": True,
-            }
+            })
 
         log.error("git_worktree.create_failed", short_id=short_id,
                   path=path, branch=branch, error=last_error)
@@ -1193,7 +1298,8 @@ yarn.lock merge=union
             }
 
         # P1-1: strip GENERATED_FILES from staging (lockfiles cause predictable
-        # merge conflicts; they should be regenerated post-merge, not committed).
+        # merge conflicts; TEST_DSH_70 P1-4 诚实化：平台不自动重生成 —— 合并
+        # 后语义修复靠 agent 本机 npm/pnpm install，钉的权威是 blob).
         # TEST6 P1-B: regenerable artifacts (tsbuildinfo / test_output*.json)
         # are stripped too — and de-tracked when already tracked, so they stop
         # dirtying every future checkout (merge-blocking main dirt).
@@ -1273,12 +1379,16 @@ yarn.lock merge=union
 
         # T1.2: 剥离说明进返回 message（此前只写 log.info，Agent 看不到）。
         # 措辞对齐 dirty 门禁新口径（T1.1）：生成物不再计入 dirty。
+        # TEST_DSH_70 P1-4（诚实化）：不再宣称合并后平台会自动重生成 ——
+        # 平台没有该实现；钉的权威是 MAIN 上的 blob，需要新 lockfile 由
+        # agent 本机 npm/pnpm install 重生成（后端不起 node）。
         generated_note = ""
         if gen_stripped:
             generated_note = (
                 f" NOTE: {len(gen_stripped)} generated file(s) stripped by "
-                f"policy (regenerated post-merge, never committed; the dirty "
-                f"gate no longer counts them): "
+                f"policy (never committed — the committed blob on MAIN "
+                f"remains the pinned authority; the dirty gate no longer "
+                f"counts them): "
                 f"{', '.join(gen_stripped[:5])}"
                 f"{'...' if len(gen_stripped) > 5 else ''}."
             )
@@ -1296,6 +1406,14 @@ yarn.lock merge=union
                 f"as evidence, rename it with your short_id prefix (e.g. "
                 f"{short_id}-evidence.txt) and checkpoint again."
             )
+
+        # TEST_DSH_70 P1-4：改名保留通道接上 lockfile 路 —— lockfile 剥离走
+        # gen_stripped（GENERATED_FILES 优先判定），「改名保留为证据」建议
+        # 此前只挂 regen_stripped ⇒ lockfile 路从未被提及。两张剥离清单都查；
+        # 注意在两个 if 之外赋值（gen_stripped 可以单独非空）。
+        lockfile_note = _lockfile_rename_note(
+            gen_stripped + regen_stripped, short_id
+        )
 
         # P1-2: 平台运行时目录剥离也进返回 message（agent 可见，避免改
         # .gitignore 自救 —— report 歪招典藏①）。
@@ -1360,7 +1478,8 @@ yarn.lock merge=union
                     "count": 0,
                     **self._empty_volume_fields(),
                     "message": "no changes to commit" + ignored_warning
-                               + generated_note + regen_note + conflict_warning}
+                               + generated_note + regen_note + lockfile_note
+                               + conflict_warning}
 
         # T1.2/P0-1: 剥离后暂存区为空 = 剩余变更全是生成物/被忽略 —— 这是
         # 「按策略无事可提交」，不是失败。此前落到 git commit「nothing to
@@ -1380,7 +1499,7 @@ yarn.lock merge=union
                 "message": (
                     "no committable changes"
                     + ignored_warning + generated_note + regen_note
-                    + runtime_note + conflict_warning
+                    + lockfile_note + runtime_note + conflict_warning
                 ).strip(),
             }
 
@@ -1475,7 +1594,7 @@ yarn.lock merge=union
         return {"success": True, "hash": head if ok else "", "count": count,
                 **_volume_fields,
                 "message": (ignored_warning + generated_note + regen_note
-                            + runtime_note + _volume_note
+                            + lockfile_note + runtime_note + _volume_note
                             + conflict_warning) or None}
 
     async def _conflict_warning(self, path: str,

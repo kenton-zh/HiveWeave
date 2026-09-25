@@ -12,6 +12,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hiveweave.services import task as _task_svc
+from hiveweave.services.param_shapes import coerce_list_param
 from hiveweave.services.tasks.verify import is_verify_task
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
@@ -191,12 +192,24 @@ class SubmitTaskParams(BaseModel):
     @field_validator("files_changed", mode="before")
     @classmethod
     def _coerce_files_changed(cls, v: Any) -> Any:
-        return _coerce_to_list(v)
+        # TEST_DSH_70 P1-6：平台级入参归一 —— {"item": […]} 群体单键形态
+        # 解包（实测 submit_task 35 条）；多键 dict 禁展平（fail-closed）。
+        return coerce_list_param(v)
 
     @field_validator("attestation_ids", mode="before")
     @classmethod
     def _coerce_attestation_ids(cls, v: Any) -> Any:
-        return _coerce_to_list(v)
+        return coerce_list_param(v)
+
+    @field_validator("failures_acknowledged", mode="before")
+    @classmethod
+    def _coerce_failures_acknowledged(cls, v: Any) -> Any:
+        return coerce_list_param(v)
+
+    @field_validator("blocking_issues", mode="before")
+    @classmethod
+    def _coerce_blocking_issues(cls, v: Any) -> Any:
+        return coerce_list_param(v)
 
 
 def _build_evidence(

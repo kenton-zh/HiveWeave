@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re as _re
 import threading
 from typing import Any
 
@@ -127,22 +128,59 @@ def clear_task_advance_deferred(agent_id: str) -> None:
 DEFER_REASON_STREAK_LIMIT = 3
 # 归一化后取前 N 字符做 key：容忍尾部细微改写，抓住"同一句话"复读。
 DEFER_REASON_KEY_CHARS = 80
+# TEST_DSH_70 P1-2（放大器遗留）：旧 key=理由前 80 字符 —— LLM 微调措辞
+#（换同义词/挪标点/加个「还是」）即归零，断路器被措辞抖动绕过。现两级：
+# ① 去空白+去标点+小写做稳定摘要；② 摘要不同但字符相似度极高（≥0.82，
+# difflib SequenceMatcher，语义复读的典型形态）仍算同一理由。真实换理由
+#（如「等测试」→「等审批」）相似度显著低于阈值 ⇒ 正常清零。
+DEFER_REASON_SIMILARITY_THRESHOLD = 0.82
+# 相似度只对足够长的理由启用：超短理由互相撞相似的概率高（「等CEO」vs
+# 「等HR」），不适用。
+_DEFER_SIMILARITY_MIN_CHARS = 12
 
 _defer_reason_streak: dict[str, tuple[str, int]] = {}
 
+_PUNCT_RE = _re.compile(r"[\W_]+", _re.UNICODE)
+
 
 def normalize_defer_reason(reason: str) -> str:
-    """Semantic key for a defer reason — whitespace/case-insensitive prefix."""
-    compact = "".join(str(reason or "").split()).lower()
+    """Semantic key for a defer reason — whitespace/punctuation/case-insensitive
+    stable summary, truncated to the key budget."""
+    compact = _PUNCT_RE.sub("", str(reason or "")).lower()
     return compact[:DEFER_REASON_KEY_CHARS]
 
 
+def _defer_reasons_similar(a: str, b: str) -> bool:
+    """两个归一化理由是否高度相似（复读 vs 真实换理由的判据）。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) < _DEFER_SIMILARITY_MIN_CHARS or (
+        len(b) < _DEFER_SIMILARITY_MIN_CHARS
+    ):
+        return False
+    from difflib import SequenceMatcher
+
+    return (
+        SequenceMatcher(None, a[:400], b[:400]).ratio()
+        >= DEFER_REASON_SIMILARITY_THRESHOLD
+    )
+
+
 def record_defer_reason(agent_id: str, reason: str) -> int:
-    """Count consecutive defers carrying the same reason key. Returns the count."""
+    """Count consecutive defers carrying the same reason key. Returns the count.
+
+    TEST_DSH_70 P1-2：同 key **或高度相似**（微调措辞）都续 streak；只有
+    语义上真实变化的理由才清零重开。
+    """
     key = normalize_defer_reason(reason)
     with _lock:
         prev_key, prev_n = _defer_reason_streak.get(agent_id, ("", 0))
-        n = prev_n + 1 if key and key == prev_key else 1
+        same = bool(key) and (
+            key == prev_key or _defer_reasons_similar(key, prev_key)
+        )
+        n = prev_n + 1 if same else 1
         _defer_reason_streak[agent_id] = (key, n)
         return n
 

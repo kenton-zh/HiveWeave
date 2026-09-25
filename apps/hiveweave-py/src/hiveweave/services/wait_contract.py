@@ -781,6 +781,23 @@ class WaitContractService:
                 wref = str(item.get("ref") or "")
                 wnote = item.get("note")
             if not wref:
+                # TEST_DSH_70 P1-6：非法 waitingOn 不许静默 continue —— 旧路径
+                # 跳过后「等待未登记而出口校验放行」，agent 以为挂上了等待实际
+                # 永远等不到唤醒。工具入口（commit_turn）已显式拒绝；此日志是
+                # 内部调用方（completion/recovery 恢复路径）的兜底留痕。
+                log.warning(
+                    "wait_contract_item_skipped_empty_ref",
+                    agent_id=agent_id,
+                    phase=phase,
+                    kind=str(wkind),
+                    item_shape=(
+                        "WaitingOnItem"
+                        if isinstance(item, WaitingOnItem)
+                        else f"dict(keys={sorted(str(k) for k in item)})"
+                        if isinstance(item, dict)
+                        else type(item).__name__
+                    ),
+                )
                 continue
             wake_on = list(DEFAULT_WAKE_ON.get(wkind, ["timeout"]))
             if isinstance(item, dict) and item.get("wake_on"):
