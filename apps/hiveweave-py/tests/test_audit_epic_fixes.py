@@ -535,11 +535,13 @@ async def test_enqueue_stays_legacy_contract_without_db(monkeypatch):
             call_llm=AsyncMock(side_effect=RuntimeError("upstream down")),
         )
     reset_ledger(AGENT_ID)
-    # 与 41+08 时代的契约完全一致（无 retry 附加键）
+    # 与 41+08 时代的契约一致（无 retry 附加键）；
+    # TEST_DSH_70 P2-3 批3：异常出口新增 capped_at_s（外层帽值，作废前置提示）
     assert result == {
         "audited": False,
         "reason": "llm_failed",
         "audit_upstream_unavailable": True,
+        "capped_at_s": 120.0,
     }
 
 

@@ -382,9 +382,14 @@ async def start_dev_server_tool(
         )
 
     async def _confined(ctx):
+        # P2-9①（TEST_DSH_70 批3）：受限 dev server 的 stdout/stderr **滚动
+        # 落盘**到与原生路径同一个日志文件 —— 此前受限路径的输出全在内存
+        # 滚动缓冲（job.output() 零调用方），磁盘 0 字节 ⇒ 「零输出」与
+        # 「健康」不可区分，_read_log_tail 回执尾/agent 只读诊断全落空。
         return await spawn_confined(
             argv=build_confined_argv(cmd),
             long_running=True,
+            long_running_log_path=str(log_path),
             **ctx.confined_kwargs(),
         )
 

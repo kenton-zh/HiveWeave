@@ -64,11 +64,128 @@ class GetTasksParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["taskId", "task_id"]},
     )
+    updated_since: int | None = Field(
+        default=None,
+        alias="updatedSince",
+        description=(
+            "Incremental cursor (epoch ms, from the previous call's "
+            "updatedSinceCursor). Returns ONLY tasks changed after this "
+            "timestamp plus a compact transition digest — a cheap "
+            "'anything changed?' check instead of re-pulling the full "
+            "ledger. Omit for the full listing."
+        ),
+        json_schema_extra={"aliases": ["updatedSince", "updated_since"]},
+    )
+
+
+async def _incremental_tasks_view(
+    project_id: str,
+    tasks: list[dict],
+    updated_since: int,
+) -> ToolResult:
+    """P1-3（TEST_DSH_70 批3）：``updatedSince`` 增量视图。
+
+    终值 262 次 get_tasks 全量轮询 = 唯一状态通道 —— 轮询税的全量重拉是
+    大头。本视图把「有没有变」收敛成一次廉价增量：tasks 表按
+    ``updated_at > 游标`` 过滤（状态转移都写 updated_at），task_events
+    outbox 提供转移摘要（谁、从什么状态、到什么状态）。返回带
+    ``updatedSinceCursor``（本轮观测到的最大变更时间），调用方原样带回
+    即可继续增量。事件条数触及 limit 时显式声明截断，游标仍推进
+    （tasks 过滤无 cap，漏掉的转移靠任务行兜底可见）。
+    """
+    from hiveweave.services.tasks.events import TaskEventService
+
+    cursor = int(updated_since)
+    try:
+        events = await TaskEventService().get_events_since(
+            project_id, cursor, limit=100
+        )
+    except Exception as e:  # noqa: BLE001 — 事件摘要失败不阻断任务行增量
+        log.debug("get_tasks_events_since_failed", error=str(e))
+        events = []
+
+    changed = [
+        t for t in tasks
+        if _ts(t.get("updated_at")) > cursor
+    ]
+    observed = [_ts(t.get("updated_at")) for t in tasks]
+    observed += [int(e.get("created_at") or 0) for e in events]
+    new_cursor = max([cursor, *observed])
+
+    lines: list[str] = []
+    if events:
+        lines.append(
+            f"Transitions since {cursor} ({len(events)}):"
+        )
+        for ev in events[:100]:
+            lines.append(
+                f"  - [{ev.get('created_at')}] {str(ev.get('task_id') or '')[:8]}: "
+                f"{ev.get('from_status') or '—'} → {ev.get('to_status') or '—'} "
+                f"({ev.get('event_type')})"
+            )
+        if len(events) >= 100:
+            lines.append(
+                "  … (digest truncated at 100; task rows below remain the "
+                "authoritative full delta)"
+            )
+    if not changed and not events:
+        return ToolResult.ok(
+            f"No task changes since {cursor}. Do not re-poll without a "
+            "wake/event; pass updatedSince="
+            f"{new_cursor} next time.",
+            tasks=[],
+            updatedSinceCursor=new_cursor,
+        )
+    for t in changed:
+        lines.append(
+            f"- [{t.get('status', '?')}] {t.get('title', '?')} "
+            f"(id={t.get('id')}, updated_at={t.get('updated_at')}, "
+            f"assignee={t.get('assignee_id') or 'unassigned'})"
+        )
+    header = (
+        f"Task changes since {cursor}: {len(changed)} task(s), "
+        f"{len(events)} transition(s). Next cursor below."
+    )
+    return ToolResult.ok(
+        f"{header}\n" + "\n".join(lines),
+        tasks=changed,
+        updatedSinceCursor=new_cursor,
+    )
+
+
+def _ts(value: Any) -> int:
+    """任务行时间戳的宽容取整（None/脏数据 = 0，永不误判为已变更）。"""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def task_id_variant_match(tk: str, wanted: str) -> bool:
+    """TEST_DSH_70 P1-1：task_id 短/长双形态变体集合匹配（纯函数）。
+
+    attestation 侧存 canonical 形态（去横线小写 32 位 hex，×359）而 tasks.id
+    是 36 位带横线 UUID（×21）—— 门内 ``canonical_task_id()`` 已兜住，但
+    外部按 task_id 的查询（``get_tasks(taskId=…)`` 单任务视图）拿原始写法
+    精确/前缀匹配 canonical 串**必 0 行**。这里按身份变体集合匹配：
+    去横线小写后相等，或 ≥8 字符前缀命中（与 ``resolve_task_id`` 的前缀
+    长度纪律一致，防短前缀歧义爆炸）。
+    """
+    tk_norm = str(tk or "").strip().lower().replace("-", "")
+    w_norm = str(wanted or "").strip().lower().replace("-", "")
+    if not tk_norm or not w_norm:
+        return False
+    if tk_norm == w_norm:
+        return True
+    return len(w_norm) >= 8 and tk_norm.startswith(w_norm)
 
 
 @tool(
     "get_tasks",
-    "List tasks in the Task Ledger with optional filters (status, assignee).",
+    "List tasks in the Task Ledger with optional filters (status, assignee). "
+    "Pass updatedSince (epoch ms cursor from the previous call's "
+    "updatedSinceCursor) for a cheap incremental check instead of the full "
+    "ledger re-pull.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -84,6 +201,20 @@ async def get_tasks_tool(
         tasks = await ts.list_tasks(
             project_id, status=params.status, assignee_id=params.assignee_id
         )
+        # P1-3（TEST_DSH_70 批3）：增量游标视图 —— 在做任何重预取之前短路，
+        # 全量路径的 waiver/audit/verify 预取一个都不跑（这正是省的部分）。
+        if params.updated_since is not None and int(params.updated_since) > 0:
+            # taskId 与增量游标互斥：增量视图不解析 taskId，静默忽略会让
+            # 「查某个任务」变成「返回全量增量」—— 显式拒绝。
+            if (params.task_id or "").strip():
+                return ToolResult.err(
+                    "taskId and updatedSince are mutually exclusive: "
+                    "incremental view does not filter by taskId. Pass one, "
+                    "not both."
+                )
+            return await _incremental_tasks_view(
+                project_id, tasks, int(params.updated_since)
+            )
         # TEST_DSH_64 #7①：单任务视图 —— 截断指针承诺的全文取回通道。
         # 整 id 精确匹配；否则接受唯一 8+ 前缀（与 claim/submit 的解析口径
         # 一致）；前缀撞多辆 → 报歧义拒绝。
@@ -104,7 +235,23 @@ async def get_tasks_tool(
                         f"{len(prefixed)} tasks share this prefix. Copy the "
                         "entire id from the listing."
                     )
-                tasks = prefixed
+                if not prefixed:
+                    # TEST_DSH_70 P1-1：原始写法必 0 行时按 canonical 变体集合
+                    # 再匹配一轮（attestation 回执里的 32 位去横线 id → 带横线
+                    # tasks.id），否则外部查询对 canonical 形态必 0 行。
+                    variants = [
+                        t for t in tasks
+                        if task_id_variant_match(str(t.get("id") or ""), wanted)
+                    ]
+                    if len(variants) > 1:
+                        return ToolResult.err(
+                            f"taskId '{wanted}' is ambiguous — {len(variants)} "
+                            "tasks match its id variants. Copy the entire id "
+                            "from the listing."
+                        )
+                    tasks = variants
+                else:
+                    tasks = prefixed
         if not tasks:
             body = "No tasks found matching the filters."
             if single_task_view:
@@ -544,4 +691,36 @@ def _expose_task_id_to_gate() -> None:
         pass
 
 
+def _expose_updated_since_to_gate() -> None:
+    """把 ``GetTasksParams.updated_since`` 同步进 executor 的手写门禁 schema。
+
+    与 :func:`_expose_task_id_to_gate` 同模式（本组所有权禁改 executor.py）：
+    pydantic 声明了但 ``TOOL_PARAM_SCHEMAS`` 没有 ⇒ ``_canonical_for_arg``
+    第 3 步归一不到 schema 正名 ⇒ 模型传 ``updatedSince`` 会被判 Unknown。
+    棘轮（test_no_new_unreachable_aliases_ratchet）会在漏同步时报警。
+    """
+    try:
+        from hiveweave.tools.executor import TOOL_PARAM_SCHEMAS
+
+        schema = TOOL_PARAM_SCHEMAS.get("get_tasks")
+        if not schema:
+            return
+        props = schema.setdefault("properties", {})
+        if "updatedSince" not in props:
+            props["updatedSince"] = {
+                "type": "integer",
+                "aliases": ["updated_since"],
+                "description": (
+                    "Incremental cursor (epoch ms) from the previous call's "
+                    "updatedSinceCursor. Returns only tasks changed after it "
+                    "plus a compact transition digest."
+                ),
+            }
+    except Exception as e:
+        # 棘轮纪律：不做裸 except —— schema 同步失败有棘轮测试兜底报警
+        # （test_no_new_unreachable_aliases_ratchet），此处只留痕。
+        log.debug("updatedSince_gate_schema_sync_failed", error=str(e))
+
+
 _expose_task_id_to_gate()
+_expose_updated_since_to_gate()

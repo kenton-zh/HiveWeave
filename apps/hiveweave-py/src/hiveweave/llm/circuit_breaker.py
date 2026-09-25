@@ -26,12 +26,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from enum import Enum
 from typing import NamedTuple
 
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+def _now() -> float:
+    """单调时钟（模块级别名：窗口判据测试可 monkeypatch 本名）。"""
+    return time.monotonic()
 
 # ── 常量 ────────────────────────────────────────────────────
 FAIL_THRESHOLD = 5
@@ -55,6 +61,21 @@ UPSTREAM_BREAKER_COOLDOWN_S = 60
 次累计），开启期并行请求在 check() 处秒败（错误带 ``UPSTREAM_BREAKER_MARKER``）。
 60s = 抖动窗（30s）的两倍余量；冷却过后 half_open 探针自动放行恢复。
 """
+
+# ── 时间窗失败率（TEST_DSH_70 P2-6 批3）────────────────────
+# consecutive-fail 的结构盲区：429 闪断**穿插成功** → report_success 里的
+# b.reset() 复位 fail_count ⇒ 128 条 429 全落在首 2h、熔断 0 open。窗口判据
+# 与连续计数**独立**：近 FAIL_RATE_WINDOW_S 秒内样本 ≥ FAIL_RATE_MIN_SAMPLES
+# 且失败率 ≥ FAIL_RATE_THRESHOLD 即 open。成功**不清洗**窗口历史（时间流逝
+# 才淘汰旧事件）；原 consecutive 逻辑一字未动。
+FAIL_RATE_WINDOW_S = 120.0
+"""时间窗长度（秒）：近这个窗内的成败样本参与失败率判定。"""
+
+FAIL_RATE_MIN_SAMPLES = 8
+"""窗口最小样本数：不足则不判（避免 2 失败 0 成功 = 100% 的假阳性开闸）。"""
+
+FAIL_RATE_THRESHOLD = 0.6
+"""窗口失败率阈值：≥ 此值即 open（429 风暴窗内哪怕穿插成功也逃不掉）。"""
 
 
 class CircuitState(str, Enum):
@@ -88,7 +109,7 @@ class _BreakerState:
 
     __slots__ = ("provider", "state", "fail_count", "opened_at",
                  "probe_deadline", "fallback", "last_error_code",
-                 "open_cooldown_ms")
+                 "open_cooldown_ms", "window_events")
 
     def __init__(self, provider: str, fallback: str | None = None) -> None:
         self.provider = provider
@@ -105,9 +126,18 @@ class _BreakerState:
         # 只由 open_for（确定性快熔，60s）设置；阈值触发的常规 open 沿用
         # 管理器默认 30s。reset() 清除。
         self.open_cooldown_ms: int | None = None
+        # P2-6（TEST_DSH_70 批3）：时间窗成败样本 [(monotonic_ts, is_fail)]。
+        # ⚠ 与 fail_count 生命周期**不同**：b.reset()（report_success 每次成功
+        # 都调）**不清**窗口 —— 那正是「穿插成功复位连续计数绕过熔断」的病根；
+        # 只有时间流逝淘汰旧事件 + 管理器级 reset()（调试/手动解除前置）显式清。
+        self.window_events: deque[tuple[float, bool]] = deque()
 
     def reset(self) -> None:
-        """回到 closed 状态，重置所有计数。"""
+        """回到 closed 状态，重置所有计数。
+
+        ⚠ 不清 ``window_events``（见上：成功复位连续计数不得连带清洗窗口
+        失败史）。管理器级 :meth:`CircuitBreaker.reset` 负责显式清窗口。
+        """
         self.state = CircuitState.CLOSED
         self.fail_count = 0
         self.opened_at = None
@@ -195,6 +225,43 @@ class CircuitBreaker:
             elif fallback is not None:
                 self._breakers[name].fallback = fallback
 
+    # ── 时间窗失败率（P2-6 批3）────────────────────────────
+
+    @staticmethod
+    def _record_window_event(b: _BreakerState, is_fail: bool) -> None:
+        """记录一次成败样本并淘汰窗外旧事件（调用方须持锁）。"""
+        now = _now()
+        b.window_events.append((now, is_fail))
+        cutoff = now - FAIL_RATE_WINDOW_S
+        ev = b.window_events
+        while ev and ev[0][0] < cutoff:
+            ev.popleft()
+
+    @staticmethod
+    def _window_rate(b: _BreakerState) -> tuple[int, int, float] | None:
+        """窗口失败率 ``(fails, total, rate)``；样本不足返回 None。
+
+        判定前先淘汰窗外事件（时间流逝是窗口唯一的清洗途径）。
+        """
+        now = _now()
+        cutoff = now - FAIL_RATE_WINDOW_S
+        ev = b.window_events
+        while ev and ev[0][0] < cutoff:
+            ev.popleft()
+        total = len(ev)
+        if total < FAIL_RATE_MIN_SAMPLES:
+            return None
+        fails = sum(1 for _t, is_fail in ev if is_fail)
+        return fails, total, fails / total
+
+    @classmethod
+    def _window_rate_trip(cls, b: _BreakerState) -> tuple[int, int, float] | None:
+        """窗口判据命中即返回 ``(fails, total, rate)``，未命中返回 None。"""
+        wr = cls._window_rate(b)
+        if wr is not None and wr[2] >= FAIL_RATE_THRESHOLD:
+            return wr
+        return None
+
     # ── 检查 ────────────────────────────────────────────────
 
     async def open_for(
@@ -246,6 +313,20 @@ class CircuitBreaker:
             now = time.monotonic()
 
             if b.state is CircuitState.CLOSED:
+                # P2-6（TEST_DSH_70 批3）：窗口失败率判据 —— consecutive
+                # 计数被穿插成功复位时，429 风暴仍能在这里被拦下。
+                wr = self._window_rate_trip(b)
+                if wr is not None:
+                    b.open()
+                    log.warning(
+                        "circuit_opened_window_rate",
+                        provider=name,
+                        window_failures=wr[0],
+                        window_total=wr[1],
+                        window_rate=round(wr[2], 3),
+                        window_s=FAIL_RATE_WINDOW_S,
+                    )
+                    return CheckResult.fallback_to(b.fallback)
                 return CheckResult.ok()
 
             if b.state is CircuitState.OPEN:
@@ -287,11 +368,16 @@ class CircuitBreaker:
     # ── 报告结果 ────────────────────────────────────────────
 
     async def report_success(self, name: str) -> None:
-        """报告请求成功 → 关闭熔断器（如果之前 open/half_open）。"""
+        """报告请求成功 → 关闭熔断器（如果之前 open/half_open）。
+
+        ⚠ P2-6：成功**先记窗口样本再 reset** —— reset 复位连续计数但不动
+        窗口历史（穿插成功不得清洗 429 风暴的失败史）。
+        """
         async with self._lock:
             b = self._breakers.get(name)
             if b is None:
                 return
+            self._record_window_event(b, False)
             was_open = b.state is not CircuitState.CLOSED
             b.reset()
             if was_open:
@@ -310,6 +396,9 @@ class CircuitBreaker:
             b = self._breakers.get(name)
             if b is None:
                 return
+            # P2-6：失败样本进时间窗（与状态机无关 —— half_open/open 期
+            # 的失败同样是窗口失败率的一部分）。
+            self._record_window_event(b, True)
             if error_code is not None:
                 b.last_error_code = error_code
 
@@ -338,6 +427,19 @@ class CircuitBreaker:
                              provider=name,
                              fail_count=b.fail_count,
                              threshold=self.fail_threshold)
+                    # 窗口失败率判据（consecutive 之外的第二条独立通道）：
+                    # 连续计数未到、但窗内失败率已越线 ⇒ 同样 open。
+                    wr = self._window_rate_trip(b)
+                    if wr is not None:
+                        b.open()
+                        log.warning(
+                            "circuit_opened_window_rate",
+                            provider=name,
+                            window_failures=wr[0],
+                            window_total=wr[1],
+                            window_rate=round(wr[2], 3),
+                            window_s=FAIL_RATE_WINDOW_S,
+                        )
 
             # OPEN 状态下的失败：保持 open，更新 opened_at 重新计时
             if b.state is CircuitState.OPEN:
@@ -373,25 +475,33 @@ class CircuitBreaker:
         return max(0, int(left))
 
     async def reset(self, name: str | None = None) -> None:
-        """重置熔断器（调试/测试用）。
+        """重置熔断器（调试/测试/手动解除前置用）。
 
         - name=None: 重置所有 provider
         - name=指定: 仅重置该 provider
+
+        ⚠ P2-6：管理器级 reset 是**显式的人工复位** ⇒ 连时间窗失败史一起清
+        （给操作者一张白纸）；per-state ``b.reset()``（report_success 每次成功
+        都调）则**不清**窗口 —— 那条路径清窗口等于让穿插成功洗掉 429 风暴。
         """
         async with self._lock:
             if name is None:
                 for b in self._breakers.values():
                     b.reset()
+                    b.window_events.clear()
             else:
                 breaker_state = self._breakers.get(name)
                 if breaker_state:
                     breaker_state.reset()
+                    breaker_state.window_events.clear()
 
     def snapshot(self) -> list[dict]:
         """全部 provider 的熔断状态快照（40 轮 #13：诊断 API / 手动解除前置）。
 
         返回 [{provider, state, fail_count, fail_threshold,
-              cooldown_left_s, fallback}]；冷却剩余按秒向下取整。
+              cooldown_left_s, fallback, last_error_code,
+              window_fail_rate, window_samples}]；冷却剩余按秒向下取整。
+        P2-6：窗口两键 = 时间窗失败率判据的可观测面（样本不足 = None）。
         """
         now = time.monotonic()
         out: list[dict] = []
@@ -405,6 +515,19 @@ class CircuitBreaker:
                         - (now - b.opened_at)
                     ),
                 )
+            # 窗口统计（只读、不淘汰 —— snapshot 是无锁同步读，不碰 deque 结构）。
+            # ⚠ deque 在被并发 popleft/append 时迭代会抛
+            # ``RuntimeError: deque mutated during iteration`` —— 快照是诊断面，
+            # 撞上竞态就放弃本轮窗口统计（None），绝不让诊断调用反过来炸调用方。
+            cutoff = now - FAIL_RATE_WINDOW_S
+            try:
+                recent = [f for (t, f) in b.window_events if t >= cutoff]
+            except RuntimeError:
+                recent = []
+            if len(recent) >= FAIL_RATE_MIN_SAMPLES:
+                window_rate = sum(1 for f in recent if f) / len(recent)
+            else:
+                window_rate = None
             out.append({
                 "provider": name,
                 "state": b.state.value,
@@ -413,6 +536,8 @@ class CircuitBreaker:
                 "cooldown_left_s": cooldown_left,
                 "fallback": b.fallback,
                 "last_error_code": b.last_error_code,
+                "window_fail_rate": window_rate,
+                "window_samples": len(recent),
             })
         return out
 

@@ -1131,6 +1131,7 @@ async def spawn_confined(
     timeout_s: float | None = None,
     entry: str = "bash",
     long_running: bool = False,
+    long_running_log_path: str | None = None,
     env_extra: dict[str, str] | None = None,
     decision: SpawnDecision | None = None,
 ) -> dict | None:
@@ -1140,6 +1141,8 @@ async def spawn_confined(
     缺省回退到 workspace_path（P0 单目录形态）。
     ``env_extra`` = 调用方增量 env（dev server 端口注入等）。
     E10：优先 ``argv``（逐元素引用修剥引号根因）；不传回退整串 ``command``。
+    ``long_running_log_path``（P2-9①，TEST_DSH_70 批3）：长驻 job 的
+    stdout/stderr 滚动落盘路径 —— 不传 = 只进内存滚动缓冲（旧行为）。
 
     ``decision``（#1 治本）：**判定由 `policy.resolve_spawn_decision` 做，
     本函数的职责只是执行**。不传 ⇒ 本函数自己调判定（兼容既有调用方，
@@ -1210,6 +1213,11 @@ async def spawn_confined(
                 job = await runner.run_long_running(
                     token, command, workdir, env,
                     **({"argv": argv} if argv is not None else {}),
+                    **(
+                        {"log_path": long_running_log_path}
+                        if long_running_log_path
+                        else {}
+                    ),
                 )
                 return {
                     "long_running": True,

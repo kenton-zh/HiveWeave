@@ -460,8 +460,17 @@ async def acceptance_coverage_kinds(task: dict[str, Any] | None) -> tuple[str, .
       门同口径，更严）；
     - soft（`coordinator_review` = None）/ 未知 policy / 要求的是非执行类
       （如 `code_audit`）⇒ 回落**全部执行类 kind**（= ``WAIVER_EVIDENCE_KINDS``
-      —— 平台自己定义的"执行证据"集合），并 **fail-loud 留日志**（soft 用
-      info：这是 VERIFY 的常态；未知/不可用用 warning）。
+      —— 平台自己定义的"执行证据"集合），并 **fail-loud 留日志**（P2-7，
+      TEST_DSH_70 批3：回落日志统一升 warning，且带上 policy_id 与**实际回落
+      集合**，让"回落与 F1 打架"的形状可被事后统计）。
+
+    ⚠ 为什么**不从回落集合里剔 kind**（P2-7 的另一半修法，本仓裁定不采）：
+    回落只在「policy 没声明执行类 kind」时发生（soft / 未知 / 声明的全是
+    code_audit 这类非执行类）——此时没有"本 policy 声明的执行 kind"可对齐；
+    往外剔（如剔 test_run）会直接改变门的接受面，且 TEST_DSH_70 本轮该路径
+    **未触发**（零实战样本），剔除的判据无从校准；全剔更会让覆盖门无解。
+    故只做 warning + 记账，不改行为。
+
     任何异常 ⇒ 回落 :data:`DEFAULT_COVERAGE_KINDS` + warning（不静默）。
     """
     try:
@@ -470,6 +479,7 @@ async def acceptance_coverage_kinds(task: dict[str, Any] | None) -> tuple[str, .
             ledger_policy_id,
             required_attestation_kinds,
         )
+        from hiveweave.services.telemetry import telemetry
 
         execution_kinds = tuple(sorted(WAIVER_EVIDENCE_KINDS))
         policy_id = ledger_policy_id(task or {})
@@ -480,16 +490,20 @@ async def acceptance_coverage_kinds(task: dict[str, Any] | None) -> tuple[str, .
             )
             if usable:
                 return usable
+            telemetry.bump("acceptance_coverage_nonexecution_fallback")
             log.warning(
                 "acceptance_coverage_policy_kinds_not_execution_evidence",
                 policy_id=policy_id,
                 kinds=sorted(needed),
+                fallback_kinds=list(execution_kinds),
             )
         else:
-            log.info(
+            telemetry.bump("acceptance_coverage_soft_fallback")
+            log.warning(
                 "acceptance_coverage_policy_soft_all_execution_kinds",
                 policy_id=policy_id,
                 kinds=list(execution_kinds),
+                fallback_kinds=list(execution_kinds),
             )
         return execution_kinds
     except Exception as e:  # noqa: BLE001 — 取不到就回落且留痕（不静默）

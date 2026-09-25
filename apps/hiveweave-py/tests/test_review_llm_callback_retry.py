@@ -3,7 +3,8 @@
 背景：_review_llm_callback 原为单发 httpx POST 无重试，上游瞬时断连
 （RemoteProtocolError "Server disconnected without sending a response"）
 导致 review / run_tests 直接失败。修复引入 _review_llm_post_with_retry：
-总窗口 45s + 最多额外重试 1 次 + Retry-After 预算检查。
+总窗口（P2-3 批3 起为 110s，须真大于 90s 首读帽——45s 时首读超时后重试
+从未发生过）+ 最多额外重试 1 次 + Retry-After 预算检查。
 """
 
 from __future__ import annotations

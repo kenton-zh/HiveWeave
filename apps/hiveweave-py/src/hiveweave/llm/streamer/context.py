@@ -93,11 +93,21 @@ class ContextMixin:
             result[i] = pruned
         self._mark_context_rewrite()
 
+        # P1-7①（TEST_DSH_70 批3）：与持久化裁剪（conversation/store.py）
+        # 同一套显式记账 —— 首个被改写下标之前的前缀跨度是下一请求必然
+        # miss 的量；不带这个数，「中段改写作废了多少缓存」隐形。
+        first_pruned_index = min(to_prune_indices)
+        prefix_invalidated_tokens = estimate_tokens_for_messages(
+            result[:first_pruned_index]
+        )
+
         log.info(
             "tool_loop_prune",
             pruned_count=len(to_prune_indices),
             pruned_tokens=plan.prune_tokens,
             protected_tokens=plan.protected_tokens,
+            first_pruned_index=first_pruned_index,
+            prefix_invalidated_tokens=prefix_invalidated_tokens,
         )
         return result
 

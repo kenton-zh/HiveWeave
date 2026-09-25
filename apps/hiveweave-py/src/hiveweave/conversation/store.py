@@ -723,6 +723,18 @@ class ConversationStore:
             return  # 收益不足，不执行
         to_prune_indices = plan.indices
 
+        # P1-7①（TEST_DSH_70 批3）：**修剪显式记账** —— 原地改写中段
+        # （条数不变、内容变 ⇒ 前缀缓存从首个被改写下标起整段作废），这条
+        # 损失此前只有 pruned_tokens（被裁内容本身）；「改写点之前的全部
+        # token = 下一请求必然 miss 的前缀跨度」不落任何桶 = 隐形。
+        # 修法选**显式记账**而非「可修剪内容排尾」：tool 消息必须紧跟其
+        # tool_call（OpenAI 语义），把被裁段挪到序列尾部会拆散配对 —— 不是
+        # 最小一致改。硬禁令照守：不动探针末位分流判据（probe.py）。
+        first_pruned_index = min(to_prune_indices)
+        prefix_invalidated_tokens = estimate_tokens_for_messages(
+            messages[:first_pruned_index]
+        )
+
         # 永久替换 cache 中的内容（in-place 修改）
         for i in to_prune_indices:
             messages[i] = {**messages[i], "content": PRUNE_PLACEHOLDER}
@@ -736,7 +748,14 @@ class ConversationStore:
             pruned_count=len(to_prune_indices),
             pruned_tokens=prune_tokens,
             protected_tokens=protected,
+            first_pruned_index=first_pruned_index,
+            prefix_invalidated_tokens=prefix_invalidated_tokens,
         )
+        # 记账进 telemetry 计数器（与 persist_pruned_failed 同机制）——
+        # 命中率事后归因时「有多少次中段改写」不再只靠翻日志。
+        from hiveweave.services.telemetry import telemetry
+
+        telemetry.bump("prune_prefix_invalidated")
         # 标记依据的是 cache（模型的活上下文）已被 in-place 改写成占位符 ——
         # 这一步在上面已完成且不可失败，所以画线此刻就是准确的，无需等
         # _persist_pruned 落库。compaction 相反：它的 cache 替换与 DB 重写

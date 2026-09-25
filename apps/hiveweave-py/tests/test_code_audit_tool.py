@@ -308,11 +308,14 @@ async def test_callback_generic_error_maps_llm_failed():
             call_llm=AsyncMock(side_effect=RuntimeError("HTTP 500 boom")),
         )
     # 41+08 P0-2：llm_failed 携带 audit_upstream_unavailable 事实位
-    # （上游能力不可用 ≠ 执行者证据缺失）
+    # （上游能力不可用 ≠ 执行者证据缺失）。
+    # TEST_DSH_70 P2-3 批3：异常出口再带 capped_at_s（外层帽值）——
+    # 「审计死于帽」与「上游真死」事后可分（作废前置提示）。
     assert result == {
         'audited': False,
         'reason': 'llm_failed',
         'audit_upstream_unavailable': True,
+        'capped_at_s': 120.0,
     }
 
 

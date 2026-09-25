@@ -449,8 +449,8 @@ def _pick_folder_blocking() -> dict:
         # 置顶：否则对话框可能藏在浏览器窗口后面，被用户当成「点了没反应」
         try:
             root.attributes("-topmost", True)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 —— 部分 Tk 后端不支持该属性，置顶失败不拦对话框
+            log.debug("folder_picker_topmost_unavailable", error=str(e))
         chosen = filedialog.askdirectory(
             parent=root, title="选择工作区目录", mustexist=True
         )
@@ -459,8 +459,8 @@ def _pick_folder_blocking() -> dict:
     finally:
         try:
             root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 —— 销毁失败无补救，只留痕（防同名根窗口残留排查无门）
+            log.debug("folder_picker_destroy_failed", error=str(e))
 
     if not chosen:
         return {"available": True, "path": None, "reason": None}
@@ -523,7 +523,8 @@ async def fs_pick_folder(request: Request) -> dict:
             # 线程里不能直接 set_result，必须回到事件循环线程
             loop.call_soon_threadsafe(fut.set_result, result)
         except RuntimeError:
-            pass  # 事件循环已关（进程正在退出）
+            # 事件循环已关（进程正在退出）——请求方早已不在，结果无处投递
+            log.debug("folder_picker_result_dropped_loop_closed")
         finally:
             _picker_lock.release()  # 锁覆盖对话框的完整生命周期
 

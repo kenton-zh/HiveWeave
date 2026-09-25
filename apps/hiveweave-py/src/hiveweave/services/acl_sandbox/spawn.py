@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import IO, Any
 from ctypes import wintypes
 
 try:  # pragma: no cover - branch 由平台决定
@@ -298,14 +298,16 @@ class ConfinedRunner:
 
     # ── 长驻命令（dev server / unbounded job） ──────────────
     async def run_long_running(
-        self, token, command: str | None = None, cwd: str = ".", env: dict | None = None, *, argv: list[str] | None = None,
+        self, token, command: str | None = None, cwd: str = ".", env: dict | None = None, *,
+        argv: list[str] | None = None, log_path: str | None = None,
     ) -> "LongRunningJob":
         loop = asyncio.get_running_loop()
         spawned = await asyncio.to_thread(
             _spawn_sync, token, command, cwd, env,
             **({"argv": argv} if argv is not None else {}),
         )
-        job = LongRunningJob(spawned, loop)
+        # P2-9①：log_path 非空 ⇒ stdout/stderr 滚动落盘到该路径
+        job = LongRunningJob(spawned, loop, log_path=log_path)
         with _ACTIVE_LOCK:
             _ACTIVE.append(job)
         _ensure_watcher()
@@ -313,14 +315,28 @@ class ConfinedRunner:
 
 
 # 长驻命令输出缓冲上限（§5.4：滚动保留尾部，防 dev server 持续输出撑爆内存；
-# 滚动落盘 job-<id>.log 属 P2，先以内存上限兜底）
+# 磁盘侧由下方 P2-9① 的滚动落盘承接——此「先以内存上限兜底」的旧注已过期）
 _LONG_RUNNING_MAX_BUF = 512 * 1024
+
+# P2-9①（TEST_DSH_70 批3）：长驻 job 的 stdout/stderr **滚动落盘**上限。
+# 此前落盘只差最后一步：内存滚动缓冲有了（output() 却零调用方 —— grep 实锤
+# 0 caller），受限 dev server 的输出全在内存里、磁盘 0 字节 ⇒ 「零输出」与
+# 「健康」不可区分（原生路径有 dev-server-<port>.log，受限路径没有）。
+# 轮转沿用仓库日志纪律：**截断不改名**（超限就地 truncate + 轮转标记）。
+_LONG_RUNNING_LOG_MAX_BYTES = 1 * 1024 * 1024
+_LOG_ROTATE_MARKER = b"\n[hiveweave] dev-server log rotated (size cap reached)\n"
 
 
 class LongRunningJob:
     """单个全局 watcher 线程轮询的活跃 job（零有界池占用）。"""
 
-    def __init__(self, spawned: _Spawned, loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        spawned: _Spawned,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        log_path: str | None = None,
+    ):
         self._spawned = spawned
         self._loop = loop
         self._done = asyncio.Event()
@@ -329,6 +345,52 @@ class LongRunningJob:
         self._out_size = 0
         self._err_size = 0
         self._finished = False
+        # P2-9①：滚动落盘接收端。None = 不落盘（兼容既有调用方，行为不变）。
+        # 只由 watcher 线程（drain → _log_append）单线程写，无锁。
+        self._log_path = log_path
+        self._log_file: IO[bytes] | None = None
+        self._log_bytes = 0
+
+    @property
+    def log_path(self) -> str | None:
+        """本 job 的滚动日志路径（未配置落盘时 None）。"""
+        return self._log_path
+
+    def _log_append(self, data: bytes) -> None:
+        """把新排空字节追加进滚动日志（best-effort，失败放弃不影响缓冲）。
+
+        轮转**先于写入**（本轮数据不被截断丢掉），超限就地截断重开
+        （轮转截断不改名），写入轮转标记后继续。
+        """
+        if not data or not self._log_path:
+            return
+        try:
+            if self._log_file is None:
+                self._log_file = open(self._log_path, "ab")  # noqa: SIM115
+            if (
+                self._log_bytes > 0
+                and self._log_bytes + len(data) > _LONG_RUNNING_LOG_MAX_BYTES
+            ):
+                self._log_file.close()
+                # 轮转 = 截断不改名（仓库日志纪律）
+                self._log_file = open(self._log_path, "wb")  # noqa: SIM115
+                self._log_file.write(_LOG_ROTATE_MARKER)
+                self._log_file.flush()
+                self._log_bytes = len(_LOG_ROTATE_MARKER)
+            self._log_file.write(data)
+            self._log_file.flush()
+            self._log_bytes += len(data)
+        except OSError:
+            # 磁盘满/句柄失效等：放弃落盘（内存缓冲仍在），不再反复尝试
+            self._log_close()
+
+    def _log_close(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception as e:  # noqa: BLE001 —— 句柄已失效时关闭无从补救，留痕供轮转异常排查
+                log.debug("dev_server_log_close_failed", error=str(e))
+            self._log_file = None
 
     @property
     def pid(self) -> int | None:
@@ -361,6 +423,9 @@ class LongRunningJob:
             self._out_size = self._append(self._out, self._out_size, data)
         for data in chunks_err:
             self._err_size = self._append(self._err, self._err_size, data)
+        # P2-9①：同批新字节滚动落盘（零输出 ⇒ 与健康可区分）
+        self._log_append(b"".join(chunks_out))
+        self._log_append(b"".join(chunks_err))
 
     def finalize(self) -> None:
         """watcher 线程调用：最后排空一次 + 通知等待方（线程安全）。"""
@@ -368,6 +433,8 @@ class LongRunningJob:
         if self._finished:
             return
         self._finished = True
+        # 进程已退出、无后续 drain ⇒ 滚动日志在此收口（close 幂等）
+        self._log_close()
         try:
             self._loop.call_soon_threadsafe(self._done.set)
         except RuntimeError:
@@ -390,6 +457,7 @@ class LongRunningJob:
             pass
 
     def close(self) -> None:
+        self._log_close()
         self._spawned.close()
 
     def output(self) -> str:

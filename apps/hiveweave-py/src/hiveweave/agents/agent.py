@@ -280,16 +280,18 @@ async def broadcast_agent_health(
 # response"）直接炸掉 review/run_tests。重试必须带预算帽：无脑 2 次重试最坏
 # 2×90s read + 退避 → 远超 120s，必被 asyncio.wait_for 强取消。
 # 预算决策：
-# - 首次尝试 read 固定 90s（与原单发行为一致——慢响应供应商不回退，
-#   ReadTimeout 后重试窗口必已耗尽 → 不会重试，等价于旧的 90s 单发）。
-# - 总重试窗口 45s：重试尝试 read = min(90, max(10, remaining))，随剩余
-#   预算收缩，地板 10s 保证重试尝试仍有最小可用窗口；最坏 ≈ 首读 90s +
-#   重试读 10s ≈ 100s < 120s 工具预算（ReadTimeout 触发时窗口已耗尽、
-#   直接上抛，所以 90s 首读不会叠加第二次长读）。
+# - 首次尝试 read 固定 90s（与原单发行为一致——慢响应供应商不回退）。
+# - 总重试窗口 110s（P2-3，TEST_DSH_70 批3：原 45s < 首读 90s ⇒ 首读超时后
+#   remaining = 45-90 < 0，第二次尝试**从未发生过** —— 实测 15/33 llm_failed
+#   里失败簇 90–91s×8 就是这个形状，审计撞帽必死）。窗口必须**真大于**首读
+#   帽 + 退避 + 最小重试读，超时后的重试才买得回一次机会：
+#   最坏 ≈ 首读 90s + 退避 ~1s + 重试读 min(90, max(10, 110-91)=19s) ≈ 110s
+#   < 120s 工具预算；非超时失败路径最坏（t=1s 429 + Retry-After 30s + 重试读
+#   min(90, 110-31)=79s）≈ 111s，同样 < 120s。
 # - 429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s），退避超预算则放弃重试；
 #   其余可重试错误小退避 0.5-1s。
 
-_REVIEW_LLM_RETRY_WINDOW_S = 45.0
+_REVIEW_LLM_RETRY_WINDOW_S = 110.0
 _REVIEW_LLM_MAX_RETRIES = 1
 _REVIEW_LLM_READ_TIMEOUT_MAX_S = 90.0
 _REVIEW_LLM_READ_TIMEOUT_MIN_S = 10.0
@@ -324,6 +326,17 @@ async def _review_llm_post_with_retry(
             remaining = retry_window_s - (time.monotonic() - start)
             if remaining <= 0:
                 assert last_exc is not None
+                # P2-3（TEST_DSH_70 批3）：**作废前置提示** —— 重试窗被首读
+                # 吃穿 ⇒ 第二次尝试从未发生。此前的 raise 是静默的：调用方
+                # 只见裸异常，事后无法把「审计死于帽」与「上游真死」分开
+                # （15/33 llm_failed 里 90–91s×8 的失败簇就是这条静默路径）。
+                log.warning(
+                    "review_llm_retry_window_exhausted",
+                    elapsed_s=round(time.monotonic() - start, 1),
+                    retry_window_s=retry_window_s,
+                    first_read_timeout_s=_REVIEW_LLM_READ_TIMEOUT_MAX_S,
+                    error=str(last_exc),
+                )
                 raise last_exc
             read_timeout = min(
                 _REVIEW_LLM_READ_TIMEOUT_MAX_S,

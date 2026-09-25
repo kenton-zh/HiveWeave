@@ -123,11 +123,14 @@ def _get_audit_gate() -> asyncio.Semaphore:
 # **实际可达上限（审计 [2]，勿再自欺）**：本值只是外层 ``asyncio.wait_for``
 # 的帽，真正决定成败的是 agents.agent._review_llm_post_with_retry：
 #   首读固定 ``_REVIEW_LLM_READ_TIMEOUT_MAX_S``（90s）→ 重试窗
-#   ``_REVIEW_LLM_RETRY_WINDOW_S``（45s）→ 首读超时后 remaining = 45-90 < 0
-#   直接上抛，第二次尝试根本不会发生。
-# 因此 > 90s 的配置**不可达**（调 env 到 300 也只跑 90s）。这里夹到
-# agent 侧的真实帽子（取不到则按 90 兜底），并在提示文案里用有效值，
-# 杜绝"改了配置没变化"的假象。想真正放宽须改 agent 侧首读帽/重试窗。
+#   ``_REVIEW_LLM_RETRY_WINDOW_S``（P2-3 批3 起为 110s；原 45s < 首读 90s
+#   ⇒ 首读超时后 remaining = 45-90 < 0 直接上抛，第二次尝试根本不会发生
+#   —— TEST_DSH_70 实测失败簇 90–91s×8 全是这条静默路径）。
+# 因此外层帽的**下限口径** = 首读帽 + 重试窗（内层最坏 ≈ 90+1+19 ≈ 110s，
+# 必须留在外层帽之内），而不是首读帽本身：夹到首读帽会让重试窗形同虚设
+# （调 env 到 300 也只跑 90s = 重试永不发生）。这里夹到
+# ``min(env, 首读帽 + 重试窗 + 5s 余量)``（取不到则按同式兜底），并在提示
+# 文案里用有效值，杜绝"改了配置没变化"的假象。
 def _timeout_from_env(name: str, default: int) -> int:
     """环境变量读取超时秒数——非法值回退默认，绝不在**模块导入期**抛异常。
 
@@ -149,20 +152,24 @@ CODE_AUDIT_LLM_TIMEOUT_S = _timeout_from_env("HIVEWEAVE_CODE_AUDIT_TIMEOUT_S", 1
 
 
 def effective_audit_timeout_s() -> float:
-    """审计实际能等到的秒数 = 请求值 ∩ agent 侧首读帽。
+    """审计实际能等到的秒数 = 请求值 ∩ agent 侧**总预算**。
 
-    agent 侧重试助手的首读帽是硬顶（见上注）：外层 wait_for 再大也没用。
-    这里**运行时**读取该帽子（不在模块导入期 import agents，避免
-    services ↔ agents 循环导入），取不到时按 90 兜底。
+    P2-3（TEST_DSH_70 批3）：agent 侧重试助手的总预算 = 首读帽 + 重试窗
+    （首读 90s 超时后仍要留出一次真重试的空间）。旧口径夹到首读帽本身
+    （90s）⇒ 外层 wait_for 与首读同时到点，重试窗形同虚设 —— 15/33
+    llm_failed 的失败簇 90–91s×8 即此形状。这里**运行时**读 agent 侧两个
+    帽（不在模块导入期 import agents，避免 services ↔ agents 循环导入），
+    取不到时按同式兜底。
     """
     try:
         from hiveweave.agents.agent import (  # noqa: PLC0415 — 见上：避免循环导入
-            _REVIEW_LLM_READ_TIMEOUT_MAX_S as cap,
+            _REVIEW_LLM_READ_TIMEOUT_MAX_S as read_cap,
+            _REVIEW_LLM_RETRY_WINDOW_S as retry_window,
         )
 
-        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, cap))
+        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, read_cap + retry_window + 5.0))
     except Exception:  # noqa: BLE001 — best-effort，取不到用兜底值
-        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, 90))
+        return float(min(CODE_AUDIT_LLM_TIMEOUT_S, 90.0 + 110.0 + 5.0))
 
 # One-shot review callback contract — same shape as
 # ``agents/agent.py:_review_llm_callback`` / tools/review.py ReviewLLMCallback.
@@ -1014,6 +1021,8 @@ async def _invoke_audit_llm(
         else:
             return None, {"audited": False, "reason": "no_callback"}
     except asyncio.TimeoutError:
+        # P2-3（TEST_DSH_70 批3）：作废前置提示 —— 外层帽击杀审计时把帽值
+        # 随 meta 带走（进回执/重试队列），让「死于帽」与「上游真死」可分。
         log.warning(
             "code_audit.llm_timeout",
             agent_id=agent_id,
@@ -1023,16 +1032,24 @@ async def _invoke_audit_llm(
             "audited": False,
             "reason": "llm_failed",
             "audit_upstream_unavailable": True,
+            "capped_at_s": _timeout_s,
         }
     except NoModelConfiguredError as exc:
         log.warning("code_audit.no_model", agent_id=agent_id, error=str(exc))
         return None, {"audited": False, "reason": "no_model"}
     except Exception as exc:  # noqa: BLE001 — soft-fail contract
-        log.warning("code_audit.llm_failed", agent_id=agent_id, error=str(exc))
+        # 内层首读超时（httpx.ReadTimeout 等）走这里 —— 同样把帽值带走。
+        log.warning(
+            "code_audit.llm_failed",
+            agent_id=agent_id,
+            error=str(exc),
+            cap_s=_timeout_s,
+        )
         return None, {
             "audited": False,
             "reason": "llm_failed",
             "audit_upstream_unavailable": True,
+            "capped_at_s": _timeout_s,
         }
     if not text:
         # Empty text is as fatal as a raised exception, but was previously

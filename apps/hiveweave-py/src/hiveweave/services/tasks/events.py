@@ -52,6 +52,30 @@ class TaskEventService:
         except Exception as e:
             log.warning("task_events_mark_delivered_failed", error=str(e))
 
+    async def get_events_since(
+        self, project_id: str, since_ms: int, limit: int = 100
+    ) -> list[dict]:
+        """项目级**增量游标**读法（P1-3，TEST_DSH_70 批3）。
+
+        返回 ``created_at > since_ms`` 的状态转移事件（升序）。供
+        ``get_tasks(updatedSince=…)`` 把「262 次全量轮询」收敛成「带游标的
+        增量拉取」：无变化时零行、有变化时只回增量 —— 观测通道不再是
+        唯一的全量重拉。失败返回 []（观测辅助，不阻断主路径）。
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT id, task_id, event_type, from_status, to_status, "
+                "actor_id, created_at "
+                "FROM task_events WHERE project_id = ? AND created_at > ? "
+                "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+                [project_id, int(since_ms), int(limit)],
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            log.warning("task_events_since_failed", error=str(e))
+            return []
+
     async def get_task_history(
         self, project_id: str, task_id: str, limit: int = 50,
         conn=None, oldest_first: bool = True,

@@ -26,6 +26,21 @@ from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
 
+# P1-7②/P2-6（TEST_DSH_70 批3）：per-agent 最近一次模型身份（provider@model）。
+# 平台刻意不自动切模型（见 stream() 内注释），但库外人工改配置后换缓存域的
+# 首请求零命中是**必然**（TEST_DSH_70：换模型后 6/6 runs near_zero）——没有
+# 显式锚点时，命中率解读会把这份 cold_start 误读成「平台改写了前缀」。
+# 这里在 stream 入口检测模型身份变更并广播（结构化日志 + agent 可见事件各一条）。
+_LAST_MODEL_BY_AGENT: dict[str, str] = {}
+
+
+def reset_model_cold_start_registry(agent_id: str | None = None) -> None:
+    """清空 cold-start 检测基准（测试隔离用；None = 全量）。"""
+    if agent_id is None:
+        _LAST_MODEL_BY_AGENT.clear()
+    else:
+        _LAST_MODEL_BY_AGENT.pop(agent_id, None)
+
 
 class Streamer(
     ToolLoopMixin,
@@ -156,6 +171,13 @@ class Streamer(
         # 熔断器注册（不再注册 fallback —— 自动模型切换已整体移除）。
         await self._circuit_breaker.register(provider_name)
 
+        # P1-7②/P2-6（TEST_DSH_70 批3）：换模型 cold-start 广播。best-effort，
+        # 绝不影响主流式链路。
+        try:
+            await self._broadcast_model_cold_start(agent_id, _llm_identity)
+        except Exception as _cs_err:  # noqa: BLE001 — 观测信号不阻断流式
+            log.debug("model_cold_start_broadcast_failed", error=str(_cs_err))
+
         # 熔断器检查。按 DSH 纪律移除全部自动 provider/模型切换，理由：
         # 1) 换 model = 换缓存域，前缀缓存整条作废（TEST_DSH_29 实测长闲置
         #    请求 100% 零命中，占全价 input token 的 90%）；
@@ -250,6 +272,61 @@ class Streamer(
             return _stamp_error_identity(self._error_result(str(e), start_time))
         finally:
             await self._fire_delta(on_delta, {"type": "done"})
+
+    @staticmethod
+    async def _broadcast_model_cold_start(agent_id: str, identity: dict) -> None:
+        """检测 per-agent 模型身份变更并广播 cold-start 信号（P1-7②/P2-6）。
+
+        换模型 = 换缓存域（provider 侧前缀缓存按模型键隔离）⇒ 换模型后的
+        首请求 ``cache_read≈0`` 是必然，不是平台改写了前缀。此事实此前无
+        锚点：探针只把它记成一次 ``model_changed`` 漂移，事后命中率归因
+        （TEST_DSH_70：换模型后 6/6 runs near_zero）无从对照。修法 = 变更
+        边界上广播两条信号（至少结构化日志 + agent 可见事件一条）：
+
+        - 结构化日志 ``llm_model_changed_cold_start``（prev/new 模型身份）；
+        - agent 可见事件：chat 上下文标记（``role=system``、``is_read=True``
+          —— 不产生 wake/token 成本，UI 可画「模型从此处切换」分界）。
+
+        身份键 = ``provider@model``（与错误回执 ``_llm_identity`` 同源）。
+        首次见到某 agent（基准为空）不算变更 —— 后端重启本身已使 provider
+        缓存失效，探针的 ``no_baseline`` 桶已覆盖该场景。
+        """
+        if not agent_id:
+            return
+        model_key = f"{identity.get('provider', '')}@{identity.get('model', '')}"
+        if model_key == "@":
+            return
+        prev = _LAST_MODEL_BY_AGENT.get(agent_id)
+        _LAST_MODEL_BY_AGENT[agent_id] = model_key
+        if prev is None or prev == model_key:
+            return
+        log.warning(
+            "llm_model_changed_cold_start",
+            agent_id=agent_id,
+            prev_model=prev,
+            new_model=model_key,
+            note=(
+                "cache domain switched; first requests expected cold start "
+                "(cache_read≈0) — not a platform-side prefix rewrite"
+            ),
+        )
+        from hiveweave.services.chat_message import ChatMessageService
+
+        await ChatMessageService().save_message({
+            "agent_id": agent_id,
+            "role": "system",
+            "content": (
+                f"模型已切换（{prev} → {model_key}）— 缓存域已更换，"
+                "接下来首个请求预期冷启动（cache_read≈0），属预期行为。"
+            ),
+            "is_read": True,
+            "metadata": {
+                "source": "system",
+                "context_marker": "model_switch",
+                "prev_model": prev,
+                "new_model": model_key,
+            },
+        })
 
     @staticmethod
     async def _read_error_body(response: httpx.Response) -> str:
