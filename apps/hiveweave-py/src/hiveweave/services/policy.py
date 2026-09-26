@@ -8,9 +8,11 @@ Evaluation order (P0 Hard Gates):
 
 Role families: ceo | hr | coordinator | executor | qa
 
-- ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档，禁源码/配置）+ BROWSE（看产品）。
-  无写码/bash/test 责任。可对单条任务 waive_attestation 关闸（可不附 evidence）；
-  禁止一次关掉所有任务。browse 本身不关闸；自己的浏览不算 approve 证据。
+- ceo: 行政 + 里程碑验收 + DOC_WRITE（任意文档）+ SOURCE_WRITE/BASH_SHELL
+  （MAIN 本地直接改码/跑 shell，免「一行代码走整条派单链」）+ BROWSE（看产品）。
+  无 STAFFING/MCP_BIND/TEST_RUN（MCP_BIND = 绑 stdio 即开执行通道；test 责任仍归 QA）。
+  可对单条任务 waive_attestation 关闸（可不附 evidence）；禁止一次关掉所有任务。
+  browse 本身不关闸；自己的浏览不算 approve 证据。
 - coordinator: 中层（设计者+接缝工）— 协调权叠加写码权
   （SOURCE_WRITE / BASH_SHELL / TEST_RUN / BROWSE；写码收敛到叶子间接缝）。
 """
@@ -54,11 +56,16 @@ RoleFamily = str  # "ceo" | "hr" | "coordinator" | "executor" | "qa"
 # Default capability matrix — hard coded.
 FAMILY_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "ceo": frozenset({
-        # CEO: 行政 + 里程碑验收 + 文档权。无写码/bash/test/staffing。
+        # CEO: 行政 + 里程碑验收 + 文档权 + MAIN 本地写码/执行（批 A 第 0 步，
+        # 2026-09-26：一行代码的修复不再走整条派单链）。仍无 STAFFING /
+        # MCP_BIND / TEST_RUN —— MCP_BIND 的理由见枚举处注释（绑 stdio server
+        # = 开执行通道，CEO 的执行通道只有受沙箱约束的 shell）；测试责任归 QA。
         Capability.DISPATCH,
         Capability.REVIEW,
         Capability.MERGE,  # 升级兜底（中层缺席时救场合并）
         Capability.SOURCE_READ,
+        Capability.SOURCE_WRITE,
+        Capability.BASH_SHELL,
         Capability.MANAGE_ORG,
         Capability.DOC_WRITE,
         # 看产品，不是测试岗。无 TEST_RUN / BROWSER_ACCEPTANCE：
@@ -547,7 +554,7 @@ def write_path_allowed(agent: dict[str, Any], file_path: str) -> str | None:
     """
     caps = capabilities_for(agent)
     if Capability.SOURCE_WRITE in caps:
-        return None  # executors / builder coordinators may write anywhere
+        return None  # executors / builder coordinators / CEO may write anywhere
 
     norm = _normalize_write_path(file_path)
     family = infer_role_family(agent)

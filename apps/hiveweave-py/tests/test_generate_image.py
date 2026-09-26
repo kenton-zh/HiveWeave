@@ -84,7 +84,9 @@ def test_generate_image_requires_source_write() -> None:
         "permission_type": "executor",
         "name": "Echo",
     }
-    assert policy_service.hard_check(ceo, "generate_image") is not None
+    # 批 A 第 0 步：CEO 有 SOURCE_WRITE ⇒ 能力门放行（拒绝点移到 CEO_TOOLS
+    # 工具表层，见 test_generate_image_in_source_write_presets_only）
+    assert policy_service.hard_check(ceo, "generate_image") is None
     assert policy_service.hard_check(hr, "generate_image") is not None
     assert policy_service.hard_check(executor, "generate_image") is None
     assert policy_service.hard_check(qa, "generate_image") is None

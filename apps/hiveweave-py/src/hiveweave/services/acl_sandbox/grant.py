@@ -42,6 +42,20 @@ FILE_GENERIC_WRITE = READ_CONTROL | 0x2 | 0x4 | 0x10 | 0x100 | 0x100000
 GRANT_MASK = (FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD) & ~STANDARD_RIGHTS_WRITE  # 0x110156
 CACHE_MASK = (FILE_GENERIC_WRITE & ~DELETE & ~FILE_DELETE_CHILD) & ~STANDARD_RIGHTS_WRITE
 FILE_ALL_ACCESS = 0x1F01FF  # 仅令牌默认 DACL 注入使用（§4.5）
+# 批 A 第 0 步（2026-09-26）：MAIN gitdir 数据面所需的**窄创建位**（winnt.h：
+# FILE_ADD_FILE / FILE_ADD_SUBDIRECTORY）。刻意不含 GRANT_MASK 的任何位以外
+# 的写位——特别是不含 DELETE/FC/写数据——使 `_agent_aces_leaking` 的「读回
+# 必须干净」判定可以用**精确掩码匹配**把它与宽授区分开（见 service.py）。
+FILE_ADD_FILE = 0x00000002
+FILE_ADD_SUBDIRECTORY = 0x00000004
+GIT_MAIN_CREATE_MASK = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY  # 0x6
+# `.git` 根**直接子文件**（index / HEAD / COMMIT_EDITMSG / ORIG_HEAD / 各 *.lock）
+# 经 OI 继承拿到的数据面位。**就用 GRANT_MASK**（与本仓一切数据面授予同掩码）：
+# git 对存量 loose 文件的写是 GENERIC_WRITE 形态的 open（CREATE_ALWAYS 截断），
+# 缺 WRITE_EA/WRITE_ATTRIBUTES/SYNCHRONIZE 任一位即 Access denied（真令牌实测
+# `could not open '.git/COMMIT_EDITMSG'`）。RCE 载体不受影响：config/
+# config.worktree 已 PROTECTED（不接受继承），容器（hooks/ 等）被 NP 断绝。
+GIT_MAIN_FILE_INHERIT_MASK = GRANT_MASK
 
 # OWNER_RIGHTS-only 目录检测（§4.12）—— 该 SID 出现即"无真实主体 ACE"信号
 _OWNER_RIGHTS_SID = "S-1-3-4"
@@ -149,6 +163,62 @@ class WriteGrant:
         return True
 
     @staticmethod
+    def grant_git_main_dir_aces(path: str, sid: str) -> bool:
+        """`.git` 根数据面的**成对窄 ACE**（批 A 第 0 步，唯一调用点在
+        `_ensure_standing_grants` 的 MAIN 分支）：
+
+        1. ``(GIT_MAIN_CREATE_MASK, flags=0)`` —— 目录自身的**非继承**创建位
+           （index.lock 等锁文件的创建入口）。
+        2. ``(GIT_MAIN_FILE_INHERIT_MASK, OI|IO|NP)`` —— **只作用于直接子
+           文件**的删+写数据位：存量直接子文件（index/HEAD/COMMIT_EDITMSG/
+           ORIG_HEAD…）经授予时的急切传播拿到有效 ACE；此后新建的直接子
+           文件（index.lock/HEAD.lock…）在创建时继承。IO ⇒ `.git` 目录自身
+           零生效（删不掉本体）；NP ⇒ 不向孙代传播（`.git/info/attributes`、
+           `hooks/**`、`worktrees/**` 一无所获——受限令牌实测：缺删位 =
+           `unable to unlink index.lock` + `fatal: unable to write new index
+           file`；缺写位 = `could not open '.git/COMMIT_EDITMSG'`）。
+
+        封条载体不受影响的机理：`config` / `config.worktree` 在封条时已置
+        PROTECTED（不接受一切继承），`hooks/` 是**容器**（NP 断绝传播，且
+        其中的 IO 副本对本目录零生效 → 投放 hook 文件仍需 ADD_FILE on
+        hooks —— 未授予；该 IO 副本由封条阶段的 hooks 检查摘除，见
+        `_seal_git_bootstrap_files` ②b）。
+        PROTECTED 写回的理由：目标已被封条置 PROTECTED，不带 PROTECTED
+        标志的 SetNamedSecurityInfo 会把父目录的可继承 ACE 重新灌进来
+        （项目根的 worktree SID GRANT_MASK）⇒ 宽写面复活。
+        verify-then-skip：两条 ACE 都在场即跳过（幂等，稳态零写盘）。
+        """
+        _require_win32()
+        wanted = [
+            (GIT_MAIN_CREATE_MASK, 0),
+            (GIT_MAIN_FILE_INHERIT_MASK, OI_IO_NO_PROPAGATE),
+        ]
+        present = {
+            (mask, ace_flags)
+            for ace_type, ace_flags, mask, s in WriteGrant.list_aces(path)
+            if ace_type == ACE_ALLOWED and s == sid
+        }
+        missing = [pair for pair in wanted if pair not in present]
+        if not missing:
+            return False
+        dacl = WriteGrant._read_dacl(path)
+        if dacl is None:
+            raise SandboxUnavailableError(
+                f"git-main grant target has no DACL (NULL DACL): {path}",
+                api_name="GetSecurityDescriptorDacl")
+        sid_obj = win32security.ConvertStringSidToSid(sid)
+        dacl.SetEntriesInAcl([
+            _explicit_access(sid_obj, mask, win32security.GRANT_ACCESS, flags)
+            for mask, flags in missing
+        ])
+        win32security.SetNamedSecurityInfo(
+            path, win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION
+            | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+            WriteGrant._owner(path), WriteGrant._group(path), dacl, None)
+        return True
+
+    @staticmethod
     def revoke_revocable(path: str, sid: str) -> None:
         """撤销 temp 类 revocable ACE。"""
         _require_win32()
@@ -238,8 +308,13 @@ class WriteGrant:
 
     # ── #2 GitSpawn 治本：git 引导文件的「封条」原语（2026-09-15） ──────
     @staticmethod
-    def list_aces(path: str) -> list[tuple[str, int, int]]:
-        """[(sid_str, ace_flags, mask)] —— 公开只读视图（不存在的路径 ⇒ []）。"""
+    def list_aces(path: str) -> list[tuple[int, int, int, str]]:
+        """[(ace_type, ace_flags, mask, sid_str)] —— 公开只读视图（不存在的路径 ⇒ []）。
+
+        ⚠ 返回形状以 `_iter_aces` 为准（4 元组）；旧注解/旧 docstring 写成
+        3 元组是笔误（2026-09-26 批 A 第 0 步顺修，`_grant_aces` 的消费端
+        一直是按 4 元组解包的）。
+        """
         _require_win32()
         if not os.path.exists(path):
             return []
@@ -591,10 +666,24 @@ class WriteGrant:
 # ── 继承位 / ACE 类型（win32con 在非 Windows 下为 None） ───────────────
 OI_CI = (win32con.CONTAINER_INHERIT_ACE | win32con.OBJECT_INHERIT_ACE
          if win32con is not None else 0)
+# OI|IO|NP（OBJECT_INHERIT | INHERIT_ONLY | NO_PROPAGATE）：**只作用于直接子
+# 文件** —— 子文件继承为有效 ACE（含授予时对存量直接子文件的急切传播）；
+# 子目录拿到的 IO 副本不可再向下传播（NP）⇒ 孙代（如 `.git/info/attributes`、
+# `.git/worktrees/**`）一无所获。`grant_git_main_dir_aces` 的第二条 ACE 用。
+OI_IO_NO_PROPAGATE = (
+    (win32con.OBJECT_INHERIT_ACE | win32con.INHERIT_ONLY_ACE
+     | win32con.NO_PROPAGATE_INHERIT_ACE)
+    if win32con is not None else 0xD
+)
 ACE_ALLOWED = (win32con.ACCESS_ALLOWED_ACE_TYPE if win32con is not None else 0)
 ACE_DENIED = (win32con.ACCESS_DENIED_ACE_TYPE if win32con is not None else 0)
 # INHERITED_ACE：ACE 上的「我是继承来的」标记（win32security.INHERITED_ACE=0x10）。
 # 封条重建时把它清掉 —— 见 seal_agent_aces 第 2 条理由。
 _INHERITED_ACE = getattr(win32security, "INHERITED_ACE", 0x10)
+# INHERIT_ONLY_ACE：ACE 不作用于本对象、只供继承（win32con.INHERIT_ONLY_ACE=0x8）。
+# `_agent_aces_leaking` 的 `.git` 根豁免要求 OI 掩码 ACE 必须带本位 ——
+# 否则（flags=0 的 DELETE ACE）等于把 `.git` 目录自身的删除权送出去。
+_INHERIT_ONLY_ACE = getattr(win32con, "INHERIT_ONLY_ACE", 0x8) if (
+    win32con is not None) else 0x8
 # 父目录禁「删子项」用的掩码：DELETCHILD 的两条准入路径都要堵
 SEAL_DENY_MASK = DELETE | FILE_DELETE_CHILD  # 0x10040

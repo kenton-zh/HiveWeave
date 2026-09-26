@@ -296,19 +296,24 @@ async def test_agent_cannot_delete_whole_git_dir(proj: Path, wt: Path) -> None:
     assert git_dir.is_dir(), "受限 agent 删掉了整个 .git"
 
 
-async def test_agent_cannot_mutate_main_git_metadata(proj: Path, wt: Path) -> None:
-    """行为变更（有意）：agent 不再能改**主树**的 git 元数据。
+async def test_main_agent_can_mutate_main_git_index(proj: Path, wt: Path) -> None:
+    """行为变更（批 A 第 0 步，2026-09-26，有意）：MAIN 边界 agent 可以改主树
+    git **数据面**（`.git/index`）。
 
-    收窄的代价面：`.git` 根不授写 ⇒ 主树 `.git/index`·`ORIG_HEAD`·`COMMIT_EDITMSG`
-    这类「直接落在 `.git` 下」的写入不再可行（agent 自己的 git 落在 worktree gitdir，
-    不受影响）。判据是**状态**：主树 index 内容不得变 —— 不靠退出码/文案。
+    旧契约（2026-09-15 封条）是「`.git` 根整体不授写 ⇒ 主树 index 不可写」；
+    批 A 起 MAIN 边界令牌携带 `git_main_sid`（`.git` 根窄创建位 + index/HEAD/
+    packed-refs 逐文件授予），CEO 一行代码修复 + `git checkout --` 还原在 MAIN
+    就地可行。封条目标不变：config/config.worktree/hooks 仍不可写（本文件其余
+    用例钉住）。判据是**状态**：主树 index 内容确实被受限 agent 改变 ——
+    不看退出码/文案。
     """
     await _bootstrap(wt, proj)
     index = proj / ".git" / "index"
     before = index.read_bytes()
     (proj / "mut.txt").write_text("m\n", encoding="utf-8")
-    await _agent(proj, proj, "git add -A", agent_id="CEO", entry="bash_main")
-    assert index.read_bytes() == before, "受限 agent 改写了主树 .git/index"
+    r = await _agent(proj, proj, "git add -A", agent_id="CEO", entry="bash_main")
+    assert r is not None and r["exit_code"] == 0, r
+    assert index.read_bytes() != before, "MAIN 边界受限 agent 未能改写主树 .git/index"
 
 
 async def test_agent_cannot_rewrite_worktree_gitdir_pointer(

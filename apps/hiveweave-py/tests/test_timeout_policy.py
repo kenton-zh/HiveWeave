@@ -251,14 +251,15 @@ def test_bash_timeout_copy_ignored_when_background():
     assert "Foreground only" in desc
 
 
-def test_ceo_hard_deny_spawn_subagent():
+def test_ceo_no_spawn_subagent_visible():
+    """批 A 第 0 步：spawn_subagent 映射 SOURCE_WRITE，CEO 能力门已过；
+    拒绝点移到 CEO_TOOLS 工具表层（不可见 ⇒ evaluate 也拒）。"""
+    from hiveweave.services.permission import CEO_TOOLS
     from hiveweave.services.policy import tool_hard_deny
 
-    deny = tool_hard_deny(
-        {"role": "ceo", "permission_type": "coordinator"},
-        "spawn_subagent",
-    )
-    assert deny is not None
+    ceo = {"role": "ceo", "permission_type": "coordinator"}
+    assert tool_hard_deny(ceo, "spawn_subagent") is None
+    assert "spawn_subagent" not in CEO_TOOLS
 
 
 @pytest.mark.asyncio

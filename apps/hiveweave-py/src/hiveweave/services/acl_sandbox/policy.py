@@ -20,6 +20,7 @@ import structlog
 from hiveweave.services.acl_sandbox.sid import (
     cache_sid,
     extra_sid,
+    git_main_sid,
     git_sid,
     shared_sid,
     temp_sid,
@@ -296,11 +297,13 @@ def build_write_sids(
     - boundary SID：空前缀，派生自边界根（worktree 或项目根），路径即边界；
     - cache\\0 / git\\0 / venv\\0：**派生自项目根**（§4.8/§8）—— 同项目全 agent 共享
       同一 git/cache/venv 能力，跨项目 SID 不同（域前缀 + 路径）；
-    - shared\\0：**派生自项目根且仅 worktree 边界携带**（boundary != project）——
+    - gitmain\\0：**派生自项目根且仅 MAIN 边界携带**（boundary == project）——
+      主树 `.git` 根下 index/HEAD/packed-refs 等数据面 + 锁文件创建（批 A 第 0 步）。
+      worktree 边界不携带：worktree agent 的 index 在自己的 gitdir（git_sid 已授），
+      主树 `.git` 根写面只该属于在 MAIN 上干活的角色（CEO/HR/bash_main）；
+    - shared\\0：**派生自项目根且所有边界携带**（2026-09-22 P2-2「团队网盘」）——
       shared 是 git 跟踪的跨 agent 契约区，各 worktree 内 git rebase/checkout
-      要写删 `<wt>/.hiveweave/shared/*`，**且它是团队网盘**（谁都可以读写）
-      ⇒ **所有边界**都带 shared SID（2026-09-22 P2-2 起；此前仅 worktree 边界，
-      使 MAIN 边界角色写不了网盘 —— 真令牌探针实测 N2 DENIED）；
+      要写删 `<wt>/.hiveweave/shared/*`，**且它是团队网盘**（谁都可以读写）。
     - temp\\0 / extra\\0 各自域分离。跨项目同 SID 撞车需全 60-bit 碰撞（~2⁻⁵⁴）。
     """
     boundary = os.path.realpath(boundary_root)
@@ -311,6 +314,8 @@ def build_write_sids(
         git_sid(project),
         temp_sid_str,
     ]
+    if boundary == project:
+        sids.append(git_main_sid(project))
     # shared SID **所有边界都给**（2026-09-22 P2-2「团队网盘」）。
     # 旧形态是 `if boundary != project`（理由是"CEO/HR/bash_main 项目根边界
     # 不授予不携带，行为不变"）—— 那让网盘**只对工作树里的 agent 可用**：

@@ -120,7 +120,8 @@ def _hire_permission_mode(perm_type: str, role: str) -> str:
 
     builder coordinator（中层，family=coordinator）须可写 —— 固定 readonly
     会让 evaluate 的 mode 兜底把写工具变 ask，SOURCE_WRITE 形同虚设；
-    CEO 保持偏只读协调 mode（有 DOC_WRITE，无 SOURCE_WRITE）。
+    CEO 保持偏只读协调 mode（mode 只对 executor 族兜底生效，CEO 族工具面
+    由 CEO_TOOLS 决定；批 A 第 0 步后有 SOURCE_WRITE/BASH_SHELL）。
 
     以 infer_role_family 为唯一判定源（C1 审计）：显式 permType=ceo/hr 与
     coordinator+role 归入 CEO/HR 族的两条路径必须产出同一个 readonly，避免

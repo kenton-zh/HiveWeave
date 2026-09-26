@@ -152,8 +152,12 @@ def test_echo_family_still_qa_for_verify_discovery():
 
 
 @pytest.mark.asyncio
-async def test_ceo_write_scope_unchanged(svc, monkeypatch):
-    # CEO: DOC_WRITE 任意文档放行；源码硬拒（无 SOURCE_WRITE）
+async def test_ceo_write_scope_any_path_after_batch_a(svc, monkeypatch):
+    """批 A 第 0 步：CEO 有 SOURCE_WRITE —— 文档与源码任意路径都放行。
+
+    旧名 `test_ceo_write_scope_unchanged` 钉的是「源码硬拒」；本批有意翻转，
+    新契约 = 路径硬门对 ceo 不再产生任何拒绝（拒绝只可能来自操作者规则）。
+    """
     _patch_agent(monkeypatch, _ceo())
     assert (
         await svc.evaluate(
@@ -177,11 +181,11 @@ async def test_ceo_write_scope_unchanged(svc, monkeypatch):
         await svc.evaluate(
             "a1", "write_file", {"filePath": "src/app.py", "content": "x"}
         )
-        == "deny"
+        == "allow"
     )
     assert (
         await svc.evaluate("a1", "edit_file", {"filePath": "src/app.py"})
-        == "deny"
+        == "allow"
     )
 
 
@@ -204,13 +208,18 @@ async def test_builder_coordinator_write_source_allowed(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ceo_can_browse_but_not_bash_or_assert(svc, monkeypatch):
+async def test_ceo_can_browse_and_shell_but_not_assert(svc, monkeypatch):
+    """批 A 第 0 步：CEO 能力/工具面拿到 bash（含 MAIN 位）；出证特判仍拒。"""
     _patch_agent(monkeypatch, _ceo())
     assert await svc.evaluate("a1", "browse", {"args": ["goto", "http://127.0.0.1:1"]}) == "allow"
     assert await svc.evaluate(
         "a1", "browse_main", {"args": ["goto", "http://127.0.0.1:1"]}
     ) == "allow"
-    assert await svc.evaluate("a1", "bash", {"command": "ls"}) == "deny"
+    assert await svc.evaluate("a1", "bash", {"command": "ls"}) == "allow"
+    assert await svc.evaluate(
+        "a1", "bash_main", {"command": "git status"}
+    ) == "allow"
+    assert await svc.evaluate("a1", "run_tests", {}) == "deny"
     assert await svc.evaluate(
         "a1",
         "assert_visual",
@@ -224,14 +233,26 @@ async def test_ceo_can_browse_but_not_bash_or_assert(svc, monkeypatch):
     assert await svc.evaluate("a1", "game_run_case_main", {}) == "deny"
 
 
-def test_ceo_tool_list_excludes_code_tools(svc):
+def test_ceo_tool_list_excludes_code_collab_tools(svc):
+    """批 A 第 0 步：shell 位可见（按宿主形态）；apply_patch/run_tests/出证类不可见。
+
+    apply_patch 能力位虽过（SOURCE_WRITE），但 allowlist 不暴露 —— 两层判定各自成立。
+    """
     tools = svc.get_tools_for_agent(_ceo())
-    for t in ("bash", "apply_patch", "run_tests", "game_run_case",
+    from hiveweave.services.host_env import host_hidden_tools
+
+    hidden = host_hidden_tools()
+    for t in ("bash", "bash_main", "pwsh", "pwsh_main"):
+        if t in hidden:
+            assert t not in tools, t
+        else:
+            assert t in tools, t
+    for t in ("apply_patch", "run_tests", "game_run_case",
               "game_run_case_main", "assert_visual"):
         assert t not in tools
     assert "browse" in tools
     assert "browse_main" in tools
-    # edit_file 在工具表内，路径硬门拦源码
+    # edit_file 在工具表内；SOURCE_WRITE 落地后源码路径也不再被路径硬门拦
     assert "edit_file" in tools
     assert "write_file" in tools
     for t in ("dispatch_task", "review_task", "git_worktree_merge",
@@ -247,9 +268,10 @@ def test_message_user_in_all_tools(svc):
 
 
 def test_deny_hint_ceo_write_points_to_mid_level():
+    """批 A 第 0 步：CEO 写工具的拒绝提示如实反映 SOURCE_WRITE（不再谎称仅 DOC_WRITE）。"""
     hint = build_deny_hint("edit_file", "ceo")
+    assert "SOURCE_WRITE" in hint
     assert "DOC_WRITE" in hint
-    assert "documentation" in hint
     assert "dispatch_task" in hint
     assert "CEO" in hint
     assert "read-only" not in hint
@@ -266,12 +288,11 @@ def test_deny_hint_builder_coordinator_write_points_to_worktree():
 
 
 def test_deny_hint_includes_real_hard_reason():
-    reason = policy_service.hard_check(
-        _ceo(), "write_file", {"filePath": "src/app.py"}
-    )
+    """硬门原因整段进提示。CEO 源码写已放行（批 A 第 0 步）——反例改 run_tests。"""
+    reason = policy_service.hard_check(_ceo(), "run_tests", {})
     assert reason
-    assert "kind=source" in reason
-    hint = build_deny_hint("write_file", "ceo", reason)
+    assert "test_run" in reason
+    hint = build_deny_hint("run_tests", "ceo", reason)
     assert reason in hint
     assert "read-only" not in hint
 
@@ -283,7 +304,11 @@ def test_deny_hint_generic_for_executor():
 
 @pytest.mark.asyncio
 async def test_pipeline_deny_hint_end_to_end(monkeypatch, tmp_path):
-    """CEO 写源码被拒 → pipeline 返回 DOC_WRITE 原则 + 委派指引。"""
+    """CEO 写工具被拒 → pipeline 返回 SOURCE_WRITE/DOC_WRITE 原则 + 委派指引。
+
+    批 A 第 0 步后源码写本身放行 —— 这里用 `_DenyAll` 模拟操作者 deny 规则，
+    验证的是「拒绝回执的提示文案与能力现状一致」。
+    """
     import hiveweave.tools.file  # noqa: F401 — 确保 write_file 完成 @tool 注册
 
     _patch_agent(monkeypatch, _ceo())
@@ -302,8 +327,8 @@ async def test_pipeline_deny_hint_end_to_end(monkeypatch, tmp_path):
     )
     assert result is not None
     assert result["success"] is False
+    assert "SOURCE_WRITE" in result["error"]
     assert "DOC_WRITE" in result["error"]
-    assert "documentation" in result["error"]
     assert "dispatch_task" in result["error"]
     assert "read-only" not in result["error"]
     assert "README.md" not in result["error"]

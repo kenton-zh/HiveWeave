@@ -70,8 +70,9 @@ async def test_ceo_allowlist_deny_reason(monkeypatch):
             permission_mode="readonly",
         ),
     )
-    # bash is capability-denied for CEO; reason comes from hard_check
-    decision, reason = await svc.evaluate_detailed("a1", "bash", {})
+    # 批 A 第 0 步后 bash 对 CEO 放行 —— 反例改用仍被拒的 apply_patch
+    #（能力门过（SOURCE_WRITE），但不在 CEO_TOOLS ⇒ allowlist 拒，理由具体）
+    decision, reason = await svc.evaluate_detailed("a1", "apply_patch", {})
     assert decision == "deny"
     assert reason
     # hard capability text OR allowlist — either is specific, not generic blocked

@@ -97,17 +97,30 @@ def test_hr_caps_no_dispatch_or_bash():
 
 
 def test_ceo_has_browse_not_test_duty():
-    """CEO 可 browse 看产品；无 bash / TEST_RUN / 写码。自己的出证不算审批。"""
+    """CEO 可 browse 看产品；无 STAFFING/MCP_BIND/TEST_RUN。
+
+    批 A 第 0 步（2026-09-26）：CEO 增 SOURCE_WRITE/BASH_SHELL（MAIN 本地
+    写码/执行，免「一行代码走整条派单链」）；测试责任仍在 QA（TEST_RUN 拒）。
+    自己的出证不算审批（_VISUAL_STAMP_TOOLS 特判不变）。
+    """
     ceo = _agent(role="ceo", permission_type="coordinator", name="归零")
     assert infer_role_family(ceo) == "ceo"
     caps = capabilities_for(ceo)
     assert Capability.DOC_WRITE in caps
     assert Capability.BROWSE in caps
-    assert Capability.SOURCE_WRITE not in caps
-    assert Capability.BASH_SHELL not in caps
+    # 批 A 第 0 步：MAIN 本地写码 + shell
+    assert Capability.SOURCE_WRITE in caps
+    assert Capability.BASH_SHELL in caps
+    # 仍然不放开的三个能力位
+    assert Capability.STAFFING not in caps
+    assert Capability.MCP_BIND not in caps
     assert Capability.TEST_RUN not in caps
     assert Capability.BROWSER_ACCEPTANCE not in caps
-    assert tool_hard_deny(ceo, "bash")
+    # shell 族能力放行（MAIN 位包含在内）
+    assert tool_hard_deny(ceo, "bash") is None
+    assert tool_hard_deny(ceo, "bash_main") is None
+    assert tool_hard_deny(ceo, "pwsh") is None
+    assert tool_hard_deny(ceo, "pwsh_main") is None
     assert tool_hard_deny(ceo, "browse") is None
     assert tool_hard_deny(ceo, "browse_main") is None
     assert tool_hard_deny(ceo, "assert_visual")
@@ -115,21 +128,24 @@ def test_ceo_has_browse_not_test_duty():
     assert tool_hard_deny(ceo, "game_run_case_main")
     assert tool_hard_deny(ceo, "run_tests")
     assert tool_hard_deny(ceo, "hire_agent")
-    assert tool_hard_deny(ceo, "apply_patch")
-    # edit_file 能力放行（DOC_WRITE），路径硬门另测
+    assert tool_hard_deny(ceo, "bind_mcp")
+    # apply_patch 能力位放行（SOURCE_WRITE），但不在 CEO_TOOLS 可见面——
+    # 「能力过门 ≠ 工具可见」两层判定各自成立
+    assert tool_hard_deny(ceo, "apply_patch") is None
+    # edit_file 能力放行（SOURCE_WRITE+DOC_WRITE），路径硬门另测
     assert tool_hard_deny(ceo, "edit_file") is None
     assert tool_hard_deny(ceo, "dispatch_task") is None
     assert tool_hard_deny(ceo, "review_task") is None
     assert tool_hard_deny(ceo, "git_worktree_merge") is None
-    assert write_path_allowed(ceo, "src/app.ts")
+    # SOURCE_WRITE ⇒ 任意路径可写（含源码/运行时配置）
+    assert write_path_allowed(ceo, "src/app.ts") is None
     assert write_path_allowed(ceo, "docs/plan.md") is None
     # 任意文档路径（不限 docs/ 前缀）
     assert write_path_allowed(ceo, "CHANGELOG.md") is None
     assert write_path_allowed(ceo, "notes/ship-report.md") is None
     assert write_path_allowed(ceo, "src/components/README.md") is None
-    # 运行时配置 / 无扩展非文档 → other → 拒
-    assert write_path_allowed(ceo, "package.json")
-    assert write_path_allowed(ceo, "docs/hack.py")
+    assert write_path_allowed(ceo, "package.json") is None
+    assert write_path_allowed(ceo, "docs/hack.py") is None
 
 
 def test_classify_write_kind():
@@ -173,7 +189,9 @@ async def test_allowed_tools_cannot_elevate_async(monkeypatch):
     agent = _agent(
         role="ceo",
         permission_type="coordinator",
-        allowed_tools='["bash", "edit_file", "assert_visual", "game_run_case"]',
+        # 批 A 第 0 步后 bash 对 CEO 能力过门 —— 升级反例改用仍被硬门死的
+        # run_tests（TEST_RUN）/ assert_visual（出证特判）。
+        allowed_tools='["run_tests", "edit_file", "assert_visual", "game_run_case"]',
     )
 
     async def fake_get(_aid):
@@ -182,7 +200,7 @@ async def test_allowed_tools_cannot_elevate_async(monkeypatch):
     monkeypatch.setattr(
         "hiveweave.services.permission.meta_db.get_agent_by_id", fake_get
     )
-    assert await svc.evaluate("a1", "bash", {}) == "deny"
+    assert await svc.evaluate("a1", "run_tests", {}) == "deny"
     assert await svc.evaluate("a1", "assert_visual", {}) == "deny"
     assert await svc.evaluate("a1", "game_run_case", {}) == "deny"
     assert await svc.evaluate("a1", "dispatch_task", {}) == "allow"
@@ -190,8 +208,12 @@ async def test_allowed_tools_cannot_elevate_async(monkeypatch):
 
 def test_policy_hard_check_write_scope():
     ceo = _agent(role="ceo", permission_type="coordinator")
-    assert policy_service.hard_check(
-        ceo, "write_file", {"filePath": "apps/web/src/App.tsx"}
+    # 批 A 第 0 步：SOURCE_WRITE ⇒ 源码写不再被路径硬门拒（MAIN 本地改码）
+    assert (
+        policy_service.hard_check(
+            ceo, "write_file", {"filePath": "apps/web/src/App.tsx"}
+        )
+        is None
     )
     assert (
         policy_service.hard_check(
@@ -205,9 +227,40 @@ def test_policy_hard_check_write_scope():
         )
         is None
     )
-    assert policy_service.hard_check(
-        ceo, "edit_file", {"filePath": "src/main.py"}
+    assert (
+        policy_service.hard_check(ceo, "edit_file", {"filePath": "src/main.py"})
+        is None
     )
+
+
+def test_ceo_shell_tools_visible_and_gated():
+    """批 A 第 0 步：CEO 工具面拿到 shell 位（bash_main/pwsh_main 含 MAIN 位）。
+
+    判定链两层各自验证：CEO_TOOLS 静态清单（allowlist 层）+ get_tools_for_agent
+    （capability 硬门 + 宿主过滤后的真实可见面）。Windows pwsh 宿主上 bash/bash_main
+    被 host filter 换成 pwsh/pwsh_main —— 按宿主实际暴露断言，不写死平台。
+    """
+    from hiveweave.services.permission import CEO_TOOLS
+    from hiveweave.services.host_env import host_hidden_tools
+
+    for t in ("bash", "bash_main", "pwsh", "pwsh_main", "write_file", "edit_file"):
+        assert t in CEO_TOOLS
+    # 仍不可见的写码/测试协作工具（能力位即使过门，allowlist 也不暴露）
+    for t in ("apply_patch", "run_tests", "spawn_subagent", "generate_image",
+              "job_kill", "python_script", "run_command"):
+        assert t not in CEO_TOOLS
+
+    ceo = _agent(role="ceo", permission_type="coordinator")
+    visible = set(PermissionService().get_tools_for_agent(ceo))
+    hidden = host_hidden_tools()
+    for t in ("bash", "bash_main", "pwsh", "pwsh_main"):
+        if t in hidden:
+            assert t not in visible, t
+        else:
+            assert t in visible, t
+    assert "write_file" in visible and "edit_file" in visible
+    # run_tests 能力硬门 + 不在 CEO_TOOLS，双层面都不可见
+    assert "run_tests" not in visible
 
 
 def test_hire_rejects_hr_as_parent():

@@ -48,6 +48,7 @@ from hiveweave.services.acl_sandbox.policy import (
 from hiveweave.services.acl_sandbox.sid import (
     cache_sid,
     extra_sid,
+    git_main_sid,
     git_sid,
     shared_sid,
     worktree_sid,
@@ -605,18 +606,49 @@ def _seal_subject_sids(policy) -> set[str]:
     return {s for s in sids if s}
 
 
-def _agent_aces_leaking(path: str) -> list[str]:
+def _agent_aces_leaking(path: str, *, allow_create_sid: str | None = None) -> list[str]:
     """读回复核：该路径上仍带写/删/改 DACL 位的**允许**能力 SID。
 
     只算 allow：deny（父目录禁删子项）本来就是我们要的形态。
+
+    `allow_create_sid`（批 A 第 0 步，2026-09-26）：**仅限 `.git` 根**的读回
+    调用传入 MAIN gitdir 数据面 SID —— 该 SID 允许恰好两条 ACE（见
+    `grant_git_main_dir_aces`）：非继承创建位（**掩码+旗标双精确**豁免，
+    flags 必须为 0）+ OI|IO|NP 继承删/写位（INHERIT_ONLY 本就对本对象零
+    生效，仅在传入本参数的读回里跳过 IO 形态）。其余任何写位形态（同一
+    SID 的更宽掩码、换了旗标的同掩码、其他 SID 的一切写位）照旧判泄漏
+    fail-closed。config/config.worktree/hooks/指针的封条读回**不传**该
+    参数（保持严格——hooks 上若出现该 SID 的 IO 惰性副本，由封条阶段
+    摘除，见 `_seal_git_bootstrap_files` ②b）。
     """
-    from hiveweave.services.acl_sandbox.grant import ACE_ALLOWED
+    from hiveweave.services.acl_sandbox.grant import (
+        ACE_ALLOWED,
+        GIT_MAIN_CREATE_MASK,
+        _INHERIT_ONLY_ACE,
+    )
+
+    # 批 A 第 0 步审计修订（P2-1）：INHERIT_ONLY 的 ACE 对**本对象**不授予
+    # 任何访问权（只供子项继承）——但这一「不算泄漏」的宽容**仅限传入了
+    # `allow_create_sid` 的 `.git` 根读回**：那里 OI|IO|NP 数据面 ACE 以
+    # inherit-only 形态出现在子目录 DACL 里是预期形态。config/config.worktree/
+    # hooks/指针的读回不传该参数 ⇒ 任何 IO 形态 ACE 一律照旧判泄漏
+    # （fail-closed：将来若有人授出「无 NP 的可继承宽授」，这里会 loud）。
+    io_skip = allow_create_sid is not None
 
     leaking = []
-    for ace_type, _f, mask, sid in _grant_aces(path):
-        if ace_type == ACE_ALLOWED and _is_agent_sid(sid) and (
-                mask & _SEAL_WRITE_BITS):
-            leaking.append(sid)
+    for ace_type, ace_flags, mask, sid in _grant_aces(path):
+        if ace_type != ACE_ALLOWED or not _is_agent_sid(sid):
+            continue
+        if io_skip and (ace_flags & _INHERIT_ONLY_ACE):
+            continue
+        if not (mask & _SEAL_WRITE_BITS):
+            continue
+        # 豁免**精确到旗标**：创建位必须是非继承形态（flags=0）。同一
+        # (SID, 掩码) 换上任何继承旗标（如 OI|CI）都会在这里判泄漏。
+        if (allow_create_sid is not None and sid == allow_create_sid
+                and mask == GIT_MAIN_CREATE_MASK and ace_flags == 0):
+            continue
+        leaking.append(sid)
     return sorted(leaking)
 
 
@@ -767,9 +799,16 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     #    （pass-2 管得住 —— 实测工作区外 create 被拒）。只封文件 ⇒ agent 一条
     #    `git config` 就把封条换成一个继承 `.git` ACE 的新文件（实测：_dbg_seal
     #    里 config 从 protected=True 变回 protected=False 且带回能力 ACE）。
-    #    ⇒ 把写面从「`.git` 整棵」收成「git 真正需要写的子目录」。
+    #    ⇒ 把写面从「`.git` 整棵」收成「git 真正需要的子目录 + 批 A 第 0 步的
+    #    窄创建位（见下方 allow_create_sid）」。
     await agrant.seal_agent_aces_async(git_dir, sids)
-    leaking_root = _agent_aces_leaking(git_dir)
+    # 批 A 第 0 步（2026-09-26）：`.git` 根的读回豁免**仅** git_main_sid 的
+    # 两条精确形态 ACE（`grant_git_main_dir_aces` 落的：非继承创建位 +
+    # OI|IO 继承删/写位，见 `_agent_aces_leaking`）。没有它们，MAIN 边界的
+    # 受限 git 连 index.lock 都建不出来（git checkout/add 在主树全废）；
+    # 没有精确匹配，任何宽授都会从这里 fail-closed。
+    leaking_root = _agent_aces_leaking(
+        git_dir, allow_create_sid=git_main_sid(project))
     if leaking_root:
         raise SandboxUnavailableError(
             f"seal read-back failed: {git_dir} 仍可被 agent 写 {leaking_root} "
@@ -793,6 +832,39 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     #    （已前置到本函数之上且改成「先读、非 false 才写」）。
     for name in ("config", "config.worktree"):
         await seal_file(os.path.join(git_dir, name), lock_against_delete=True)
+
+    # ②b hooks 载体加固（批 A 第 0 步，2026-09-26）：`.git` 根拿到窄创建位后，
+    #    **缺失的 `hooks/` 会变成 agent 可自建的目录**（git init 模板缺失/被清
+    #    理过的仓库）—— agent 建 hooks/ 投放 hook 文件 = GitSpawn RCE 复活。
+    #    ⇒ 不存在就平台先建空目录（git 对空 hooks 目录是合法形态），再封条；
+    #      已存在但残留能力 SID 写 ACE 的（早期宽授时代的继承残留）一并补封。
+    #    ⚠ seal 的 subject 集要**并上 git_main_sid**：NP 传播会把 OI|IO|NP ACE
+    #      的 **IO 惰性副本**落到 hooks 的 DACL 里（对本目录零生效、无法向
+    #      hook 文件传播，但 hooks 读回严格 —— 审计 P2-1 —— 不豁免 IO 形态，
+    #      必须真的摘掉）；摘除零损失（NP 已断绝它对 hook 文件的一切作用），
+    #      且 seal 顺带置 PROTECTED ⇒ 下一轮 `.git` 传播进不来，稳态零写盘。
+    #    读回不传豁免 —— hooks 上任何能力 SID 写位（含任何 IO 形态）都算泄漏。
+    hooks_dir = os.path.join(git_dir, "hooks")
+    if not os.path.isdir(hooks_dir):
+        try:
+            os.makedirs(hooks_dir, exist_ok=True)
+            changed.append("create:hooks")
+        except OSError as exc:
+            raise SandboxUnavailableError(
+                f"cannot create git hooks placeholder {hooks_dir}: {exc}. "
+                f"`hooks/` 缺席时 agent 可自建并投放 hook（RCE 载体），拒绝继续",
+            ) from exc
+    if _agent_aces_leaking(hooks_dir):
+        await agrant.seal_agent_aces_async(
+            hooks_dir, sids | {git_main_sid(project)})
+        changed.append("seal:hooks")
+        leaking_hooks = _agent_aces_leaking(hooks_dir)
+        if leaking_hooks:
+            raise SandboxUnavailableError(
+                f"seal read-back failed: {hooks_dir} 仍有能力 SID 写位 "
+                f"{leaking_hooks} —— hooks 是执行载体，拒绝继续执行 agent 命令",
+                platform_side=True,
+            )
 
     # ③ 每个 worktree 的 gitdir：本身要继续可写（agent 的 index/index.lock 在
     #    那里），故这里封的 `config.worktree` / `commondir` **只是提高门槛**：
@@ -910,6 +982,26 @@ async def _ensure_standing_grants(policy, agrant: _AsyncGrant) -> None:
         # git 真正需要写的子目录（objects/refs/logs + 各 worktree gitdir）。
         # P0-3：**接住返回值** —— 封条函数说的话是执行阶段判「封条拒绝」的唯一依据。
         _remember_sealed(policy, await _seal_git_bootstrap_files(policy, agrant))
+
+        # 批 A 第 0 步（2026-09-26）：MAIN gitdir 数据面 —— 仅 MAIN 边界
+        # （boundary == project：CEO/HR/bash_main）的令牌携带 git_main_sid。
+        # config/config.worktree/hooks 的封条**原样保留**：两条窄 ACE 都不
+        # 触及它们（创建位非继承；继承位 OI-only 不进子目录，且 config 已
+        # PROTECTED 拒绝一切继承）；hooks 缺席已由封条函数的 ②b 先建+先封。
+        if os.path.realpath(policy.boundary_root) == project:
+            # 两条窄 ACE 落在 `.git` 根（见 grant_git_main_dir_aces）：直接子
+            # 文件（index/HEAD/packed-refs/COMMIT_EDITMSG/各 *.lock…）经 OI|IO|NP
+            # 继承拿到写/删位 —— 无需逐文件枚举，孙代（info/worktrees/hooks 内）
+            # 被 NP 断绝。
+            await asyncio.to_thread(
+                WriteGrant.grant_git_main_dir_aces, git_path,
+                git_main_sid(project))
+            # `worktrees/**`：注册目录本身授 OI/CI（各 gitdir 已在封条函数里
+            # 按目录逐个授过 git_sid；本条让 MAIN 侧可建/修 gitdir 注册项）。
+            wt_root = os.path.join(git_path, "worktrees")
+            if os.path.isdir(wt_root):
+                await _grant_if_missing(
+                    wt_root, git_main_sid(project), GRANT_MASK, agrant)
 
     cache_dir = policy.cache_dir
     if not os.path.isdir(cache_dir):

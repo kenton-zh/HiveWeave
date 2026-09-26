@@ -172,6 +172,7 @@ def test_write_path_allows_reports_and_drafts_for_ceo():
     assert write_path_allowed(
         ceo, "/d/PC_AI/Project/X/.hiveweave/shared/s.md"
     ) is None
-    deny = write_path_allowed(ceo, "src/app.py")
-    assert deny is not None
-    assert "doc_write" in deny or "kind=source" in deny
+    # 批 A 第 0 步（2026-09-26）：SOURCE_WRITE 落地 ⇒ 源码路径一并放行
+    # （旧契约「kind=source 拒」作废；reports/drafts/shared 白名单语义被
+    #  SOURCE_WRITE 的「任意路径可写」覆盖，结果不变）。
+    assert write_path_allowed(ceo, "src/app.py") is None

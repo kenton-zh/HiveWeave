@@ -76,6 +76,24 @@ def test_build_write_sids_project_root_separate_from_boundary(tmp_path) -> None:
     assert a[2] == b[2]  # git SID 同
 
 
+def test_build_write_sids_git_main_only_on_main_boundary(tmp_path) -> None:
+    """批 A 第 0 步：gitmain SID 仅 MAIN 边界携带（boundary == project）。
+
+    worktree 令牌拿不到主树 `.git` 根的数据面/创建位 —— 它们的 index 在自己
+    gitdir（git_sid 已授）；MAIN 写面属于在 MAIN 干活的角色（CEO/HR/bash_main）。
+    """
+    from hiveweave.services.acl_sandbox.sid import git_main_sid
+
+    project = str(tmp_path)
+    t = temp_sid(str(tmp_path / "t"))
+    main_sids = build_write_sids(project, project, t)
+    wt_sids = build_write_sids(str(tmp_path / "wt"), project, t)
+    assert git_main_sid(project) in main_sids
+    assert git_main_sid(project) not in wt_sids
+    # 域分离：gitmain 不与其余任何域撞车
+    assert len(set(main_sids)) == len(main_sids)
+
+
 def test_build_write_sids_extra_dirs(tmp_path) -> None:
     """附加可写目录（§5.5b②）追加 extra SID，域前缀独立。"""
     boundary = str(tmp_path)
@@ -84,9 +102,13 @@ def test_build_write_sids_extra_dirs(tmp_path) -> None:
     t = temp_sid(str(tmp_path / "t"))
     sids = build_write_sids(boundary, project, t, extra_dirs=(extra,))
     assert sids[-1] == extra_sid(extra)
-    # extra SID 与其余域不撞：worktree + cache + git + temp + **shared** + extra = 6
-    # （2026-09-22 P2-2 起项目根边界也带 shared ⇒ 比旧的 5 多一个）
-    assert len(set(sids)) == 6
+    # extra SID 与其余域不撞：worktree + cache + git + temp + gitmain + shared
+    # + extra = 7（MAIN 边界：2026-09-22 P2-2 起带 shared；批 A 第 0 步起带
+    # gitmain。worktree 边界无 gitmain ⇒ 仍是 6）
+    assert len(set(sids)) == 7
+    wt_sids = build_write_sids(str(tmp_path / "wt"), project, t,
+                               extra_dirs=(extra,))
+    assert len(set(wt_sids)) == 6
 
 
 def test_resolve_temp_dir_nesting(tmp_path) -> None:
@@ -108,11 +130,12 @@ def test_resolve_policy_full(tmp_path) -> None:
     assert p.boundary_root == str(tmp_path)
     assert p.project_root == str(tmp_path)  # 缺省 project_workspace_path → 回退边界
     assert p.temp_dir == resolve_temp_dir(str(tmp_path), "A001")
-    # 39 审计 P0-1：write_sids 顺序 = [worktree, cache, git, temp, shared, venv]
+    # 39 审计 P0-1：write_sids 顺序 = [worktree, cache, git, temp, gitmain,
+    # shared, venv]（gitmain 为批 A 第 0 步新增，仅 MAIN 边界携带）
     assert p.temp_sid == p.write_sids[3]
     assert p.venv_sid_str in p.write_sids
     assert p.venv_dir == str(tmp_path / ".venv")
-    assert len(p.write_sids) == 6
+    assert len(p.write_sids) == 7
     # P2-2（2026-09-22）：项目根边界（root == project）**也带** shared SID ——
     # 网盘（`.hiveweave/shared`）要对 CEO/HR 同样可写。授予面仍只在 shared 子树。
     assert p.shared_sid_str == shared_sid(str(tmp_path))

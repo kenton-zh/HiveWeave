@@ -44,6 +44,20 @@ def git_sid(workspace_path: str) -> str:
     return _digest_sid("git", workspace_path)
 
 
+def git_main_sid(project_root: str) -> str:
+    """MAIN gitdir 数据面（`.git` 根下 index/HEAD/packed-refs + index.lock 等
+    锁文件的创建），批 A 第 0 步（2026-09-26）。
+
+    **只授给 MAIN 边界的令牌**（boundary == project：CEO/HR/bash_main）——
+    worktree agent 的 index 在自己的 gitdir（已有 git_sid 授予），不需要也不应
+    拿到主树 `.git` 根的写面。域前缀 `gitmain` 防与 git/worktree/cache 撞车；
+    **刻意不进封条的 subject 集**（`service._seal_subject_sids`）：封条只摘
+    它认识的 subject，本 SID 的 ACE 才能在 `.git` 根上稳定存活（豁免范围由
+    `_agent_aces_leaking` 的精确掩码匹配收紧，见 service.py）。
+    """
+    return _digest_sid("gitmain", project_root)
+
+
 def shared_sid(workspace_path: str) -> str:
     """项目共享契约区 `.hiveweave/shared/`（s3c09 git×ACL 死锁修复）。
 

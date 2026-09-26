@@ -2075,9 +2075,10 @@ class MessageUserParams(BaseModel):
 _MESSAGE_USER_MAX_IMAGES = 5
 _MESSAGE_USER_MAX_IMAGE_CHARS = 2_800_000
 
-# 报告截图直传（2026-09-05）：CEO 无 bash/SOURCE_WRITE（硬门），无法自己把
-# 验收截图转 base64 —— images 允许直接传项目 `.hiveweave/reports/` 下的截图
-# 路径，平台读文件转 data URL 内联（与既有 data URL 同形态，前端零改动）。
+# 报告截图直传（2026-09-05，当时 CEO 无 bash/SOURCE_WRITE；批 A 第 0 步后
+# CEO 有 shell，但受限令牌不配做 base64 转换这类平台杂务）—— images 允许直接
+# 传项目 `.hiveweave/reports/` 下的截图路径，平台读文件转 data URL 内联
+# （与既有 data URL 同形态，前端零改动）。
 _MESSAGE_USER_REPORT_PREFIX = ".hiveweave/reports/"
 _MESSAGE_USER_REPORT_IMAGE_EXTS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp",
@@ -2666,7 +2667,7 @@ async def message_user_tool(
     # 件3（agent→用户发图 2026-09-05）：可选 images 校验（≤5 张、单张
     # ~2MB 软上限），超限报错并附处方（压缩/降张数）。
     # 报告截图直传（2026-09-05）：`.hiveweave/reports/` 下截图路径在此处
-    # 由平台读文件转 data URL 内联（CEO 无 bash/SOURCE_WRITE，转不了 base64）。
+    # 由平台读文件转 data URL 内联（与 CEO 是否有 shell 无关，平台内联更省令牌）。
     images = params.images or []
     if images:
         # 报告截图读文件+b64 最坏 ~10MiB 同步 IO：to_thread 防阻塞事件循环。
