@@ -234,9 +234,11 @@ async def test_ceo_can_browse_and_shell_but_not_assert(svc, monkeypatch):
 
 
 def test_ceo_tool_list_excludes_code_collab_tools(svc):
-    """批 A 第 0 步：shell 位可见（按宿主形态）；apply_patch/run_tests/出证类不可见。
+    """批 A 第 0 步 + 追平单兵补齐：shell 位可见（按宿主形态）；文件操作六件套
+    随「先追平单兵」进可见集；run_tests/出证类仍不可见。
 
-    apply_patch 能力位虽过（SOURCE_WRITE），但 allowlist 不暴露 —— 两层判定各自成立。
+    apply_patch 等能力位（SOURCE_WRITE）与 allowlist 现已同时放行；仍排除的
+    是 TEST_RUN 系（run_tests 经 bash 覆盖）与 spawn_subagent（派单链替代）。
     """
     tools = svc.get_tools_for_agent(_ceo())
     from hiveweave.services.host_env import host_hidden_tools
@@ -247,9 +249,13 @@ def test_ceo_tool_list_excludes_code_collab_tools(svc):
             assert t not in tools, t
         else:
             assert t in tools, t
-    for t in ("apply_patch", "run_tests", "game_run_case",
+    for t in ("run_tests", "game_run_case",
               "game_run_case_main", "assert_visual"):
         assert t not in tools
+    # 追平单兵：文件操作六件套可见（单兵对照 opencode registry 面）
+    for t in ("apply_patch", "delete_file", "move_file",
+              "create_directory", "delete_directory", "search_files"):
+        assert t in tools, t
     assert "browse" in tools
     assert "browse_main" in tools
     # edit_file 在工具表内；SOURCE_WRITE 落地后源码路径也不再被路径硬门拦

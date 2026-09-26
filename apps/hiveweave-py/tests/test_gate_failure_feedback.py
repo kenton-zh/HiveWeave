@@ -70,9 +70,10 @@ async def test_ceo_allowlist_deny_reason(monkeypatch):
             permission_mode="readonly",
         ),
     )
-    # 批 A 第 0 步后 bash 对 CEO 放行 —— 反例改用仍被拒的 apply_patch
+    # 批 A 第 0 步后 bash 对 CEO 放行；追平单兵后 apply_patch 也进可见集 ——
+    # 反例改用仍被拒的 spawn_subagent
     #（能力门过（SOURCE_WRITE），但不在 CEO_TOOLS ⇒ allowlist 拒，理由具体）
-    decision, reason = await svc.evaluate_detailed("a1", "apply_patch", {})
+    decision, reason = await svc.evaluate_detailed("a1", "spawn_subagent", {})
     assert decision == "deny"
     assert reason
     # hard capability text OR allowlist — either is specific, not generic blocked

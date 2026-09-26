@@ -129,8 +129,7 @@ def test_ceo_has_browse_not_test_duty():
     assert tool_hard_deny(ceo, "run_tests")
     assert tool_hard_deny(ceo, "hire_agent")
     assert tool_hard_deny(ceo, "bind_mcp")
-    # apply_patch 能力位放行（SOURCE_WRITE），但不在 CEO_TOOLS 可见面——
-    # 「能力过门 ≠ 工具可见」两层判定各自成立
+    # apply_patch 能力位放行（SOURCE_WRITE）且已进 CEO_TOOLS 可见面（追平单兵）
     assert tool_hard_deny(ceo, "apply_patch") is None
     # edit_file 能力放行（SOURCE_WRITE+DOC_WRITE），路径硬门另测
     assert tool_hard_deny(ceo, "edit_file") is None
@@ -243,10 +242,13 @@ def test_ceo_shell_tools_visible_and_gated():
     from hiveweave.services.permission import CEO_TOOLS
     from hiveweave.services.host_env import host_hidden_tools
 
-    for t in ("bash", "bash_main", "pwsh", "pwsh_main", "write_file", "edit_file"):
+    for t in ("bash", "bash_main", "pwsh", "pwsh_main", "write_file", "edit_file",
+              "apply_patch", "delete_file", "move_file",
+              "create_directory", "delete_directory", "search_files"):
         assert t in CEO_TOOLS
-    # 仍不可见的写码/测试协作工具（能力位即使过门，allowlist 也不暴露）
-    for t in ("apply_patch", "run_tests", "spawn_subagent", "generate_image",
+    # 仍不可见：TEST_RUN 系（run_tests 经 bash 覆盖）+ spawn_subagent（派单链替代）
+    # + 重执行/出证类（能力位即使过门，allowlist 也不暴露）
+    for t in ("run_tests", "spawn_subagent", "generate_image",
               "job_kill", "python_script", "run_command"):
         assert t not in CEO_TOOLS
 

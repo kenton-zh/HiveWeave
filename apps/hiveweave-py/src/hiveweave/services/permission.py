@@ -50,12 +50,16 @@ _BASE_TOOLS = frozenset({
 CEO_TOOLS = _BASE_TOOLS | frozenset({
     # CEO: 行政 + 里程碑验收 + 文档权 + MAIN 本地写码/执行（SOURCE_WRITE/
     # BASH_SHELL 能力位见 policy；写码收敛到 MAIN 工作树——CEO 无 worktree）。
-    # 仍无 run_tests（TEST_RUN）/apply_patch/spawn_subagent（写码协作仍派中层/
-    # 叶子）；browse 可看产品。关闸走 waive_attestation(单条 taskId)；
+    # 仍无 run_tests（TEST_RUN；测试执行经 bash 覆盖）/spawn_subagent（派单链
+    # 替代）；browse 可看产品。关闸走 waive_attestation(单条 taskId)；
     # 自己的出证仍不算 approve。不能一次关掉所有任务。
     "check_agent_progress",
-    # write/edit 任意路径（SOURCE_WRITE 落地后源码/配置不再被 policy 拒）
+    # write/edit 任意路径（SOURCE_WRITE 落地后源码/配置不再被 policy 拒）；
+    # 文件操作六件套（patch/删除/移动/建目录/搜索）与单兵主 agent 工具面对齐
+    # ——「先追平单兵」，写码协作仍靠提示词引导派中层/叶子，不靠工具面硬拦
     "write_file", "edit_file",
+    "apply_patch", "delete_file", "move_file",
+    "create_directory", "delete_directory", "search_files",
     # MAIN 本地 shell（bash 系在 Windows pwsh 宿主上由 host filter 换成 pwsh 系；
     # MAIN 位的 bash_main/pwsh_main 对 CEO 是默认工作位——它没有 worktree）
     "bash", "bash_main", "pwsh", "pwsh_main",
