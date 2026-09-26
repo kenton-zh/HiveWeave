@@ -1151,6 +1151,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_stop_failed", error=str(e))
 
+    # 批 G P1-7③：取消全部在武装的缓存续暖任务 —— 必须排在 stop_agent
+    # 之后（stop_agent 路径会经 _go_idle 武装新任务）。
+    try:
+        from hiveweave.services.cache_warmer import cache_warmer
+
+        cache_warmer.cancel_all()
+    except Exception as e:
+        log.warning("cache_warmer_shutdown_cancel_failed", error=str(e))
+
     # Close DBs
     await close_project_dbs()
     await close_meta_db()

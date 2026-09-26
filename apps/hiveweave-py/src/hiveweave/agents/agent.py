@@ -160,26 +160,38 @@ _sent_platform_notices: set[str] = set()
 
 
 def _cache_drifts_payload(probe: dict | None) -> str | None:
-    """把探针 verdict 的漂移明细 + 首个不一致下标序列化成 `cache_drifts` 值。
+    """把探针 verdict 的漂移明细 + 归因观测位序列化成 `cache_drifts` 值。
 
     issue-5 §3.2 ④(b)：`first_mismatch_index` 必须随明细落库。为避免 schema
     迁移，直接放进既有的 `cache_drifts` JSON：`{"drifts": [...],
-    "first_mismatch_index": N}`。无漂移时返回 None（保持"未确定"语义，
-    不把 NULL 写成 '[]' —— 与既有 test_set_run_fact_skips_none_drifts 一致）。
+    "first_mismatch_index": N}`。
     L7-b（TEST_DSH_62 观测批）：`prev_dialog_len` / `dialog_len` / `gap_s`
     一并序列化 —— 机检判「末位单点 vs 中段改写」与缓存窗口是否过期需要
     这三个观测位，此前它们只在日志里。
+    批 G P1-7④（2026-09-26）：补 pi cache-stats ``detectMiss`` 的两个归因
+    观测位 —— `idle_ms`（同 agent 相邻两次请求间隔，gap_s×1000；报告实测
+    「间隔 >60min 命中 0.25%」的判定就靠它）与 `model_changed`（换缓存域
+    布尔，cold_start 里 no_baseline 与 model_changed 两因的分诊位）。
+    **载荷何时非 None**：有漂移、或带 idle 归因（readout 产物恒带
+    `model_changed`）——`prefix_stable`+零命中的 idle 归因此前因
+    drifts 空被丢掉（正是要补的洞）。完全无观测（probe=None / 空跑）
+    仍返回 None（保持"未确定"语义）。
     """
-    drifts = (probe or {}).get("drifts") or []
-    if not drifts:
+    probe = probe or {}
+    drifts = probe.get("drifts") or []
+    idle_ms = probe.get("idle_ms")
+    model_changed = probe.get("model_changed")
+    if not drifts and idle_ms is None and model_changed is None:
         return None
     return json.dumps(
         {
             "drifts": drifts,
-            "first_mismatch_index": (probe or {}).get("first_mismatch_index"),
-            "prev_dialog_len": (probe or {}).get("prev_dialog_len"),
-            "dialog_len": (probe or {}).get("dialog_len"),
-            "gap_s": (probe or {}).get("gap_s"),
+            "first_mismatch_index": probe.get("first_mismatch_index"),
+            "prev_dialog_len": probe.get("prev_dialog_len"),
+            "dialog_len": probe.get("dialog_len"),
+            "gap_s": probe.get("gap_s"),
+            "idle_ms": idle_ms,
+            "model_changed": model_changed,
         },
         ensure_ascii=False,
     )
@@ -1392,6 +1404,7 @@ class Agent:
                         f"{model_config.get('model_id') or ''}"
                         f"@{model_config.get('base_url') or ''}"
                     ),
+                    tools=tools,  # P1-7④：tools 哈希并入指纹
                 )
                 log.info(
                     "prompt_prefix_probe",
@@ -1503,6 +1516,20 @@ class Agent:
                     self._pending_usage = []
                 pending_sink = self._pending_usage.append
 
+                # 批 G P1-7③：agent 再次活动 ⇒ 取消在武装的缓存续暖任务
+                # （cache_warmer.on_agent_settled 在 _go_idle 武装；新请求
+                # 即续跑概率 1，续暖让位给真实请求）。best-effort。
+                try:
+                    from hiveweave.services.cache_warmer import cache_warmer
+
+                    cache_warmer.cancel(self.id)
+                except Exception as warm_err:
+                    log.debug(
+                        "cache_warmer_cancel_failed",
+                        agent_id=self.id,
+                        error=str(warm_err),
+                    )
+
                 result = await streamer.stream(
                     agent_id=self.id,
                     messages=current_messages,
@@ -1552,6 +1579,34 @@ class Agent:
                     # TEST_DSH_64 #7）。置于 record_rounds/clear 之前：
                     # 清空后这个事实只剩这里能作证。
                     self._run_saw_stream_chunk = True
+                # 批 G P1-7③：记录本 attempt 最后一次真实请求快照（run 收尾
+                # `_go_idle` 据此武装跨 run 续暖）。prompt_tokens 取末轮
+                # usage（input+cache_read+cache_creation，pi
+                # ``lastPromptTokens`` 同口径）。best-effort。
+                try:
+                    from hiveweave.services.cache_warmer import cache_warmer
+
+                    _warm_last_round = (
+                        _rounds_this_attempt[-1] if _rounds_this_attempt else {}
+                    )
+                    cache_warmer.observe_request(
+                        agent_id=self.id,
+                        project_id=self.project_id,
+                        model_config=model_config,
+                        messages=list(current_messages),
+                        tools=tools,
+                        prompt_tokens=(
+                            int(_warm_last_round.get("input") or 0)
+                            + int(_warm_last_round.get("cache_read") or 0)
+                            + int(_warm_last_round.get("cache_creation") or 0)
+                        ),
+                    )
+                except Exception as warm_err:
+                    log.debug(
+                        "cache_warmer_observe_failed",
+                        agent_id=self.id,
+                        error=str(warm_err),
+                    )
                 await token_meter.record_rounds(
                     agent_id=self.id,
                     project_id=self.project_id,
@@ -3481,6 +3536,21 @@ class Agent:
                     agent_id=self.id,
                     error=str(e),
                 )
+        # 批 G P1-7③：run 收尾 = pi ``onAgentSettled`` 等价点 —— 此处武装
+        # 跨 run 缓存续暖（idle 阶段，按 TTL×90% + $0.05 预期省钱阈值决策；
+        # 下一次 _run_llm 发请求前会 cancel）。本函数是 completion 与
+        # recovery 全部出口的共同汇点，挂在它上面成功/失败 run 一视同仁
+        # （失败 run 的请求同样写过缓存条目）。best-effort。
+        try:
+            from hiveweave.services.cache_warmer import cache_warmer
+
+            cache_warmer.on_agent_settled(self.id)
+        except Exception as warm_err:
+            log.debug(
+                "cache_warmer_settle_failed",
+                agent_id=self.id,
+                error=str(warm_err),
+            )
         try:
             await self._org.touch_last_active(self.id)
         except Exception as e:

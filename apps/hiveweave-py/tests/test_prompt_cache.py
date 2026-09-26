@@ -1,7 +1,9 @@
 """Prompt cache 单元测试 — 验证 Anthropic prompt caching 断点注入。
 
 参考 opencode cache-policy.test.ts 的测试策略：
-- auto 策略在 3 个位置注入 cache_control: {type: "ephemeral"}
+- auto 策略在 3 个位置注入 cache_control: {type: "ephemeral"}（批 G
+  P1-7① 起默认带 ``ttl: "1h"``，断点值以 ``_anthropic_cache_control()``
+  为准——本文件断言与该函数逐字对齐，勿再散写字面量）
 - OpenAI/Gemini 是 no-op（隐式缓存协议）
 - 断点不超过 Anthropic 4 个上限
 
@@ -9,6 +11,7 @@
 """
 import pytest
 import json
+from hiveweave.config import settings
 from hiveweave.llm.provider import (
     ApiFormat,
     AnthropicHandler,
@@ -16,6 +19,7 @@ from hiveweave.llm.provider import (
     OpenAIHandler,
     ProviderConfig,
     ProviderFactory,
+    _anthropic_cache_control,
 )
 from hiveweave.llm.util import billed_prompt_tokens, cache_hit_percent, normalize_usage
 
@@ -75,7 +79,7 @@ class TestAnthropicCacheBreakpoints:
             supports_prompt_cache=True,
         )
         system = body["system"]
-        assert system[-1]["cache_control"] == {"type": "ephemeral"}
+        assert system[-1]["cache_control"] == _anthropic_cache_control()
         # 前面的 system block 不应被标记（本例只有一个）
 
     def test_cache_enabled_marks_latest_user_message(self):
@@ -96,7 +100,7 @@ class TestAnthropicCacheBreakpoints:
         assert last_user_msg is not None
         # 最后一个 block 应有 cache_control
         last_block = last_user_msg["content"][-1]
-        assert last_block["cache_control"] == {"type": "ephemeral"}
+        assert last_block["cache_control"] == _anthropic_cache_control()
 
     def test_cache_enabled_marks_last_tool(self):
         """auto 策略标记最后一个 tool 定义。"""
@@ -108,7 +112,7 @@ class TestAnthropicCacheBreakpoints:
             supports_prompt_cache=True,
         )
         tools = body["tools"]
-        assert tools[-1]["cache_control"] == {"type": "ephemeral"}
+        assert tools[-1]["cache_control"] == _anthropic_cache_control()
         # 前面的 tool 不应被标记
         if len(tools) > 1:
             assert "cache_control" not in tools[0]
@@ -147,6 +151,55 @@ class TestAnthropicCacheBreakpoints:
         )
         count = _cache_count(body)
         assert count == 2, f"期望 2 个断点，实际 {count}"
+
+
+# ── 批 G P1-7①：断点长 TTL（默认开，网关不兼容可一键回退）──────
+
+
+class TestCacheControlLongTtl:
+    """cache_control 长 TTL 开关（上游 pi anthropic-messages.ts:70-84）。
+
+    病灶：断点无 ttl ⇒ Anthropic 默认 5min 窗口，「唤醒间隔 > 缓存窗口」
+    （P1-7 实测 >60min 命中 0.25%）无解。默认写 ``ttl:"1h"``；
+    ``HIVEWEAVE_CACHE_CONTROL_LONG_TTL=0`` 回退无 ttl 形态。
+    """
+
+    def test_default_long_ttl_on(self):
+        assert _anthropic_cache_control() == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_switch_off_falls_back_to_plain_ephemeral(self, monkeypatch):
+        monkeypatch.setattr(settings, "cache_control_long_ttl", False)
+        assert _anthropic_cache_control() == {"type": "ephemeral"}
+
+    def test_breakpoints_carry_ttl_when_enabled(self, monkeypatch):
+        """三个断点位置（tools/system/user）都带 ttl:"1h"。"""
+        monkeypatch.setattr(settings, "cache_control_long_ttl", True)
+        handler = AnthropicHandler()
+        body = handler.build_body(
+            messages=SAMPLE_MESSAGES,
+            model_id="claude-sonnet-4-5",
+            tools=SAMPLE_TOOLS,
+            supports_prompt_cache=True,
+        )
+        expected = {"type": "ephemeral", "ttl": "1h"}
+        assert body["tools"][-1]["cache_control"] == expected
+        assert body["system"][-1]["cache_control"] == expected
+        assert body["messages"][-1]["content"][-1]["cache_control"] == expected
+
+    def test_breakpoints_plain_when_disabled(self, monkeypatch):
+        """开关关 ⇒ 三个断点回到无 ttl 形态（回退路径）。"""
+        monkeypatch.setattr(settings, "cache_control_long_ttl", False)
+        handler = AnthropicHandler()
+        body = handler.build_body(
+            messages=SAMPLE_MESSAGES,
+            model_id="claude-sonnet-4-5",
+            tools=SAMPLE_TOOLS,
+            supports_prompt_cache=True,
+        )
+        expected = {"type": "ephemeral"}
+        assert body["tools"][-1]["cache_control"] == expected
+        assert body["system"][-1]["cache_control"] == expected
+        assert body["messages"][-1]["content"][-1]["cache_control"] == expected
 
 
 # ── OpenAIHandler.build_body no-op ──────────────────────────

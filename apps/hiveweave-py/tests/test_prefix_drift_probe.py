@@ -649,3 +649,158 @@ def test_cache_drifts_payload_none_without_drifts():
 
     assert _cache_drifts_payload({"drifts": [], "first_mismatch_index": None}) is None
     assert _cache_drifts_payload(None) is None
+
+
+# ── 12. 批 G P1-7④：tools 哈希并入指纹 + idle/model 归因观测位 ──────
+
+
+TOOLS_A = [{"type": "function", "function": {"name": "read_file"}}]
+TOOLS_B = [
+    {"type": "function", "function": {"name": "read_file"}},
+    {"type": "function", "function": {"name": "write_file"}},
+]
+
+
+def test_tools_drift_detected():
+    """tools 数组漂移 ⇒ 单列 tools_drift（旧指纹漏看它 ⇒ 误归因
+    cache_window_expired，report P1-7 方法论缺口）。"""
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-tools", _build_messages(history=h, user="q2"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    h2 = h + [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    v = compare_and_record(
+        "a-tools", _build_messages(history=h2, user="q3"),
+        model_key=MODEL_KEY, tools=TOOLS_B,
+    )
+    assert "tools_drift" in v["drifts"]
+
+
+def test_tools_hash_stable_when_same_tools():
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-tools-ok", _build_messages(history=h, user="q2"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    h2 = h + [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    v = compare_and_record(
+        "a-tools-ok", _build_messages(history=h2, user="q3"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    assert v["verdict"] == "prefix_stable"
+
+
+def test_tools_drift_skipped_when_baseline_lacks_hash():
+    """基准**没有** tools_hash 键（升级前旧基准，手工删键模拟）⇒ 不对比，
+    防升级假阳。升级后的基准恒带该键（无 tools 时是 ""）。"""
+    from hiveweave.llm.streamer import probe as probe_mod
+
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-tools-legacy", _build_messages(history=h, user="q2"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    # 模拟升级前的旧基准：指纹里没有 tools_hash 键
+    probe_mod._last_request["a-tools-legacy"].pop("tools_hash", None)
+    h2 = h + [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    v = compare_and_record(
+        "a-tools-legacy", _build_messages(history=h2, user="q3"),
+        model_key=MODEL_KEY, tools=TOOLS_B,
+    )
+    assert "tools_drift" not in v["drifts"], (
+        "旧基准无键 ⇒ 无法比较 ⇒ 不得假阳（判键存在，不是判真值）"
+    )
+
+
+def test_tools_drift_reported_when_one_side_empty():
+    """P2-1（审计 2026-09-26）：一侧空一侧非空 = 真漂移，必须报 ——
+    旧写法 `prev.get(...) and fp.get(...)` 的双真值守卫把它漏掉。"""
+    # 基准无 tools（""），本次有 tools
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-tools-empty", _build_messages(history=h, user="q2"),
+        model_key=MODEL_KEY,  # 未传 tools ⇒ tools_hash=""
+    )
+    h2 = h + [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    v = compare_and_record(
+        "a-tools-empty", _build_messages(history=h2, user="q3"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    assert "tools_drift" in v["drifts"], (
+        "上次无 tools / 本次有 tools ⇒ 前缀在 tools 段分叉 ⇒ 真漂移"
+    )
+    # 反向：基准有 tools，本次无 tools
+    reset_probe()
+    compare_and_record(
+        "a-tools-drop", _build_messages(history=h, user="q2"),
+        model_key=MODEL_KEY, tools=TOOLS_A,
+    )
+    v2 = compare_and_record(
+        "a-tools-drop", _build_messages(history=h2, user="q3"),
+        model_key=MODEL_KEY,  # 本次未传 tools
+    )
+    assert "tools_drift" in v2["drifts"]
+
+
+def test_fingerprint_tools_hash_normalizes_falsy():
+    """None / [] ⇒ 同一 tools_hash=""（无 tools 与没传等价）。"""
+    fp_none = fingerprint_messages(_build_messages(), model_key=MODEL_KEY, tools=None)
+    fp_empty = fingerprint_messages(_build_messages(), model_key=MODEL_KEY, tools=[])
+    assert fp_none["tools_hash"] == fp_empty["tools_hash"] == ""
+
+
+def test_readout_carries_idle_attribution():
+    """P1-7④：readout 结果补 idle_ms / model_changed（pi detectMiss
+    归因模式）。gap_s=312.5 ⇒ idle_ms=312500；drifts 无 model_changed
+    ⇒ False。"""
+    h = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+    compare_and_record(
+        "a-idle", _build_messages(history=h, user="q2"), model_key=MODEL_KEY,
+    )
+    import time as _time
+
+    # 人工拨老基准时间戳，制造确定的 gap
+    from hiveweave.llm.streamer import probe as probe_mod
+
+    probe_mod._last_request["a-idle"]["ts"] -= 312.5
+    h2 = h + [{"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"}]
+    compare_and_record(
+        "a-idle", _build_messages(history=h2, user="q3"), model_key=MODEL_KEY,
+    )
+    r = report_cache_readout(
+        "a-idle", input_tokens=10_000, cache_read=0, cache_creation=0
+    )
+    assert r is not None
+    assert r["final"] == "cache_window_expired"
+    assert r["idle_ms"] == 312500, "idle 归因位必须随 readout 带出（落库源）"
+    assert r["model_changed"] is False
+
+
+def test_readout_model_changed_flag_true_on_model_switch():
+    compare_and_record("a-mc", _build_messages(), model_key="m1@u")
+    compare_and_record("a-mc", _build_messages(), model_key="m2@u")
+    r = report_cache_readout(
+        "a-mc", input_tokens=10, cache_read=0, cache_creation=0
+    )
+    assert r is not None
+    assert r["final"] == "cold_start"
+    assert r["model_changed"] is True, "cold_start 内必须能分诊出换缓存域"
+
+
+def test_cache_drifts_payload_carries_idle_attribution():
+    """P1-7④：idle 归因随既有 cache_drifts JSON 落库（无新列）。"""
+    import json as _json
+
+    from hiveweave.agents.agent import _cache_drifts_payload
+
+    payload = _cache_drifts_payload(
+        {"drifts": [], "gap_s": 312.5, "idle_ms": 312500, "model_changed": False}
+    )
+    assert payload is not None, (
+        "prefix_stable+零命中的 idle 归因不能因 drifts 空被丢（正是要补的洞）"
+    )
+    decoded = _json.loads(payload)
+    assert decoded["idle_ms"] == 312500
+    assert decoded["model_changed"] is False
+    assert decoded["drifts"] == []

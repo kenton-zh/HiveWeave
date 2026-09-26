@@ -122,6 +122,25 @@ def _apply_opencode_gateway_headers(
     )
 
 
+# ── cache_control 断点长 TTL（批 G P1-7①，2026-09-26）─────────────
+# 上游机制（pi `packages/ai/src/api/anthropic-messages.ts:70-84`，HEAD
+# 2b0a123de）：``PI_CACHE_RETENTION=long`` ⇒ cache_control 带 ``ttl: "1h"``
+# （原话：``cacheControl: { type: "ephemeral", ...(ttl && { ttl }) }``）。
+# 本仓无 per-model compat 门控（pi 还有 ``supportsLongCacheRetention``），
+# 退化为全局开关：默认开；网关对 ttl 字段不兼容时
+# ``HIVEWEAVE_CACHE_CONTROL_LONG_TTL=0`` 一键回退为无 ttl 的 5min 断点。
+def _anthropic_cache_control() -> dict[str, str]:
+    """Anthropic cache_control 断点值（三处写入点共用，勿散写字面量）。"""
+    from hiveweave.config import settings
+
+    if getattr(settings, "cache_control_long_ttl", True):
+        # 1h TTL：写入按 2× 输入价计费（Anthropic 官方口径），换
+        # 「唤醒间隔 > 5min 缓存窗口」场景的前缀命中（P1-7 实测
+        # >60min 命中 0.25%）。
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
+
+
 # ── Format Handler (Strategy Pattern) ──────────────────────────
 
 
@@ -775,7 +794,7 @@ class AnthropicHandler(FormatHandler):
             body["tools"] = self.normalize_tools(tools)
             # 标记最后一个 tool 的 cache_control（缓存 tools schema）
             if supports_prompt_cache and body["tools"]:
-                body["tools"][-1]["cache_control"] = {"type": "ephemeral"}
+                body["tools"][-1]["cache_control"] = _anthropic_cache_control()
 
         # Thinking support — dialect first-class; empty effort still enables
         # (ModelConfigPage used to omit effort and this branch never fired).
@@ -880,7 +899,7 @@ class AnthropicHandler(FormatHandler):
         if system_blocks:
             last_system = system_blocks[-1]
             if "cache_control" not in last_system:
-                last_system["cache_control"] = {"type": "ephemeral"}
+                last_system["cache_control"] = _anthropic_cache_control()
 
         # 断点 2: 最后一条 user 消息的最后一个 text block
         # 逆序找最后一条 user 消息
@@ -899,7 +918,7 @@ class AnthropicHandler(FormatHandler):
             mark_idx = text_idx if text_idx >= 0 else len(blocks) - 1
             target = blocks[mark_idx]
             if isinstance(target, dict) and "cache_control" not in target:
-                target["cache_control"] = {"type": "ephemeral"}
+                target["cache_control"] = _anthropic_cache_control()
             break  # 只标记最后一条 user 消息
 
     def normalize_tools(self, tools: list[dict]) -> list[dict]:

@@ -604,7 +604,11 @@ class ToolLoopMixin:
             try:
                 from hiveweave.llm.streamer.probe import compare_and_record
 
-                compare_and_record(agent_id, messages, slot="run_inner")
+                # P1-7④（2026-09-26）：run 内请求同样带 tools 哈希
+                # （run_inner 不覆盖首请求 verdict，只在真漂移时立粘性标记）。
+                compare_and_record(
+                    agent_id, messages, slot="run_inner", tools=tools
+                )
             except Exception as probe_err:  # noqa: BLE001
                 # 探针是诊断设施：失败不得影响主流程，但**不许静默**（棘轮纪律：
                 # 写明吞掉了什么）。此处只记 debug，因为下一轮还会再探。

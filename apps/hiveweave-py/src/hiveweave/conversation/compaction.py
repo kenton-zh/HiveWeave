@@ -425,7 +425,19 @@ async def _call_compactor_llm(
         return None
     provider = config.api_format.value
     url = config.build_url()
-    headers = config.build_headers()
+    # ⭐ 批 G P1-7②（2026-09-26）：压缩请求与会话**同 session_id** ⇒ 同缓存域。
+    # 病灶：`build_headers()` 无参 → opencode 网关的 x-opencode-session 落到
+    # 模块级 uuid4 兜底（provider.py `_opencode_fallback_session`）⇒ 压缩
+    # 与主链路**不同会话路由**，前缀缓存域不同 ⇒ 61 次压缩请求 cache_read
+    # 恒 0（report P1-7）。主链路是 `build_headers(session_id=agent_id)`
+    # （llm/streamer/http_stream.py:272）——这里对齐同一取值。
+    # 上游机制（pi `packages/coding-agent/src/core/compaction/compaction.ts:649-655`
+    # 与 :985 注释，HEAD 2b0a123de）："Reuse caller-supplied routing when
+    # available; callers without a session ID … receive a fresh routing ID"。
+    # ⚠ 裁决=需适配：pi 压缩走 `cacheRetention:"none"`（一次性摘要不写缓存），
+    # 本仓**有意不用**——P1-2 起压缩请求带主前缀+真实 tools，目标就是命中
+    # 主链路前缀缓存（省压缩侧 input 钱），故同 session 而非关缓存。
+    headers = config.build_headers(session_id=agent_id)
     budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
 
     for attempt in (1, 2):
@@ -476,7 +488,13 @@ async def _call_compactor_llm(
                 # 透传 cache 写入原字段：仅在上游真的带值时加键 ——
                 # usage_has_cache_creation_field 按键存在判定 reported，
                 # 恒加键会把「没回传」误标成「真回传 0」（42 轮 P2-9）。
+                # ⭐ 批 G P1-2（审计 2026-09-26）：anthropic 的
+                # ``cache_read_input_tokens`` 必须映射进 raw["cache_read"]
+                # （llm/util.openai_wire_cache_read 的兜底键）——漏映射 ⇒
+                # anthropic 压缩请求的命中被记成 cache_read=0，恰好打在
+                # P1-7②「压缩 cache_read 由 0 变正」的验收口径上。
                 for wire_field, src in (
+                    ("cache_read", "cache_read_input_tokens"),
                     ("cache_creation", "cache_creation_input_tokens"),
                     ("cache_creation_tokens", "cache_creation_tokens"),
                 ):

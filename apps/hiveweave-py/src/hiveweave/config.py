@@ -122,6 +122,21 @@ class Settings(BaseSettings):
     # （TEST18 巡检 P0），且解耦 agent 主模型故障与压缩故障。
     compactor_model_id: str = ""
 
+    # 批 G P1-7①（2026-09-26）：cache_control 断点长 TTL（默认开）。
+    # 开=Anthropic 协议断点写 {"type":"ephemeral","ttl":"1h"}（上游 pi
+    # PI_CACHE_RETENTION=long 同款，1h 写入按 2× 输入计费）；关=回退
+    # {"type":"ephemeral"}（默认 5min 窗口）。
+    # ⚠ 风险与回退：opencode/ark 等网关对 cache_control 里的未知字段 ttl
+    # 的容忍度**未实测**——若网关严格校验并 400，用
+    # HIVEWEAVE_CACHE_CONTROL_LONG_TTL=0（或 false/off）一键回退。
+    cache_control_long_ttl: bool = True
+
+    # 批 G P1-7③（2026-09-26）：跨 run 续暖 cache-warmer（默认开）。
+    # agent run 收尾后按 TTL×90% 用会话前缀发 min-token 真实请求续住
+    # provider 前缀缓存（治「唤醒间隔 > 缓存窗口」的命中率坍缩）。
+    # HIVEWEAVE_CACHE_WARMER_ENABLED=0 关闭。
+    cache_warmer_enabled: bool = True
+
     # Round-robin across active models to spread rate limits (default on)
     model_pool_enabled: bool = True
 

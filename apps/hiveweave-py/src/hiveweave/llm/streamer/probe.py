@@ -10,6 +10,11 @@ run 首请求 ``cache_read=0``，零命中 input 合计 1,742,881 tokens。R3 �
 - ``no_baseline``       无对比基准（agent 首个 run / 后端重启后首个 run）
 - ``model_changed``     ``model_id@base_url`` 变化（换缓存域；不同模型本无
                         前缀可比，属配置责任，仅记录）
+- ``tools_drift``       tools 定义数组哈希变化（P1-7④，2026-09-26：tools
+                        逐 run 重建，权限模式/family 查表翻转会真漂移并
+                        打断前缀命中；旧指纹漏看它 ⇒ 零命中被误归因为
+                        ``cache_window_expired``。基准侧无 tools_hash
+                        （升级前旧基准）时不对比，防升级假阳）
 - ``identity_drift``    System1 身份段字节变化（异常——identity 应纯静态）
 - ``compacted_drift``   compacted 摘要段变化（伴随 compaction/prune 属预期
                         ——摘要只在压缩触发时变更；无压缩事件时异常）
@@ -169,9 +174,19 @@ def _split_segments(
 
 
 def fingerprint_messages(
-    messages: list[dict], *, model_key: str
+    messages: list[dict],
+    *,
+    model_key: str,
+    tools: list[dict] | None = None,
 ) -> dict[str, Any]:
-    """计算首请求指纹（纯函数，无副作用）。"""
+    """计算首请求指纹（纯函数，无副作用）。
+
+    批 G P1-7④（2026-09-26）：**tools 数组哈希并入指纹**。报告方法论缺口：
+    tools 由 `agent._get_tool_definitions()` 逐 run 重建（family/mode 查表
+    结果可随权限模式翻转而漂移），旧指纹只看 messages —— tools 漂移造成的
+    零命中会被误归因为 `cache_window_expired`（平台侧不可修）。
+    falsy（None/[]）归一为 ""：无 tools 与没传 tools 是同一状态。
+    """
     s1_hash, compacted_hash, dialog = _split_segments(messages)
     return {
         "model_key": model_key,
@@ -179,6 +194,7 @@ def fingerprint_messages(
         "compacted_hash": compacted_hash,
         "dialog_hashes": [_h(m) for m in dialog],
         "dialog_len": len(dialog),
+        "tools_hash": _h(tools) if tools else "",
         "ts": time.time(),
     }
 
@@ -190,6 +206,7 @@ def compare_and_record(
     model_key: str | None = None,
     now: float | None = None,
     slot: str = "run_first",
+    tools: list[dict] | None = None,
 ) -> dict[str, Any]:
     """与该 agent 上次 run 首请求指纹对比，更新基准，返回漂移分类。
 
@@ -202,11 +219,14 @@ def compare_and_record(
     - ``run_inner``：**不覆盖**首请求的 verdict，只在**真漂移**时把粘性标记
       `_inner_drift` 立起来 ⇒ 让「本 run 自己改写过前缀」这件事能被归因。
     ⚠ `model_key` 在 run 内路径可为 None ⇒ 复用基准里的那个（streamer 拿不到 model_key）。
+    ``tools``（P1-7④，2026-09-26）：本次请求的 tools 定义 —— 哈希进指纹，
+    参与漂移分类（``tools_drift``）。基准侧无 tools_hash（升级前的旧基准）
+    时不对比，避免升级首 run 假阳。
     """
     prev = _last_request.get(agent_id)
     if model_key is None:
         model_key = str((prev or {}).get("model_key") or "")
-    fp = fingerprint_messages(messages, model_key=model_key)
+    fp = fingerprint_messages(messages, model_key=model_key, tools=tools)
     if now is not None:
         fp["ts"] = now
     if slot == "run_first" or prev is None:
@@ -230,6 +250,13 @@ def compare_and_record(
         drifts.append("model_changed")
     if prev["identity_hash"] != fp["identity_hash"]:
         drifts.append("identity_drift")
+    # tools 数组漂移（P1-7④）。判键存在而非判真值（P2-1，审计 2026-09-26）：
+    # 旧基准（升级前）**没有** tools_hash 键 ⇒ 跳过，防升级假阳；升级后的
+    # 基准恒带该键（无 tools 时是 ""）⇒ 直接比值 —— 「一侧空一侧非空」是
+    # 真漂移（此前 run 无 tools、本次有 tools ⇒ 前缀在 tools 段分叉），
+    # 旧写法 `prev.get(...) and fp.get(...)` 把它漏掉。
+    if "tools_hash" in prev and prev["tools_hash"] != fp.get("tools_hash", ""):
+        drifts.append("tools_drift")
     # compacted 仅在两侧都被识别为独立摘要段时对比：识别状态翻转
     # （如 run1 无 S2 使 C 被排除、run2 出现 S2 后同一 C 被计入）是
     # 切分歧义而非真实漂移，不报。摘要从无到有（首次压缩）伴随
@@ -385,6 +412,17 @@ def report_cache_readout(
         "cache_creation": cache_creation,
         "cache_hit_ratio": round(ratio, 4),
     }
+    # 批 G P1-7④（2026-09-26）：按 pi cache-stats ``detectMiss``（:56-90）
+    # 的归因模式补两个观测位 —— ``idle_ms``（同 agent 相邻两次请求间隔，
+    # = verdict gap_s×1000；report P1-7 实测「>60min 命中 0.25%」的判定
+    # 就靠它，`cache_window_expired` 档的机检分诊位）与 ``model_changed``
+    # （换缓存域布尔；cold_start 内分诊 no_baseline vs model_changed）。
+    # 落库走 `_cache_drifts_payload`（既有 cache_drifts JSON，无新列）。
+    _gap_s = last.get("gap_s")
+    result["idle_ms"] = (
+        int(round(_gap_s * 1000)) if isinstance(_gap_s, (int, float)) else None
+    )
+    result["model_changed"] = "model_changed" in (last.get("drifts") or [])
     log = logger.bind(agent_id=agent_id)
     log.info(
         "prompt_prefix_probe_result",
