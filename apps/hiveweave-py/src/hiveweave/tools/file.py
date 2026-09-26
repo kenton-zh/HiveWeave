@@ -911,6 +911,97 @@ def _format_size(size: int) -> str:
 
 # ── Public tool functions ──────────────────────────────────
 
+# ── 批E#3 任务5：跨树**只读**取物通道 ────────────────────────────
+# 审计（四项目慢因 2026-09-26，跨树拒绝卡）：装配缝摩擦 19 次（订正后），
+# OUT_OF_BOUNDARY 只给"别写别的树"不给"那我要的东西怎么拿"。本通道是
+# **窄**门：限本项目 worktrees、只读（read_file 独有参数）、回执注明来源
+# 树；写侧零改动（write_file 没有 tree 参数，ACL 边界原样）。
+# 上游裁决：亦无（pi 无 worktree 隔离；DSH fs-sandbox 是进程内 fence 非
+# ACL）—— 平台自造缺口需自研，故按最小面实现。
+
+
+def _resolve_cross_tree_read(
+    project_root: str, tree: str, file_path: str
+) -> tuple[str | None, str | None]:
+    """把 ``tree`` + ``file_path`` 解析到本项目该 worktree 内的绝对路径。
+
+    Returns ``(abs_path, None)`` 或 ``(None, 拒绝文案)``。拒绝文案**必带
+    处方**（批E#3 纪律）。窄通道判据（审计 P0 修复后的完整闸链）：
+
+    - ``tree`` 必须是**单个目录名**（拒 ``..`` 段 / 盘符 / 路径分隔符 /
+      绝对形态 —— pathlib join 对绝对实参整体胜出，必须在 join 前拒）；
+    - resolve 后必须仍在 ``.hiveweave/worktrees/`` 根下（防符号链接等
+      resolve 后偏移；``relative_to`` 拿逃逸后的根自比恒过，所以锚点是
+      **worktrees 根**，不是 tree_root 自己）；
+    - ``tree`` 必须真实存在；
+    - ``file_path`` 必须是相对路径、不含 ``.hiveweave`` 段（平台内部不在
+      通道内）、解析后**不得逃出该树**（``..`` / 树内符号链接皆拒）。
+    """
+    raw = (tree or "").strip()
+    tid = raw.strip("/\\")
+    if not tid:
+        return None, (
+            "Error: tree 参数为空 —— 跨树只读取物需指定目标树 id（如 "
+            "tree=\"A461-b\"）。"
+        )
+    # ① P0（独立审计 2026-09-26）：tid 只许单个目录名。pathlib 的 join 遇
+    # 绝对实参会整体胜出、``..`` 可向上越级 —— 形状必须在 join **之前**拒。
+    if (
+        "\\" in tid
+        or "/" in tid
+        or ":" in tid
+        or tid in (".", "..")
+        or Path(tid).is_absolute()
+    ):
+        return None, (
+            "Error: tree 必须是**单个 worktree 目录名**（如 "
+            "tree=\"A461-b\"）—— 不接受路径分隔符、..、盘符或绝对路径。"
+            "处方：tree 只填树 id（目录名），文件路径写在 filePath"
+            "（相对该树）。"
+        )
+    worktrees_root = (Path(project_root) / HIVEWEAVE_DIR / "worktrees").resolve()
+    tree_root = (worktrees_root / tid).resolve()
+    # ② P0：resolve 后锚定回 **worktrees 根**（不是 tree_root 自比）——
+    # 树内符号链接把 tree_root resolve 到别处时在此拒绝。
+    try:
+        tree_root.relative_to(worktrees_root)
+    except ValueError:
+        return None, (
+            f"Error: worktree '{tid}' 解析后落在 .hiveweave/worktrees/ 之外"
+            "（疑似符号链接指向树外）—— 已拒绝。"
+            "处方：树 id 以平台状态（org 树 / git worktree list）为准，"
+            "不要手造路径。"
+        )
+    if not tree_root.is_dir():
+        return None, (
+            f"Error: worktree '{tid}' 不存在于本项目的 "
+            f".hiveweave/worktrees/ —— 跨树只读通道**限本项目**的树。"
+            f"处方：树 id 以平台状态（org 树 / git worktree list）为准，"
+            f"不要凭记忆猜 id。"
+        )
+    fp = normalize_input_path(file_path)
+    candidate = Path(fp)
+    if candidate.is_absolute():
+        return None, (
+            "Error: 跨树只读通道只收相对路径 —— 传 filePath 相对该树的"
+            "路径（不要绝对路径）。"
+        )
+    if ".hiveweave" in candidate.parts:
+        return None, (
+            "Error: 跨树只读通道只覆盖项目文件 —— .hiveweave/ 是平台内部"
+            "目录，不在通道内。"
+        )
+    try:
+        full = (tree_root / candidate).resolve()
+        full.relative_to(tree_root)
+    except (OSError, ValueError):
+        return None, (
+            f"Error: Sandbox violation — \"{file_path}\" escapes worktree "
+            f"'{tid}'（跨树只读通道不得用 .. 逃出目标树）。"
+        )
+    return str(full), None
+
+
 async def read_file(
     file_path: str,
     offset: int,
@@ -921,29 +1012,52 @@ async def read_file(
     *,
     agent_id: str | None = None,
     project_id: str | None = None,
+    tree: str | None = None,
 ) -> dict[str, Any]:
     """Read a file with line numbers. Refuses binary files.
 
     Returns {success, output, error} where output is line-numbered text.
     Reads may resolve anywhere under the project root (∪ extra_read_dirs, P1);
     writes stay sandboxed to workspace_path (see write_file).
+
+    ``tree``（批E#3 任务5）：跨树**只读**取物通道 —— 指定本项目另一棵
+    worktree 的 id 时，``file_path`` 改从该树解析；回执注明来源树。
+    写侧零改动（write 工具无此参数）。
     """
     if not file_path:
         return {"success": False, "output": "",
                 "error": "Error: filePath is required"}
 
     root = project_root or infer_project_root(workspace_path)
-    full, hint = _resolve_for_read_detail(
-        workspace_path, file_path, root, extra_read_dirs
-    )
-    if hint is not None:
-        # L6（2026-09-11）：hint 只可能是「幽灵 worktree 前缀路径」——那是
-        # **模型自己写错了路径**，平台无责。此前用 blocked=True 表达，
-        # 而 blocked 的语义是「平台拒绝执行 —— not a model mistake」
-        # （result.py 的 docstring）⇒ agent 收到「不是你的 bug」信号后
-        # 在同一 run 里原地重撞（52_B 实测）。
-        # 改判 bad_args：归因落到调用方，stall 走 tool_failed。
-        return ToolResult.err(f"Error: {hint}", fact="bad_args").to_dict()
+    # P2（独立审计 2026-09-26）：tree= 与平台共享路径互斥 —— 共享产物
+    # （reports/shared/…）走 _resolve_shared_across_trees 的自动跨树查找，
+    # tree= 在那条路上会被静默忽略（参数像生效实则没生效）。显式拒绝。
+    if tree and _platform_shared_read_subdir(file_path) is not None:
+        return {"success": False, "output": "", "error": (
+            "Error: tree= 与平台共享路径互斥 —— .hiveweave/{reports,shared,"
+            "drafts,handoffs} 下的文件由读侧自动跨树查找（回执自带来源树），"
+            "不接受 tree= 参数。处方：二选一 —— 去掉 tree= 直接读共享路径，"
+            "或改传普通项目文件路径再带 tree=。"
+        )}
+    cross_tree_src: str | None = None
+    if tree:
+        # 批E#3 任务5：跨树只读通道解析（拒绝文案自带处方）。
+        full, ct_err = _resolve_cross_tree_read(root, tree, file_path)
+        if full is None:
+            return {"success": False, "output": "", "error": ct_err}
+        cross_tree_src = f"worktree {(tree or '').strip().strip('/\\')}"
+    else:
+        full, hint = _resolve_for_read_detail(
+            workspace_path, file_path, root, extra_read_dirs
+        )
+        if hint is not None:
+            # L6（2026-09-11）：hint 只可能是「幽灵 worktree 前缀路径」——那是
+            # **模型自己写错了路径**，平台无责。此前用 blocked=True 表达，
+            # 而 blocked 的语义是「平台拒绝执行 —— not a model mistake」
+            # （result.py 的 docstring）⇒ agent 收到「不是你的 bug」信号后
+            # 在同一 run 里原地重撞（52_B 实测）。
+            # 改判 bad_args：归因落到调用方，stall 走 tool_failed。
+            return ToolResult.err(f"Error: {hint}", fact="bad_args").to_dict()
     if full is None:
         return {"success": False, "output": "",
                 "error": f'Error: Sandbox violation — "{file_path}" '
@@ -1085,6 +1199,12 @@ async def read_file(
         # "written to MAIN by design"，与本批"shared 无单一权威落点"正面冲突。
         suffix += (
             f"\n\n[read from {read_tree_tag}{hit_note_for(_shared_sub)}]"
+        )
+    elif cross_tree_src is not None:
+        # 批E#3 任务5：跨树只读通道的来源树归因（回执必须注明读了哪棵树）。
+        suffix += (
+            f"\n\n[read from {cross_tree_src} via cross-tree read-only "
+            "channel — writes stay confined to your own workspace]"
         )
     record_file_version(full)
     return {"success": True, "output": body + suffix, "error": None}
@@ -1434,6 +1554,16 @@ class ReadFileParams(BaseModel):
         ge=1,
         description="Max lines to read (default: 2000).",
     )
+    tree: str | None = Field(
+        default=None,
+        description=(
+            "Optional cross-tree READ channel: id of another worktree of "
+            "THIS project (e.g. 'A461-b'). Reads <file_path> from "
+            ".hiveweave/worktrees/<tree>/ — read-only, receipt names the "
+            "source tree. Writes stay confined to your own workspace."
+        ),
+        json_schema_extra={"aliases": ["treeId", "tree_id", "worktree"]},
+    )
 
 
 class WriteFileParams(BaseModel):
@@ -1483,7 +1613,10 @@ class ListFilesParams(BaseModel):
     "read_file",
     "Reads file contents with line numbers. Relative paths resolve from your "
     "workspace. Reviewers read unmerged code at .hiveweave/worktrees/<shortId>/. "
-    "Do not use ../ for MAIN docs. Writes stay confined to your workspace.",
+    "Do not use ../ for MAIN docs. Writes stay confined to your workspace. "
+    "Cross-tree READ channel: pass tree='<worktree id>' to read a file from "
+    "another worktree of THIS project (read-only; receipt names the source "
+    "tree).",
     requires_workspace=True,
     security_level="file_op",
 )
@@ -1499,6 +1632,7 @@ async def read_file_tool(params: ReadFileParams, agent_id: str, workspace: str) 
         extra_read_dirs=extra,
         agent_id=agent_id,
         project_id=await _project_id_for_workspace(workspace),
+        tree=params.tree,
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])

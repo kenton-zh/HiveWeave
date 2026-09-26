@@ -251,6 +251,43 @@ def os_sep() -> str:
     return "\\" if sys.platform.startswith("win") else "/"
 
 
+def validate_include_shape(include: str) -> str | None:
+    """``include`` 形状校验：非法 ⇒ 返回**带替代写法**的错误文案，合法 ⇒ None。
+
+    移植自 DSH ``packages/fs/tool-fs-search/src/grep.ts:67-78 validateInclude``
+    （HEAD 477b4f420，行号现测）—— 原话（docstring）：
+    ``Reject an include that is not ONE positive glob filter: blank strings,
+    negated patterns ('!…'), and comma-separated lists. A comma inside a
+    brace group is fine — *.{ts,tsx} is one glob with alternation, not a
+    list.`` 三条报错文案逐字照搬（第三条自带处方 ``use {a,b} alternation
+    instead``）。拒绝必带处方（批E#3）：不猜改、不静默吞 —— 非法 include
+    传给 rg 会被当成字面 glob 静默零命中，agent 只能盲试。
+    """
+    inc = (include or "").strip()
+    if not inc:
+        return (
+            "include must be a non-empty glob when given "
+            "(omit the parameter entirely to search all files)"
+        )
+    if inc.startswith("!"):
+        return (
+            'include must be a positive glob filter; negated patterns '
+            '("!…") are not supported'
+        )
+    brace_depth = 0
+    for ch in inc:
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif ch == "," and brace_depth == 0:
+            return (
+                "include must be one glob, not a comma-separated list "
+                "(use {a,b} alternation instead)"
+            )
+    return None
+
+
 async def execute_grep(
     pattern: str,
     path: str,
@@ -277,6 +314,14 @@ async def execute_grep(
     if not pattern:
         return {"success": False, "output": "",
                 "error": "Error: pattern is required"}
+
+    # include 形状校验（批E#3，移植 DSH validateInclude）：非法形状显式拒绝
+    # 并给替代写法，不传给 rg 静默零命中。
+    if include:
+        inc_err = validate_include_shape(include)
+        if inc_err:
+            return {"success": False, "output": "",
+                    "error": f"Error: {inc_err}"}
 
     from hiveweave.tools.file import infer_project_root, resolve_for_read
 
@@ -371,7 +416,11 @@ class GrepParams(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     pattern: str = Field(
-        description="Regular expression pattern to search for.",
+        description=(
+            "Regular expression pattern (pure regex, passed to ripgrep "
+            "directly — no shell, no quoting: match a literal '(' with "
+            "'\\(' )."
+        ),
         json_schema_extra={"aliases": ["regex", "query", "search"]},
     )
     path: str = Field(
@@ -381,7 +430,11 @@ class GrepParams(BaseModel):
     )
     include: str = Field(
         default="",
-        description="Glob pattern to include (e.g. '*.py'). Empty means all files.",
+        description=(
+            "ONE positive glob filter (e.g. '*.py'). Comma lists and "
+            "'!' negation are rejected — use {a,b} alternation instead. "
+            "Empty means all files."
+        ),
         json_schema_extra={"aliases": ["glob", "filter"]},
     )
     exclude: str = Field(
@@ -427,7 +480,13 @@ class GrepParams(BaseModel):
 
 @tool(
     "grep",
-    "Search file contents using regex (ripgrep). Returns matching lines with file/line info.",
+    "Search file contents using regex (ripgrep). Returns matching lines with "
+    "file/line info. Contract: `pattern` is a PURE regex passed to ripgrep as "
+    "a plain argument — there is NO shell layer, so no quoting applies: do "
+    "NOT wrap the pattern in quotes, and escape regex metacharacters "
+    "yourself (match a literal paren with '\\(', a literal dot with '\\.'). "
+    "`include` is ONE positive glob (e.g. '*.py'); '!…' negation and "
+    "comma lists are rejected — use brace alternation '{a,b}'.",
     requires_workspace=True,
     security_level="standard",
 )

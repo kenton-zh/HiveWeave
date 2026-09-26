@@ -447,14 +447,18 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "read_file": {
         "description": (
             "Read a UTF-8 text file and return line-numbered content. "
-            "Use offset/limit for a slice; do not dump a huge file in one call."
+            "Use offset/limit for a slice; do not dump a huge file in one call. "
+            "Cross-tree READ channel: pass tree='<worktree id>' to read from "
+            "another worktree of THIS project (read-only; receipt names the "
+            "source tree)."
         ),
         "properties": {
             "filePath": {
                 "type": "string",
                 "aliases": ["path", "file_path", "file"],
                 "description": (
-                    "Path to read (relative to your workspace). Reviewers: "
+                    "Path to read (relative to your workspace — or, with "
+                    "tree=, relative to that worktree). Reviewers: "
                     ".hiveweave/worktrees/<shortId>/… is the assignee tree. "
                     "Do not use ../ for MAIN docs."
                 ),
@@ -463,6 +467,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": "Starting line number (0-based, default: 0)."},
             "limit": {"type": "integer", "aliases": ["maxLines", "lineLimit"],
                 "description": "Max lines to return (default: 2000)."},
+            "tree": {
+                "type": "string",
+                "aliases": ["treeId", "tree_id", "worktree"],
+                "description": (
+                    "Optional. Another worktree's id in THIS project "
+                    "(e.g. 'A461-b'): reads filePath from that tree "
+                    "(read-only). Use this instead of writing the other "
+                    "tree's path into your command — cross-tree paths are "
+                    "rejected for writes and shell."
+                ),
+            },
         },
         "required": ["filePath"],
     },
@@ -512,10 +527,22 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Search file contents with a regex. Returns matching paths and "
             "lines. Use read_file on a match for surrounding context. For "
-            "filename/glob search use search_files — not bash grep."
+            "filename/glob search use search_files — not bash grep. "
+            "Contract: pattern is a PURE regex passed to ripgrep as a plain "
+            "argument — no shell layer, so no quoting applies: do NOT wrap "
+            "it in quotes; escape metacharacters yourself (literal paren = "
+            "'\\(', literal dot = '\\.'). include is ONE positive glob; "
+            "'!' negation and comma lists are rejected — use {a,b} "
+            "alternation."
         ),
         "properties": {
-            "pattern": {"type": "string", "aliases": ["regex", "query", "search"]},
+            "pattern": {
+                "type": "string",
+                "aliases": ["regex", "query", "search"],
+                "description": (
+                    "Pure regex, no shell quoting (literal '(' = '\\(' )."
+                ),
+            },
             "path": {
                 "type": "string",
                 "aliases": ["filePath", "file", "directory", "dir"],
@@ -524,7 +551,14 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "Reviewers: .hiveweave/worktrees/<shortId>/."
                 ),
             },
-            "include": {"type": "string", "aliases": ["glob", "filter"]},
+            "include": {
+                "type": "string",
+                "aliases": ["glob", "filter"],
+                "description": (
+                    "ONE positive glob (e.g. '*.py'). '!…' and comma lists "
+                    "rejected — use {a,b} alternation."
+                ),
+            },
             "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"],
                 "description": "Max results to return (default: 500)."},
             "context": {"type": "integer", "aliases": ["contextLines", "contextAround"],
@@ -2574,6 +2608,19 @@ def _canonical_for_arg(tool_name: str, key: str, props: dict) -> str | None:
     )
 
 
+# 批E#3 任务3（审计 named rejection：'branchName': Field required）：
+# legacy 路径参数缺漏/未知回执附带的**正确形状样例**（pi validation.ts 模式
+# —— 拒绝必带处方：只说缺什么是结论，给可抄样例才是出口）。键 = 工具名。
+LEGACY_PARAM_EXAMPLES: dict[str, str] = {
+    "git_worktree_merge": (
+        '{"branchName": "hw/A461/t-1a2b3c4d", "targetBranch": "main", '
+        '"taskId": "<36-char task id>"}  — branchName accepts the full '
+        'branch name, OR the worktree alias (e.g. "A461-b"), OR pass '
+        'taskId to auto-resolve hw/<shortId>/t-<taskId[:8]>.'
+    ),
+}
+
+
 def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
     """Validate and normalize tool arguments against the schema.
 
@@ -2644,10 +2691,15 @@ def validate_tool_args(tool_name: str, args: dict) -> tuple[dict, str | None]:
     if missing:
         expected = ", ".join(f"'{r}'" for r in missing)
         received = ", ".join(f"'{k}'" for k in args.keys()) if args else "(none)"
+        example = LEGACY_PARAM_EXAMPLES.get(tool_name)
+        example_seg = (
+            f" Correct shape example (copy this): {example}" if example else ""
+        )
         return normalized, (
             f"Missing required parameters: {expected}. "
             f"You passed: {received}. "
             f"Please retry with the correct parameter names."
+            f"{example_seg}"
         )
 
     if unknown:

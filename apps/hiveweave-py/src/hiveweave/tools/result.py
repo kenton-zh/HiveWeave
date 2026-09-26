@@ -197,6 +197,11 @@ class ToolResult:
         失败必须给**（由 ``tools/fact_positions.py`` 的启动断言把关）。
         注意 ``bad_args`` 走这里而**不是** :meth:`blocked_err` —— 参数错
         是调用方的责任，标成平台护栏拒绝会让 agent 原地重撞（L6）。
+
+        ``remedy=``（批E#3 任务3，保留 extra 键）：拒绝必带处方 ——
+        一句**可执行**的下一步（模型语言，或含可抄的正确形状样例）。
+        约定：凡是「调用方能改变结果」的拒绝都应携带；纯平台故障可不带。
+        测试守卫见 ``test_rejection_remedy_guard.py``。
         """
         return cls(
             success=False, output="", error=message, extra=extra, fact=fact

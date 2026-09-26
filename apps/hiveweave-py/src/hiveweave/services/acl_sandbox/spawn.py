@@ -55,6 +55,9 @@ SW_HIDE = win32con.SW_HIDE if win32con is not None else 0
 HANDLE_FLAG_INHERIT = win32con.HANDLE_FLAG_INHERIT if win32con is not None else 0
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_INFO_CLASS = 9  # JobObjectExtendedLimitInformation
+# win32process.STILL_ACTIVE：进程未退出时 GetExitCodeProcess 返回的哨兵码。
+# 手写数值 —— non-Windows 分支 win32process 为 None，模块导入期不能取属性。
+_STILL_ACTIVE = 259
 
 
 def _require() -> None:
@@ -469,12 +472,33 @@ class LongRunningJob:
 
     @property
     def exit_code(self) -> int | None:
-        if not self._finished:
-            return None
+        """真实退出码，三态：运行中 ⇒ ``None``；已退出 ⇒ 真值；不可得 ⇒ ``None``。
+
+        批E#3（审计 P0：``_ConfinedDevProc`` 缺 ``returncode`` ⇒ ×38
+        AttributeError 的修法落点）：退出码是**独立事实**，与存活位正交 ——
+        DSH ``docs/defensive-patterns.md``「Report orthogonal outcomes
+        independently」：``Surface each independent fact (timedOut, signal,
+        exitCode) on its own; never nest one flag's report inside another's
+        branch, or a caller reads a cut-short run as a clean success.``
+
+        判据与前台路径同源（``ConfinedRunner._run_foreground_sync`` 的
+        ``GetExitCodeProcess``）。旧实现以 ``_finished``（watcher 0.25s tick
+        的 finalize）为闸 —— 进程已退出但 tick 未到的窗口内会把"已退出"
+        谎报成 ``None``；现改以 ``is_exited()``（WaitForSingleObject 直查）
+        为闸，退出即刻可读。**绝不伪造 0**（假成功）；句柄异常 /
+        ``STILL_ACTIVE``（状态位与退出码位矛盾）⇒ 如实回 ``None``（未知）。
+        """
         try:
-            return win32process.GetExitCodeProcess(self._spawned.h_proc)
-        except pywintypes.error:
+            if not self.is_exited():
+                return None
+            code = win32process.GetExitCodeProcess(self._spawned.h_proc)
+        except Exception:  # noqa: BLE001 — 句柄失效等 ⇒ 退出码不可知
             return None
+        if code == _STILL_ACTIVE:
+            # 已退出却仍报 STILL_ACTIVE（259）：Windows 句柄语义的矛盾态，
+            # 真实退出码 259 与它不可区分 ⇒ 按未知处理，不谎报。
+            return None
+        return int(code)
 
 
 _ACTIVE: list[LongRunningJob] = []

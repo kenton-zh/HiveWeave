@@ -368,7 +368,14 @@ async def apply_patch(
 
 # ── Pydantic models + @tool registration (Phase 2 migration) ──────
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    ConfigDict,
+    field_validator,
+    model_validator,
+)
 
 from .base import tool
 from .helpers import coerce_to_list
@@ -398,28 +405,43 @@ def _infer_op(patch: dict) -> str:
 
 
 class PatchItem(BaseModel):
-    """Single patch operation."""
-    model_config = ConfigDict(populate_by_name=True)
+    """Single patch operation.
+
+    批E#3（审计 P1「apply_patch 的参数形状，agent 学了两遍还是错」）：
+    **嵌套与顶层同形** —— 数组项经 ``AliasChoices`` 接受与顶层直传形态
+    **完全相同**的字段名族（camelCase / snake_case / 常见变体），同一语义
+    字段的容错收在同一层（上游裁决 pi ``packages/ai/src/utils/validation.ts``
+    ：模型侧不该为平台的字段设计付往返成本）。此前数组项只认
+    ``filePath``/``oldString``/``newString``，模型照顶层学来的
+    ``file``/``old_str`` 传 ⇒ ``'patches.#.filePath': Field required``
+    （72: 5 人/同人 3 次，73: 5 人/同人 7 次）。
+
+    ``extra="forbid"``：未知键显式报错（逐条 instancePath 点名），不再
+    静默吞掉 —— 静默忽略正是「参数形状错误率 25-32%」的放大器。
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     op: str = Field(
         description="Operation: 'add' (create), 'update' (replace), or 'delete'.",
     )
     file_path: str = Field(
-        alias="filePath",
         description="Path to the file (relative to workspace).",
-        json_schema_extra={"aliases": ["file_path", "file", "path"]},
+        validation_alias=AliasChoices("filePath", "file_path", "file", "path"),
     )
     old_string: str | None = Field(
         default=None,
-        alias="oldString",
         description="For update: text to find in the file.",
-        json_schema_extra={"aliases": ["old_string", "old_str", "oldText", "search"]},
+        validation_alias=AliasChoices(
+            "oldString", "old_string", "old_str", "oldText", "search"
+        ),
     )
     new_string: str | None = Field(
         default=None,
-        alias="newString",
         description="For update: replacement text.",
-        json_schema_extra={"aliases": ["new_string", "new_str", "newText", "replace"]},
+        validation_alias=AliasChoices(
+            "newString", "new_string", "new_str", "newText", "replace"
+        ),
     )
     content: str | None = Field(
         default=None,
@@ -428,13 +450,18 @@ class PatchItem(BaseModel):
     replace_all: bool = Field(
         default=False,
         description="If true, replace all occurrences (skip uniqueness check).",
-        json_schema_extra={"aliases": ["replaceAll"]},
+        validation_alias=AliasChoices("replaceAll", "replace_all"),
     )
 
 
 class ApplyPatchParams(BaseModel):
-    """Parameters for apply_patch tool."""
-    model_config = ConfigDict(populate_by_name=True)
+    """Parameters for apply_patch tool.
+
+    ``extra="forbid"``（批E#3）：顶层未知键显式报错并带正确形状样例
+    （见 ``apply_patch`` 的 ``param_example``），不静默吞。
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     patches: list[PatchItem] = Field(
         default_factory=list,
@@ -536,12 +563,22 @@ class EditFileParams(BaseModel):
     )
 
 
+# 参数校验失败回执附带的正确形状样例（批E#3，pi validation.ts 模式）。
+# 覆盖两类常见错形：① 顶层直传（本就支持）② patches[] 数组项（现与顶层
+# 同形容错）。样例用数组形态 —— 它是两条路的超集，照抄必成。
+_APPLY_PATCH_EXAMPLE = (
+    '{"patches": [{"op": "update", "filePath": "src/app.py", '
+    '"oldString": "old text", "newString": "new text"}]}'
+)
+
+
 @tool(
     "apply_patch",
     "Apply file patch operations (add/update/delete). Prefer this or "
     "edit_file for a small change; write_file fully replaces a file.",
     requires_workspace=True,
     security_level="file_op",
+    param_example=_APPLY_PATCH_EXAMPLE,
 )
 async def apply_patch_tool(params: ApplyPatchParams, agent_id: str, workspace: str) -> ToolResult:
     """Apply a list of patch operations."""

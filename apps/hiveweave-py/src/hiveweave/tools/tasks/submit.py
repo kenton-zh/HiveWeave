@@ -22,6 +22,21 @@ from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
 
+# ── 批E#3 任务3：拒绝必带处方（结构化 remedy）────────────────────
+# 门禁 issue 的**约定键**：``remedy`` = 一句**可执行**的下一步（模型语言）。
+# 测试守卫（test_rejection_remedy_guard）AST 扫描本文件全部 ``issues.append``
+# 字典：带 ``code`` 键的必须带 ``remedy`` —— 新增无处方拒绝分支时转红。
+# 渲染经 :func:`_fmt_issue_line` 进 dry-run 与聚合回执（结构化键 + 文案双面）。
+
+
+def _fmt_issue_line(i: dict) -> str:
+    """聚合回执里的单条门禁行：``[code] message`` + 处方行（有则附）。"""
+    line = f"- [{i.get('code', '?')}] {i.get('message', '')}"
+    remedy = i.get("remedy")
+    if remedy:
+        line += f"\n  处方: {remedy}"
+    return line
+
 # ── submit_task ─────────────────────────────────────────
 
 
@@ -425,6 +440,10 @@ async def _submit_preflight(
                         else ""
                     )
                 ),
+                "remedy": (
+                    "按上面 Do 步骤用 browse 真实执行核心交互（taskId 记得带上），"
+                    "然后原样重新 submit_task —— 平台自动附上凭证。"
+                ),
             })
         elif core_att not in attest_ids:
             attest_ids.append(core_att)
@@ -450,6 +469,11 @@ async def _submit_preflight(
                         f"Either rework until green, or acknowledge structurally "
                         f"(free-text excuses alone are not accepted)."
                     ),
+                    "remedy": (
+                        f"重新 submit_task 并带 failuresAcknowledged=[{{\"test\": "
+                        f"\"<失败用例>\", \"reason\": \"<为何非阻塞>\"}} …] "
+                        f"（至少 {required} 条，字段非空）；或先修到全绿再交。"
+                    ),
                 })
             else:
                 bad = [
@@ -462,10 +486,14 @@ async def _submit_preflight(
                     issues.append({
                         "code": "failures_acknowledged_invalid",
                         "message": (
-                            "VERIFY submit rejected: each failuresAcknowledged "
-                            "entry must be {test, reason} with non-empty fields."
-                        ),
-                    })
+                        "VERIFY submit rejected: each failuresAcknowledged "
+                        "entry must be {test, reason} with non-empty fields."
+                    ),
+                    "remedy": (
+                        '重新 submit_task，每条 entry 一律 '
+                        '{"test": "<用例名>", "reason": "<原因>"}，两字段非空。'
+                    ),
+                })
 
     if needed:
         # Waiver 短路：coordinator 已显式豁免（CLI/脚本类任务正式出口）
@@ -525,6 +553,11 @@ async def _submit_preflight(
                     issues.append({
                         "code": "attestation",
                         "message": format_umbrella_gate_hint(policy_id, err),
+                        "remedy": (
+                            "按 umbrella-gate 提示把缺失 kind 的凭证补齐后重交；"
+                            "确属本任务无法签发时，请协调者/CEO 对**这一条**任务 "
+                            "waive_attestation。"
+                        ),
                         "gate": "submit_attestation",
                         "expectedKinds": _gate_report.get("expectedKinds", []),
                         "givenKinds": _gate_report.get("givenKinds", []),
@@ -587,6 +620,12 @@ async def _submit_preflight(
                                 f"Bare testsPassed is rejected."
                             )
                         ),
+                        "remedy": (
+                            "按 Options 选一条执行（本任务 policy 对应 "
+                            "request_code_audit / browse / attest_doc_review），"
+                            "凭证到手后原样重交；确属平台侧无法签发时才走 "
+                            "waive_attestation。"
+                        ),
                         "gate": "submit_attestation",
                         "expectedKinds": _gate_report.get("expectedKinds", []),
                         "givenKinds": _gate_report.get("givenKinds", []),
@@ -612,6 +651,11 @@ async def _submit_preflight(
                             "records attestation_impossible(reason="
                             "tool_limited) itself and needs no waiver.)"
                         ),
+                        "remedy": (
+                            "等 inbox 里的自动重试成功通知（不要静默重交）；"
+                            "自动重试 5 次仍失败，才请协调者 waive_attestation"
+                            f"(taskId=\"{task_id}\", reasonKind=\"tool_failure\")。"
+                        ),
                     })
     elif params.tests_passed is not True:
         # docs_only still asks for explicit ack
@@ -621,6 +665,7 @@ async def _submit_preflight(
                 "docs_only submit still requires testsPassed=true "
                 "(note N/A in summary)."
             ),
+            "remedy": "重新 submit_task 并带 testsPassed=true（summary 里注明 N/A）。",
         })
 
     evidence = _build_evidence(params, policy_id, attest_ids)
@@ -665,6 +710,10 @@ async def _submit_preflight(
                     "E1 verdict gate: " + _gap + "。补齐后重新 submit_task"
                     "（verdict ∈ {PASS, FAIL}；FAIL 还需非空 blockingIssues）。"
                 ),
+                "remedy": (
+                    "重新 submit_task：verdict 必填 PASS|FAIL；FAIL 时另带非空 "
+                    "blockingIssues=[...]。"
+                ),
             })
         _cov_kinds = await acceptance_coverage_kinds(task)
         # TEST_DSH_70 P0-1a：三态评估（未声明/形状错/未核验），回执按态分解
@@ -683,6 +732,10 @@ async def _submit_preflight(
                 # F1：处方按本任务 policy 渲染 kind（防照抄 test_run 示例）。
                 "message": format_acceptance_coverage_verdict(
                     _coverage, _cov_kinds
+                ),
+                "remedy": (
+                    "按回执逐条补齐缺失 kind 的执行凭证（以本任务 policy 渲染"
+                    "的 kind 为准），再重新 submit_task。"
                 ),
             })
 
@@ -716,6 +769,7 @@ async def _submit_preflight(
                         "submit_task rejected: worktree has uncommitted changes. "
                         "Call git_worktree_checkpoint first, then submit_task."
                     ),
+                    "remedy": "先 git_worktree_checkpoint 提交工作树，再重新 submit_task。",
                 })
             if not evidence.get("files_changed"):
                 from hiveweave.services.git_worktree import _git
@@ -737,6 +791,10 @@ async def _submit_preflight(
                     "message": (
                         "submit_task rejected: no files_changed and worktree is dirty. "
                         "Call git_worktree_checkpoint first."
+                    ),
+                    "remedy": (
+                        "先 git_worktree_checkpoint —— 平台会从 worktree diff "
+                        "自动回填 filesChanged 清单，然后重新 submit_task。"
                     ),
                 })
 
@@ -816,6 +874,10 @@ async def _submit_preflight(
                     "attestationIds 重交（平台自动盖 no_code_change "
                     "旗标），或打 docs/explore 标签。"
                 ),
+                "remedy": (
+                    "首选 1)：git_worktree_checkpoint 后重交（平台自动回填清单）；"
+                    "或显式 submit_task(..., filesChanged=[磁盘上真实存在的路径])。"
+                ),
             })
 
     # P1-2: submit-time symmetric existence gate (mirrors approve-time
@@ -867,6 +929,16 @@ async def _submit_preflight(
                         + "Ensure all deliverables are committed in your "
                         "worktree before submitting."
                     ),
+                    # 批E#3 任务3（审计 named rejection）：门禁方向对（磁盘
+                    # 存在性），但旧回执不说「以什么为准」——agent 凭记忆列
+                    # 路径（TEST_DSH_74 逐字自述：rowband_probe.py 是记错的
+                    # 名字）。处方指向**磁盘真名单**，不靠回忆。
+                    "remedy": (
+                        "以磁盘为准，不要凭记忆列路径：在提交前用 "
+                        "`git diff --name-status main...HEAD` 取真实变更名单，"
+                        "逐字抄进 filesChanged 再重交；未提交的先 "
+                        "git_worktree_checkpoint。"
+                    ),
                 })
             if invisible_at_submit:
                 log.warning(
@@ -915,6 +987,11 @@ async def _submit_preflight(
                           "，然后重新 submit_task。"
                           "不要让 coordinator 在合并时替你解冲突。"
                     ),
+                    "remedy": (
+                        "在你的 worktree 里 git_worktree_sync 同步 main → "
+                        "解冲突 → commit → git_worktree_checkpoint → 重新 "
+                        "submit_task。"
+                    ),
                 })
     except Exception as _ce:  # noqa: BLE001
         log.debug("submit_conflict_gate_failed", task_id=task_id,
@@ -957,6 +1034,12 @@ async def _submit_preflight(
                     "waive_attestation 正式豁免——未豁免的 not_applicable 不放行。"
                     "非代码交付可显式 contractWaived=true 跳过（不静默缺失）。"
                 ),
+                "remedy": (
+                    "submit_task(..., deliveryContract={'summary': '<摘要>', "
+                    "'test': 'test_run:<本任务凭证id>'}) 重交；跑不了测试走 "
+                    "not_applicable + waive_attestation；非代码交付用 "
+                    "contractWaived=true。"
+                ),
             })
         else:
             test_v = str(
@@ -971,6 +1054,11 @@ async def _submit_preflight(
                             "确无法跑测试请改交 evidence_kind='not_applicable' + "
                             "not_applicable_reason，并经 waive_attestation 豁免。"
                         ),
+                        "remedy": (
+                            "重交 deliveryContract={'evidence_kind': "
+                            "'not_applicable', 'not_applicable_reason': '<原因>'} "
+                            "并请协调者 waive_attestation；能跑就引用 test_run:<id>。"
+                        ),
                     })
                 elif await has_successful_test_run(
                     project_id, task_id, task=task
@@ -984,6 +1072,10 @@ async def _submit_preflight(
                             "成功（exit_code=0）的 test_run 凭证。应引用该凭证 "
                             "test_run:<id>；N/A 文本已不再放行。"
                         ),
+                        "remedy": (
+                            "用库里那张成功凭证的 id 重交：deliveryContract="
+                            "{'summary': …, 'test': 'test_run:<id>'}。"
+                        ),
                     })
             else:
                 aid = parse_test_evidence_attestation_id(test_v)
@@ -994,6 +1086,11 @@ async def _submit_preflight(
                             "Delivery contract 测试证据格式无法识别：期望 "
                             "'test_run:<本任务 attestationId>'，"
                             f"实际：{test_v[:80]!r}。"
+                        ),
+                        "remedy": (
+                            "test 字段一律写成 'test_run:<本任务的 "
+                            "attestationId>'（bash 跑测试自动落库的那张凭证）"
+                            "后重交。"
                         ),
                     })
                 else:
@@ -1012,6 +1109,10 @@ async def _submit_preflight(
                                 "Delivery contract 测试凭证不可验证："
                                 f"test_run:{aid} —— {_terr}。"
                                 "请用真实 test_run 凭证 id（bash 跑测试自动落库）。"
+                            ),
+                            "remedy": (
+                                "先 bash(..., taskId=本任务) 真跑一次测试拿到"
+                                "新凭证，再引用它的 id 重交。"
                             ),
                             "gate": "delivery_contract_test",
                             "expectedKinds": _dc_report.get("expectedKinds", []),
@@ -1158,9 +1259,7 @@ async def submit_task_tool(
             )
         return ToolResult.ok(
             "submit_task dry-run: 以下前置条件未满足，提交将被拒绝：\n"
-            + "\n".join(
-                f"- [{i['code']}] {i['message']}" for i in preflight["issues"]
-            ),
+            + "\n".join(_fmt_issue_line(i) for i in preflight["issues"]),
             dry_run=True,
             missing=preflight["issues"],
         )
@@ -1169,10 +1268,11 @@ async def submit_task_tool(
     if preflight["issues"]:
         first = preflight["issues"][0]
         msg = str(first["message"])
+        if first.get("remedy"):
+            msg += f"\n处方: {first['remedy']}"
         if len(preflight["issues"]) > 1:
             msg += "\n\n[additional blockers]\n" + "\n".join(
-                f"- [{i['code']}] {i['message']}"
-                for i in preflight["issues"][1:]
+                _fmt_issue_line(i) for i in preflight["issues"][1:]
             )
         # TEST_DSH_70 P1-2 活性出口：同一任务连续被门拒 N 次 ⇒ 自动
         # blocked(wait_kind=external) 升级，不再无限拉锯（37 连拒 110′ 实证）。

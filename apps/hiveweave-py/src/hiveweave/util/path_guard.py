@@ -108,8 +108,14 @@ OUT_OF_BOUNDARY_HINT = (
     # TEST_DSH_64 #10①：补官方时序指路——此前只讲读侧与相对路径，没讲
     # 「想在合并前验证还没 merge 的实现怎么办」，agent 只能试错撞墙。
     "合并前要验证叶子实现：等 merge 后在 MAIN 验证，或先 "
-    "``git_worktree_merge(dryRun=true)`` 查前置条件；跨树只读需求请该树 "
-    "assignee 代跑/贴结果。"
+    "``git_worktree_merge(dryRun=true)`` 查前置条件。"
+    # 批E#3 任务5（审计跨树拒绝卡）：拒绝必带处方 —— 此前跨树**只读**需求
+    # 只剩"找该树 assignee 代跑"一条路（19 次拒绝的摩擦本源）。现给出
+    # 官方窄通道：read_file 的 tree= 参数（限本项目 worktree、只读、
+    # 回执注明来源树）。写仍拒 —— 通道不存在于任何写工具。
+    "跨树**只读**取物：``read_file(filePath=\"<相对该树的路径>\", "
+    "tree=\"<目标树 id>\")`` —— 限本项目 worktree，回执注明来源树；"
+    "写永远只在你自己的树里。"
 )
 
 

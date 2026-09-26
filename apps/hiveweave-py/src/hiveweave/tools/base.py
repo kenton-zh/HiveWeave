@@ -69,6 +69,7 @@ class ToolDef:
         execute_fn: Callable,
         requires_workspace: bool = False,
         security_level: str = "standard",
+        param_example: str | None = None,
     ):
         self.name = name
         self.description = description
@@ -76,6 +77,10 @@ class ToolDef:
         self.execute_fn = execute_fn
         self.requires_workspace = requires_workspace
         self.security_level = security_level
+        # 批E#3（审计 P1「缺 filePath 却拿不到正确形状」）：参数校验失败回执
+        # 附带的**可抄 JSON 样例**（正确形状的最小示例）。None = 该工具未提供。
+        # 只在 pipeline 的 parameter-error 回执里消费（base 不拼文案）。
+        self.param_example = param_example
 
     # ── schema generation ────────────────────────────────
 
@@ -281,11 +286,16 @@ def tool(
     description: str,
     requires_workspace: bool = False,
     security_level: str = "standard",
+    param_example: str | None = None,
 ) -> Callable:
     """Register an async function as a tool.
 
     The function's first parameter must be a Pydantic BaseModel subclass
     (the params model). Remaining parameters are ``(agent_id, workspace)``.
+
+    ``param_example``（批E#3）：正确参数形状的最小 JSON 样例，参数校验
+    失败回执原样附带（pi ``packages/ai/src/utils/validation.ts`` 模式 ——
+    逐条 instancePath 之外再给形状，agent 不用猜）。
 
     Example::
 
@@ -331,6 +341,7 @@ def tool(
             execute_fn=fn,
             requires_workspace=requires_workspace,
             security_level=security_level,
+            param_example=param_example,
         )
         return fn
 

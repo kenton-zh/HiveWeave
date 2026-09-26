@@ -69,13 +69,16 @@ def build_deny_hint(
     if family == "ceo":
         if tool_name in _SOURCE_WRITE_TOOLS:
             return (
-                f"{base} CEO has DOC_WRITE: create/edit any documentation "
-                "(prose/markup). Never modify source code or runtime config — "
-                "dispatch_task those to a mid-level coordinator."
+                f"{base} CEO has SOURCE_WRITE (write anywhere on MAIN) + "
+                "DOC_WRITE — this denial usually comes from operator-"
+                "configured denied/ask rules, not a role-capability gap. "
+                "Large code changes still belong to mid-level coordinators "
+                "(dispatch_task)."
             )
         return (
             f"{base} This tool is outside CEO capabilities "
-            "(org design, docs, milestone dispatch/review, final verification). "
+            "(org design, docs, milestone dispatch/review, final "
+            "verification; no staffing/MCP-bind/test-run). "
             "Delegate hands-on code work to your mid-level coordinators."
         )
     if family == "coordinator":
@@ -339,11 +342,21 @@ async def execute_registered_tool(
         # H6②：把逐项违规（方括号路径 + message）追加进 `error` 文本，让模型
         # 能看到**具体哪条**数组项错了，而不是只有 pydantic 的原生单句；既有
         # 句子与 expected/received 一字不动（其他测试按子串断言）。
+        # 批E#3（pi validation.ts 模式）：工具声明了 ``param_example`` 时，
+        # 回执直接附**可抄的正确形状 JSON 样例** —— 「缺 filePath」类拒绝
+        # 必须同时给「正确形状长什么样」（审计 P1：agent 每次都拿到缺参
+        # 结论，拿不到形状 ⇒ 同形错误反复重撞）。
+        example = getattr(tool_def, "param_example", None)
+        example_seg = (
+            f"\n\nCorrect shape example (copy this):\n{example}"
+            if example
+            else ""
+        )
         return ToolResult.err(
             f"Parameter error in '{tool_name}': {error}.{expected} "
             f"You provided these parameters: {received_keys}. "
             f"Check the parameter names and make sure all required fields are included."
-            f"{format_invalid_args_detail(violations)}",
+            f"{format_invalid_args_detail(violations)}{example_seg}",
             # P2-1：结构化违规清单（`path` 为方括号形态，如 files[0].path）。
             # ⚠ 口径：**落库/进模型可见面的只有 `error` 文本**（点号形态
             # `files.0.path`，见 streaming 的 excerpt 取 result_content/error）；

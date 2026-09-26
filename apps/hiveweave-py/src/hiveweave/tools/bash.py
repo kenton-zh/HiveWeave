@@ -1030,22 +1030,60 @@ class _ConfinedDevProc:
         except Exception:  # noqa: BLE001
             pass
 
-    def poll(self) -> int | None:
-        """Popen-like 存活探测：仍在跑 ⇒ ``None``；已退出 ⇒ ``0``。
+    def is_exited(self) -> bool:
+        """存活位（**独立事实**，与退出码正交上报 —— DSH defensive-patterns）：
+        已退出 ⇒ ``True``；仍在跑 / 探测失败 ⇒ ``False``。
 
-        ⚠ 为什么补在这里而不是让调用方各写一份：`dev_server_tools` 的
+        为什么单列：``poll()`` 在「已退出但退出码不可知」时只能回 ``None``
+        （不许伪造码），与"仍在跑"不可区分 —— 调用方要**存活位**这一维时
+        必须走这里（``dev_server_tools`` 的早退分支两个都看）。
+        """
+        try:
+            return bool(self.job.is_exited())
+        except Exception:  # noqa: BLE001 — 探测失败按"仍在跑"处理，不误杀
+            return False
+
+    def poll(self) -> int | None:
+        """Popen-like 探测：仍在跑 ⇒ ``None``；已退出 ⇒ **真实退出码**。
+
+        批E#3（2026-09-26）：job 已提供真实退出码（``LongRunningJob.exit_code``
+        —— 与前台路径同源的 ``GetExitCodeProcess``）⇒ ``poll()`` 恢复 Popen
+        语义返回真值。旧形态「已退出一律返回 ``0``」已删 —— 那是假成功。
+        ⚠ 「已退出但退出码不可知」也回 ``None``（绝不补 0）—— 调用方要区分
+        这一态与"仍在跑"时，用 :meth:`is_exited`（存活位正交上报）。
+
+        为什么补在 shim 而不是让调用方各写一份：`dev_server_tools` 的
         `start_dev_server` 需要 `poll()`（判"起来后是否立刻退出"），而 bash 路不需要
         —— 于是本 shim 此前没有它。**但同一个 shim 出现两份就会各自演化**
         （这正是 #1 的根因：同一个 dev-server 功能两条路各写一份 spawn）。
         ⇒ 需求差异用**加方法**吸收，不复制类型。
-
-        退出码不可得（沙箱 job 只给存活位）⇒ 已退出一律返回 ``0``；调用方只判
-        `is not None`（"是否已退出"），不要拿这个 ``0`` 当"成功"。
         """
-        try:
-            return 0 if self.job.is_exited() else None
-        except Exception:  # noqa: BLE001 — 探测失败按"仍在跑"处理，不误杀
+        if not self.is_exited():
             return None
+        return self.returncode
+
+    @property
+    def returncode(self) -> int | None:
+        """Popen-like 退出码，三态（审计 P0 ×38 AttributeError 的修法）：
+
+        - 运行中 ⇒ ``None``
+        - 已退出 ⇒ 沙箱 job 的**真实**退出码（委托 ``LongRunningJob.exit_code``）
+        - 不可得（job 替身不提供 / 句柄异常）⇒ ``None``
+
+        **绝不补 0**（假成功）—— 语义依据 DSH ``docs/defensive-patterns.md``
+        「Report orthogonal outcomes independently」：退出码是独立事实，
+        不得嵌进存活位的分支里伪造。``dev_server_tools`` 的早退回执按本值
+        区分成败（``_early_exit_receipt``）；``None`` 分支在那里如实报
+        「退出了但码不可知」，不进成败回执。
+        """
+        value = getattr(self.job, "exit_code", None)
+        if callable(value):
+            # 兼容两种暴露面：真 job 是 @property（值），测试替身可能是方法。
+            try:
+                value = value()
+            except Exception:  # noqa: BLE001 — 拿不到就如实说不可知
+                return None
+        return value if isinstance(value, int) else None
 
 # Self-destructive command patterns (契约 02 — 7 patterns)
 # Match semantics mirror Elixir check_self_destructive/1:

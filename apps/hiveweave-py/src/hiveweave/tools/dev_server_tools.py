@@ -6,6 +6,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
@@ -120,6 +121,57 @@ def _early_exit_receipt(
         exit_code=exit_code,
         **_st,
     )
+
+
+def _early_exit_receipt_or_none(
+    proc: Any, cmd: str, log_path: Path, stamp: dict[str, Any] | None,
+    log_file: Any,
+) -> ToolResult | None:
+    """健康探测里的早退分支（批E#3 抽出可测接缝）。
+
+    Returns ``None`` when the process is still running（调用方继续探测）；
+    否则关闭日志并返回回执：
+
+    - 退出码**已知** ⇒ :func:`_early_exit_receipt` 按事实区分成败；
+    - 退出码**不可知** ⇒ **不进** 成败回执（那会把未知谎报成 ``0``=成功
+      或 ``N``=失败），单开 ``outcome_unknown`` 出口：可能已产生副作用，
+      不许盲目重试。
+
+    ⚠ 存活位与退出码是**两个正交事实**（DSH defensive-patterns）：真
+    Popen 用 ``poll() is not None`` 判退出即可；受限 shim 的 ``poll()``
+    在「已退出但码不可知」时也回 ``None`` ⇒ 还要看 ``is_exited()``
+    （shim 提供的存活位），否则"退了但拿不到码"会被当"仍在跑"空转。
+    """
+
+    def _unknown_code_receipt() -> ToolResult:
+        """退出码不可知时的如实出口（两分支共用一段文案）。"""
+        tail = _read_log_tail(log_path)
+        msg = (
+            "Dev server command exited immediately, but its exit "
+            f"code could not be determined. Command was: {cmd}"
+        )
+        if tail:
+            msg += f"\n--- log tail ({log_path.name}) ---\n{tail[-2000:]}"
+        return ToolResult.err(msg, fact="outcome_unknown", **dict(stamp or {}))
+
+    if proc.poll() is None:
+        # 真 Popen：= 仍在跑。受限 shim：还可能是"已退出但码不可知"。
+        is_exited = getattr(proc, "is_exited", None)
+        if not callable(is_exited):
+            return None
+        try:
+            exited = bool(is_exited())
+        except Exception:  # noqa: BLE001 — 探测失败按"仍在跑"处理
+            return None
+        if not exited:
+            return None
+        log_file.close()
+        return _unknown_code_receipt()
+    log_file.close()
+    rc = getattr(proc, "returncode", None)
+    if rc is None:
+        return _unknown_code_receipt()
+    return _early_exit_receipt(rc, cmd, log_path, stamp)
 
 
 class StartDevServerParams(BaseModel):
@@ -543,9 +595,11 @@ async def start_dev_server_tool(
     listening_port: int | None = None
     for _ in range(15):
         await asyncio.sleep(0.4)
-        if proc.poll() is not None:
-            log_file.close()
-            return _early_exit_receipt(proc.returncode, cmd, log_path, _stamp)
+        early = _early_exit_receipt_or_none(
+            proc, cmd, log_path, _stamp, log_file
+        )
+        if early is not None:
+            return early
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", port),

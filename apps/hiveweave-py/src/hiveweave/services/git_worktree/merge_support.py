@@ -7,6 +7,7 @@ from pathlib import Path
 import structlog
 
 from .constants import (
+    CHECKPOINT_PREFIX,
     TRACKED_WS_DIRS,
     _UNTRACKED_FILE_LINE_RE,
     _UNTRACKED_OVERWRITE_RE,
@@ -16,6 +17,169 @@ from .git_cmd import _git
 from .porcelain import _in_tracked_ws_dir, _porcelain_tracked_dirty_paths
 
 log = structlog.get_logger(__name__)
+
+# ── 批E#3 任务4：平台机制自造的非再生脏（三机制死锁拆解）─────────────
+# 死锁链（constants.py REGENERABLE_PATTERNS 注释 + 审计卡 P1-12）：
+#   ① checkpoint 的 ``git add -A`` 把可再生产物提交进分支 ⇒ merge 落到 MAIN
+#      后 MAIN **跟踪**它们 ⇒ 引擎一重生成 MAIN 就永久脏；
+#   ② merge 门禁判 non_regen 硬拒（REGENERABLE_PATTERNS 只覆盖 4 类）；
+#   ③ 门禁处方让 agent 自己跑 ``checkout HEAD --`` ⇒ 受限进程撞 .git 封条。
+# 修法：③的平台化 —— 凡 HEAD 里某路径的内容**最后**由平台 checkpoint 提交
+# 写入（即 HEAD 基线本身就是平台快照，不是团队甄别过的源码），其上的
+# 未提交改动就由**平台侧**（非受限进程，走信任锚 _git）代为恢复。恢复前
+# 工作树副本先**复制**进 merge-quarantine —— untracked 计入 dirty 是设计
+# 目的，本清理只碰 tracked 脏、且绝不静默丢内容（AI_MEMORY 纪律）。
+#
+# ⚠ P1（独立审计 2026-09-26）：「HEAD 末次写入者是 checkpoint」只证明
+# **HEAD 基线**的来源，**不证明**工作树未提交增量的来源 —— user_suspect
+# 本来就把这批路径标了疑似人工编辑。故代清绝不静默：warning 日志列路径 +
+# 隔离目录内写显式声明文件（该目录是 merge 期间新建 ⇒ service_merge 的
+# ``_attach_quarantine_events`` 会把它自动附进**成功与失败两条 merge 回执**
+# 的 ``[QUARANTINE]`` 行与 urgent ``[MERGE QUARANTINE]`` 收件箱，且
+# merge-quarantine 对 read_file 只读放行 —— 声明可达三通道）。
+#
+# 上游裁决：亦无（ACL 特有，上游无此机制可抄）。
+_CHECKPOINT_COMMIT_SUBJECTS = (CHECKPOINT_PREFIX, "pre-merge-checkpoint:")
+_PLATFORM_DIRT_QUERY_CAP = 20
+#: 隔离目录内的显式声明文件名（文件名本身进回执文件清单 = 声明可见）。
+_RESTORE_DECLARATION_FILENAME = "_PLATFORM-RESTORED-SUSPECTED-HUMAN-EDITS.txt"
+
+
+async def _checkpoint_committed_dirt(
+    workspace_path: str, paths: list[str]
+) -> list[str]:
+    """``paths`` 中「HEAD 内容最后由平台 checkpoint 提交写入」的子集。
+
+    判据：``git log -1 --format=%s -- <path>`` 的主题行以 checkpoint 前缀
+    开头。HEAD 基线既是平台快照，把它恢复回来不会丢团队甄别过的内容
+    （快照之后的未提交增量先隔离再恢复，见
+    :func:`_restore_platform_created_dirt`）。
+    """
+    hit: list[str] = []
+    for rel in paths[:_PLATFORM_DIRT_QUERY_CAP]:
+        ok, out = await _git(
+            ["log", "-1", "--format=%s", "--", rel], workspace_path
+        )
+        subj = (out or "").strip()
+        if ok and subj.startswith(_CHECKPOINT_COMMIT_SUBJECTS):
+            hit.append(rel)
+    return hit
+
+
+async def _restore_platform_created_dirt(
+    workspace_path: str, paths: list[str], *, branch: str
+) -> dict | None:
+    """平台侧恢复平台自造脏：先隔离工作树副本，再 ``checkout HEAD --``。
+
+    Returns a rejection dict on failure, None on success（调用方原样返回）。
+    """
+    quarantined, quarantine_dest = await _quarantine_dirty_copies(
+        workspace_path, paths
+    )
+    # P1（独立审计）：这批路径同属 user_suspect（疑似人工/外部编辑）——
+    # 代清必须 red flag：warning 列路径；显式声明已写进隔离目录的
+    # ``_PLATFORM-RESTORED-SUSPECTED-HUMAN-EDITS.txt``，随 merge 回执的
+    # ``[QUARANTINE]`` 行与 urgent 收件箱可见（成功路径同样附）。
+    if quarantined:
+        log.warning(
+            "git_worktree.platform_restore_suspected_human_edits",
+            paths=paths[:10],
+            quarantine_dir=quarantine_dest,
+            note=(
+                "以下路径 HEAD 基线来自平台 checkpoint，其未提交改动疑似"
+                "人工/外部编辑——平台已代清恢复到 HEAD；工作树副本保留在"
+                "隔离目录，merge 回执与收件箱均附声明。"
+            ),
+        )
+    ok_restore, restore_out = await _git(
+        ["checkout", "HEAD", "--"] + paths, workspace_path
+    )
+    if not ok_restore:
+        return {
+            "success": False,
+            "reason": "main_dirty",
+            "message": (
+                "MAIN had platform-checkpoint dirt but the platform-side "
+                f"restore failed: {(restore_out or '')[:300]}"
+            ),
+            "remedy": (
+                "重试一次 merge；仍失败请报告平台（附上面 git 输出）——"
+                "这是平台侧清理通道的故障，不要自己在受限 shell 里跑 git "
+                "checkout（会撞 .git 封条）。"
+            ),
+            "branch": branch,
+        }
+    log.info(
+        "git_worktree.platform_created_dirt_restored",
+        count=len(paths),
+        restored=paths[:10],
+        quarantined=len(quarantined),
+    )
+    return None
+
+
+async def _quarantine_dirty_copies(
+    workspace_path: str, files: list[str]
+) -> tuple[list[str], str | None]:
+    """把待恢复路径的**工作树副本**复制进 merge-quarantine（best-effort）。
+
+    复制（不移动）：checkout 失败时原文件仍在；quarantine 清单照常经
+    ``list_pending_quarantine_dirs`` 进平台状态、经 ``_attach_quarantine_events``
+    进 merge 回执。内容零丢失（AI_MEMORY 纪律：不静默删树丢码）。
+
+    P1（独立审计）：复制成功时在隔离目录写**显式声明文件**
+    （``_RESTORE_DECLARATION_FILENAME``）——「以下路径疑似人工编辑、已代清、
+    副本在本目录」，随回执与收件箱可见。Returns ``(copied, dest_str_or_None)``。
+    """
+    import time as _time
+
+    root = Path(workspace_path)
+    stamp = _time.strftime("%Y%m%d-%H%M%S")
+    dest_root = root / ".hiveweave" / "merge-quarantine" / f"{stamp}-pre-restore"
+    copied: list[str] = []
+    for rel in files:
+        src = root / rel
+        if not src.is_file():
+            continue
+        dest = dest_root / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
+            copied.append(rel.replace("\\", "/"))
+        except OSError as e:
+            log.warning(
+                "git_worktree.pre_restore_quarantine_failed",
+                path=rel,
+                error=str(e),
+            )
+    if copied:
+        declaration = (
+            "PLATFORM RESTORE DECLARATION / 平台代清显式声明\n"
+            "以下路径疑似人工编辑（疑似人工/外部编辑，user_suspect），"
+            "平台已代清恢复到 HEAD（已代清）。你未提交的工作树改动**未丢弃**"
+            "——副本在本目录（.hiveweave/merge-quarantine/ 的 "
+            f"{dest_root.name}/，只读可取回）：\n"
+            + "\n".join(f"- {rel}" for rel in copied[:20])
+            + "\n恢复指引：确认改动是你要的 → 取回副本重新提交；"
+            "确认是误编辑 → 忽略本目录即可。"
+        )
+        try:
+            (dest_root / _RESTORE_DECLARATION_FILENAME).write_text(
+                declaration, encoding="utf-8"
+            )
+        except OSError as e:
+            log.warning(
+                "git_worktree.pre_restore_declaration_write_failed",
+                error=str(e),
+            )
+        log.info(
+            "git_worktree.pre_restore_quarantined",
+            count=len(copied),
+            dest=str(dest_root),
+            files=copied[:12],
+        )
+        return copied, str(dest_root)
+    return copied, None
 
 
 async def classify_main_dirt(workspace_path: str) -> dict:
@@ -56,7 +220,12 @@ async def restore_regenerable_dirt_or_reject(
     previously this hard-reject cost a cross-agent git-stash round-trip
     (TEST6 23:21-23:23) and left residue behind. Any non-regenerable
     tracked dirt → hard reject (unchanged contract: no auto-commit spam
-    on main history).
+    on main history) — **except** 平台机制自造的非再生脏（批E#3 任务4：
+    HEAD 基线本身就是 checkpoint 快照的路径），平台侧代清后放行，见
+    :func:`_restore_platform_created_dirt`。这批路径同属 ``user_suspect``
+    （疑似人工编辑）⇒ 代清**不静默**：warning 日志列路径 + 隔离目录内的
+    ``_PLATFORM-RESTORED-SUSPECTED-HUMAN-EDITS.txt`` 声明文件随 merge 回执
+    （``[QUARANTINE]`` 行）与 urgent 收件箱可见。
 
     Restore is split by presence in HEAD: paths known to HEAD are restored
     via ``checkout HEAD --``; staged-new regenerable files (an agent's
@@ -72,6 +241,28 @@ async def restore_regenerable_dirt_or_reject(
     dirty_paths = dirt["dirty_paths"]
     if not dirty_paths:
         return None
+
+    # ── 批E#3 任务4：平台自造非再生脏，平台侧代清（merge 主路打通）──────
+    # 与 preflight_merge 共用同一份分类（classify_main_dirt）——预检报的
+    # hard_blockers 与本门禁拒的集合从此一致。清理限定在「平台机制自造且
+    # 已可识别」（HEAD 内容最后写入者是 checkpoint 提交），不扩大化。
+    hard_blockers = dirt["hard_blockers"]
+    if hard_blockers:
+        platform_created = await _checkpoint_committed_dirt(
+            workspace_path, hard_blockers
+        )
+        if platform_created:
+            fail = await _restore_platform_created_dirt(
+                workspace_path, platform_created, branch=branch
+            )
+            if fail is not None:
+                return fail
+            # 恢复后重取状态：剩余硬阻塞才进下面的硬拒。
+            dirt = await classify_main_dirt(workspace_path)
+            dirty_paths = dirt["dirty_paths"]
+            if not dirty_paths:
+                return None
+
     non_regen = [p for p in dirty_paths if not is_generated_path(p)]
     if non_regen and not all(_in_tracked_ws_dir(p) for p in non_regen):
         # 按路径类别分流处方（fixlist #7）：生成物与源码脏的**正确动作不同**。
@@ -95,6 +286,15 @@ async def restore_regenerable_dirt_or_reject(
             "message": (
                 "MAIN has uncommitted changes; auto-save to main history is "
                 "disabled. " + " | ".join(parts)
+            ),
+            # 批E#3 任务3：拒绝必带处方。平台自造脏已由平台侧代清（上方），
+            # 走到这里的必是**疑似人工/外部编辑**（P1-4）——正确动作是
+            # 请用户确认，不是让受限 agent 自己跑 git（撞封条）。
+            "remedy": (
+                "这批改动疑似人工/外部编辑：通知用户确认后再处理"
+                "（用户认可的工作让它先提交，误编辑由用户丢弃）——不要 "
+                "stash/checkout 吞掉，也不要把引擎缓存 commit 进库；"
+                "处理完重新发起 merge。"
             ),
             "branch": branch,
         }
@@ -126,6 +326,10 @@ async def restore_regenerable_dirt_or_reject(
                     "MAIN has regenerable-only dirt but de-staging "
                     f"staged-new files failed: {(rm_out or '')[:300]}"
                 ),
+                "remedy": (
+                    "重试一次 merge；仍失败请报告平台（附上面 git 输出）——"
+                    "这是平台侧清理通道的故障。"
+                ),
                 "branch": branch,
             }
     if in_head_paths:
@@ -139,6 +343,11 @@ async def restore_regenerable_dirt_or_reject(
                 "message": (
                     "MAIN has regenerable-only dirt but auto-restore "
                     f"failed: {(restore_out or '')[:300]}"
+                ),
+                "remedy": (
+                    "重试一次 merge；仍失败请报告平台（附上面 git 输出）——"
+                    "这是平台侧清理通道的故障，不要自己在受限 shell 里跑 "
+                    "git checkout（会撞 .git 封条）。"
                 ),
                 "branch": branch,
             }
@@ -173,6 +382,9 @@ async def restore_regenerable_dirt_or_reject(
                     "MAIN has workspace-doc dirt but auto-staging failed: "
                     f"{(add_out or '')[:300]}"
                 ),
+                "remedy": (
+                    "重试一次 merge；仍失败请报告平台（附上面 git 输出）。"
+                ),
                 "branch": branch,
             }
         ok_ci, ci_out = await _git(
@@ -190,6 +402,9 @@ async def restore_regenerable_dirt_or_reject(
                 "message": (
                     "MAIN has workspace-doc dirt but auto-commit failed: "
                     f"{(ci_out or '')[:300]}"
+                ),
+                "remedy": (
+                    "重试一次 merge；仍失败请报告平台（附上面 git 输出）。"
                 ),
                 "branch": branch,
             }
@@ -395,6 +610,11 @@ async def _merge_failure_result(
                 target=target_branch,
                 untracked=untracked,
             ),
+            "remedy": (
+                "平台已把这些 untracked 文件搬进 .hiveweave/merge-quarantine/"
+                "（可恢复，位置见回执/quarantine_ref）—— 直接重试 merge 即可；"
+                "不要手工去 MAIN 删文件。"
+            ),
             "untracked": untracked,
             "conflicts": [],
             "branch": branch,
@@ -421,6 +641,11 @@ async def _merge_failure_result(
                 target=target_branch,
                 conflicts=conflict_files,
             ),
+            "remedy": (
+                "派回 assignee：在**他的 worktree**里 git_worktree_sync "
+                "同步 main → 就地解冲突 → commit → checkpoint；平台已 "
+                "abort 本次 merge，不要在 MAIN 上解。"
+            ),
             "conflicts": conflict_files,
             "branch": branch,
             "files": branch_files,
@@ -438,6 +663,10 @@ async def _merge_failure_result(
             "Do NOT ask the executor to 'fix merge conflict in worktree' "
             "unless conflicted files are listed. Inspect main hygiene "
             "(untracked / local edits) and retry."
+        ),
+        "remedy": (
+            "按回执列出的 MAIN hygiene 问题逐项处理后重试 merge；"
+            "没有列冲突文件就不要按冲突处理（那会烧掉一轮返修）。"
         ),
         "conflicts": [],
         "branch": branch,

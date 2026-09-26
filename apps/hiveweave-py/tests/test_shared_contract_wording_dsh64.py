@@ -219,4 +219,9 @@ def test_out_of_boundary_hint_has_merge_timing_guidance():
     # 新增时序指路
     assert "MAIN 验证" in hint
     assert "git_worktree_merge(dryRun=true)" in hint
-    assert "assignee 代跑" in hint
+    # 批E#3 任务5（2026-09-26）：跨树只读有了官方窄通道（read_file 的 tree=
+    # 参数，限本项目、回执注明来源树）⇒ 处方从「请 assignee 代跑」升级为
+    # 「自己走通道」。时序指路与通道处方必须同时在。
+    assert "read_file(filePath=" in hint
+    assert 'tree="' in hint
+    assert "限本项目" in hint
