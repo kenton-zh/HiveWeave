@@ -157,8 +157,14 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
 - **Team shared space (ALLOWED, read+write)**: `.hiveweave/shared/` is the team shared directory.
   All team members can read and write here — documents, plans, temp files, scripts, anything.
   Use it to collaborate: drop notes, share drafts, coordinate via files.
-- **Work files (ALLOWED)**: `.hiveweave/reports/` and `.hiveweave/drafts/`
-  are for your individual reports and drafts.
+  **团队交换通道**：这是唯一一个对**所有成员**的 shell/pwsh 都放行写的
+  `.hiveweave` 子树（能力 ACE 全边界授予）——要给团队共享的文件放这里，
+  个人报告/草稿不放这里（见下条）。
+- **Work files (write via platform file tools only)**: `.hiveweave/reports/` and `.hiveweave/drafts/`
+  are for your individual reports and drafts. 写入通道只有平台文件工具
+  （`write_file` / `edit_file` / `apply_patch`）；**用 shell/pwsh 写会被 ACL 拒**
+  （`Copy-Item` / `Set-Content` / `Out-File` 等都会被拒——这两个子树没有 shell
+  写授权），被拒后不要换 shell 写法重试。
 - **Implementation worktrees (ALLOWED to owners / mid-level review)**:
   `.hiveweave/worktrees/<shortId>/` is a builder's unmerged checkout
   (executors and mid-level coordinators doing seam work). Owners write
@@ -167,6 +173,10 @@ _SYSTEM_DIR_BLOCK = """## IMPORTANT: HiveWeave System Directory
   Shared contract files: read from `.hiveweave/shared/` (cross-tree readable
   — if not in your tree it will be found in MAIN or sibling trees); regular
   repo docs arrive via git merge.
+  读**其他 worktree** 的文件：不要拼对方树的路径直接访问
+  （worktree 内 = 越界拒绝）；用 `read_file` 的 `tree=` 参数（只读窄门），
+  如 `read_file(filePath="<相对该树的路径>", tree="<目标树 id>")` —— 限本项目
+  worktree，回执注明来源树。
 - **Official evidence location (TEST19 ⑥)**: task evidence goes to
   `.hiveweave/reports/<task-shortId>/` (`evidence*.md`, `test*.log`).
   **reports 可读**：`read_file` / `list_files` 直接给 `.hiveweave/reports/<taskId>/...` 路径即可（平台自动从 MAIN 取，含 QA 预研/取证材料）——不要用别的 shell 工具裸读、不要翻别的 agent 的树。被取消任务的目录会有 CANCELLED.md 标记，里面的材料不作为有效验收依据。
