@@ -519,7 +519,11 @@ async def test_enqueue_exhausts_after_max_attempts(env):
 @pytest.mark.asyncio
 async def test_enqueue_stays_legacy_contract_without_db(monkeypatch):
     """无项目 DB（workspace 不存在）→ 入队失败，llm_failed 回执保持原契约。"""
-    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+    from hiveweave.services.code_audit import (
+        effective_audit_timeout_s,
+        reset_ledger,
+        run_code_audit,
+    )
 
     async def no_workspace(pid: str):
         return None
@@ -537,11 +541,13 @@ async def test_enqueue_stays_legacy_contract_without_db(monkeypatch):
     reset_ledger(AGENT_ID)
     # 与 41+08 时代的契约一致（无 retry 附加键）；
     # TEST_DSH_70 P2-3 批3：异常出口新增 capped_at_s（外层帽值，作废前置提示）
+    # 批 B 起帽值来自 env HIVEWEAVE_CODE_AUDIT_TIMEOUT_S（默认 600），
+    # 断言与 effective_audit_timeout_s() 同源而非硬编码。
     assert result == {
         "audited": False,
         "reason": "llm_failed",
         "audit_upstream_unavailable": True,
-        "capped_at_s": 120.0,
+        "capped_at_s": effective_audit_timeout_s(),
     }
 
 

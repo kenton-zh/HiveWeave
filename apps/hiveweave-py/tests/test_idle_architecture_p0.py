@@ -326,8 +326,14 @@ async def test_migrate_orphan_approved(task_env):
 
 
 @pytest.mark.asyncio
-async def test_gate_preserves_inbox_ids_in_retrigger_opts():
-    """Repair retrigger must carry inbox_msg_ids into chat opts."""
+async def test_slice_continue_retrigger_uses_dedicated_source():
+    """批 C 第1步②：切片续跑以 source=turn_continue 开新 run。
+
+    原断言对象是 _retrigger_for_turn_gate 的 inbox ids 透传 —— 门禁修复
+    已改为 run 关闭前的同 run 补步（completion.build_gate_supplement_hint，
+    run 内不换 run，inbox 天然保持未读），跨 run 重触路径随之删除。现钉住
+    唯一存活的跨 run 续跑（ADR-002 切片）与门禁源彻底分流。
+    """
     import asyncio
 
     from hiveweave.agents.agent import Agent, AgentState
@@ -341,7 +347,11 @@ async def test_gate_preserves_inbox_ids_in_retrigger_opts():
     async def fake_chat(msg, opts=None):
         captured.append(opts or {})
 
+    async def _no_enrich(hint):
+        return hint
+
     agent.chat = fake_chat  # type: ignore
+    agent._enrich_hint_with_inbox = _no_enrich  # type: ignore
 
     with (
         patch("hiveweave.agents.agent.SELF_RETRIGGER_DELAY_MS", 0),
@@ -355,17 +365,15 @@ async def test_gate_preserves_inbox_ids_in_retrigger_opts():
             return t
 
         with patch("asyncio.create_task", side_effect=capture_task):
-            await Agent._retrigger_for_turn_gate(
-                agent,
-                "fix me",
-                inbox_msg_ids=["m1", "m2"],
-            )
+            await Agent._retrigger_slice_continue(agent, "continue slice")
             if tasks:
                 await asyncio.gather(*tasks)
 
     assert captured
-    assert captured[0].get("inbox_msg_ids") == ["m1", "m2"]
+    assert captured[0].get("source") == "turn_continue"
     assert captured[0].get("trigger") is True
+    # 门禁修复不再产生任何 turn_exit_gate 新 run
+    assert not hasattr(Agent, "_retrigger_for_turn_gate")
 
 
 def test_no_progress_fingerprint_stable():

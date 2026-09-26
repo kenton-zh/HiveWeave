@@ -583,8 +583,12 @@ def test_completion_gate_feeds_narrow_resolved_set():
     src = inspect.getsource(completion_mod)
     assert "_task_ids_gate_resolved_this_turn" in src
     assert "tasks_advanced=gate_resolved" in src
-    # 宽集不得再直连 ExitContext
-    assert "tasks_advanced=tasks_advanced" not in src
+    # 宽集不得直连 ExitContext。批 C 第1步②后装配提取为 ExitGateFacts：
+    # 宽集允许进 facts（fingerprint/stall/telemetry 活动量语义仍用它），
+    # 但 ExitContext 的唯一组装点 to_context() 必须只喂窄集。
+    assert "tasks_advanced=tasks_advanced" not in inspect.getsource(
+        completion_mod.ExitGateFacts.to_context
+    )
 
 
 def test_gate_resolved_narrow_set_semantics():

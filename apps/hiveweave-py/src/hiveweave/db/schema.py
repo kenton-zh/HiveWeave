@@ -860,7 +860,7 @@ PROJECT_DB_TABLES = [
         run_id TEXT,
         task_id TEXT,
         model_id TEXT,
-        request_type TEXT DEFAULT 'main',   -- main | compaction_conversation | compaction_memory | subagent | cache_warm
+        request_type TEXT DEFAULT 'main',   -- main | compaction_conversation | compaction_memory | subagent | cache_warm | oneshot
         provider TEXT,
         input_tokens INTEGER DEFAULT 0,
         output_tokens INTEGER DEFAULT 0,

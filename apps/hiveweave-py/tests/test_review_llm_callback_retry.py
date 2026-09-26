@@ -1,171 +1,141 @@
-"""review LLM 回调受限重试（预算帽）回归测试。
+"""review LLM 回调重试语义（批 B 流式化后）回归测试。
 
-背景：_review_llm_callback 原为单发 httpx POST 无重试，上游瞬时断连
-（RemoteProtocolError "Server disconnected without sending a response"）
-导致 review / run_tests 直接失败。修复引入 _review_llm_post_with_retry：
-总窗口（P2-3 批3 起为 110s，须真大于 90s 首读帽——45s 时首读超时后重试
-从未发生过）+ 最多额外重试 1 次 + Retry-After 预算检查。
+背景变迁：_review_llm_callback 原为单发 httpx POST 无重试，上游瞬时断连
+（RemoteProtocolError）直接炸掉 review/run_tests → 引入
+_review_llm_post_with_retry（预算帽 110s）。批 B（审计 P0·L6）把 oneshot
+链路整体流式化（llm/streamer/oneshot），旧函数删除，重试语义**重定义**：
+
+- 重试只对「连接失败 / 立即拒绝」（HTTP 429/5xx、connect 类异常、流未开口）
+  生效，最多额外 1 次；429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s）；
+- 退避会顶破剩余总时长预算 → 放弃重试直接上抛（本文件钉住）；
+- idle / 首 chunk / 总时长判死与流开口后的死亡一律不重试
+  （行为回归在 test_oneshot_stream.py）。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-import hiveweave.agents.agent as agent_mod
-from hiveweave.llm.retry import RetryableError
+import hiveweave.llm.streamer.oneshot as oneshot_mod
+from hiveweave.llm.provider import provider_factory
+from hiveweave.llm.retry import PermanentError, RetryableError
+from hiveweave.llm.streamer.oneshot import stream_oneshot_with_retry
 
-URL = "https://gw.fake/v1/chat/completions"
-BODY = {"model": "m", "messages": []}
-HEADERS = {"Accept": "application/json"}
+MODEL_CFG = {"base_url": "https://gw.fake/v1", "api_key": "sk-test", "model_id": "m"}
 
 
-class FakeResponse:
-    """httpx.Response 替身：status / raise_for_status / json / headers。"""
+class _ErrResponse:
+    """非 200 响应替身（带头），走 stream_oneshot 的 classify 分支。
 
-    def __init__(self, status=200, json_data=None, headers=None, text=""):
+    不继承 httpx.Response：httpx.Response.__init__ 在无 content 时会内部
+    调用 self.read()，覆写的 read 依赖后赋值的属性会炸。
+    """
+
+    def __init__(self, status: int, body: bytes, headers: dict | None = None) -> None:
         self.status_code = status
-        self._data = json_data or {}
+        self._body = body
         self.headers = dict(headers or {})
-        self._text = text
 
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            request = httpx.Request("POST", URL)
-            response = httpx.Response(
-                self.status_code,
-                request=request,
-                headers=self.headers,
-                text=self._text,
-            )
-            raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}", request=request, response=response
-            )
+    def read(self) -> bytes:
+        return self._body
 
-    def json(self):
-        return self._data
-
-
-class FakeClient:
-    """按 behaviors 顺序应答 post；异常项直接抛出，耗尽后额外调用即失败。"""
-
-    def __init__(self, behaviors):
-        self.behaviors = list(behaviors)
-        self.posts: list[str] = []
-
-    async def __aenter__(self):
+    def __enter__(self) -> "_ErrResponse":
         return self
 
-    async def __aexit__(self, *args):
+    def __exit__(self, *exc: object) -> bool:
         return False
 
-    async def post(self, url, json=None, headers=None):
+    def iter_bytes(self):  # type: ignore[no-untyped-def]
+        return iter(())
+
+
+class _OkResponse:
+    """200 流式响应替身：一个 text 事件 + DONE。"""
+
+    status_code = 200
+    headers: dict = {}
+
+    def read(self) -> bytes:
+        return b""
+
+    def __enter__(self) -> "_OkResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def iter_bytes(self):  # type: ignore[no-untyped-def]
+        yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeClient:
+    def __init__(self, behaviors: list) -> None:  # type: ignore[type-arg]
+        self._behaviors = behaviors
+        self.posts: list[str] = []
+
+    def stream(self, method: str, url: str, headers: object = None,
+               content: object = None):  # noqa: ARG002
         self.posts.append(url)
-        if not self.behaviors:
-            raise AssertionError("unexpected extra post call")
-        item = self.behaviors.pop(0)
+        item = self._behaviors.pop(0)
         if isinstance(item, BaseException):
             raise item
         return item
 
-
-def _ok(content: str = "review ok") -> FakeResponse:
-    return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+    def close(self) -> None:
+        pass
 
 
 @pytest.mark.asyncio
-async def test_retries_once_after_remote_protocol_error_then_succeeds():
-    """RemoteProtocolError → 小退避后重试成功返回内容。"""
-    client = FakeClient([
-        httpx.RemoteProtocolError("Server disconnected without sending a response"),
-        _ok("review ok after retry"),
+async def test_429_retry_after_exceeding_budget_gives_up_without_retry():
+    """429 + Retry-After(帽 30s) 超出剩余总时长预算 → 放弃重试直接上抛。"""
+    client = _FakeClient([
+        _ErrResponse(429, b'{"error":{"message":"rate limited"}}',
+                     {"retry-after": "60"}),
+        _OkResponse(),
     ])
     with (
-        patch("httpx.AsyncClient", return_value=client),
+        patch("httpx.Client", lambda timeout=None: client),
         patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
+        pytest.raises(RetryableError) as exc_info,
     ):
-        result = await agent_mod._review_llm_post_with_retry(
-            URL, BODY, HEADERS, asyncio.Semaphore(1)
+        await stream_oneshot_with_retry(
+            provider_factory.create(MODEL_CFG),
+            [{"role": "user", "content": "x"}],
+            agent_id="agent-r",
+            total_timeout_s=5.0,  # Retry-After 30s >> 剩余预算 → 放弃
         )
-    assert result == "review ok after retry"
-    assert len(client.posts) == 2
-    fake_sleep.assert_awaited_once()
-    delay = fake_sleep.await_args.args[0]
-    assert 0.5 <= delay <= 1.0
-
-
-@pytest.mark.asyncio
-async def test_continuous_network_failures_raise_after_retries_exhausted():
-    """连续网络失败 → 重试耗尽后上抛最后一次异常，不无限循环。"""
-    client = FakeClient([
-        httpx.RemoteProtocolError("boom 1"),
-        httpx.ConnectError("boom 2"),
-    ])
-    with (
-        patch("httpx.AsyncClient", return_value=client),
-        patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
-    ):
-        with pytest.raises(httpx.ConnectError):
-            await agent_mod._review_llm_post_with_retry(
-                URL, BODY, HEADERS, asyncio.Semaphore(1)
-            )
-    assert len(client.posts) == 2
-    assert fake_sleep.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_429_retry_after_exceeding_budget_gives_up_without_sleep():
-    """429 + Retry-After(帽 30s) 超出剩余预算 → 放弃重试直接上抛。"""
-    client = FakeClient([
-        FakeResponse(
-            429,
-            json_data={"error": {"message": "rate limited"}},
-            headers={"retry-after": "60"},
-            text='{"error": {"message": "rate limited"}}',
-        ),
-        _ok("never reached"),
-    ])
-    with (
-        patch("httpx.AsyncClient", return_value=client),
-        patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
-    ):
-        with pytest.raises(RetryableError) as exc_info:
-            await agent_mod._review_llm_post_with_retry(
-                URL,
-                BODY,
-                HEADERS,
-                asyncio.Semaphore(1),
-                retry_window_s=5.0,  # Retry-After 30s >> 剩余预算 → 放弃
-            )
     assert exc_info.value.status == 429
-    assert len(client.posts) == 1
+    assert len(client.posts) == 1  # 只尝试了一次
     fake_sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_503_retry_after_within_budget_retries():
     """503 + Retry-After=1s 在预算内 → 按 Retry-After 退避后重试成功。"""
-    client = FakeClient([
-        FakeResponse(
-            503,
-            json_data={"error": {"message": "overloaded"}},
-            headers={"retry-after": "1"},
-            text='{"error": {"message": "overloaded"}}',
-        ),
-        _ok("recovered"),
+    client = _FakeClient([
+        _ErrResponse(503, b'{"error":{"message":"overloaded"}}',
+                     {"retry-after": "1"}),
+        _OkResponse(),
     ])
     with (
-        patch("httpx.AsyncClient", return_value=client),
+        patch("httpx.Client", lambda timeout=None: client),
         patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
     ):
-        result = await agent_mod._review_llm_post_with_retry(
-            URL, BODY, HEADERS, asyncio.Semaphore(1)
+        result = await stream_oneshot_with_retry(
+            provider_factory.create(MODEL_CFG),
+            [{"role": "user", "content": "x"}],
+            agent_id="agent-r",
+            total_timeout_s=60.0,
         )
-    assert result == "recovered"
+    assert result["text"] == "ok"
     assert len(client.posts) == 2
     fake_sleep.assert_awaited_once()
     assert fake_sleep.await_args.args[0] == 1.0
@@ -173,62 +143,69 @@ async def test_503_retry_after_within_budget_retries():
 
 @pytest.mark.asyncio
 async def test_400_permanent_error_no_retry():
-    """其他 4xx → 原样上抛 HTTPStatusError，不重试不睡眠。"""
-    client = FakeClient([
-        FakeResponse(
-            400,
-            json_data={"error": {"message": "bad request"}},
-            text='{"error": {"message": "bad request"}}',
-        ),
+    """400 客户端错误 → PermanentError，不重试不睡眠。"""
+    client = _FakeClient([
+        _ErrResponse(400, b'{"error":{"message":"bad request"}}'),
     ])
     with (
-        patch("httpx.AsyncClient", return_value=client),
+        patch("httpx.Client", lambda timeout=None: client),
         patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
+        pytest.raises(PermanentError) as exc_info,
     ):
-        with pytest.raises(httpx.HTTPStatusError):
-            await agent_mod._review_llm_post_with_retry(
-                URL, BODY, HEADERS, asyncio.Semaphore(1)
-            )
-    assert len(client.posts) == 1
-    fake_sleep.assert_not_awaited()
-
-
-class BadJsonResponse(FakeResponse):
-    def json(self):
-        raise json.JSONDecodeError("not json", "doc", 0)
-
-
-@pytest.mark.asyncio
-async def test_content_layer_json_error_no_retry():
-    """内容层错误（JSON 解析失败）→ 直接上抛，不重试。"""
-    client = FakeClient([BadJsonResponse(200)])
-    with (
-        patch("httpx.AsyncClient", return_value=client),
-        patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
-    ):
-        with pytest.raises(json.JSONDecodeError):
-            await agent_mod._review_llm_post_with_retry(
-                URL, BODY, HEADERS, asyncio.Semaphore(1)
-            )
-    assert len(client.posts) == 1
-    fake_sleep.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_extracts_reasoning_content_when_message_content_empty():
-    """Thinking models often return empty content; parse reasoning_content."""
-    client = FakeClient([
-        FakeResponse(200, {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "reasoning_content": "VERDICT: PASS\n",
-                },
-            }],
-        }),
-    ])
-    with patch("httpx.AsyncClient", return_value=client):
-        result = await agent_mod._review_llm_post_with_retry(
-            URL, BODY, HEADERS, asyncio.Semaphore(1)
+        await stream_oneshot_with_retry(
+            provider_factory.create(MODEL_CFG),
+            [{"role": "user", "content": "x"}],
+            agent_id="agent-r",
         )
-    assert result == "VERDICT: PASS\n"
+    assert exc_info.value.status == 400
+    assert len(client.posts) == 1
+    fake_sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_content_layer_error_chunk_400_no_retry():
+    """HTTP 200 但 body 内包 400 错误 chunk（内容层错误）→ 不重试。"""
+    class _ErrorChunkResponse(_OkResponse):
+        def iter_bytes(self):  # type: ignore[no-untyped-def]
+            yield b'data: {"error":{"message":"bad request","code":"400"}}\n\n'
+
+    client = _FakeClient([_ErrorChunkResponse()])
+    with (
+        patch("httpx.Client", lambda timeout=None: client),
+        patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
+        pytest.raises((PermanentError, Exception)) as exc_info,
+    ):
+        await stream_oneshot_with_retry(
+            provider_factory.create(MODEL_CFG),
+            [{"role": "user", "content": "x"}],
+            agent_id="agent-r",
+        )
+    # 流已开口（error chunk 之前无事件也算「未开口」，但错误 chunk 走
+    # classify 分支携带状态/文本判据）——断言只尝试一次即上抛。
+    assert len(client.posts) == 1
+    fake_sleep.assert_not_awaited()
+    assert not isinstance(exc_info.value, oneshot_mod.OneshotIdleTimeout)
+
+
+@pytest.mark.asyncio
+async def test_remote_protocol_error_before_stream_retries():
+    """RemoteProtocolError「Server disconnected without sending a response」
+    （本重试机制的原始动机，流未开口）→ 小退避后重试成功。"""
+    client = _FakeClient([
+        httpx.RemoteProtocolError("Server disconnected without sending a response"),
+        _OkResponse(),
+    ])
+    with (
+        patch("httpx.Client", lambda timeout=None: client),
+        patch.object(asyncio, "sleep", new=AsyncMock()) as fake_sleep,
+    ):
+        result = await stream_oneshot_with_retry(
+            provider_factory.create(MODEL_CFG),
+            [{"role": "user", "content": "x"}],
+            agent_id="agent-r",
+        )
+    assert result["text"] == "ok"
+    assert len(client.posts) == 2
+    fake_sleep.assert_awaited_once()
+    delay = fake_sleep.await_args.args[0]
+    assert 0.5 <= delay <= 1.0

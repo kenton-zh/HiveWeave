@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 import structlog
@@ -105,6 +105,7 @@ class Streamer(
         steer_queue: asyncio.Queue | None = None,
         skip_providers: set[str] | None = None,
         usage_sink: Callable[[dict], None] | None = None,
+        exit_gate_check: Callable[[list[dict]], Awaitable[str | None]] | None = None,
     ) -> dict:
         """流式调用 LLM，执行 tool loop，返回最终结果。
 
@@ -118,6 +119,10 @@ class Streamer(
             max_tool_rounds: 本轮调用的 tool loop 上限。若提供则覆盖构造器
                 默认值（来自 agent 的 DEFAULT_MAX_TOOL_ROUNDS = 600）。
                 未提供时回退到 self.max_tool_rounds。
+            exit_gate_check: 出口门禁同 run 补步回调（批 C 第1步②）。模型产出
+                收尾文本但未 commit_turn、run 关闭前调用一次；返回 hint 则在
+                同一 run 注入 user 消息续跑，返回 None 按原样收口。见
+                _run_tool_loop 文档。
 
         Returns:
             结果 dict（见类文档字符串）
@@ -212,6 +217,7 @@ class Streamer(
                 max_tool_rounds=effective_max_rounds,
                 steer_queue=steer_queue,
                 usage_sink=usage_sink,
+                exit_gate_check=exit_gate_check,
             )
             result = await asyncio.wait_for(
                 loop_coro,

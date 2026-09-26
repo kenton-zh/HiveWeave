@@ -9,6 +9,7 @@ MUST NOT top-level import hiveweave.agents.trigger — lazy import inside functi
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import structlog
@@ -216,6 +217,310 @@ def build_display_segments(
     return segs
 
 
+@dataclass
+class ExitGateFacts:
+    """出口门禁上下文装配结果（批 C 第1步②提取）。
+
+    纯读事实集：run 收口权威判定（handle_completion）与 run 关闭前的同 run
+    补步评估（build_gate_supplement_hint）共用同一装配，保证两处判据同源。
+    逃逸阀（escape valve）带副作用，不进本装配 —— 只在 handle_completion
+    收口路径执行，事后回写 ``unreplied_asks``。
+    """
+
+    agent_id: str
+    project_id: str
+    tool_calls: list
+    pending_msgs: list[dict] = field(default_factory=list)
+    unreplied_asks: list[dict] = field(default_factory=list)
+    outbound_ask_refs: set[str] = field(default_factory=set)
+    messaged_refs: set[str] = field(default_factory=set)
+    name_by_id: dict[str, str] = field(default_factory=dict)
+    open_obligations: list[dict] = field(default_factory=list)
+    delegated_in_flight: list[dict] = field(default_factory=list)
+    tasks_advanced: set[str] = field(default_factory=set)
+    gate_resolved: set[str] = field(default_factory=set)
+    worktree_uncommitted: bool = False
+    ceo_project_pending: list[str] = field(default_factory=list)
+
+    def to_context(self) -> Any:
+        """组装 evaluate_turn_exit 的 ExitContext（字段口径不变）。"""
+        from hiveweave.services.turn_exit import ExitContext
+
+        # 窄集 pin（test_completion_gate_feeds_narrow_resolved_set）：
+        # ExitContext.tasks_advanced 必须喂 _task_ids_gate_resolved_this_turn
+        # 的结果（义务解除窄集），不得换回宽集。
+        gate_resolved = self.gate_resolved
+        return ExitContext(
+            agent_id=self.agent_id,
+            project_id=self.project_id,
+            tool_calls=self.tool_calls,
+            pending_inbox_msgs=self.pending_msgs,
+            unreplied_asks=self.unreplied_asks,
+            open_task_obligations=self.open_obligations,
+            delegated_in_flight=self.delegated_in_flight,
+            tasks_advanced=gate_resolved,
+            messaged_refs=self.messaged_refs,
+            outbound_ask_refs=self.outbound_ask_refs,
+            name_by_id=self.name_by_id,
+            worktree_uncommitted=self.worktree_uncommitted,
+            ceo_project_pending=self.ceo_project_pending,
+        )
+
+
+async def gather_exit_gate_facts(agent: Any, tool_calls: list) -> ExitGateFacts:
+    """装配出口门禁所需的全部事实（纯读，无副作用）。
+
+    从 handle_completion 原地提取（批 C 第1步②），行为逐行保留。逃逸阀
+    （UNREPLIED_ASKS 连败降级，带 waive/mark_read 副作用）不在此函数内 ——
+    仍由 handle_completion 在收口路径执行。
+    """
+    from hiveweave.db import meta as meta_db
+    from hiveweave.services.turn_exit import collect_unreplied_asks
+
+    # UNREPLIED / ACK scope = ids shown this turn only (pending_inbox_msg_ids).
+    # Mid-turn arrivals are NOT injected into the live streamer — merging them
+    # into obligations or ACK would silently drop messages the model never saw.
+    pending_msgs: list[dict] = []
+    if agent.pending_inbox_msg_ids:
+        all_pending = await agent._inbox.get_pending_messages(agent.id)
+        id_set = set(agent.pending_inbox_msg_ids)
+        pending_msgs = [m for m in all_pending if m["id"] in id_set]
+
+    name_by_id: dict[str, str] = {}
+    exempt_senders: set[str] = set()
+    from hiveweave.services.wake_policy import is_user_sender
+
+    for m in pending_msgs:
+        fid = m.get("from_agent_id") or ""
+        if not fid:
+            continue
+        ag = await meta_db.get_agent_by_id(fid)
+        if fid not in name_by_id:
+            name_by_id[fid] = ag.get("name", fid[:8]) if ag else fid[:8]
+        # 豁免边界（结构化判定，不猜文案）：
+        # - user/system 发送方：回复通道是 assistant 输出本身
+        # - 发送方已归档/不存在：回复义务随其消亡，不得死锁退出门禁
+        if (
+            is_user_sender(fid)
+            or fid == "system"
+            or ag is None
+            or (ag.get("status") or "") == "archived"
+        ):
+            exempt_senders.add(fid)
+
+    # 本 turn 成功送达的收件人（inbox 落库 = send_message 成功的 DB 证据）
+    # turn_started_ms 只用于 reply 窗口扫描，不用于 mid-turn 并入/ACK
+    # （mid-turn 到达本 turn 未展示，不得进义务或 ACK —— 见上方 pending_msgs 范围）。
+    sent_to: set[str] = set()
+    replied_contracts: set[str] = set()
+    turn_started_ms = int((agent.current_job or {}).get("started_at") or 0)
+    if turn_started_ms:
+        try:
+            # TEST10 修复: 判定窗口从「本 turn 开始后」扩展到「最老待回复
+            # 消息到达之后」。此前 sent_to / replied_contracts 都只扫本
+            # turn —— agent 在上一 turn 回复了 ask（无论是否带 reply_to）
+            # 都不算数，合约/回复义务跨 turn 永远关闭不了 → gate 死锁。
+            reply_window_ms = turn_started_ms
+            expect_ts = [
+                m.get("created_at")
+                for m in pending_msgs
+                if m.get("expect_report")
+            ]
+            expect_ts = [
+                t for t in expect_ts if isinstance(t, (int, float)) and t
+            ]
+            if expect_ts:
+                reply_window_ms = min(
+                    reply_window_ms,
+                    cast(int, min([cast(int, t) for t in expect_ts])),
+                )
+            sent_to = await agent._inbox.get_sent_recipients_since(
+                agent.id, reply_window_ms
+            )
+            import time as _time
+
+            since_30min = int(_time.time() * 1000) - 30 * 60 * 1000
+            sent_30min = await agent._inbox.get_sent_recipients_since(
+                agent.id, since_30min
+            )
+            sent_to = set(sent_to) | set(sent_30min)
+            replied_contracts = await agent._inbox.get_replied_contracts_since(
+                agent.id, reply_window_ms
+            )
+        except Exception as e:
+            log.debug("reply_gate_sent_lookup_failed", error=str(e))
+
+    unreplied_asks = collect_unreplied_asks(
+        pending_msgs,
+        tool_calls,
+        name_by_id,
+        extra_replied_to=sent_to,
+        exempt_senders=exempt_senders,
+        replied_contracts=replied_contracts,
+    )
+
+    # TEST11 #1a: evidence for WAIT_WITHOUT_ASK
+    outbound_ask_refs: set[str] = set()
+    try:
+        outbound_ask_refs = await agent._inbox.get_outstanding_ask_recipients(
+            agent.id
+        )
+    except Exception as e:
+        log.debug("outbound_ask_refs_failed", error=str(e))
+    # Enrich messaged_refs with display names for ref matching
+    messaged_refs = set(sent_to)
+    for aid in list(sent_to):
+        if aid in name_by_id:
+            messaged_refs.add(name_by_id[aid])
+    for aid in list(outbound_ask_refs):
+        if aid not in name_by_id:
+            try:
+                ag = await meta_db.get_agent_by_id(aid)
+                if ag and ag.get("name"):
+                    name_by_id[aid] = ag["name"]
+            except Exception:
+                pass
+        if aid in name_by_id:
+            outbound_ask_refs.add(name_by_id[aid])
+
+    open_obligations: list[dict] = []
+    delegated_in_flight: list[dict] = []
+    try:
+        from hiveweave.services.task import TaskService
+
+        ts = TaskService()
+        # ADR-001 R4（硬性改造）：完成闸的义务清单消费闭式单一判定源
+        # get_open_work_obligations（assignee 负空间：blocked 及未来新增
+        # 状态计入——白名单 get_actionable_obligations 漏掉它们会让
+        # done_slice 在名下仅 blocked 任务时被放行）。
+        open_obligations = await ts.get_open_work_obligations(
+            agent.project_id, agent.id
+        )
+        try:
+            delegated_in_flight = await ts.list_delegated_in_flight(
+                agent.project_id, agent.id
+            )
+        except Exception as e:
+            log.debug(
+                "turn_exit_delegated_in_flight_failed",
+                agent_id=agent.id,
+                error=str(e),
+            )
+    except Exception as e:
+        log.warning(
+            "turn_exit_obligations_failed",
+            agent_id=agent.id,
+            error=str(e),
+        )
+
+    tasks_advanced = agent._task_ids_advanced_this_turn(tool_calls)
+    # ADR-001 补丁（DSH_22 场景A 逃逸口）：完成闸只认"义务已解除"窄集。
+    # 宽集把同轮 claim/拨 running 当"已推进"→ exit backstop 豁免 assignee
+    # 义务 → 持 running 任务合法 complete。宽集继续喂 fingerprint /
+    # stall forgive / telemetry（活动量语义），闸语义 = 义务解除。
+    gate_resolved = agent._task_ids_gate_resolved_this_turn(tool_calls)
+    worktree_uncommitted = False
+    try:
+        from hiveweave.services.turn_exit import agent_worktree_has_uncommitted
+
+        worktree_uncommitted = await agent_worktree_has_uncommitted(
+            agent.id, agent.project_id
+        )
+    except Exception as e:
+        log.debug("turn_exit_worktree_check_failed", error=str(e))
+
+    # P0-2: CEO done_slice 项目级义务（backstop 与 commit_turn 预检同口径）。
+    # 仅在 pending TurnResult 为 done_slice 时查询；非 CEO 在函数内短路。
+    ceo_project_pending: list[str] = []
+    try:
+        from hiveweave.services.turn_session import get_pending_turn_result
+
+        _pending_raw = get_pending_turn_result(agent.id)
+        if _pending_raw and _pending_raw.get("phase") == "done_slice":
+            from hiveweave.services.turn_exit import (
+                ceo_project_pending_obligations,
+            )
+
+            ceo_project_pending = await ceo_project_pending_obligations(
+                agent.project_id, agent.id
+            )
+    except Exception as e:
+        log.debug("turn_exit_ceo_project_pending_failed", error=str(e))
+
+    return ExitGateFacts(
+        agent_id=agent.id,
+        project_id=agent.project_id,
+        tool_calls=tool_calls,
+        pending_msgs=pending_msgs,
+        unreplied_asks=unreplied_asks,
+        outbound_ask_refs=outbound_ask_refs,
+        messaged_refs=messaged_refs,
+        name_by_id=name_by_id,
+        open_obligations=open_obligations,
+        delegated_in_flight=delegated_in_flight,
+        tasks_advanced=tasks_advanced,
+        gate_resolved=gate_resolved,
+        worktree_uncommitted=worktree_uncommitted,
+        ceo_project_pending=ceo_project_pending,
+    )
+
+
+async def build_gate_supplement_hint(agent: Any, tool_calls: list) -> str | None:
+    """出口门禁同 run 补步判据（批 C 第1步②，DSH 纪律的落地）。
+
+    上游依据：DSH ``docs/agent-lifecycle.md:51`` "retry in the open step:
+    prepare and reconcile the same rendered assembly without repeating
+    pre-step or users"；``agent.ts:402`` 第一尝试后只在同一 session 追加
+    user 消息继续当前 step。等价映射到本仓：我们无独立 step 边界，等价物
+    是「run 关闭前的 tool loop 继续」—— 违规在当前 run 关闭【前】判定
+    （tool loop 末轮收尾文本出口，``tool_loop.exit_gate_check`` 接缝），
+    可修复时返回注入 hint（等价 session.append('user/message')：一条 user
+    消息进当前对话），模型在同一 run 内补齐 commit_turn/收尾工具调用。
+
+    返回 None = 不补步：无违规 / 不可修复（park 类）/ 补步预算
+    （``_TURN_GATE_MAX``，单 run 内）耗尽。纯读无副作用（评估走
+    ``emit_telemetry=False``）；run 收口后的权威判定仍由 handle_completion
+    完成 —— 收口时仍违规即显式记录关闭，不再跨 run 重触。
+    """
+    from hiveweave.services.turn_exit import evaluate_turn_exit
+
+    if getattr(agent, "_turn_gate_count", 0) >= getattr(
+        agent, "_TURN_GATE_MAX", 1
+    ):
+        return None
+    try:
+        facts = await gather_exit_gate_facts(agent, tool_calls)
+    except Exception as e:
+        log.warning(
+            "gate_supplement_facts_failed",
+            agent_id=getattr(agent, "id", "?"),
+            error=str(e),
+        )
+        return None
+    decision = evaluate_turn_exit(facts.to_context(), emit_telemetry=False)
+    if decision.ok or not decision.should_repair:
+        return None
+    agent._turn_gate_count = getattr(agent, "_turn_gate_count", 0) + 1
+    log.info(
+        "turn_gate_supplement",
+        agent_id=agent.id,
+        violations=decision.violations,
+        gate_round=agent._turn_gate_count,
+    )
+    try:
+        from hiveweave.services.telemetry import telemetry
+
+        telemetry.turn_exit_gate(
+            agent.id,
+            decision.violations,
+            "supplement",
+            gate_round=agent._turn_gate_count,
+        )
+    except Exception:
+        pass
+    return decision.hint
+
+
 async def handle_completion(
     agent: Any,
     result: dict,
@@ -401,119 +706,16 @@ async def handle_completion(
     )
 
     # 3. Turn exit gates — validate only; scheduler decides continue/park
-    from hiveweave.db import meta as meta_db
-    from hiveweave.services.turn_exit import (
-        ExitContext,
-        collect_unreplied_asks,
-        evaluate_turn_exit,
-    )
+    from hiveweave.services.turn_exit import evaluate_turn_exit
     from hiveweave.services.turn_session import pop_pending_turn_result
 
-    # UNREPLIED / ACK scope = ids shown this turn only (pending_inbox_msg_ids).
-    # Mid-turn arrivals are NOT injected into the live streamer — merging them
-    # into obligations or ACK would silently drop messages the model never saw.
-    pending_msgs: list[dict] = []
-    if agent.pending_inbox_msg_ids:
-        all_pending = await agent._inbox.get_pending_messages(agent.id)
-        id_set = set(agent.pending_inbox_msg_ids)
-        pending_msgs = [m for m in all_pending if m["id"] in id_set]
-
-    name_by_id: dict[str, str] = {}
-    exempt_senders: set[str] = set()
-    from hiveweave.services.wake_policy import is_user_sender
-
-    for m in pending_msgs:
-        fid = m.get("from_agent_id") or ""
-        if not fid:
-            continue
-        ag = await meta_db.get_agent_by_id(fid)
-        if fid not in name_by_id:
-            name_by_id[fid] = ag.get("name", fid[:8]) if ag else fid[:8]
-        # 豁免边界（结构化判定，不猜文案）：
-        # - user/system 发送方：回复通道是 assistant 输出本身
-        # - 发送方已归档/不存在：回复义务随其消亡，不得死锁退出门禁
-        if (
-            is_user_sender(fid)
-            or fid == "system"
-            or ag is None
-            or (ag.get("status") or "") == "archived"
-        ):
-            exempt_senders.add(fid)
-
-    # 本 turn 成功送达的收件人（inbox 落库 = send_message 成功的 DB 证据）
-    # turn_started_ms 只用于 reply 窗口扫描，不用于 mid-turn 并入/ACK
-    # （mid-turn 到达本 turn 未展示，不得进义务或 ACK —— 见上方 pending_msgs 范围）。
-    sent_to: set[str] = set()
-    replied_contracts: set[str] = set()
-    turn_started_ms = int((agent.current_job or {}).get("started_at") or 0)
-    if turn_started_ms:
-        try:
-            # TEST10 修复: 判定窗口从「本 turn 开始后」扩展到「最老待回复
-            # 消息到达之后」。此前 sent_to / replied_contracts 都只扫本
-            # turn —— agent 在上一 turn 回复了 ask（无论是否带 reply_to）
-            # 都不算数，合约/回复义务跨 turn 永远关闭不了 → gate 死锁。
-            reply_window_ms = turn_started_ms
-            expect_ts = [
-                m.get("created_at")
-                for m in pending_msgs
-                if m.get("expect_report")
-            ]
-            expect_ts = [
-                t for t in expect_ts if isinstance(t, (int, float)) and t
-            ]
-            if expect_ts:
-                reply_window_ms = min(
-                    reply_window_ms,
-                    cast(int, min([cast(int, t) for t in expect_ts])),
-                )
-            sent_to = await agent._inbox.get_sent_recipients_since(
-                agent.id, reply_window_ms
-            )
-            import time as _time
-
-            since_30min = int(_time.time() * 1000) - 30 * 60 * 1000
-            sent_30min = await agent._inbox.get_sent_recipients_since(
-                agent.id, since_30min
-            )
-            sent_to = set(sent_to) | set(sent_30min)
-            replied_contracts = await agent._inbox.get_replied_contracts_since(
-                agent.id, reply_window_ms
-            )
-        except Exception as e:
-            log.debug("reply_gate_sent_lookup_failed", error=str(e))
-
-    unreplied_asks = collect_unreplied_asks(
-        pending_msgs,
-        tool_calls,
-        name_by_id,
-        extra_replied_to=sent_to,
-        exempt_senders=exempt_senders,
-        replied_contracts=replied_contracts,
-    )
-
-    # TEST11 #1a: evidence for WAIT_WITHOUT_ASK
-    outbound_ask_refs: set[str] = set()
-    try:
-        outbound_ask_refs = await agent._inbox.get_outstanding_ask_recipients(
-            agent.id
-        )
-    except Exception as e:
-        log.debug("outbound_ask_refs_failed", error=str(e))
-    # Enrich messaged_refs with display names for ref matching
-    messaged_refs = set(sent_to)
-    for aid in list(sent_to):
-        if aid in name_by_id:
-            messaged_refs.add(name_by_id[aid])
-    for aid in list(outbound_ask_refs):
-        if aid not in name_by_id:
-            try:
-                ag = await meta_db.get_agent_by_id(aid)
-                if ag and ag.get("name"):
-                    name_by_id[aid] = ag["name"]
-            except Exception:
-                pass
-        if aid in name_by_id:
-            outbound_ask_refs.add(name_by_id[aid])
+    # 批 C 第1步②：门禁事实装配提取为 gather_exit_gate_facts —— 与
+    # build_gate_supplement_hint（run 关闭前的同 run 补步评估，经 tool loop
+    # 的 exit_gate_check 接缝进入）共用同一装配，两处判据同源。
+    facts = await gather_exit_gate_facts(agent, tool_calls)
+    unreplied_asks = facts.unreplied_asks
+    open_obligations = facts.open_obligations
+    tasks_advanced = facts.tasks_advanced
 
     # ── P1 escape valve(TEST10): 连续 N 次被 UNREPLIED_ASKS 阻塞后强制降级 ──
     # 防止 ask 合约因 LLM 不理解 reply_to 参数而永久死锁。
@@ -584,91 +786,12 @@ async def handle_completion(
     else:
         agent._unreplied_asks_streak = 0
 
-    open_obligations: list[dict] = []
-    delegated_in_flight: list[dict] = []
-    try:
-        from hiveweave.services.task import TaskService
+    # 逃逸阀可能清空 unreplied_asks —— 回写事实集再组装 ExitContext，
+    # 保证收口判定与补步评估（build_gate_supplement_hint）同一口径。
+    facts.unreplied_asks = unreplied_asks
+    exit_decision = evaluate_turn_exit(facts.to_context())
 
-        ts = TaskService()
-        # ADR-001 R4（硬性改造）：完成闸的义务清单消费闭式单一判定源
-        # get_open_work_obligations（assignee 负空间：blocked 及未来新增
-        # 状态计入——白名单 get_actionable_obligations 漏掉它们会让
-        # done_slice 在名下仅 blocked 任务时被放行）。
-        open_obligations = await ts.get_open_work_obligations(
-            agent.project_id, agent.id
-        )
-        try:
-            delegated_in_flight = await ts.list_delegated_in_flight(
-                agent.project_id, agent.id
-            )
-        except Exception as e:
-            log.debug(
-                "turn_exit_delegated_in_flight_failed",
-                agent_id=agent.id,
-                error=str(e),
-            )
-    except Exception as e:
-        log.warning(
-            "turn_exit_obligations_failed",
-            agent_id=agent.id,
-            error=str(e),
-        )
-
-    tasks_advanced = agent._task_ids_advanced_this_turn(tool_calls)
-    # ADR-001 补丁（DSH_22 场景A 逃逸口）：完成闸只认"义务已解除"窄集。
-    # 宽集把同轮 claim/拨 running 当"已推进"→ exit backstop 豁免 assignee
-    # 义务 → 持 running 任务合法 complete。宽集继续喂 fingerprint /
-    # stall forgive / telemetry（活动量语义），闸语义 = 义务解除。
-    gate_resolved = agent._task_ids_gate_resolved_this_turn(tool_calls)
-    worktree_uncommitted = False
-    try:
-        from hiveweave.services.turn_exit import agent_worktree_has_uncommitted
-
-        worktree_uncommitted = await agent_worktree_has_uncommitted(
-            agent.id, agent.project_id
-        )
-    except Exception as e:
-        log.debug("turn_exit_worktree_check_failed", error=str(e))
-
-    # P0-2: CEO done_slice 项目级义务（backstop 与 commit_turn 预检同口径）。
-    # 仅在 pending TurnResult 为 done_slice 时查询；非 CEO 在函数内短路。
-    ceo_project_pending: list[str] = []
-    try:
-        from hiveweave.services.turn_session import get_pending_turn_result
-
-        _pending_raw = get_pending_turn_result(agent.id)
-        if _pending_raw and _pending_raw.get("phase") == "done_slice":
-            from hiveweave.services.turn_exit import (
-                ceo_project_pending_obligations,
-            )
-
-            ceo_project_pending = await ceo_project_pending_obligations(
-                agent.project_id, agent.id
-            )
-    except Exception as e:
-        log.debug("turn_exit_ceo_project_pending_failed", error=str(e))
-
-    exit_decision = evaluate_turn_exit(
-        ExitContext(
-            agent_id=agent.id,
-            project_id=agent.project_id,
-            tool_calls=tool_calls,
-            pending_inbox_msgs=pending_msgs,
-            unreplied_asks=unreplied_asks,
-            open_task_obligations=open_obligations,
-            delegated_in_flight=delegated_in_flight,
-            tasks_advanced=gate_resolved,
-            messaged_refs=messaged_refs,
-            outbound_ask_refs=outbound_ask_refs,
-            name_by_id=name_by_id,
-            worktree_uncommitted=worktree_uncommitted,
-            ceo_project_pending=ceo_project_pending,
-        )
-    )
-
-    gate_retrigger_hint: str | None = None
     continue_slice = False
-    carry_inbox_ids: list[str] | None = None
     budget_exhausted = bool(result.get("budget_exhausted"))
     # NEW-1 / TEST18: phase is only set on exit_decision.ok; public tail
     # elif (phase == "in_progress") must not UnboundLocalError on park/exhaust.
@@ -742,41 +865,27 @@ async def handle_completion(
                     agent.id, agent.pending_inbox_msg_ids
                 )
             agent.pending_inbox_msg_ids = None
-        elif (
-            exit_decision.should_repair
-            and agent._turn_gate_count < agent._TURN_GATE_MAX
-        ):
-            agent._turn_gate_count += 1
-            gate_retrigger_hint = exit_decision.hint
-            carry_inbox_ids = list(agent.pending_inbox_msg_ids or [])
-            # Keep unreplied ask ids for the repair turn
-            if unreplied_asks:
-                carry_inbox_ids = list(
-                    {*(carry_inbox_ids or []), *(m["id"] for m in unreplied_asks)}
-                )
-            # FIX(dup-hint): 不再直接 append_turn — retrigger_for_turn_gate
-            # 调用 chat(hint) 时 hint 会作为 user 消息正常保存。之前这里
-            # 额外 append 了一次，导致同一条 [TURN EXIT BLOCKED] 在
-            # conversation_turns 中出现两份（一份来自这里，一份来自 chat()）。
-            log.info(
-                "turn_exit_repair",
-                agent_id=agent.id,
-                violations=exit_decision.violations,
-                gate_round=agent._turn_gate_count,
-            )
-            try:
-                from hiveweave.services.telemetry import telemetry
-
-                telemetry.turn_exit_gate(
-                    agent.id,
-                    exit_decision.violations,
-                    "repair",
-                    gate_round=agent._turn_gate_count,
-                )
-            except Exception:
-                pass
-            # Do not clear pending_inbox_msg_ids yet — carried into opts
         else:
+            # 批 C 第1步②：可修复违规的修复已前移为 run 关闭前的「同 run
+            # 补步」（build_gate_supplement_hint，经 tool_loop 的
+            # exit_gate_check 接缝注入，预算 _TURN_GATE_MAX/run）。走到这里
+            # = 补步预算耗尽（或本轮经 stall/budget 出口无补步窗口）仍违规
+            # ⇒ 显式记录后关闭 run，不再跨 run 重触（原
+            # repair → _retrigger_for_turn_gate 重开整轮路径退役；DSH:
+            # retry in the open step，回合关闭后不重跑）。
+            _supplement_used = agent._turn_gate_count
+            # P3-2：两种形态分开说 —— 窗口开过且耗尽 vs 窗口从未打开
+            # （本轮经 stall/budget/empty 出口，未经补步门）。
+            if _supplement_used:
+                _gate_footer_head = (
+                    f"同 run 补步预算已用尽（本轮已补步 {_supplement_used} 次），"
+                    "违规未能在 run 内闭合。"
+                )
+            else:
+                _gate_footer_head = (
+                    "本轮无补步窗口（预算墙/断流/空响应出口未经补步门），"
+                    "违规未闭合。"
+                )
             if unreplied_asks:
                 await agent._escalate_unreplied(unreplied_asks)
             if agent.pending_inbox_msg_ids:
@@ -788,19 +897,21 @@ async def handle_completion(
             agent._reply_reminder_count = 0
             agent.disposition = "blocked"
             await agent._persist_gate_notice(
-                "TURN EXIT BLOCKED — GATE EXHAUSTED",
+                "TURN EXIT BLOCKED — GATE UNRESOLVED",
                 exit_decision.hint
                 or f"gates={exit_decision.violations}",
                 footer=(
-                    "修复次数已用尽，disposition=blocked。"
+                    f"{_gate_footer_head}"
+                    "disposition=blocked。"
                     "上级可能已收到升级。下次唤醒时请先处理上述 GATE，"
                     "再 commit_turn。"
                 ),
             )
             log.warning(
-                "turn_exit_gate_exhausted",
+                "turn_exit_gate_unresolved",
                 agent_id=agent.id,
                 violations=exit_decision.violations,
+                supplement_used=_supplement_used,
             )
             try:
                 from hiveweave.services.telemetry import telemetry
@@ -809,7 +920,7 @@ async def handle_completion(
                     agent.id,
                     exit_decision.violations,
                     "exhausted",
-                    gate_round=agent._turn_gate_count,
+                    gate_round=_supplement_used,
                 )
             except Exception:
                 pass
@@ -1002,7 +1113,10 @@ async def handle_completion(
                 ),
                 "disposition": agent.disposition,
                 "exit_ok": exit_decision.ok,
-                "gate_repairing": bool(gate_retrigger_hint),
+                # 批 C 第1步②：门禁修复 = run 内补步（已发生在 tool loop 中），
+                # 收口后不再有 repairing 态 —— 恒 False（task-advance nudge
+                # 不再需要为「重触修复轮」让位）。
+                "gate_repairing": False,
                 "continue_slice": continue_slice,
                 "deferred": is_task_advance_deferred(agent.id),
                 "reminder_count": agent._task_reminder_count,
@@ -1250,7 +1364,10 @@ async def handle_completion(
                 error=str(e),
             )
 
-    # 9. Repair once OR one progress slice OR hook nudge — never unlimited
+    # 9. One progress slice OR hook nudge — never unlimited
+    # 批 C 第1步②：原「gate repair → _retrigger_for_turn_gate 重开整轮」
+    # 分支已退役 —— 门禁修复前移为 run 内补步（build_gate_supplement_hint），
+    # 收口仍违规走上面的显式记录分支，不再为补一句 commit_turn 开新 run。
     if _stall_parked:
         pass  # Parked — do not retrigger
     elif _stall_resume_refs:
@@ -1260,23 +1377,35 @@ async def handle_completion(
 
         mark_degraded(agent.id)  # E5: stall 打断 → 置位降级标志
         agent._arm_interrupted_resume(_stall_resume_refs)
-    elif gate_retrigger_hint:
-        await agent._retrigger_for_turn_gate(
-            gate_retrigger_hint, inbox_msg_ids=carry_inbox_ids
-        )
     elif budget_exhausted:
-        await agent._retrigger_for_turn_gate(
-            "[TURN BUDGET] Previous slice hit the turn budget after "
-            "productive work. commit_turn(phase='in_progress') if needed, "
-            "then continue from where you left off.",
-            inbox_msg_ids=None,
+        # 预算墙是权威收口（DSH: budget stop）。模型在 run 内已收到
+        # [TURN BUDGET] pacing/soft 提示 + soft 续命的 commit 窗口；仍未
+        # commit_turn 就收口 ⇒ 上面门禁分支已显式记录，不再开新 run 补一句
+        # commit_turn（下一外部唤醒时模型按持久化 hint 先补提交）。
+        log.info(
+            "turn_budget_closed_no_retrigger",
+            agent_id=agent.id,
+            supplement_used=agent._turn_gate_count,
         )
+        try:
+            from hiveweave.services.telemetry import telemetry
+
+            telemetry.turn_exit_gate(
+                agent.id,
+                [],
+                "budget_closed",
+                gate_round=agent._turn_gate_count,
+            )
+        except Exception:
+            pass
     elif continue_slice:
-        await agent._retrigger_for_turn_gate(
+        # ADR-002 切片续跑：门禁已 ok、仍有义务且本轮有进展 → 下一片以
+        # 新 run 续跑。这是设计内切片（source=turn_continue），不是门禁
+        # 修复 —— 门禁修复不再产生任何新 run。
+        await agent._retrigger_slice_continue(
             "[TURN CONTINUE] You still have actionable obligations and made "
             "progress this slice. Continue once more, then commit_turn "
             "(prefer waiting/done_slice when idle on the user).",
-            inbox_msg_ids=None,
         )
     elif (
         phase == "in_progress"

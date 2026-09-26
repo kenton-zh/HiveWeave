@@ -34,14 +34,9 @@ import structlog
 from hiveweave.conversation.store import ConversationStore, conversation_store
 from hiveweave.db import meta as meta_db
 from hiveweave.llm.retry import (
-    MAX_DELAY_MS,
-    RetryableError,
     UPSTREAM_STREAM_ERROR_KEYWORDS as _UPSTREAM_KEYWORDS_FROM_RETRY,
-    classify_http_error,
     compute_backoff,
     is_stream_idle_exhausted,
-    parse_retry_after_ms,
-    should_retry_exception,
 )
 # ── 跨组契约（组3）：上游死亡判定 ────────────────────────────────────
 # 契约：is_upstream_death(err) 覆盖 PermanentError(status=403) / 含
@@ -286,183 +281,16 @@ async def broadcast_agent_health(
         pass
 
 
-# ── review LLM 回调：受限重试（预算帽） ──────────────────────
-# review 工具整体超时 TOOL_EXECUTION_TIMEOUT_S = 120s。原实现单发无重试，
-# 上游瞬时断连（RemoteProtocolError "Server disconnected without sending a
-# response"）直接炸掉 review/run_tests。重试必须带预算帽：无脑 2 次重试最坏
-# 2×90s read + 退避 → 远超 120s，必被 asyncio.wait_for 强取消。
-# 预算决策：
-# - 首次尝试 read 固定 90s（与原单发行为一致——慢响应供应商不回退）。
-# - 总重试窗口 110s（P2-3，TEST_DSH_70 批3：原 45s < 首读 90s ⇒ 首读超时后
-#   remaining = 45-90 < 0，第二次尝试**从未发生过** —— 实测 15/33 llm_failed
-#   里失败簇 90–91s×8 就是这个形状，审计撞帽必死）。窗口必须**真大于**首读
-#   帽 + 退避 + 最小重试读，超时后的重试才买得回一次机会：
-#   最坏 ≈ 首读 90s + 退避 ~1s + 重试读 min(90, max(10, 110-91)=19s) ≈ 110s
-#   < 120s 工具预算；非超时失败路径最坏（t=1s 429 + Retry-After 30s + 重试读
-#   min(90, 110-31)=79s）≈ 111s，同样 < 120s。
-# - 429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s），退避超预算则放弃重试；
-#   其余可重试错误小退避 0.5-1s。
-
-_REVIEW_LLM_RETRY_WINDOW_S = 110.0
-_REVIEW_LLM_MAX_RETRIES = 1
-_REVIEW_LLM_READ_TIMEOUT_MAX_S = 90.0
-_REVIEW_LLM_READ_TIMEOUT_MIN_S = 10.0
-_REVIEW_LLM_BACKOFF_RANGE_S = (0.5, 1.0)
-
-
-async def _review_llm_post_with_retry(
-    url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-    sem: asyncio.Semaphore,
-    *,
-    retry_window_s: float = _REVIEW_LLM_RETRY_WINDOW_S,
-    max_retries: int = _REVIEW_LLM_MAX_RETRIES,
-) -> str:
-    """带预算帽的非流式 LLM POST（首次 + 最多额外 max_retries 次重试）。
-
-    可重试：连接类异常（ConnectError/PoolTimeout/RemoteProtocolError/ReadError/
-    asyncio.TimeoutError）+ HTTP 429/5xx（读 resp 后 classify_http_error 判定，
-    raise_for_status 在 with 块内）。不可重试：其他 4xx、内容层错误（JSON 解析
-    失败等）直接上抛。每次尝试内持全局 LLM 信号量，重试之间释放。
-    """
-    import httpx
-
-    start = time.monotonic()
-    last_exc: BaseException | None = None
-    for attempt in range(max_retries + 1):
-        if attempt == 0:
-            # 首读保持 90s 原语义（慢响应供应商不回退）；预算帽只管重试窗口。
-            read_timeout = _REVIEW_LLM_READ_TIMEOUT_MAX_S
-        else:
-            remaining = retry_window_s - (time.monotonic() - start)
-            if remaining <= 0:
-                assert last_exc is not None
-                # P2-3（TEST_DSH_70 批3）：**作废前置提示** —— 重试窗被首读
-                # 吃穿 ⇒ 第二次尝试从未发生。此前的 raise 是静默的：调用方
-                # 只见裸异常，事后无法把「审计死于帽」与「上游真死」分开
-                # （15/33 llm_failed 里 90–91s×8 的失败簇就是这条静默路径）。
-                log.warning(
-                    "review_llm_retry_window_exhausted",
-                    elapsed_s=round(time.monotonic() - start, 1),
-                    retry_window_s=retry_window_s,
-                    first_read_timeout_s=_REVIEW_LLM_READ_TIMEOUT_MAX_S,
-                    error=str(last_exc),
-                )
-                raise last_exc
-            read_timeout = min(
-                _REVIEW_LLM_READ_TIMEOUT_MAX_S,
-                max(_REVIEW_LLM_READ_TIMEOUT_MIN_S, remaining),
-            )
-        try:
-            async with sem:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(
-                        connect=10.0, read=read_timeout, write=10.0, pool=10.0
-                    )
-                ) as client:
-                    resp = await client.post(url, json=body, headers=headers)
-                    try:
-                        resp.raise_for_status()
-                    except httpx.HTTPStatusError as exc:
-                        classified = classify_http_error(
-                            exc.response.status_code,
-                            exc.response.text,
-                            headers=exc.response.headers,
-                        )
-                        if isinstance(classified, RetryableError):
-                            raise classified from exc
-                        raise
-            data = resp.json()
-            # Use the shared extractor: it understands Chat, Responses and
-            # Anthropic shapes. The services/vision copy predates Responses
-            # API support (audit P0-6: 6/6 request_code_audit llm_failed).
-            from hiveweave.llm.wire_endpoint import extract_nonstream_text
-            text = extract_nonstream_text(data) if isinstance(data, dict) else ""
-            if text:
-                return text
-            # Review 回调专属的 reasoning 回退：审查结论可能被 reasoning 模型
-            # 写进 reasoning_content（test_review_llm_callback_retry 钉住）。
-            # 共享解析器刻意不做这一步 —— compactor 的 length 守卫依赖
-            # 「content 空 = 失败」（见 wire_endpoint.extract_nonstream_text
-            # 的 NOTE），两个消费方语义相反，回退必须留在消费方。
-            if isinstance(data, dict):
-                choices = data.get("choices") or []
-                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                    msg = choices[0].get("message")
-                    if isinstance(msg, dict):
-                        for key in ("reasoning_content", "reasoning", "thinking"):
-                            fallback = msg.get(key)
-                            if isinstance(fallback, str) and fallback.strip():
-                                return fallback
-            return text
-        except RetryableError as exc:
-            last_exc = exc
-            if attempt >= max_retries:
-                log.warning(
-                    "review_llm_retry_exhausted",
-                    attempt=attempt,
-                    status=exc.status,
-                    error=str(exc),
-                )
-                raise
-            # 现算剩余预算（首次尝试也会走到这里，循环头的 remaining 只在
-            # attempt>=1 赋值；现算同时扣掉刚失败的请求耗时，预算更准）。
-            remaining = retry_window_s - (time.monotonic() - start)
-            delay_s = _review_llm_retry_delay(exc, remaining)
-            if delay_s is None:
-                log.warning(
-                    "review_llm_retry_abandon_over_budget",
-                    attempt=attempt,
-                    remaining_s=round(remaining, 3),
-                    status=exc.status,
-                )
-                raise
-            log.info(
-                "review_llm_retry_scheduled",
-                attempt=attempt + 1,
-                delay_s=round(delay_s, 3),
-                status=exc.status,
-            )
-            await asyncio.sleep(delay_s)
-        except Exception as exc:
-            if not should_retry_exception(exc):
-                raise
-            last_exc = exc
-            if attempt >= max_retries:
-                log.warning(
-                    "review_llm_retry_exhausted_network",
-                    attempt=attempt,
-                    error=str(exc),
-                )
-                raise
-            delay_s = random.uniform(*_REVIEW_LLM_BACKOFF_RANGE_S)
-            log.info(
-                "review_llm_retry_scheduled_network",
-                attempt=attempt + 1,
-                delay_s=round(delay_s, 3),
-                reason=type(exc).__name__,
-            )
-            await asyncio.sleep(delay_s)
-
-    assert last_exc is not None  # 循环内必返回或抛出，防御性兜底
-    raise last_exc
-
-
-def _review_llm_retry_delay(exc: RetryableError, remaining_s: float) -> float | None:
-    """计算重试退避延迟（秒）；返回 None 表示退避会耗尽预算 → 放弃重试。
-
-    429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s）；其余小退避 0.5-1s。
-    预算检查预留 read 地板（10s），保证重试尝试仍有最小可用窗口。
-    """
-    if exc.status in (429, 503):
-        retry_after_ms = parse_retry_after_ms(exc.headers)
-        if retry_after_ms is not None:
-            delay_s = min(retry_after_ms / 1000.0, MAX_DELAY_MS / 1000.0)
-            if delay_s >= remaining_s - _REVIEW_LLM_READ_TIMEOUT_MIN_S:
-                return None
-            return delay_s
-    return random.uniform(*_REVIEW_LLM_BACKOFF_RANGE_S)
+# ── oneshot LLM（审计 / 评审 / run_tests）────────────────────
+# 批 B（审计 P0·L6）：旧实现是非流式单发 HTTP（_review_llm_post_with_retry，
+# httpx read=90s 等效「总时长墙」+ 110s 重试窗恒死循环）—— request_code_audit
+# 69-86% 调用整齐卡死在 111-112s。现整链路迁到 llm/streamer/oneshot.py：
+# SSE 流式 + idle 看门狗（事件间隔判活）+ 独立总时长帽（env
+# HIVEWEAVE_CODE_AUDIT_TIMEOUT_S，默认 540（< turn 硬预算 570s），内外层单一真相）+ 重试仅针对
+# 连接失败/立即拒绝。usage 经 record_oneshot_usage 进 llm_usage 记账。
+# 上游裁决：pi / DSH / opencode 均无 request_code_audit 同类工具（HiveWeave
+# 特有），流式机制复用本仓主链路机件（http_stream 传输形状 + constants
+# 看门狗语义 + retry 错误分类）。
 
 
 # ── Agent 类 ────────────────────────────────────────────────
@@ -544,8 +372,8 @@ class Agent:
         self._REPLY_REMINDER_MAX = 3   # 即时提醒上限
         self._task_reminder_count = 0  # open-task 收工续跑次数
         self._TASK_REMINDER_MAX = 2    # 防死循环
-        self._turn_gate_count = 0      # TurnResult 退出门禁续跑次数
-        self._TURN_GATE_MAX = 1        # P0: at most one repair retrigger
+        self._turn_gate_count = 0      # 本 run 内出口门禁补步次数（批C：同 run 补步，见 completion.build_gate_supplement_hint）
+        self._TURN_GATE_MAX = 1        # 单 run 补步上限；耗尽仍违规 ⇒ 关闭 run + 显式记录，不再跨 run 重开
         self._resume_cooldown_until: float = 0.0  # monotonic deadline；超时后防 doom loop
         self._consecutive_errors: int = 0  # 连续错误次数，超过阈值后停止 resume
         self._CONSECUTIVE_ERROR_MAX = 3   # 连续错误上限，超过后 ACK inbox 不再 resume
@@ -871,6 +699,9 @@ class Agent:
                     "task_transition",
                     "inbox_task",
                     "verify",
+                    # 批 C：ADR-002 切片续跑（原 source=turn_exit_gate 的
+                    # continue_slice 分支），与门禁修复彻底分流。
+                    "turn_continue",
                 ) or o.get("message_type") == "task" or bool(o.get("task_id"))
                 # Reminder / wait-timeout must not burn tokens after complete.
                 # ADR-001 §2：complete 不再是无条件免死金牌——名下有开放
@@ -881,7 +712,6 @@ class Agent:
                 if source in (
                     "open_task_reminder",
                     "wait_timeout",
-                    "turn_exit_gate",
                 ):
                     _complete_has_work = True
                     try:
@@ -919,16 +749,20 @@ class Agent:
             self.status = AgentState.PROCESSING
             self._cancel_reason = None
             self.empty_retry_count = 0
+            # 批 C 第1步②：补步预算按 run 计 —— 新 run 重新获得
+            # _TURN_GATE_MAX 次同 run 补步机会（原跨 run 计数语义退役）。
+            self._turn_gate_count = 0
             self._cancel_productive_continue()
             self._cancel_interrupted_resume()
             source = (opts or {}).get("source") or ""
-            # External wakes refill slice budget; gate/reminder/productive
-            # continue turns do not (ADR-002 + audit P1-3).
+            # External wakes refill slice budget; reminder/productive-continue/
+            # slice-continue turns do not (ADR-002 + audit P1-3). 批 C 第1步②：
+            # 原 turn_exit_gate（门禁重触）已无生产者 —— 门禁修复 = run 内补步。
             if source not in (
-                "turn_exit_gate",
                 "open_task_reminder",
                 "productive_continue",
                 "interrupted_resume",
+                "turn_continue",
             ):
                 self._slice_budget = self._SLICE_BUDGET_MAX
                 # New wake: allow [TASK ADVANCE] again; clear explicit 不推进
@@ -967,7 +801,7 @@ class Agent:
                     if self.disposition == "waiting_human" and not opts.get("trigger"):
                         self.disposition = "runnable"
             self.visibility = (
-                "system" if source in ("turn_exit_gate", "open_task_reminder")
+                "system" if source in ("open_task_reminder", "turn_continue")
                 else "foreground" if not opts.get("trigger") else "background"
             )
             try:
@@ -1530,6 +1364,18 @@ class Agent:
                         error=str(warm_err),
                     )
 
+                # 批 C 第1步②：出口门禁同 run 补步回调 —— run 关闭前
+                # （tool loop 末轮收尾文本出口）评估门禁，可修复违规时在
+                # 同一 run 的同一上下文注入 user hint 续跑补齐 commit_turn，
+                # 替代旧的「run 关闭后重开整轮」。判定逻辑在
+                # completion.build_gate_supplement_hint。
+                async def _gate_supplement_check(tool_calls: list) -> str | None:
+                    from hiveweave.agents.completion import (
+                        build_gate_supplement_hint,
+                    )
+
+                    return await build_gate_supplement_hint(self, tool_calls)
+
                 result = await streamer.stream(
                     agent_id=self.id,
                     messages=current_messages,
@@ -1540,6 +1386,7 @@ class Agent:
                     max_tool_rounds=max_rounds,
                     steer_queue=self._steer_q,
                     usage_sink=pending_sink,
+                    exit_gate_check=_gate_supplement_check,
                 )
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。
@@ -2152,38 +1999,58 @@ class Agent:
 
     async def _oneshot_llm(
         self, model_config: dict, system_prompt: str, user_prompt: str,
+        *, request_type: str = "oneshot",
     ) -> str:
-        """Non-streaming completion on an explicit model config.
+        """Streaming one-shot completion on an explicit model config.
 
         Shared by review tools (author's model) and request_code_audit
-        (peer model when the live team has another family). Same HTTP
-        retry / semaphore as ``_review_llm_callback``.
+        (peer model when the live team has another family).
+
+        批 B（审计 P0·L6）：旧实现是非流式单发（``stream=False`` +
+        ``Accept: application/json``），httpx read 等效「总时长墙」，
+        request_code_audit 69-86% 卡死在 111-112s。现走 SSE 流式
+        （``llm/streamer/oneshot``）：超时单位 = 事件间隔（idle 看门狗）
+        + 独立总时长帽；重试只对连接失败/立即拒绝生效；usage 进
+        llm_usage 记账（``request_type`` 默认 "oneshot" —— review 套件
+        各工具共用同一回调漏斗，无法在漏斗处区分，留本参数作接缝）。
         """
         if not model_config:
             raise NoModelConfiguredError("No model configured for oneshot LLM")
 
         from hiveweave.llm.provider import provider_factory
+        from hiveweave.llm.streamer.oneshot import (
+            record_oneshot_usage,
+            stream_oneshot_with_retry,
+        )
+
         provider = provider_factory.create(model_config)
-
-        body = provider.build_body(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=False,
-            temperature=0.3,
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        result = await stream_oneshot_with_retry(
+            provider, messages, agent_id=self.id, temperature=0.3,
         )
-        headers = provider.build_headers(session_id=self.id)
-        headers["Accept"] = "application/json"
-
-        from hiveweave.llm.streamer.constants import _get_llm_semaphore
-
-        return await _review_llm_post_with_retry(
-            provider.build_url(), body, headers, _get_llm_semaphore()
+        await record_oneshot_usage(
+            agent_id=self.id,
+            project_id=self.project_id,
+            provider=provider,
+            model_config=model_config,
+            result=result,
+            request_type=request_type,
         )
+        text = result["text"]
+        if not text and result.get("thinking"):
+            # Review 回调专属的 reasoning 回退：审查结论可能被 reasoning
+            # 模型写进 reasoning/thinking（test_review_llm_callback_retry
+            # 钉住）。流式形状下该内容走 thinking 通道；回退语义与旧单发
+            # 实现一致，留在消费方（compactor 的「content 空 = 失败」守卫
+            # 依赖共享解析器不做这一步）。
+            text = str(result["thinking"])
+        return text
 
     async def _review_llm_callback(self, system_prompt: str, user_prompt: str) -> str:
-        """LLM callback for review tools — makes a non-streaming LLM call.
+        """LLM callback for review tools — streaming one-shot LLM call.
 
         Uses the agent's model config + provider to call the LLM with
         system_prompt + user_prompt and return the text response.
@@ -2191,12 +2058,8 @@ class Agent:
         request_code_audit uses ``_oneshot_llm`` with a peer-team model.
 
         持全局 LLM 信号量（与流式调用同帽；信号量只在 HTTP 请求级占槽，
-        tool 执行期间父 stream 已释放，无自死锁）。
-
-        重试（_review_llm_post_with_retry）：首读固定 90s（原单发语义），
-        重试窗口 45s + 最多额外 1 次。连接类异常 / 429+5xx 可重试；其他
-        4xx 与内容层错误直接上抛。最坏 ≈ 首读 90s + 重试读 10s ≈ 100s <
-        120s 工具预算，不会被 asyncio.wait_for 强取消。
+        tool 执行期间父 stream 已释放，无自死锁）。流式 + idle 看门狗 +
+        总时长帽语义见 ``_oneshot_llm`` / ``llm/streamer/oneshot.py``。
         """
         model_config = await self._get_model_config()
         if model_config is None:
@@ -2516,28 +2379,33 @@ class Agent:
                 error=str(e),
             )
 
-    async def _retrigger_for_turn_gate(
-        self, hint: str, *, inbox_msg_ids: list[str] | None = None
-    ) -> None:
-        """Re-enter chat with a turn-exit / continue hint; preserve inbox ids."""
+    async def _retrigger_slice_continue(self, hint: str) -> None:
+        """ADR-002 切片续跑：门禁已 ok、仍有义务且本轮有进展时的下一片。
+
+        批 C 第1步②：本方法取代 _retrigger_for_turn_gate —— 后者的门禁修复
+        语义已退役（门禁修复 = run 关闭前的同 run 补步，见
+        completion.build_gate_supplement_hint；不再有任何 source=turn_exit_gate
+        的新 run）。切片续跑是设计内的跨 run 延续（source=turn_continue），
+        与门禁修复彻底分流，遥测可区分。
+        """
         await asyncio.sleep(SELF_RETRIGGER_DELAY_MS / 1000.0)
         if self._in_resume_cooldown():
             return
         if self.status != AgentState.IDLE:
             return
-        # 修 #2: retrigger 前查 inbox，把未读消息摘要拼进 hint
+        # retrigger 前查 inbox，把未读消息摘要拼进 hint（与旧路径同款）
         hint = await self._enrich_hint_with_inbox(hint)
-        log.info("turn_gate_retrigger", agent_id=self.id)
-        opts: dict = {
-            "trigger": True,
-            "is_background": True,
-            "source": "turn_exit_gate",
-        }
-        if inbox_msg_ids:
-            opts["inbox_msg_ids"] = inbox_msg_ids
+        log.info("turn_slice_continue", agent_id=self.id)
         asyncio.create_task(
-            self.chat(hint, opts=opts),
-            name=f"agent-{self.id}-turn-gate-retrigger",
+            self.chat(
+                hint,
+                opts={
+                    "trigger": True,
+                    "is_background": True,
+                    "source": "turn_continue",
+                },
+            ),
+            name=f"agent-{self.id}-turn-slice-continue",
         )
 
     def _cancel_productive_continue(self) -> None:

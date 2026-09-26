@@ -15,9 +15,10 @@
    未配置 log_path 不落盘（负向）。
 6. P2-7 soft policy 回落：warning 级 + policy_id + 回落集合 + telemetry
    记账；policy 声明执行类 kind 时行为不变（对照）。
-7. P2-3 审计读帽：重试窗（110s）真大于首读帽（90s）⇒ 首读超时后仍有
-   真重试；窄窗（旧 45s）下重试被吃穿时落**作废前置提示**再上抛；
-   ``effective_audit_timeout_s`` 夹到「首读帽 + 重试窗 + 余量」。
+7. P2-3 / 批 B 审计总时长帽：oneshot 流式化后外层 wait_for 与内层
+   流式看门狗共享 ``HIVEWEAVE_CODE_AUDIT_TIMEOUT_S``（默认 540，钳到
+   < turn 硬预算 570）——
+   env 是真闸、非法值回退默认；行为回归在 test_oneshot_stream.py。
 """
 
 from __future__ import annotations
@@ -29,13 +30,11 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import httpx
 import pytest
 from structlog.testing import capture_logs
 
 import hiveweave.agents.agent as agent_mod
 import hiveweave.conversation.store as store_mod
-from hiveweave.agents.agent import _review_llm_post_with_retry
 from hiveweave.conversation.store import ConversationStore
 from hiveweave.conversation.token_utils import (
     PRUNE_PLACEHOLDER,
@@ -592,133 +591,42 @@ async def test_nonexecution_policy_fallback_carries_set():
 # #7 P2-3 审计读帽
 # ════════════════════════════════════════════════════════════
 
-_URL = "https://gw.fake/v1/chat/completions"
-_BODY = {"model": "m", "messages": []}
-_HEADERS = {"Accept": "application/json"}
+# ── 7. P2-3 / 批 B：审计总时长帽 = 单一真相（oneshot 流式化后）──
+# 旧三道帽（内层 read 90s / 重试窗 110s / 外层 wait_for 120s）已收敛：
+# 内层走 SSE 流式（llm/streamer/oneshot，超时单位=事件间隔），外层
+# wait_for 与内层共享 HIVEWEAVE_CODE_AUDIT_TIMEOUT_S（默认 540，P2-3
+# 独立审计 2026-09-27 钳到 < turn 硬预算 570）——
+# env 是真闸（旧实现内层 110s 恒 < 外层 120s ⇒ env 永不生效）。
+# 流式判死/重试/记账的行为回归在 test_oneshot_stream.py。
 
 
-class _FakeResponse:
-    def __init__(self, status=200, json_data=None, headers=None, text=""):
-        self.status_code = status
-        self._data = json_data or {}
-        self.headers = dict(headers or {})
-        self._text = text
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            request = httpx.Request("POST", _URL)
-            response = httpx.Response(
-                self.status_code, request=request,
-                headers=self.headers, text=self._text,
-            )
-            raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}", request=request, response=response
-            )
-
-    def json(self):
-        return self._data
-
-
-class _FakeClient:
-    def __init__(self, behaviors):
-        self.behaviors = list(behaviors)
-        self.posts = 0
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def post(self, url, json=None, headers=None):
-        self.posts += 1
-        item = self.behaviors.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-
-def _ok(content: str = "audit ok") -> _FakeResponse:
-    return _FakeResponse(200, {"choices": [{"message": {"content": content}}]})
-
-
-class _FakeAgentClock:
-    """首读耗尽 90s 的时钟：start=0，之后恒 90（模拟 90s 读超时）。"""
-
-    def __init__(self):
-        self.calls = 0
-
-    def monotonic(self) -> float:
-        self.calls += 1
-        return 0.0 if self.calls == 1 else 90.0
-
-
-@pytest.mark.asyncio
-async def test_retry_window_survives_first_read_timeout():
-    """正向：重试窗（110s）> 首读帽（90s）⇒ 首读超时后第二次尝试真发生。"""
-    client = _FakeClient([
-        httpx.RemoteProtocolError("read timeout at 90s"),
-        _ok("audit ok after retry"),
-    ])
-    clock = _FakeAgentClock()
-    with (
-        patch("httpx.AsyncClient", return_value=client),
-        patch.object(agent_mod, "time", clock),
-        patch.object(asyncio, "sleep", new=AsyncMock()),
-    ):
-        result = await _review_llm_post_with_retry(
-            _URL, _BODY, _HEADERS, asyncio.Semaphore(1),
-        )
-    assert result == "audit ok after retry"
-    assert client.posts == 2
-
-
-@pytest.mark.asyncio
-async def test_narrow_window_exhaustion_logs_void_notice():
-    """负向（旧 45s 形状）：重试窗被首读吃穿 ⇒ 先落作废前置提示再上抛。"""
-    client = _FakeClient([
-        httpx.RemoteProtocolError("read timeout at 90s"),
-        _ok("never reached"),
-    ])
-    clock = _FakeAgentClock()
-    with (
-        patch("httpx.AsyncClient", return_value=client),
-        patch.object(agent_mod, "time", clock),
-        patch.object(asyncio, "sleep", new=AsyncMock()),
-        capture_logs() as logs,
-    ):
-        with pytest.raises(httpx.RemoteProtocolError):
-            await _review_llm_post_with_retry(
-                _URL, _BODY, _HEADERS, asyncio.Semaphore(1),
-                retry_window_s=45.0,  # 旧值：45 - 90 < 0 ⇒ 重试从未发生
-            )
-    assert client.posts == 1
-    ev = [
-        e for e in logs
-        if e.get("event") == "review_llm_retry_window_exhausted"
-    ]
-    assert ev, f"void-before-cap notice missing: {logs}"
-    assert ev[0].get("retry_window_s") == 45.0
-
-
-def test_effective_audit_timeout_covers_retry_window(monkeypatch):
-    """外层帽夹到「首读帽 + 重试窗 + 余量」，且严格大于首读帽本身。"""
+def test_effective_audit_timeout_single_source_default_540():
+    """默认 540：外层帽与内层流式看门狗同源同值，且 < turn 硬预算 570。"""
+    from hiveweave.llm.streamer import oneshot as oneshot_mod
+    from hiveweave.llm.streamer.constants import HARD_TOTAL_TIMEOUT_S
     from hiveweave.services import code_audit as ca_mod
-    from hiveweave.services.code_audit import (
-        CODE_AUDIT_LLM_TIMEOUT_S,
-        effective_audit_timeout_s,
-    )
 
-    # 默认 env=120：min(120, 90+110+5) = 120 > 90（旧口径恰为 90 ⇒ 重试死）
-    assert CODE_AUDIT_LLM_TIMEOUT_S == 120
-    eff = effective_audit_timeout_s()
-    assert eff == 120.0
-    assert eff > agent_mod._REVIEW_LLM_READ_TIMEOUT_MAX_S
+    assert ca_mod.CODE_AUDIT_LLM_TIMEOUT_S == 540
+    eff = ca_mod.effective_audit_timeout_s()
+    assert eff == 540.0
+    assert eff == oneshot_mod.oneshot_total_timeout_s()
+    # 结构约束（P2-3）：审计帽必须 < turn 硬预算 —— 否则审计跑满帽时
+    # agent turn 先被收口，审计完成也送不到 agent 手里
+    assert 540.0 < HARD_TOTAL_TIMEOUT_S
 
-    # env 调大到 1000：夹到内层总预算 205
-    monkeypatch.setattr(ca_mod, "CODE_AUDIT_LLM_TIMEOUT_S", 1000)
-    assert effective_audit_timeout_s() == 90.0 + 110.0 + 5.0
 
-    # env 调小到 60：尊重调用方（宁快不慢）
-    monkeypatch.setattr(ca_mod, "CODE_AUDIT_LLM_TIMEOUT_S", 60)
-    assert effective_audit_timeout_s() == 60.0
+def test_effective_audit_timeout_env_is_a_real_gate(monkeypatch):
+    """env 调小/调大都实时生效（旧实现调到 300 也只跑 90s 的假闸已拆除）。"""
+    from hiveweave.llm.streamer import oneshot as oneshot_mod
+    from hiveweave.services import code_audit as ca_mod
+
+    monkeypatch.setenv("HIVEWEAVE_CODE_AUDIT_TIMEOUT_S", "33")
+    assert ca_mod.effective_audit_timeout_s() == 33.0
+    assert oneshot_mod.oneshot_total_timeout_s() == 33.0
+
+    monkeypatch.setenv("HIVEWEAVE_CODE_AUDIT_TIMEOUT_S", "900")
+    assert ca_mod.effective_audit_timeout_s() == 900.0
+
+    monkeypatch.setenv("HIVEWEAVE_CODE_AUDIT_TIMEOUT_S", "abc")
+    # 非法值回退默认 540，不炸链路
+    assert ca_mod.effective_audit_timeout_s() == 540.0

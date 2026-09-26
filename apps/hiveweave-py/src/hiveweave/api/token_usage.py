@@ -4,7 +4,7 @@
 （TokenMeter 服务聚合）。全部只读，best-effort —— 表/库不存在时返回空而非报错。
 
 - ``GET /api/projects/{project_id}/token-usage``
-  按 agent × request_type 拆分的汇总（main / compaction_* / subagent）。
+  按 agent × request_type 拆分的汇总（main / compaction_* / subagent / cache_warm / oneshot）。
 - ``GET /api/projects/{project_id}/token-usage/daily``
   按天然日分组的汇总（近 N 天，默认 30）。
 - ``GET /api/projects/{project_id}/token-usage/agents/{agent_id}``

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 
@@ -305,12 +305,23 @@ class ToolLoopMixin:
         max_tool_rounds: int | None = None,
         steer_queue: asyncio.Queue | None = None,
         usage_sink: Callable[[dict], None] | None = None,
+        exit_gate_check: Callable[[list[dict]], Awaitable[str | None]] | None = None,
     ) -> dict:
         """Tool loop: 流式请求 → 检查 tool_calls → 执行工具 → 重复。
 
         ``steer_queue``：插话通道。每轮开头的 next-step 窗口 poll 其中消息，
         作为 user 消息注入本轮 LLM 请求（参考 DSH session.prompt(mode='steer')），
         让运行中的 turn 不必等整轮结束即可响应用户插话。
+
+        ``exit_gate_check``（批 C 第1步②）：出口门禁同 run 补步接缝。在模型
+        产出收尾文本（无 tool_calls）即将自然关闭 run 之前调用一次
+        ``exit_gate_check(tool_history)``；返回 hint 字符串则把该 hint 作为
+        user 消息注入当前 run 的同一上下文并续跑（等价 DSH 的
+        session.append('user/message') 续当前 open step），让模型补上缺失的
+        commit_turn/收尾工具调用后再正常关闭；返回 None 则按原样收口。
+        预算与违规判定在回调内（``completion.build_gate_supplement_hint``），
+        本循环不持有补步计数。已 commit 的 run（end_turn 短路）永远不会
+        走到注入点，零额外开销。
         """
         # 使用调用方传入的上限，回退到实例默认值
         rounds_cap = max_tool_rounds if max_tool_rounds else self.max_tool_rounds
@@ -1523,6 +1534,51 @@ class ToolLoopMixin:
             final_msg = _assistant_with_reasoning(
                 final_text, provider.supports_thinking, new_thinking
             )
+
+            # ── 批 C 第1步②：出口门禁同 run 补步（DSH: retry in the open
+            # step，docs/agent-lifecycle.md:51）────────────────────────
+            # 模型产出了收尾文本但没有 commit_turn ⇒ run 即将关闭。在关闭
+            # 【前】问一次出口门禁：可修复违规且补步预算未耗尽时，把 hint
+            # 作为一条 user 消息注入当前 run 的同一上下文并续跑（同族机制：
+            # 与上方 stall/budget/no-text 提示同为 messages.append + continue，
+            # 不另造第二套），让模型补齐 commit_turn/收尾工具调用后正常关闭。
+            # 旧路径是 run 关闭后 _retrigger_for_turn_gate 重开整轮 —— 已退役。
+            # hint 随 _acc 落 tool_turn_acc ⇒ 与整轮一起持久化进对话历史。
+            if exit_gate_check is not None:
+                try:
+                    gate_hint = await exit_gate_check(tool_history)
+                except Exception as exc:
+                    log.warning(
+                        "exit_gate_check_failed",
+                        agent_id=agent_id,
+                        round=round_num,
+                        error=str(exc),
+                    )
+                    gate_hint = None
+                if gate_hint:
+                    # 末轮 assistant 消息原先只落 tool_turn_acc 不进请求
+                    # messages（循环随即退出）；续跑时必须先补进请求历史。
+                    # ⚠ 必须同时 _acc(final_msg)（P2-2 账本缺口）：补步轮若
+                    # 再走文本收口（预算耗尽判 None）或 end_turn，原收尾文本
+                    # 否则只活在直播流 —— tool_turn_acc（→ conversation_turns
+                    # / metadata.segments）与 result.content 双双丢失，且
+                    # segments 与 content 失配会触发展示层全量兜底复读。
+                    messages.append(final_msg)
+                    _acc(final_msg)
+                    messages.append({"role": "user", "content": gate_hint})
+                    _acc({"role": "user", "content": gate_hint})
+                    log.info(
+                        "exit_gate_supplement_injected",
+                        agent_id=agent_id,
+                        round=round_num,
+                        hint_len=len(gate_hint),
+                    )
+                    # 续跑前同步累积器（与工具轮 continue 前的口径一致），
+                    # 后续轮的 combined_text/combined_thinking 才不丢前文。
+                    text_acc = self._strip_placeholder(combined_text)
+                    thinking_acc = combined_thinking
+                    continue
+
             _acc(final_msg)
 
             log.info("stream_complete",

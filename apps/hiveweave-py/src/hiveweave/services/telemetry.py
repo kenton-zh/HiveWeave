@@ -317,7 +317,12 @@ class Telemetry:
         *,
         gate_round: int = 0,
     ) -> None:
-        """Record a turn-exit evaluation (repair|park|exhausted|ok)."""
+        """Record a turn-exit evaluation (supplement|park|exhausted|budget_closed|ok).
+
+        批 C 第1步②：``repair`` 已随跨 run 重触退役 —— 可修复违规先走
+        ``supplement``（run 内补步），收口仍违规记 ``exhausted``，预算墙
+        收口不重触记 ``budget_closed``。
+        """
         viols = list(violations or [])
         self.emit(AGENT_TURN_EXIT, {
             "agent_id": agent_id,

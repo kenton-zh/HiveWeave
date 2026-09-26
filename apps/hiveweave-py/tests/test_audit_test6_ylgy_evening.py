@@ -430,7 +430,13 @@ async def test_refuse_project_root_allows_verify_only_writer():
 
 
 def test_productive_continue_source_does_not_refill_budget():
-    """Audit P1-3: productive_continue must be in no-refill set."""
+    """Audit P1-3 + 批 C 第1步②：no-refill 集合契约（按成员断言）。
+
+    productive_continue / interrupted_resume / open_task_reminder /
+    turn_continue 不回填 slice budget。原断言的 `"turn_exit_gate" in src`
+    分支在其生产者删除后会靠注释文字侥幸通过 —— 现改为负向断言：
+    turn_exit_gate 不再以集合成员形式出现。
+    """
     # Source gate is inline in Agent.chat — assert the exclusion set contract
     # by grepping the compiled source of the refill condition.
     import inspect
@@ -438,17 +444,17 @@ def test_productive_continue_source_does_not_refill_budget():
     from hiveweave.agents import agent as agent_mod
 
     src = inspect.getsource(agent_mod.Agent.chat)
-    assert "productive_continue" in src
     # Must appear in the "do not refill" tuple/set near _slice_budget
-    assert (
-        'source not in (\n                "turn_exit_gate",\n'
-        '                "open_task_reminder",\n'
-        '                "productive_continue",\n            )'
-        in src
-        or '"productive_continue"' in src
-        and "turn_exit_gate" in src
-        and "_slice_budget" in src
-    )
+    for member in (
+        "open_task_reminder",
+        "productive_continue",
+        "interrupted_resume",
+        "turn_continue",
+    ):
+        assert f'"{member}"' in src
+    assert "_slice_budget" in src
+    # 门禁重触生产者已删：不再是 no-refill 集合成员（注释文字不算）
+    assert '"turn_exit_gate",' not in src
 
 
 # ── E3: VERIFY baseline hard gate ──────────────────────────────────────────

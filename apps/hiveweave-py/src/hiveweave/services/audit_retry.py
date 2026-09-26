@@ -353,12 +353,13 @@ async def enqueue_failed_audit(
     }
 
 
-async def _resolve_oneshot_callback(agent_id: str):
+async def _resolve_oneshot_callback(agent_id: str, project_id: str | None = None):
     """重跑用的 oneshot 回调：优先在册 Agent 实例，否则同 HTTP 路径 adhoc。
 
     生产回调是 ``Agent._oneshot_llm(model_config, system, user)``；后台循环
     里 agent 实例可能已停（off-duty / 重启），此时用 adhoc 版本走同一条
-    provider + retry 栈，不依赖 Agent 进程内状态。
+    流式 provider + retry 栈（``llm/streamer/oneshot``，批 B），不依赖
+    Agent 进程内状态。adhoc 带上 agent/project 身份以便 llm_usage 记账。
     """
     try:
         from hiveweave.agents.supervisor import agent_manager
@@ -368,36 +369,63 @@ async def _resolve_oneshot_callback(agent_id: str):
             return inst._oneshot_llm
     except Exception:  # noqa: BLE001
         pass
-    return _adhoc_oneshot_llm
+
+    async def _bound_adhoc(
+        model_config: dict, system_prompt: str, user_prompt: str
+    ) -> str:
+        return await _adhoc_oneshot_llm(
+            model_config,
+            system_prompt,
+            user_prompt,
+            agent_id=agent_id,
+            project_id=project_id,
+        )
+
+    return _bound_adhoc
 
 
 async def _adhoc_oneshot_llm(
-    model_config: dict, system_prompt: str, user_prompt: str
+    model_config: dict,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    agent_id: str = "",
+    project_id: str | None = None,
 ) -> str:
-    """Agent._oneshot_llm 的无实例版本（同 HTTP 路径，见 agents/agent.py）。"""
+    """Agent._oneshot_llm 的无实例版本（同流式路径，见 agents/agent.py）。"""
     if not model_config:
         from hiveweave.services.model import NoModelConfiguredError
 
         raise NoModelConfiguredError("No model configured for oneshot LLM")
 
-    from hiveweave.agents.agent import _review_llm_post_with_retry
     from hiveweave.llm.provider import provider_factory
-    from hiveweave.llm.streamer.constants import _get_llm_semaphore
+    from hiveweave.llm.streamer.oneshot import (
+        record_oneshot_usage,
+        stream_oneshot_with_retry,
+    )
 
     provider = provider_factory.create(model_config)
-    body = provider.build_body(
-        messages=[
+    result = await stream_oneshot_with_retry(
+        provider,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        stream=False,
+        agent_id=agent_id,
         temperature=0.3,
     )
-    headers = provider.build_headers()
-    headers["Accept"] = "application/json"
-    return await _review_llm_post_with_retry(
-        provider.build_url(), body, headers, _get_llm_semaphore()
+    await record_oneshot_usage(
+        agent_id=agent_id,
+        project_id=project_id,
+        provider=provider,
+        model_config=model_config,
+        result=result,
+        request_type="oneshot",
     )
+    text = result["text"]
+    if not text and result.get("thinking"):
+        text = str(result["thinking"])
+    return text
 
 
 class AuditRetryLoop:
@@ -537,7 +565,7 @@ class AuditRetryLoop:
             await self._discard_row(project_id, row, "diff 已变化")
             return
 
-        oneshot = await _resolve_oneshot_callback(agent_id)
+        oneshot = await _resolve_oneshot_callback(agent_id, project_id)
         # 审计 P1-4：重跑透传入队时的作者申诉（与首次审计同一申诉上下文）
         appeal_notes: str | None = None
         try:

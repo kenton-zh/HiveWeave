@@ -11,17 +11,19 @@ import pytest
 
 
 def test_completion_initializes_phase_before_gate_tail():
-    """Source guard: phase = None sits next to gate_retrigger_hint init."""
+    """Source guard: phase = None sits next to the gate decision locals init."""
     from pathlib import Path
 
     here = Path(__file__).resolve()
     completion = here.parents[1] / "src" / "hiveweave" / "agents" / "completion.py"
     text = completion.read_text(encoding="utf-8")
     assert "phase: str | None = None" in text
-    # Init must be adjacent to gate_retrigger_hint (public-tail safety)
-    hint_pos = text.index("gate_retrigger_hint: str | None = None")
+    # Init must sit in the same locals block as the gate decision flags
+    # (public-tail safety). 批 C 第1步②：gate_retrigger_hint 已随「门禁修复
+    # 重开整轮」路径退役，phase 的同块邻居是 continue_slice/budget_exhausted。
+    slice_pos = text.index("continue_slice = False")
     phase_pos = text.index("phase: str | None = None")
-    assert abs(phase_pos - hint_pos) < 400
+    assert abs(phase_pos - slice_pos) < 400
     # Productive-continue tail still references phase
     assert "_arm_productive_continue" in text
     assert 'phase == "in_progress"' in text

@@ -482,8 +482,14 @@ def _agent_wait_has_ask_evidence(ref: str, ctx: ExitContext) -> bool:
     return False
 
 
-def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
-    """Validate turn exit. Never sets continue_work for unlimited re-entry."""
+def evaluate_turn_exit(ctx: ExitContext, *, emit_telemetry: bool = True) -> ExitDecision:
+    """Validate turn exit. Never sets continue_work for unlimited re-entry.
+
+    ``emit_telemetry=False``：批 C 第1步②同 run 补步的关闭前评估复用本函数
+    （``completion.build_gate_supplement_hint``）。补步评估是纯读预检，权威
+    判定仍在 run 收口时发生 —— 双次评估只应让收口那一次落 gate_hard_reject
+    遥测，否则同一违规按 run 双倍计数。
+    """
     violations: list[str] = []
     raw = get_pending_turn_result(ctx.agent_id)
     turn_result: TurnResult | None = None
@@ -670,24 +676,25 @@ def evaluate_turn_exit(ctx: ExitContext) -> ExitDecision:
             park = not repair_only
         if park:
             disposition = "runnable" if remaining_obligations else disposition
-        try:
-            from hiveweave.services.telemetry import telemetry
+        if emit_telemetry:
+            try:
+                from hiveweave.services.telemetry import telemetry
 
-            for ref in wait_without_ask_refs:
-                telemetry.gate_hard_reject(f"WAIT_WITHOUT_ASK:{ref}")
-            if "UNREPLIED_ASKS" in uniq and unreplied:
-                for m in unreplied[:8]:
-                    sender = (
-                        m.get("from_name")
-                        or m.get("from_agent_id")
-                        or "?"
-                    )
-                    telemetry.gate_hard_reject(f"UNREPLIED_ASKS:{sender}")
-            for gate in uniq:
-                if gate not in ("WAIT_WITHOUT_ASK", "UNREPLIED_ASKS"):
-                    telemetry.gate_hard_reject(gate)
-        except Exception as e:
-            log.debug("gate_telemetry_failed", error=str(e))
+                for ref in wait_without_ask_refs:
+                    telemetry.gate_hard_reject(f"WAIT_WITHOUT_ASK:{ref}")
+                if "UNREPLIED_ASKS" in uniq and unreplied:
+                    for m in unreplied[:8]:
+                        sender = (
+                            m.get("from_name")
+                            or m.get("from_agent_id")
+                            or "?"
+                        )
+                        telemetry.gate_hard_reject(f"UNREPLIED_ASKS:{sender}")
+                for gate in uniq:
+                    if gate not in ("WAIT_WITHOUT_ASK", "UNREPLIED_ASKS"):
+                        telemetry.gate_hard_reject(gate)
+            except Exception as e:
+                log.debug("gate_telemetry_failed", error=str(e))
         return ExitDecision(
             ok=False,
             violations=uniq,

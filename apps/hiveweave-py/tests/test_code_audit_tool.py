@@ -292,7 +292,11 @@ async def test_callback_no_model_error_maps_no_model():
 @pytest.mark.asyncio
 async def test_callback_generic_error_maps_llm_failed():
     """其他异常（网络/HTTP）→ llm_failed。"""
-    from hiveweave.services.code_audit import reset_ledger, run_code_audit
+    from hiveweave.services.code_audit import (
+        effective_audit_timeout_s,
+        reset_ledger,
+        run_code_audit,
+    )
 
     reset_ledger("agent-1")
     with (
@@ -311,11 +315,14 @@ async def test_callback_generic_error_maps_llm_failed():
     # （上游能力不可用 ≠ 执行者证据缺失）。
     # TEST_DSH_70 P2-3 批3：异常出口再带 capped_at_s（外层帽值）——
     # 「审计死于帽」与「上游真死」事后可分（作废前置提示）。
+    # 批 B 起帽值来自 env HIVEWEAVE_CODE_AUDIT_TIMEOUT_S（默认 540，
+    # P2-3 独立审计 2026-09-27 钳到 < turn 硬预算 570），
+    # 断言与 effective_audit_timeout_s() 同源而非硬编码。
     assert result == {
         'audited': False,
         'reason': 'llm_failed',
         'audit_upstream_unavailable': True,
-        'capped_at_s': 120.0,
+        'capped_at_s': effective_audit_timeout_s(),
     }
 
 
