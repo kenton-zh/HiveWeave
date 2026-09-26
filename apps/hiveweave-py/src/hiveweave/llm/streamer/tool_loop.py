@@ -605,7 +605,10 @@ class ToolLoopMixin:
             # 前缀缓存从第一处 replace 整段作废。压力线先 DSH 锯齿（prune /
             # 摘要旧头），0.95 硬裁仍是 API 安全网。
             messages = await self._pressure_compact_if_needed(
-                messages, provider, session_id=agent_id
+                messages, provider, session_id=agent_id,
+                # 批 D 第 2 步任务 5：记账归属 —— 工作集压力摘要的旁路
+                # LLM 调用进 llm_usage（request_type=compaction_working_set）。
+                agent_id=agent_id,
             )
             messages = self._trim_context_if_needed(messages, provider)
             # P1-1②另半（2026-09-21）：**run 内每次请求前也对比一次** —— 否则

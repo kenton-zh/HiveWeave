@@ -33,6 +33,116 @@ from .types import DeltaCallback
 log = structlog.get_logger(__name__)
 
 
+# ── 批 D 第 2 步任务 5：旁路 LLM 调用的记账 ────────────────────────
+# 病灶（审计 §6 第 2 步④）：本模块两条旁路 client.post（工作集头摘要、
+# 收尾总结）整条不进 llm_usage —— Token 页/命中率对这两类流量全盲，
+# duration 也无从统计。此处接进 token_meter.record_rounds（批 B
+# record_oneshot_usage 同一漏斗/sink；不复用该函数是因为它要求 provider
+# 对象 + model_config 形状，而这里只有 ProviderConfig —— 直接走
+# record_rounds 少一层包装，记账语义一致）。
+# request_type 取值风格照现有枚举（main/subagent/oneshot/cache_warm/
+# compaction_<kind>）：
+#   compaction_working_set — 压缩类（工作集压力摘要，compaction_ 前缀族）
+#   turn_summary           — 收尾总结（max_rounds / stall_break / no_text）
+
+
+def _extract_bypass_usage(data: Any) -> dict | None:
+    """从非流式响应体提取 wire usage（openai / anthropic / responses 形状）。"""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    choices = data.get("choices")
+    if not usage and isinstance(choices, list) and choices:
+        usage = (choices[0] or {}).get("usage") if isinstance(choices[0], dict) else None
+    if not usage and isinstance(data.get("response"), dict):
+        usage = data["response"].get("usage")
+    return usage if isinstance(usage, dict) and usage else None
+
+
+async def _record_bypass_usage(
+    agent_id: str | None,
+    provider: ProviderConfig,
+    data: Any,
+    duration_ms: int,
+    request_type: str,
+) -> None:
+    """旁路调用进 llm_usage 记账（token + 实测耗时）。best-effort。
+
+    ``project_id`` 由 agent 反查后传入（独立审计 P1-1）：record_rounds 的
+    四类消费方（agent_summary / project_by_agent / daily_summary /
+    run_summary）全按 project_id/run_id 过滤 —— project_id=None 的行只有
+    platform_overview 看得到，等于「旁路全盲」只修了一半。同文件
+    ``record_compaction`` 既有做法 = ``meta_db.get_agent_project_id``；
+    run_id 本模块无源（旁路调用在 Streamer 内执行，Streamer 不持有
+    run），保持 NULL 与压缩行同形。
+
+    anthropic 的 cache 字段映射与 conversation/compaction.py 同款
+    （批 G P1-2：``cache_read_input_tokens`` 必须进 raw["cache_read"]，
+    否则命中被记 0）。
+    """
+    if not agent_id:
+        return
+    usage = _extract_bypass_usage(data)
+    if not usage:
+        return
+    try:
+        from hiveweave.db import meta as meta_db
+        from hiveweave.llm.util import normalize_usage
+        from hiveweave.services.token_meter import token_meter
+
+        try:
+            project_id = await meta_db.get_agent_project_id(agent_id)
+        except Exception:  # noqa: BLE001 — project 反查失败不挡记账本体
+            project_id = None
+
+        provider_value = provider.api_format.value
+        raw_usage: dict[str, Any] = {
+            "input": usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+            "output": usage.get("completion_tokens") or usage.get("output_tokens") or 0,
+            "prompt_tokens_details": (
+                usage.get("prompt_tokens_details")
+                or usage.get("input_tokens_details")
+            ),
+            "prompt_cache_hit_tokens": usage.get("prompt_cache_hit_tokens"),
+            "prompt_cache_miss_tokens": usage.get("prompt_cache_miss_tokens"),
+        }
+        for wire_field, src in (
+            ("cache_read", "cache_read_input_tokens"),
+            ("cache_creation", "cache_creation_input_tokens"),
+            ("cache_creation_tokens", "cache_creation_tokens"),
+        ):
+            if usage.get(src) is not None:
+                raw_usage[wire_field] = usage.get(src)
+        norm = normalize_usage(raw_usage, provider_value)
+        if not norm:
+            return
+        await token_meter.record_rounds(
+            agent_id,
+            # P1-1（独立审计）：project_id 解析后传入 —— Token 页四类消费方
+            # 全按 project_id 过滤，NULL 行等于没修盲区。
+            project_id,
+            [
+                {
+                    "input": norm["input"],
+                    "output": norm["output"],
+                    "cache_read": norm["cache_read"],
+                    "cache_creation": norm["cache_creation"],
+                    "total": norm["total"],
+                    "duration_ms": int(duration_ms or 0),
+                    "cache_creation_reported": bool(
+                        norm["cache_creation_reported"]
+                    ),
+                }
+            ],
+            model_id=str(getattr(provider, "model_name", "") or ""),
+            provider=provider_value,
+            request_type=request_type,
+        )
+    except Exception as e:  # noqa: BLE001 — 记账失败绝不影响主流程
+        log.debug("bypass_usage_meter_failed", error=str(e),
+                  request_type=request_type)
+
+
 class ContextMixin:
     """Context management methods for Streamer."""
 
@@ -349,8 +459,15 @@ class ContextMixin:
         provider: ProviderConfig,
         transcript: str,
         session_id: str | None = None,
+        agent_id: str | None = None,
     ) -> str | None:
-        """One-shot non-tool LLM call. Empty/error → None (caller hard-trims)."""
+        """One-shot non-tool LLM call. Empty/error → None (caller hard-trims).
+
+        ``agent_id``（批 D 第 2 步任务 5）：记账归属 —— 传入时本次调用
+        进 llm_usage（request_type="compaction_working_set"，含实测耗时）；
+        缺省维持旧行为（不记账）。由 ``_pressure_compact_if_needed`` 从
+        tool_loop 透传。
+        """
         prompt = (
             "Summarize the following in-progress agent tool-loop history.\n"
             "Keep: goal, constraints, files touched, commands run, errors, "
@@ -370,6 +487,7 @@ class ContextMixin:
         )
         client = provider.build_client()
         try:
+            _t0 = time.monotonic()
             resp = await asyncio.wait_for(
                 client.post(
                     url,
@@ -378,6 +496,7 @@ class ContextMixin:
                 ),
                 timeout=30.0,
             )
+            _elapsed_ms = int((time.monotonic() - _t0) * 1000)
             if resp.status_code != 200:
                 log.warning(
                     "working_set_summary_http",
@@ -385,6 +504,11 @@ class ContextMixin:
                 )
                 return None
             data = resp.json()
+            # 批 D 第 2 步任务 5：旁路调用记账（token + 实测耗时）。
+            await _record_bypass_usage(
+                agent_id, provider, data, _elapsed_ms,
+                "compaction_working_set",
+            )
             choices = data.get("choices") or []
             if not choices:
                 return None
@@ -405,11 +529,15 @@ class ContextMixin:
         *,
         summarize: Callable[[str], Awaitable[str | None]] | None = None,
         session_id: str | None = None,
+        agent_id: str | None = None,
     ) -> list[dict]:
         """DSH-style step-boundary compact: prune, then LLM-summarize old head.
 
         Below ``0.8 × usable`` this is a no-op (append-only, prefix cache).
         Does not call ``conversation.compaction.Compaction.compact``.
+
+        ``agent_id``（批 D 第 2 步任务 5）：透传给 ``_summarize_working_set_head``
+        做记账归属；缺省不记账（保持旧调用方行为）。
         """
         messages = self._drop_orphan_tool_artifacts(messages)
         _usable, pressure_at, retain_at = self._working_set_budgets(provider)
@@ -451,7 +579,8 @@ class ContextMixin:
                     summary_text = await summarize(transcript)
                 else:
                     summary_text = await self._summarize_working_set_head(
-                        provider, transcript, session_id=session_id
+                        provider, transcript, session_id=session_id,
+                        agent_id=agent_id,
                     )
             except Exception as e:
                 log.warning("working_set_summarize_failed", error=str(e))
@@ -708,6 +837,7 @@ class ContextMixin:
 
         client = provider.build_client()
         try:
+            _t0 = time.monotonic()
             post_coro = client.post(
                 url, headers=headers,
                 content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -719,8 +849,15 @@ class ContextMixin:
                 resp = await asyncio.wait_for(post_coro, timeout=wait_s)
             else:
                 resp = await post_coro
+            _elapsed_ms = int((time.monotonic() - _t0) * 1000)
             if resp.status_code == 200:
                 data = resp.json()
+                # 批 D 第 2 步任务 5：收尾总结也是 LLM 调用 —— 旁路此前
+                # 整条不进 llm_usage（审计 §6 第 2 步④），此处接账
+                # （request_type="turn_summary"，含实测耗时）。
+                await _record_bypass_usage(
+                    agent_id, provider, data, _elapsed_ms, "turn_summary",
+                )
                 choices = data.get("choices") or []
                 if choices:
                     content = choices[0].get("message", {}).get("content")

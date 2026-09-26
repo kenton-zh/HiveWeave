@@ -13,6 +13,7 @@ from typing import Awaitable, Callable
 import inspect
 import os
 import structlog
+import time
 
 from hiveweave.conversation.token_utils import (
     COMPACTION_BUFFER,
@@ -455,8 +456,15 @@ async def _call_compactor_llm(
             tools=tools,
         )
         try:
+            # 批 D 第 2 步（审计 §6 第 2 步④）：压缩调用实测计时。
+            # 此前 record_compaction 的 INSERT 里 duration_ms 是**字面量 0**
+            # —— 压缩耗时占比在 Token 页恒不可见，聚合 duration 对压缩流量
+            # 说谎。monotonic 计时经新增的 duration_ms 参数落账（token_meter
+            # 侧字面量已改占位符）。
+            _t0 = time.monotonic()
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(url, json=body, headers=headers)
+            _elapsed_ms = int((time.monotonic() - _t0) * 1000)
         except Exception as e:
             logger.warning("compactor_llm_call_failed", error=str(e))
             return None
@@ -512,6 +520,7 @@ async def _call_compactor_llm(
                         kind=kind,
                         provider=provider,
                         creation_unreported=0 if norm["cache_creation_reported"] else 1,
+                        duration_ms=_elapsed_ms,
                     )
             except Exception as meter_err:
                 logger.warning("compactor_token_meter_failed",

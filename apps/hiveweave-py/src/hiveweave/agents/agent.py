@@ -1816,6 +1816,27 @@ class Agent:
                 agent_id=self.id,
                 error=str(e),
             )
+        # 5a-2. 失败记忆读侧自动注入（批 D 第 2 步任务 6，读写比 1:15）。
+        # failure_signature 此前只写不读 —— 要等 agent 主动撞到同签名才被
+        # hint 命中。装配期反查「本 agent 最近失败的工具 ↔ 共享签名条目」，
+        # 有解法的条目自动注入（top3、24h 新鲜度、纯镜子条目不注入 ——
+        # 最小实现，无推荐系统）。best-effort：失败静默跳过。
+        try:
+            from hiveweave.services.failure_signature import (
+                recent_failure_memories_hint,
+            )
+
+            fm_hint = await recent_failure_memories_hint(
+                self.id, self.project_id
+            )
+            if fm_hint:
+                user_content = f"{user_content}\n\n{fm_hint}"
+        except Exception as e:
+            log.debug(
+                "failure_memory_inject_failed",
+                agent_id=self.id,
+                error=str(e),
+            )
         # Failed LLM turns persist user+[ERROR] into history; a short nudge
         # like 继续 must still see that pending instruction (no text scan).
         try:

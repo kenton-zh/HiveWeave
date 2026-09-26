@@ -139,6 +139,64 @@ def _keep_path_tail(match: re.Match) -> str:
     return "/".join(parts[-2:])
 
 
+def structured_signature_of(
+    tool_name: str,
+    *,
+    exception_type: str | None = None,
+    is_platform_bug: bool | None = None,
+    # 独立审计 P3：runner_failed 维度**当前无生产调用方**（executor 的 F10
+    # 钩子尚未传 fact_kind，异常出口只带 exception 位）—— 参数预留，接线
+    # 时勿改身份词表（改了 = 库里既有条目失配，同 signature_of 的搁浅语义）。
+    fact_kind: str | None = None,
+    dialect_failed: bool | None = None,
+) -> str | None:
+    """结构化签名身份：tool + 事实位组合（批 D 第 2 步任务 6 最小版）。
+
+    **裁决（对照上游与本仓登记的死结）**：
+
+    - 本仓 ``signature_of`` docstring 原话（现测 services/failure_signature.py，
+      HEAD ab2bcc2 + 本批）：「彻底的做法是改用**结构化身份**（tool + 事实位），
+      但那要求事实位先可用 —— …… 现在就切会把身份塌成"只剩 tool"，
+      属于过度合并」——批 D 任务 1 落位（``run_steps.exception_type`` /
+      ``is_platform_bug``）后，该死结的**前提已解除**，本函数即其兑现。
+    - 上游机制原话（DSH ``docs/defensive-patterns.md:7-9``，HEAD 477b4f420）：
+      「Report orthogonal outcomes independently」—— 事实各落各位；
+      以及 ``packages/core/session/src/repair.ts:16-21`` 的**具名恢复码**
+      （TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN）：按**事实**（调用生命周期）
+      给闭合枚举身份，不读错误措辞。本函数同构：身份 = 闭合词表的
+      ``<维度>::<tool>[::<子维>]`` 组合。
+    - pi（2b0a123de）``cache-stats.ts:56-90`` detectMiss 的归因四列
+      （missedTokens/missedCost/idleMs/modelChanged）同纪律：归因维度
+      **各自成列**，不嵌套文本推断（idleMs 已由批 G 落）。
+
+    维度设计（**可采纳/不适用**的边界）：
+
+    - ``is_platform_bug=1`` → ``platform_bug::<tool>::<exception_type>``。
+      平台 bug 的错误文案差异（属性名/路径/uuid）与根因**正交**；同 tool +
+      同异常类 = 同一堵墙（73 项目 38 条 ``_ConfinedDevProc`` AttributeError
+      即此形态 —— 文本签名下它们是几十条互异条目，distinct_hitters 攒不到
+      阈值 → R7 空转）。
+    - ``fact_kind="runner_failed"`` → ``runner_failed::<tool>``（dialect_failed
+      细分为 ``runner_failed::dialect::<tool>``）—— 命令从未执行，根因在
+      平台/环境侧（方言/权限/执行器），文案几乎不带增量信息。
+    - 其余（command_failed / bad_args / 事实位缺失）→ ``None``：业务失败的
+      错误内容**本身就是区分信息**，合并会把共享条目变成大杂烩（本仓明写
+      「错解比无解更贵」）⇒ 调用方回落文本签名。
+
+    结构化签名**跳过 ``_MIN_SIG_LEN`` 门槛**：门槛防的是「文本信息量不足」；
+    结构化身份是闭合词表组合，语义来自组合本身而非长度。仍受
+    ``_MAX_SIG_LEN`` 截断（防超长工具名）。
+    """
+    tool = (tool_name or "").strip() or "?"
+    if is_platform_bug and exception_type:
+        return f"platform_bug::{tool}::{exception_type}"[:_MAX_SIG_LEN]
+    if fact_kind == "runner_failed":
+        if dialect_failed:
+            return f"runner_failed::dialect::{tool}"[:_MAX_SIG_LEN]
+        return f"runner_failed::{tool}"[:_MAX_SIG_LEN]
+    return None
+
+
 def signature_of(error: str | None, root: str | None = None) -> str | None:
     """规范化失败签名：剥噪声（uuid/时间戳/哈希/路径/**平台标识**）+ 空白归一 + 截断。
 
@@ -363,7 +421,7 @@ async def _project_root_of(project_id: str) -> str | None:
 
     ⚠ **写侧（``record_failure_signature``）与查侧（``known_signature_hint``）
     必须经由同一个解析函数** ⇒ 同一 project_id 永远得到同一 root（或同
-    None），两次 ``signature_of`` 才能对上同一签名 —— 一侧带 root 一侧不带
+    None），两次 ``signature_of`` 才能对上签名 —— 一侧带 root 一侧不带
     就是新的「同一事实两处判」。
     """
     try:
@@ -374,6 +432,215 @@ async def _project_root_of(project_id: str) -> str | None:
         return None
 
 
+async def _project_id_of_agent(agent_id: str) -> str | None:
+    """agent → project_id（异常出口写入侧用；best-effort ⇒ None）。"""
+    try:
+        from hiveweave.db import meta as meta_db
+
+        return await meta_db.get_agent_project_id(agent_id)
+    except Exception:
+        return None
+
+
+async def record_exception_failure_signature(
+    *,
+    agent_id: str,
+    tool_name: str,
+    exc: BaseException,
+    fact_flags: dict | None = None,
+) -> dict:
+    """异常出口 → 共享失败签名（批 D 第 2 步任务 6 写入侧；由
+    ``llm/streamer/tool_exec.py`` 的异常分支调用）。
+
+    为什么必须独立成口：异常路径**不经过** executor 的 F10 钩子
+    （``record_failure_signature`` 只在工具返回失败回执时跑）⇒ 73 项目
+    38 条 ``_ConfinedDevProc`` AttributeError 这类平台 bug 对签名池全盲，
+    distinct_hitters 攒不到阈值 → R7 组织升级空转。
+
+    身份 = **结构化签名**（``structured_signature_of``：tool + 事实位组合
+    —— 任务 1 的 ``exception_type`` / ``is_platform_bug`` 落位后才可用）；
+    事实位判不出（表外异常）时回落文本签名（``signature_of``），保留
+    fallback 语义。best-effort：任何失败只记日志。
+    """
+    flags = fact_flags or {}
+    exception_type = str(
+        flags.get("exception_type") or type(exc).__name__ or ""
+    ).strip()
+    is_bug = flags.get("is_platform_bug")
+    structured = structured_signature_of(
+        tool_name,
+        exception_type=exception_type or None,
+        is_platform_bug=is_bug if isinstance(is_bug, bool) else None,
+    )
+    error = f"{type(exc).__name__}: {exc}"
+    attribution = (
+        (
+            f"platform_bug: 工具抛平台侧异常（{exception_type}）—— 平台责"
+            "任，不是参数错；不要原样重试同一调用"
+        )
+        if structured
+        else ""
+    )
+    project_id = await _project_id_of_agent(agent_id)
+    rec = await record_failure_signature(
+        project_id=project_id,
+        agent_id=agent_id,
+        tool_name=tool_name,
+        error=error,
+        attribution=attribution,
+        sig_override=structured,
+    )
+    if rec.get("written"):
+        log.info(
+            "failure_signature.exception_recorded",
+            agent_id=agent_id[:12],
+            tool=tool_name,
+            exception_type=exception_type,
+            is_platform_bug=is_bug,
+            sig=(rec.get("sig") or "")[:60],
+        )
+        # P1-2（独立审计）：喂 distinct_hitters。``note_distinct_hitter``
+        # 的唯一既有调用点在 executor 的 **dict-回执** 路径 —— 工具 raise
+        # 不经过它 ⇒ 异常类平台 bug（38 条 AttributeError 各自踩）永不
+        # 聚人，3/5/8 组织升级梯度对 R7 的动机案例失灵。写入成功后对同一
+        # 签名补喂（幂等：同 agent 重复并入被集合去重）；命中梯度时走
+        # executor 同款 deliver_notice 通道投递组织级信号。
+        if project_id:
+            try:
+                org_text = await note_distinct_hitter(
+                    project_id=project_id,
+                    signature_key=str(rec.get("sig") or ""),
+                    tool_name=tool_name,
+                    agent_id=agent_id,
+                )
+                if org_text:
+                    from hiveweave.services.health_notice import (
+                        KIND_ORG_ESCALATION,
+                        deliver_notice,
+                    )
+
+                    await deliver_notice(
+                        agent_id,
+                        org_text,
+                        kind=KIND_ORG_ESCALATION,
+                        project_id=project_id,
+                        wake=False,
+                    )
+            except Exception as e:  # noqa: BLE001 — 聚人/升级是旁支
+                log.debug(
+                    "failure_signature.exception_hitter_failed",
+                    error=str(e),
+                )
+    return rec
+
+
+#: 读侧注入上限（批 D 任务 6：限条数，别造推荐系统）。
+_FAILURE_HINT_MAX_ENTRIES = 3
+#: 读侧注入新鲜度窗口（24h）—— 更旧的签名条目由 hint 工具按需查。
+_FAILURE_HINT_FRESHNESS_MS = 24 * 3600 * 1000
+
+
+async def recent_failure_memories_hint(
+    agent_id: str,
+    project_id: str | None,
+    *,
+    limit: int = _FAILURE_HINT_MAX_ENTRIES,
+    freshness_ms: int = _FAILURE_HINT_FRESHNESS_MS,
+) -> str:
+    """记忆读侧自动注入（批 D 第 2 步任务 6，读写比 1:15 的最小修法）。
+
+    病灶：failure_signature 只写不读 —— 条目进入共享空间后要等 agent
+    **主动**撞到同签名（``known_signature_hint`` 按错误文本精确匹配）才被
+    读到，读写比约 1:15（R7 审计）。本函数在**上下文装配**时反查：本
+    agent 最近的失败工具（run_steps，status ∈ failed/error，新鲜窗口内）
+    命中哪些共享签名条目 → 有解法的条目自动注入（带解法原文），不再等
+    主动检索。
+
+    最小实现边界（**没做的**，如实登记）：不做相关性排序/推荐系统 ——
+    只按「工具名命中 + 有解法优先 + 最近优先」取 top N；无解法的纯镜子
+    条目**不注入**（TEST_DSH_70 P2-1 定案：空态广播是 token 噪声，注入
+    同理）；无最近失败时零注入零查询开销（只有一次 run_steps 小查询）。
+
+    Returns 注入文案（空串 = 不注入）。best-effort：任何失败返回 ""。
+    """
+    if not project_id or not agent_id:
+        return ""
+    try:
+        from hiveweave.db import project as project_db
+        from hiveweave.services.memory import MemoryService
+
+        cutoff = int(time.time() * 1000) - int(freshness_ms)
+        rows = await project_db.query(
+            agent_id,
+            "SELECT tool_name, MAX(ended_at) AS last_at FROM run_steps "
+            "WHERE status IN ('failed', 'error') "
+            "AND tool_name IS NOT NULL "
+            "AND started_at >= ? "
+            "AND run_id IN (SELECT id FROM agent_runs WHERE agent_id = ?) "
+            "GROUP BY tool_name ORDER BY last_at DESC LIMIT 10",
+            [cutoff, agent_id],
+        )
+        failed_tools = {
+            str(r["tool_name"] or "").strip() for r in rows or []
+        } - {""}
+        if not failed_tools:
+            return ""
+        mems = await MemoryService().get_project_memories(project_id)
+        candidates: list[tuple[int, dict]] = []
+        now_ms = int(time.time() * 1000)
+        for m in mems or []:
+            if m.get("type") != "failure_signature":
+                continue
+            meta = m.get("metadata") or {}
+            if str(meta.get("tool_name") or "").strip() not in failed_tools:
+                continue
+            updated = int(m.get("updated_at") or m.get("created_at") or 0)
+            if updated and now_ms - updated > freshness_ms:
+                continue
+            content = m.get("content") or ""
+            # 有解法优先：verified 解法行 > 同参重试回声 > 无解法（不注入）。
+            status = _content_derived_status(content)
+            rank = 2 if status == SOLUTION_STATUS_VERIFIED else (
+                1 if status == SOLUTION_STATUS_RETRIED_OK else 0
+            )
+            if rank == 0:
+                continue  # 纯镜子条目 = 噪声，不注入（P2-1 同判据）
+            candidates.append((rank, m))
+        if not candidates:
+            return ""
+        # 有解法优先，其次最近更新。
+        candidates.sort(
+            key=lambda rm: (
+                rm[0],
+                int(rm[1].get("updated_at") or rm[1].get("created_at") or 0),
+            ),
+            reverse=True,
+        )
+        lines = [
+            "[团队失败记忆] 你最近失败的这些工具，团队已有记录的解法"
+            "（勿原样重试同一写法）："
+        ]
+        for _rank, m in candidates[: max(1, limit)]:
+            content = m.get("content") or ""
+            meta = m.get("metadata") or {}
+            solution_line = ""
+            for ln in content.splitlines():
+                if ln.startswith(_SOLUTION_LINE_PREFIX) and ln.split(":", 1)[-1].strip():
+                    solution_line = ln.split(":", 1)[1].strip()
+                    break
+                if ln.startswith(_RETRY_ECHO_LINE_PREFIX):
+                    solution_line = "同参重试曾成功（环境/代码已变化）"
+                    break
+            sig = str(meta.get("signature") or "")[:48]
+            tool = str(meta.get("tool_name") or "?")
+            detail = solution_line or sig
+            lines.append(f"- tool={tool}: {detail}")
+        return "\n".join(lines)
+    except Exception as e:  # noqa: BLE001 — 读侧注入绝不阻断回合
+        log.debug("failure_signature.inject_failed", error=str(e))
+        return ""
+
+
 async def record_failure_signature(
     *,
     project_id: str | None,
@@ -381,8 +648,14 @@ async def record_failure_signature(
     tool_name: str,
     error: str | None,
     attribution: str = "",
+    sig_override: str | None = None,
 ) -> dict:
     """把新失败签名写入项目共享空间（R7 → 0 的可机检支撑）。
+
+    ``sig_override``（批 D 第 2 步任务 6）：**结构化签名**（
+    ``structured_signature_of`` 的返回值）—— 给定时取代文本归一化直接作为
+    条目身份（module_id / metadata.signature / 首行全部同源，仍是**单一
+    判据**的两种输入形态，不是两份判据）。None 时回落文本签名（原行为）。
 
     Returns ``{"written": bool, "preexisting": bool, "preexisting_source":
     str|None, "sig": str|None, "module_id": str|None}``：``preexisting``=该
@@ -402,7 +675,9 @@ async def record_failure_signature(
             "sig": None,
             "module_id": None,
         }
-    sig = signature_of(error, root=await _project_root_of(project_id))
+    sig = sig_override or signature_of(
+        error, root=await _project_root_of(project_id)
+    )
     if sig is None:
         return {
             "written": False,

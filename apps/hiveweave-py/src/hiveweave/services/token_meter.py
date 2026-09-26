@@ -199,13 +199,18 @@ class TokenMeter:
             # 取反落列 —— 1 = provider 未回传 cache 写入（0 是「无数据」），
             # 0 = 上游真回传（含真 0）。旧路径无该位按未回传处理。
             creation_unreported = 0 if r.get("cache_creation_reported") else 1
+            # 批 D 第 2 步任务 4：断流/超时归因层（"first_chunk"/"idle"/
+            # "total"，批 B 在判死异常上随行）。只在能确定时写（缺键 →
+            # SQL NULL），正常完成行恒 NULL —— 与事实位「未确定不落」同纪律。
+            _timeout_layer = r.get("timeout_layer") or None
             statements.append((
                 "INSERT INTO llm_usage "
                 "(id, agent_id, project_id, run_id, task_id, model_id, "
                 "request_type, provider, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, cold_start, creation_unreported, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "duration_ms, cold_start, creation_unreported, "
+                "timeout_layer, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -223,6 +228,7 @@ class TokenMeter:
                     int(r.get("duration_ms", 0) or 0),
                     1 if (i == 0 and is_cold_start) else 0,
                     creation_unreported,
+                    _timeout_layer,
                     # P2 观测（八轮 TEST_DSH_38）：优先用 streamer 逐次记录
                     # 的真实时刻；缺失（旧路径/异常分支）才退回批量盖章时刻。
                     int(r.get("ts") or now),
@@ -282,6 +288,7 @@ class TokenMeter:
         kind: str = "conversation",
         provider: str | None = None,
         creation_unreported: int = 0,
+        duration_ms: int = 0,
     ) -> None:
         """落库一次压缩 LLM 调用（绕过 Streamer，F3 修正）。
 
@@ -292,6 +299,10 @@ class TokenMeter:
         ``creation_unreported``：1 = provider 未回传 cache 写入
         （与 record_rounds 同口径，调用方由 normalize_usage 的
         cache_creation_reported 取反传入）。
+        ``duration_ms``（批 D 第 2 步）：调用方在 client.post 前后用
+        time.monotonic() 实测传入。此前 INSERT 里是**字面量 0**（审计 §6
+        第 2 步④）—— 压缩耗时占比在 Token 页恒不可见，聚合 duration_ms
+        对压缩流量说谎。默认 0 保持旧调用方兼容（0 = 未计时，诚实缺省）。
         """
         try:
             project_id = await meta_db.get_agent_project_id(agent_id)
@@ -312,7 +323,7 @@ class TokenMeter:
                 "request_type, provider, input_tokens, output_tokens, "
                 "cache_read_tokens, cache_creation_tokens, total_tokens, "
                 "duration_ms, creation_unreported, created_at) "
-                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -325,6 +336,7 @@ class TokenMeter:
                     cache_read_tokens,
                     cache_creation_tokens,
                     total,
+                    int(duration_ms or 0),
                     1 if creation_unreported else 0,
                     _now_ms(),
                 ],

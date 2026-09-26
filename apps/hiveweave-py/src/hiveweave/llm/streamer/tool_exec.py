@@ -56,6 +56,98 @@ def _unknown_outcome_content(
     return base
 
 
+# ── 批 D 第 2 步：异常出口的结构化事实位 ─────────────────────────
+# 病灶（审计 §6 第 2 步①）：异常出口只造文案，行级无结构化位 ——
+# 73 项目 38 条 `_ConfinedDevProc` AttributeError（平台 shim 的代码 bug）
+# 在 run_steps 里与工具业务失败同形，「平台侧 bug」只能靠人工读文案猜。
+# 字段形态对齐 DSH 的**具名恢复码**（`packages/core/session/src/repair.ts:16-21`，
+# HEAD 477b4f420）：TOOL_NOT_STARTED / TOOL_OUTCOME_UNKNOWN 是**闭合枚举**、
+# 按事实（调用生命周期）而非措辞归类 —— 这里同理：`exception_type` = 异常类名
+# （事实），`is_platform_bug` = 按类名的闭合判定表归因，不读错误文案。
+
+#: 判定为**平台侧缺陷**的异常类型（代码 bug / 平台环境问题，模型无责）。
+#: OSError 含全部子类（FileNotFoundError / PermissionError…）：工具实现在
+#: OS 边界上炸了，属平台侧可修（哪怕是环境问题，也不是模型的参数错）。
+_PLATFORM_BUG_EXC_TYPES: tuple[type[BaseException], ...] = (
+    AttributeError,
+    KeyError,
+    IndexError,
+    TypeError,
+    AssertionError,
+    NotImplementedError,
+    NameError,
+    UnboundLocalError,
+    RecursionError,
+    SystemError,
+    OSError,
+)
+
+#: 判定为**工具业务失败**的异常类型（调用方可改变结果 —— 换参数/换输入能过）。
+_TOOL_BUSINESS_EXC_TYPES: tuple[type[BaseException], ...] = (
+    ValueError,
+    LookupError,  # 注意 KeyError 是其子类，已被上方平台表优先命中
+)
+
+
+def is_platform_bug_exception(exc: BaseException) -> bool | None:
+    """异常是否平台侧缺陷（批 D 第 2 步任务 1 的**单一判定实现**）。
+
+    返回三态：True = 平台侧（is_platform_bug=1）；False = 工具业务失败；
+    None = 不在判定表内（未判定，调用方**不落库** —— 宁可留 NULL 不臆断，
+    同 run_steps 事实位的「未确定不写」纪律）。
+
+    判定按**异常类名**（MRO 逐级匹配子类），与错误文案/语言无关 ——
+    对齐本仓「状态判据优先于文本判据」的一等纪律。
+    """
+    for cls in type(exc).__mro__:
+        if cls in _PLATFORM_BUG_EXC_TYPES:
+            return True
+        if cls in _TOOL_BUSINESS_EXC_TYPES:
+            return False
+    return None
+
+
+def exception_fact_flags(exc: BaseException) -> dict:
+    """从异常构造结构化事实位（tool_msg 透传 + 落库共用形状）。
+
+    只带能确定的位：`is_platform_bug` 判不出时不写（None 不落）。
+    """
+    flags: dict = {"exception_type": type(exc).__name__}
+    verdict = is_platform_bug_exception(exc)
+    if verdict is not None:
+        flags["is_platform_bug"] = verdict
+    return flags
+
+
+async def _record_exception_signature(
+    agent_id: str,
+    tool_name: str,
+    exc: BaseException,
+    fact_flags: dict,
+) -> None:
+    """异常出口 → 共享失败签名（批 D 第 2 步任务 6 的写入侧接线）。
+
+    异常路径**不经过** executor 的 F10 钩子（``record_failure_signature``
+    只在工具返回失败回执的路径上跑）⇒ 平台 bug（38 条 AttributeError）
+    对签名池全盲，distinct_hitters 攒不到阈值 → R7 组织升级空转。
+
+    身份用**结构化签名**（tool + 事实位组合 —— 任务 1 落位后才可用，
+    破 failure_signature docstring 里「现在切会塌成只剩 tool」的死结；
+    文本签名作 fallback，见 ``record_exception_failure_signature``）。
+    best-effort：任何失败只记日志，绝不影响工具回执。
+    """
+    from hiveweave.services.failure_signature import (
+        record_exception_failure_signature,
+    )
+
+    await record_exception_failure_signature(
+        agent_id=agent_id,
+        tool_name=tool_name,
+        exc=exc,
+        fact_flags=fact_flags,
+    )
+
+
 class ToolExecMixin:
     """Tool execution methods for Streamer."""
 
@@ -126,6 +218,26 @@ class ToolExecMixin:
                     tc["name"], type(result).__name__, str(result)
                 )
                 error_ids.add(tc["id"])
+                # 批 D 第 2 步任务 1：异常出口的结构化事实位。
+                # 行级落库在 agents/streaming.py 的 except 分支（record_step_end
+                # —— 那里有 step_id，是行关闭的唯一点位）；本层职责：
+                # ① 事实位透传到 tool_msg（stall 归因/回扫可见）；
+                # ② 平台侧异常写共享失败签名（任务 6 —— 异常路径此前根本
+                #    不经过 executor 的 F10 钩子，签名池对 38 条
+                #    AttributeError 这类平台 bug 全盲，distinct_hitters
+                #    攒不到阈值 → R7 空转）。
+                _exc_flags = exception_fact_flags(result)
+                try:
+                    await _record_exception_signature(
+                        agent_id, tc["name"], result, _exc_flags
+                    )
+                except Exception as e:  # noqa: BLE001 — 签名是旁支，绝不影响回执
+                    # 静默吞掉 = 「平台 bug 为什么没聚人」无从排查（独立审计
+                    # P2-2）：留 debug 摘要，不刷屏但可捞。
+                    log.debug("tool_exception_signature_failed",
+                              tool=tc["name"],
+                              error_type=type(result).__name__,
+                              error=str(e)[:200])
             else:
                 content = result.get("content", "")
                 if (
@@ -160,6 +272,11 @@ class ToolExecMixin:
                 for _fk in ("blocked", "runner_failed", "command_failed"):
                     if result.get(_fk):
                         tool_msg[_fk] = True
+            else:
+                # 批 D 第 2 步任务 1：异常出口事实位随 tool_msg 透传
+                # （exception_type / is_platform_bug）。与 F4 同纪律：
+                # provider 组包白名单剥离，只带能确定的位。
+                tool_msg.update(_exc_flags)
             # Multimodal: preserve screenshot pixels for the next LLM round.
             images = None if isinstance(result, BaseException) else result.get("images")
             if images:

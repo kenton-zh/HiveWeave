@@ -605,7 +605,14 @@ PROJECT_DB_TABLES = [
         -- 有它 ⇒ 续跑（上一 run 被中断/失败）时**承接**上一 run 的计数，可跨进程重建。
         -- ⚠ **无 DEFAULT**（同 P0-3 三列的纪律）：NULL = 该 run 从未记录（老行/未重试过），
         --   与 0（明确记录"0 次"）**不同形**；新行由写口显式写值。
-        upstream_retry_attempt INTEGER
+        upstream_retry_attempt INTEGER,
+        -- 批 D 第 2 步（2026-09-26）：stall 收口归因（tool_failed / blocked /
+        -- readonly / no_progress…，取值域 = doom_loop.STALL_REASON_*）。
+        -- 病灶：收口算出的 stall_reason 只进日志，跨 run 不可机检。写入点 =
+        -- agents/completion.py 的 stall_break 消费分支（set_run_fact）。
+        -- ⚠ 与 services/run_ledger.py `_FACT_COLUMNS` **双登记点**；TEXT 无
+        -- DEFAULT（NULL = 该 run 非 stall 收口 / 老行）。
+        stall_reason TEXT
     )
     """,
     """
@@ -752,6 +759,43 @@ PROJECT_DB_TABLES = [
     # `ADD COLUMN … DEFAULT 0` 会给**存量行回填 0**，把"没这条信息"说成
     # "确认未加固" —— 那是假事实。新行由写入点显式给值。
     """ALTER TABLE run_steps ADD COLUMN git_hardened INTEGER""",
+    # 批 D 第 2 步（2026-09-26）：工具异常出口的结构化事实位。
+    # 病灶：工具执行抛异常时只造 [Tool Error] / [TOOL OUTCOME UNKNOWN] 文案，
+    # 行级没有任何结构化位 —— 73 项目 38 条 `_ConfinedDevProc` AttributeError
+    # 在数据里与普通业务失败同形，「平台侧 bug」只能靠人工读 error 文案猜。
+    #   exception_type  — 异常类名（AttributeError / OSError / …）。
+    #   is_platform_bug — 1 = 平台侧异常（OSError/AttributeError/KeyError 等
+    #                     代码/环境缺陷，模型无责）；0 = 工具业务失败
+    #                     （ValueError 等调用方可改变结果的）；NULL = 未判定
+    #                     （不在判定表内的异常类型，宁可留空不臆断）。
+    #                     ⚠ **回扫判据**（独立审计 P2-3 登记）：平台 bug 的
+    #                     机器判定只认 `is_platform_bug = 1` —— NULL 与 0
+    #                     都不算（NULL 是"没判过"，把它算进平台 bug 会把
+    #                     未判定面虚增成缺陷面；判 0 是"判了、不是"）。
+    # ⚠ **不写 DEFAULT**（同 started / enforcement 纪律）：存量行回填 0 会把
+    # "没这条信息"说成"确认非平台 bug"。新行由异常出口的 record_step_end
+    # 显式写值（判定单一实现在 llm/streamer/tool_exec.py）。
+    """ALTER TABLE run_steps ADD COLUMN exception_type TEXT""",
+    """ALTER TABLE run_steps ADD COLUMN is_platform_bug INTEGER""",
+    # 批 D 第 2 步（2026-09-26）：命令执行三正交位（P2-20 假成功通道）。
+    # 上游戒律（DSH `docs/defensive-patterns.md:7-9`，HEAD 477b4f420）：
+    # 「Report orthogonal outcomes independently — Surface each independent
+    # fact (timedOut, signal, exitCode) on its own; never nest one flag's
+    # report inside another's branch, or a caller reads a cut-short run as a
+    # clean success.」——「exit=0 且空输出」此前在数据里与「exit=0 且有产出」
+    # 同形，假成功不可机检。三列**互相独立、绝不嵌套**：
+    #   exit_code    — 命令真实退出码；NULL = 没有退出码（进程没启动/未判定），
+    #                  绝不补 0（补 0 = 伪造成功，正是 P2-20 的病）。
+    #   output_empty — 1 = 命令 stdout+stderr 语义为空（构造点在 bash/pwsh
+    #                  出口按剥掉提示后缀前的 body 判定）；0 = 有产出；
+    #                  NULL = 非 shell 类工具/未判定。
+    #   truncated    — 1 = 输出在工具层被截断（1MB 帽）；0 = 完整；
+    #                  NULL = 未判定。
+    # ⚠ 三列同批**不写 DEFAULT**：NULL = 未判定（老行/非 shell 工具），
+    # 与 0「已判定为否」不同形 —— 回扫判据 `IS NULL` 才能区分「没判」与「判了」。
+    """ALTER TABLE run_steps ADD COLUMN exit_code INTEGER""",
+    """ALTER TABLE run_steps ADD COLUMN output_empty INTEGER""",
+    """ALTER TABLE run_steps ADD COLUMN truncated INTEGER""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -860,7 +904,7 @@ PROJECT_DB_TABLES = [
         run_id TEXT,
         task_id TEXT,
         model_id TEXT,
-        request_type TEXT DEFAULT 'main',   -- main | compaction_conversation | compaction_memory | subagent | cache_warm | oneshot
+        request_type TEXT DEFAULT 'main',   -- main | compaction_conversation | compaction_memory | compaction_working_set | turn_summary | subagent | cache_warm | oneshot
         provider TEXT,
         input_tokens INTEGER DEFAULT 0,
         output_tokens INTEGER DEFAULT 0,
@@ -884,6 +928,14 @@ PROJECT_DB_TABLES = [
     # 量程位由 llm/util.normalize_usage 的 cache_creation_reported 单一判据
     # 取反落库，新旧库都由 ALTER 补列（与 cold_start 同模式）。
     """ALTER TABLE llm_usage ADD COLUMN creation_unreported INTEGER DEFAULT 0""",
+    # 批 D 第 2 步（2026-09-26）：oneshot 断流/超时的**归因层**落账。
+    # 批 B 已让判死异常携带 `timeout_layer`（"first_chunk"/"idle"/"total"），
+    # 但只在日志与 code_audit meta 里 —— 日志一停就永远答不出「那次审查
+    # 死于哪一层」。本列把层随 llm_usage 行落库：断流后仍收到 usage 的行
+    # （partial_usage 接账，见 services/code_audit.py）与正常行共用此列，
+    # NULL = 正常完成/未判定。TEXT 无 CHECK（同 cache_verdict 纪律：新增
+    # 档位不需要迁移）。
+    """ALTER TABLE llm_usage ADD COLUMN timeout_layer TEXT""",
     # ── 团队开会（docs/spec/team-meeting.md）─────────────────
     # 平台侧会务记录（人观察 / debug / export），不是 agent 记忆。
     # 每次状态迁移写行；同项目只允许一场进行中（partials unique index，
@@ -934,7 +986,7 @@ PROJECT_DB_TABLES = [
 # DSH 对照：deepseek-harness invariant 框架的启动自检同构
 # （packages/llm/token-meter/src/invariant.ts）。
 PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
-    "llm_usage": {"cold_start", "creation_unreported"},
+    "llm_usage": {"cold_start", "creation_unreported", "timeout_layer"},
     "run_steps": {
         "runner_failed", "command_failed", "injection_applied",
         "timeout_kind", "timeout_ms", "outcome_unknown", "not_started",
@@ -947,6 +999,11 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
         #（ALTER 排到 CREATE 前被吞 / 旧库没跑 ALTER）会在启动时 fail-loud，
         # 而不是让「成因永远 NULL」静默退化成本条要治的那种假归因。
         "denied_by", "blocked_by_environment", "sealed_by",
+        # 批 D 第 2 步（2026-09-26）：异常出口事实位 + 命令三正交位。
+        # 登记进自检 ⇒ 迁移断裂在启动时 fail-loud，而不是让「平台侧异常
+        # 38 条 AttributeError」继续与业务失败同形、假成功继续不可机检。
+        "exception_type", "is_platform_bug", "exit_code", "output_empty",
+        "truncated",
     },
     # meeting_utterances.abstain_reason（2026-09-18）：区分「主动弃权」与
     # 「被轮次预算掐断/超时/异常」。登记进自检 ⇒ 迁移断裂会在启动时 fail-loud，

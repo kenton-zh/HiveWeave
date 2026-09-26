@@ -53,6 +53,13 @@ _FACT_COLUMNS: tuple[tuple[str, str], ...] = (
     # ⚠ 与 `db/schema.py` 的正典 DDL **双登记点**（其一遗漏 ⇒ 新旧库行为分叉，
     #   同 P0-3 的教训）；**无 DEFAULT**（NULL = 老行未记录，与 0 不同形）。
     ("upstream_retry_attempt", "INTEGER"),
+    # 批 D 第 2 步（2026-09-26）：stall 收口归因落 run 层。
+    # 病灶：`tool_loop` 收口时算出的 `stall_reason`（tool_failed / blocked /
+    # readonly / no_progress…）只进日志与返回值，`agent_runs` 无此列 ——
+    # 「这个 agent 为什么反复被停泊」跨 run 不可机检（第 3 步验收的前置事实位）。
+    # ⚠ 同 `upstream_retry_attempt` 的双登记点纪律（`db/schema.py` 正典 DDL
+    #   同步登记 agent_runs 列）；TEXT 无 DEFAULT（NULL = 该 run 非 stall 收口）。
+    ("stall_reason", "TEXT"),
 )
 _fact_columns_ready: set[tuple[str, int]] = set()
 
@@ -535,6 +542,11 @@ class RunLedger:
         denied_by: str | None = None,
         blocked_by_environment: bool | None = None,
         sealed_by: str | None = None,
+        exception_type: str | None = None,
+        is_platform_bug: bool | None = None,
+        exit_code: int | None = None,
+        output_empty: bool | None = None,
+        truncated: bool | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -602,6 +614,8 @@ class RunLedger:
                 runner_failed, command_failed, injection_applied,
                 timeout_kind, timeout_ms, enforcement, git_hardened,
                 executed, denied_by, blocked_by_environment, sealed_by,
+                exception_type, is_platform_bug, exit_code, output_empty,
+                truncated,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -618,7 +632,14 @@ class RunLedger:
                     # P0-3：同款 COALESCE —— 否则既有真值会被后来的 NULL 覆写。
                     "denied_by = COALESCE(?, denied_by), "
                     "blocked_by_environment = COALESCE(?, blocked_by_environment), "
-                    "sealed_by = COALESCE(?, sealed_by) "
+                    "sealed_by = COALESCE(?, sealed_by), "
+                    # 批 D 第 2 步：异常出口事实位 + 命令三正交位（同款 COALESCE
+                    # —— None = 未确定，保留既有值；False 必须写成 0 不与 None 混同）。
+                    "exception_type = COALESCE(?, exception_type), "
+                    "is_platform_bug = COALESCE(?, is_platform_bug), "
+                    "exit_code = COALESCE(?, exit_code), "
+                    "output_empty = COALESCE(?, output_empty), "
+                    "truncated = COALESCE(?, truncated) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -641,6 +662,12 @@ class RunLedger:
                         1 if blocked_by_environment else 0
                     ),
                     sealed_by,
+                    # 批 D 第 2 步：同款 None=未确定 / False→0 纪律。
+                    exception_type,
+                    None if is_platform_bug is None else (1 if is_platform_bug else 0),
+                    exit_code,
+                    None if output_empty is None else (1 if output_empty else 0),
+                    None if truncated is None else (1 if truncated else 0),
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层
@@ -704,7 +731,11 @@ class RunLedger:
           同一件事，而只有后者是平台侧可修的。
         把事实落库后，口径才能在**判定**层收窄，而不是在**解释**层打补丁。
         """
-        allowed = {"empty_stream", "cache_verdict", "cache_drifts", "orphan_steps"}
+        allowed = {
+            "empty_stream", "cache_verdict", "cache_drifts", "orphan_steps",
+            # 批 D 第 2 步：stall 收口归因（agents/completion.py 写入）。
+            "stall_reason",
+        }
         cols = {k: v for k, v in facts.items() if k in allowed and v is not None}
         if not cols:
             return

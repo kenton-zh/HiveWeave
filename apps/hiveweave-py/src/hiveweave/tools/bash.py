@@ -862,6 +862,9 @@ _SHELL_FACT_FLAG_KEYS: tuple[str, ...] = (
     # ⚠ 登记点不止此处：`_native_shaped` 会**重建** dict，那边也要带过来
     #   （审计 B：只补白名单会白做）。
     "denied_by", "blocked_by_environment", "sealed_by",
+    # 批 D 第 2 步（P2-20）：命令三正交位。⚠ 不登记此处 = 字段在这一层被
+    # 过滤掉（2026-09-01 两次实战教训：单测全绿、生产字段恒 None）。
+    "exit_code", "output_empty", "truncated",
     # 0-3 + #1 + F5：spawn 面戳（决策面 4 键 + 加固面 git_hardened +
     # 执行面 executed）。从 policy 派生而非再列一遍 —— 见上方补正。
     *ALL_SPAWN_STAMP_KEYS,
@@ -1526,6 +1529,18 @@ def _cwd_missing_error(cwd: str, requested: str | None, ws: str) -> str:
         f"Error: Working directory does not exist: "
         f"{cwd_display(cwd, requested)}"
     )
+
+
+def _output_was_truncated(output: str) -> bool:
+    """输出是否超过 1MB 帽（即 ``_truncate_output`` 会/已改写它）。
+
+    批 D 第 2 步（P2-20 三正交位）：``truncated`` 与 ``exit_code`` /
+    ``output_empty`` 互相独立上报（DSH defensive-patterns:7-9 戒律）——
+    「截断」不进任何其他位的分支，调用方要单独这一维时不必反推。
+    与 ``_truncate_output`` 用**同一判据**（编码字节数 vs MAX_CAPTURE_BYTES），
+    不靠"截后再比"（那要跑两遍编码）。
+    """
+    return len(output.encode("utf-8", errors="replace")) > MAX_CAPTURE_BYTES
 
 
 def _truncate_output(output: str) -> str:
@@ -2884,6 +2899,15 @@ async def execute_bash(
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
+    # 批 D 第 2 步（P2-20 三正交位）：两个正交位在此构造点判定 ——
+    #   output_empty 按**剥掉 cwd_hint / Exit code 后缀之前**的语义输出判空
+    #   （后缀恒非空，事后从回执判恒 False = 假事实）；
+    #   truncated 用与 _truncate_output 同一判据。
+    # 与 exit_code **并排独立**落库（run_steps.exit_code / output_empty /
+    # truncated）——「exit=0 且空输出」从此可与「exit=0 且有产出」区分，
+    # 假成功通道（P2-20）可机检。
+    _output_empty = not str(result["output"] or "").strip()
+    _truncated = _output_was_truncated(result["output"])
 
     if exit_code == 0:
         body = output if output.strip() else "(no output)"
@@ -2891,6 +2915,8 @@ async def execute_bash(
                 "output": f"{body}\n\n{cwd_hint}\nExit code: 0",
                 "error": None,
                 "exit_code": 0,
+                "output_empty": _output_empty,
+                "truncated": _truncated,
                 **_enforcement_stamp(result)}
 
     body = output if output.strip() else "(no output)"
@@ -2918,6 +2944,8 @@ async def execute_bash(
         "output": f"{body}\n\n{cwd_hint}\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
+        "output_empty": _output_empty,
+        "truncated": _truncated,
         # F4：命令执行了但失败（非零退出 = command_failed，不是 runner 失败）
         "fact": "command_failed",
         **_enforcement_stamp(result),
@@ -3060,11 +3088,17 @@ async def execute_run_command(
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
+    # 批 D 第 2 步（独立审计 P2-1）：run_command 两出口与 execute_bash
+    # 同款三正交位 —— 此前只落 exit_code，output_empty/truncated 恒 NULL。
+    _output_empty = not str(result["output"] or "").strip()
+    _truncated = _output_was_truncated(result["output"])
 
     if exit_code == 0:
         body = output if output.strip() else "(no output)"
         return {"success": True, "output": f"{body}\n\nExit code: 0",
                 "error": None, "exit_code": 0,
+                "output_empty": _output_empty,
+                "truncated": _truncated,
                 **_enforcement_stamp(result)}
 
     body = output if output.strip() else "(no output)"
@@ -3088,6 +3122,8 @@ async def execute_run_command(
         "output": f"{body}\n\nExit code: {exit_code}",
         "error": error_msg,
         "exit_code": exit_code,
+        "output_empty": _output_empty,
+        "truncated": _truncated,
         # F4：命令执行了但失败（非零退出 = command_failed）
         "fact": "command_failed",
         **_enforcement_stamp(result),

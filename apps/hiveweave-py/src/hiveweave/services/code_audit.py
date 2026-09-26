@@ -940,6 +940,77 @@ async def resolve_peer_audit_model(
     return author_cfg, "own"
 
 
+async def _record_partial_audit_usage(
+    *,
+    project_id: str,
+    agent_id: str,
+    chosen: dict | None,
+    exc: BaseException,
+    timeout_layer: str | None,
+) -> dict:
+    """把断流异常随行的 ``partial_usage`` 接进 llm_usage（批 D 任务 4）。
+
+    Returns 追加进 soft-fail meta 的键（``partial_usage_recorded`` /
+    ``partial_total_tokens``）；无 usage 可记时返回 ``{}``。
+    best-effort：任何失败只记 debug，绝不影响调用方。
+    """
+    usage = getattr(exc, "partial_usage", None)
+    if not isinstance(usage, dict) or not usage:
+        return {}
+    try:
+        from hiveweave.llm.provider import provider_factory
+        from hiveweave.llm.util import normalize_usage
+        from hiveweave.services.token_meter import token_meter
+
+        # provider 串用于 cache 量程判定（anthropic 才报 cache 写入）。
+        # config 造不出 provider（缺 key/base_url 等）时降级 None ——
+        # normalize_usage 的 openai 形状兜底仍可用。
+        provider_value: str | None = None
+        if chosen:
+            try:
+                provider_value = provider_factory.create(chosen).api_format.value
+            except Exception:  # noqa: BLE001 — 造不出就 None，不挡记账
+                provider_value = None
+        norm = normalize_usage(usage, provider_value)
+        if not norm:
+            return {}
+        await token_meter.record_rounds(
+            agent_id,
+            project_id,
+            [
+                {
+                    "input": norm.get("input", 0),
+                    "output": norm.get("output", 0),
+                    "cache_read": norm.get("cache_read", 0),
+                    "cache_creation": norm.get("cache_creation", 0),
+                    "total": norm.get("total", 0),
+                    # 断流时长不可考（内层计时随流死）—— 0 = 诚实缺省。
+                    "duration_ms": 0,
+                    "cache_creation_reported": bool(
+                        norm.get("cache_creation_reported")
+                    ),
+                    "timeout_layer": timeout_layer,
+                }
+            ],
+            model_id=str((chosen or {}).get("model_id") or ""),
+            provider=provider_value,
+            request_type="oneshot",
+        )
+        log.info(
+            "code_audit.partial_usage_recorded",
+            agent_id=agent_id,
+            total=norm.get("total", 0),
+            timeout_layer=timeout_layer,
+        )
+        return {
+            "partial_usage_recorded": True,
+            "partial_total_tokens": int(norm.get("total", 0) or 0),
+        }
+    except Exception as e:  # noqa: BLE001 — 接账失败不影响 soft-fail
+        log.debug("code_audit.partial_usage_meter_failed", error=str(e))
+        return {}
+
+
 async def _invoke_audit_llm(
     project_id: str,
     agent_id: str,
@@ -1027,12 +1098,28 @@ async def _invoke_audit_llm(
             cap_s=_timeout_s,
             timeout_layer=_layer,
         )
+        # 批 D 第 2 步任务 4（批 B 审计点名的接账缝）：断流前已收到的
+        # usage（``partial_usage``，oneshot.py 随异常 setattr）此前在此被
+        # **整条丢弃** —— 死掉的审查调用 token 无账。此处接进
+        # token_meter.record_rounds（批 B record_oneshot_usage 的同一
+        # sink；不复用该函数：它要求 provider 对象 + 成功 result 形状，
+        # 而这里只有 config dict + 异常随行的 raw usage）。timeout_layer
+        # 随行落 llm_usage 新列（批 D）。best-effort：接账失败不影响
+        # soft-fail 契约。
+        _partial_meta = await _record_partial_audit_usage(
+            project_id=project_id,
+            agent_id=agent_id,
+            chosen=chosen,
+            exc=exc,
+            timeout_layer=_layer,
+        )
         return None, {
             "audited": False,
             "reason": "llm_failed",
             "audit_upstream_unavailable": True,
             "capped_at_s": _timeout_s,
             **({"timeout_layer": _layer} if _layer else {}),
+            **_partial_meta,
         }
     if not text:
         # Empty text is as fatal as a raised exception, but was previously

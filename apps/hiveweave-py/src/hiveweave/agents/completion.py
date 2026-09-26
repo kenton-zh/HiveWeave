@@ -1151,6 +1151,20 @@ async def handle_completion(
 
         now_ms = int(_time.time() * 1000)
         agent._last_stall_break_ms = now_ms
+        # 批 D 第 2 步任务 3：stall 收口归因落 run 层（事实位）。
+        # 病灶：tool_loop 收口时算出的 stall_reason 只进日志/返回值，
+        # agent_runs 无此列 —— 「为什么反复被停泊」跨 run 不可机检。
+        # 落库与收口判定**同一处**消费：宽免/停泊两条路的日志都带归因，
+        # 第 3 步验收机检直接读 agent_runs.stall_reason。
+        _stall_reason = str(result.get("stall_reason") or "") or None
+        _stall_run_id = getattr(agent, "_current_run_id", None)
+        if _stall_reason and _stall_run_id:
+            try:
+                await agent._run_ledger.set_run_fact(
+                    agent.id, _stall_run_id, stall_reason=_stall_reason
+                )
+            except Exception as e:
+                log.debug("stall_reason_persist_failed", error=str(e))
         had_progress = _turn_has_substantial_progress(
             tool_calls, tasks_advanced
         )
@@ -1159,6 +1173,7 @@ async def handle_completion(
                 "stall_break_forgiven",
                 agent_id=agent.id,
                 reason="substantial_progress",
+                stall_reason=_stall_reason,
             )
             try:
                 from hiveweave.services.telemetry import telemetry
@@ -1209,6 +1224,7 @@ async def handle_completion(
                         agent_id=agent.id,
                         break_count=len(breaks),
                         window_ms=STALL_BREAK_WINDOW_MS,
+                        stall_reason=_stall_reason,
                     )
                     try:
                         from hiveweave.services.telemetry import telemetry

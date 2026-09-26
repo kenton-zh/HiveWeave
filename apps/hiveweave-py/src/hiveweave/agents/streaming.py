@@ -288,6 +288,25 @@ async def on_tool_call(
         # 再**原样抛出**（裸 raise 保留 traceback）—— 上层 tool_exec 的
         # [Tool Error] 路径与模型可见内容保持不变，不改变既有语义。
         if step_id:
+            # 批 D 第 2 步任务 1：异常出口的结构化事实位。判定单一实现在
+            # llm/streamer/tool_exec.is_platform_bug_exception（懒 import 防环）。
+            # ⚠ 事实位计算包在**独立** try 里：它失败绝不能连带跳过下面的
+            # record_step_end（那会把该行滞留 running → 被 sweep 误判
+            # outcome_unknown —— P0-3 修的正是这个）。
+            _exc_flags: dict = {}
+            try:
+                from hiveweave.llm.streamer.tool_exec import (
+                    exception_fact_flags,
+                )
+
+                _exc_flags = exception_fact_flags(exc)
+            except Exception as e:  # noqa: BLE001 — 事实位是旁支，宁缺勿假
+                # 独立审计 P2-2：静默 = 「这行为什么没有 exception_type」
+                # 无从排查。留 debug 摘要（不刷屏但可捞）。
+                log.debug("exception_fact_flags_failed",
+                          agent_id=agent.id,
+                          error=str(e)[:200])
+                _exc_flags = {}
             try:
                 await agent._run_ledger.record_step_end(
                     agent_id=agent.id,
@@ -300,6 +319,8 @@ async def on_tool_call(
                         "结果未知（可能已执行，勿直接重试）"
                     ),
                     result_excerpt=f"{type(exc).__name__}: {exc}",
+                    exception_type=_exc_flags.get("exception_type"),
+                    is_platform_bug=_exc_flags.get("is_platform_bug"),
                     # ⚠ **不标 runner_failed**（审计 P0-3 第 1 条）：该格语义是
                     # 「命令从未执行」⇒ 下游读成「无副作用、可直接重试」。而本
                     # except 的触发点**在执行之后** ⇒ 命令可能已经执行过，标它
@@ -365,6 +386,15 @@ async def on_tool_call(
                 denied_by=result.get("denied_by"),
                 blocked_by_environment=result.get("blocked_by_environment"),
                 sealed_by=result.get("sealed_by"),
+                # 批 D 第 2 步：命令执行三正交位（P2-20）。值由 bash/pwsh
+                # 构造点声明（exit_code 真值 / output_empty 按剥后缀前的
+                # body / truncated 按 1MB 帽）；非 shell 工具缺键 ⇒ None ⇒
+                # 列留 NULL（未判定，不臆断）。三列**互相独立**，绝不嵌套
+                # （DSH defensive-patterns:7-9：「Surface each independent
+                # fact (timedOut, signal, exitCode) on its own」）。
+                exit_code=result.get("exit_code"),
+                output_empty=result.get("output_empty"),
+                truncated=result.get("truncated"),
                 # 0-3：git 加固事实位（`HIVEWEAVE_GIT_HARDENED` 的消费者）。
                 # 工具层给不出（None）⇒ 列留 NULL = 不适用/未判定，不回填 0。
                 git_hardened=result.get("git_hardened"),
@@ -426,6 +456,11 @@ async def on_tool_call(
         "command_failed": result.get("command_failed"),
         "timeout_kind": result.get("timeout_kind"),
         "timeout_ms": result.get("timeout_ms"),
+        # 批 D 第 2 步：命令三正交位透传给 tool_exec（与 F4 同理：不进
+        # LLM 消息体，provider 组包白名单剥离；观测/回扫消费）。
+        "exit_code": result.get("exit_code"),
+        "output_empty": result.get("output_empty"),
+        "truncated": result.get("truncated"),
         # Multimodal screenshot pixels (browse / assert_visual)
         "images": result.get("images"),
     }
