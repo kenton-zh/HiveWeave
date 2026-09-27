@@ -1079,18 +1079,45 @@ class RunLedger:
 run_ledger = RunLedger()
 
 
-async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
+async def sweep_stale_agent_runs(
+    workspace_path: str | None,
+    *,
+    close_reason: str = "startup_sweep: stale running run from prior process",
+) -> int:
     """E16 (复盘 P2)：启动收尾 sweep —— 清算上次进程残留的 running runs。
 
     Agent 长驻服务在 turn 中途被杀时，agent_runs 会残留 ``status='running'``
     的孤儿行（无 ended_at），污染查询/统计并掩盖真实收尾语义。启动时把
     workspace 内所有仍为 running 的 run 归并为 ``interrupted``（预留步骤，
     与现有 interrupt_run 语义一致，供恢复/审计读取）。返回清理行数。
+
+    I8（批 7，2026-09-27）：
+    · ``close_reason`` 参数化（审计 P2-2）—— 下班收尾 / activate 回收复用
+      本函数时，error_reason 不得再谎称「prior process」（同状态不同来路，
+      恢复 Trail 语义必须可分）。
+    · ``result_summary`` 对齐 ``interrupt_run``（审计 P2-3）：空值补
+      close_reason —— 同状态两种行的 summary 可空性不再分叉（下游
+      ``IS NOT NULL`` 判据不再读反）。
+    · ⚠ **全程持 per-workspace 写锁**（审计 P1-2，``db/project.py`` 共享
+      连接纪律）：sweep 的 UPDATE 与 commit 之间，持锁写者（game time tick
+      等）的 error-path rollback 会把未提交的 interrupted **静默卷回
+      running**（函数仍返回 N ⇒ 收尾/回收验收假绿）。与 create_run 同锁
+      串行化后，SELECT→UPDATE 的 TOCTOU 一并关闭。
+    · 失败可观测（审计 P2-1）：内部失败升 warning —— 「回收失败」与
+      「扫了没有」在日志层必须可分，否则验收①静默假绿。
     """
     if not workspace_path:
         return 0
     now = _now_ms()
-    reason = "startup_sweep: stale running run from prior process"
+    lock = await project_db.get_workspace_write_lock(workspace_path)
+    async with lock:
+        return await _sweep_stale_agent_runs_locked(
+            workspace_path, now, close_reason)
+
+
+async def _sweep_stale_agent_runs_locked(
+    workspace_path: str, now: int, reason: str,
+) -> int:
     try:
         conn = await project_db.ensure_project_db(workspace_path)
         cursor = await conn.execute(
@@ -1140,16 +1167,26 @@ async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
             )
             await conn.commit()
         except Exception as e:
-            log.debug(
+            log.warning(
                 "run_ledger.startup_sweep_steps_failed",
                 workspace=str(workspace_path), error=str(e),
             )
         cursor = await conn.execute(
             "UPDATE agent_runs SET status = 'interrupted', ended_at = ?, "
-            "error_reason = ? WHERE status = 'running'",
-            [now, reason],
+            "error_reason = ?, "
+            "result_summary = COALESCE(NULLIF(result_summary, ''), ?) "
+            "WHERE status = 'running'",
+            [now, reason, reason],
         )
         await cursor.close()
+        # I8 (批7)：收尾 UPDATE 必须显式 commit —— 本函数共享连接（aiosqlite
+        # 默认 deferred 事务），后续写者的 rollback（实例：`_ensure_fact_columns`
+        # 的 duplicate-column 幂等路径在 `_execute_write_with_retry` 里
+        # conn.rollback()）会把这条未提交的 interrupted 静默卷回 running。
+        # 此前只 commit 了 run_steps 段，启动路径靠后续写者的 commit 侥幸落盘。
+        # （审计 P1-2 后本函数已全程持 workspace 写锁，此处 commit 是锁内
+        # 事务的正常收口。）
+        await conn.commit()
         if rows:
             log.info(
                 "run_ledger.startup_sweep",
@@ -1158,6 +1195,6 @@ async def sweep_stale_agent_runs(workspace_path: str | None) -> int:
             )
         return len(rows)
     except Exception as e:
-        log.debug("run_ledger.startup_sweep_failed",
-                  workspace=str(workspace_path), error=str(e))
+        log.warning("run_ledger.startup_sweep_failed",
+                    workspace=str(workspace_path), error=str(e))
         return 0

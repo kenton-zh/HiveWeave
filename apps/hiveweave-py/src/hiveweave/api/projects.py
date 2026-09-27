@@ -1609,11 +1609,16 @@ async def activate_project(project_id: str) -> dict:
     复工时把下班期间 park 的 inbox 合并成每 agent 一条 briefing，避免踩踏。
     """
     row = await meta_db.query_one(
-        "SELECT id FROM projects WHERE id = ?", [project_id]
+        "SELECT id, is_started FROM projects WHERE id = ?", [project_id]
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     await _set_active_project_id(project_id)
+    # 批 7 审计 P1-1：重复 activate 守卫 —— sweep 无时间窗（无条件收割所有
+    # running），项目已上班时再调 activate 会把**存活 agent 的活 run** 打成
+    # interrupted，而 agent 因 start_project_agents 跳过继续跑 ⇒ 账面
+    # interrupted 的 run 还活着，下次唤醒即真双 run（恰是 I8 验收③要防的）。
+    was_started = bool(row["is_started"]) if row is not None else False
 
     # 先 park 积压（此时仍 is_started=0，残留 watcher 不会开火）
     try:
@@ -1631,6 +1636,23 @@ async def activate_project(project_id: str) -> dict:
     await meta_db.execute(
         "UPDATE projects SET is_started = 1 WHERE id = ?", [project_id]
     )
+
+    # I8 (批7)：先回收孤儿 run 再开新 run —— 覆盖「上次下班收尾失败/进程
+    # 被杀后 activate 而非重启」的残留 running 行；start_project_agents 开新
+    # run 前库里已无 running ⇒ 同 agent 不会并出双 run。复用统一判定源
+    # sweep_stale_agent_runs（与启动 sweep / 停止收尾同源），不新写清扫。
+    # ⚠ 已在班（重复 activate）⇒ 跳过回收（P1-1）：活 run 不是孤儿。
+    runs_reclaimed = 0
+    if not was_started:
+        try:
+            from hiveweave.services.project_lifecycle import close_running_runs
+
+            runs_reclaimed = await close_running_runs(
+                project_id,
+                close_reason="activate_reclaim: orphan run reclaimed before new run",
+            )
+        except Exception as e:
+            log.warning("activate_run_reclaim_failed", project_id=project_id, error=str(e))
 
     # 启动 agents（如果未运行）— start_project_agents 内部会跳过已存在的
     try:
@@ -1679,6 +1701,7 @@ async def activate_project(project_id: str) -> dict:
         "is_started": True,
         "resumeBriefings": briefing_stats,
         "meetingRecovery": meeting_stats,
+        "runsReclaimed": runs_reclaimed,
     }
 
 

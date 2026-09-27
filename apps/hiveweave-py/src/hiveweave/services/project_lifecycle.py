@@ -66,6 +66,44 @@ async def park_project_inbox(project_id: str, agent_ids: list[str] | None = None
     return total
 
 
+async def close_running_runs(
+    project_id: str,
+    *,
+    close_reason: str = "startup_sweep: stale running run from prior process",
+) -> int:
+    """I8 (批7)：收尾该项目 workspace 内所有 ``status='running'`` 的 agent_runs。
+
+    病灶：``agent.cancel``（off_duty 下班）不写 run ledger —— cancel 只掐
+    asyncio task，run 行永远停在 running（s3-clone_13 实测 8 个 run 30 分钟
+    后仍 ``status='running'``、``ended_at`` 全 NULL）。修复 = 复用统一判定源
+    ``sweep_stale_agent_runs``（running→interrupted + 孤儿 run_step 按
+    started 事实位分流），**不新写清扫**；启动 sweep（main.py lifespan）、
+    停止收尾（stop_project_cleanly）、恢复回收（activate 路径）三处同源。
+
+    ``close_reason``（批 7 审计 P2-2）：落进 agent_runs.error_reason ——
+    调用方必须给可区分来路的文案（off_duty_close / activate_reclaim），
+    恢复 Trail 不能把本进程主动关闭误读成「进程死亡残留」。
+
+    Returns number of runs reaped；任何失败 best-effort 返回 0（下班/上班
+    流程不能因收尾失败而中断）。
+    """
+    try:
+        from hiveweave.services.run_ledger import sweep_stale_agent_runs
+
+        workspace_path = await meta_db.get_project_workspace(project_id)
+        if not workspace_path:
+            return 0
+        return await sweep_stale_agent_runs(
+            workspace_path, close_reason=close_reason)
+    except Exception as e:
+        log.warning(
+            "close_running_runs_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        return 0
+
+
 async def stop_project_cleanly(project_id: str) -> dict:
     """Stop every in-memory agent for the project (manager ∪ router), off-duty cancel."""
     from hiveweave.agents.supervisor import agent_manager
@@ -77,6 +115,7 @@ async def stop_project_cleanly(project_id: str) -> dict:
         "agent_ids": ids,
         "leftover_cleared": 0,
         "offturn_reaped": 0,
+        "runs_interrupted": 0,
     }
 
     # Reap before cancel so finishing jobs cannot wake=1 after agents die.
@@ -145,6 +184,16 @@ async def stop_project_cleanly(project_id: str) -> dict:
             error=str(e),
         )
         result["processes"] = {"error": str(e)}
+
+    # I8 (批7)：run 收尾必须排在 agent 全部 cancel **之后** —— cancel 会
+    # await 已掐的 llm task，此后不再有写 run 行的在跑写方，sweep 才不会与
+    # 完成路径竞态。cancel 路径本身不写 ledger（I8 根因），由这里的统一
+    # sweep 兜底：running→interrupted + 孤儿 run_step 分流。
+    result["runs_interrupted"] = await close_running_runs(
+        project_id,
+        close_reason="off_duty_close: run closed by project stop (agent cancelled)",
+    )
+
     log.info("stop_project_cleanly_done", project_id=project_id, **result)
     return result
 
