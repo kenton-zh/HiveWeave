@@ -396,6 +396,15 @@ PROJECT_DB_TABLES = [
     )
     """,
     """ALTER TABLE questions ADD COLUMN options TEXT""",
+    # I9（fixplan 批 8，2026-09-27）：question 无人值守门铃三列。
+    # expires_at = created_at + QUESTION_UNATTENDED_TIMEOUT_S（此前该表对
+    # 「等到什么时候」零概念，pending 永久挂账 —— s3-clone_13 实测跨两次
+    # 下班仍 status='pending'）；timed_out_at / resolved_by = 裁决事实位
+    # （resolved_by ∈ 'timeout'（时间触发 A）| 'lifecycle_stop'（下班/停止
+    # 触发 B））。登记进 PROJECT_DB_COLUMN_CHECKS ⇒ 迁移断裂 fail-loud。
+    """ALTER TABLE questions ADD COLUMN expires_at INTEGER""",
+    """ALTER TABLE questions ADD COLUMN timed_out_at INTEGER""",
+    """ALTER TABLE questions ADD COLUMN resolved_by TEXT""",
     # BUG-A migration: persist worktree creation errors for observability
     """ALTER TABLE agents ADD COLUMN worktree_error TEXT""",
     # D6: activity timestamp — stall/UI must not treat lifecycle status as busy
@@ -1062,6 +1071,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     # 「被轮次预算掐断/超时/异常」。登记进自检 ⇒ 迁移断裂会在启动时 fail-loud，
     # 而不是让主持人把「没来得及说话」静默读成「没有意见」。
     "meeting_utterances": {"abstain_reason"},
+    # I9（2026-09-27）：question 无人值守门铃三列。登记进自检 ⇒ 迁移断裂
+    # （ALTER 排错位被吞 / 旧库没跑 ALTER）在启动时 fail-loud，而不是让
+    # pending question 继续「无界挂账 + 裁决无事实位可查」。
+    "questions": {"expires_at", "timed_out_at", "resolved_by"},
 }
 
 # ── Meta DB 索引 ────────────────────────────────────────────

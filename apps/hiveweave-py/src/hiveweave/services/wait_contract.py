@@ -1554,6 +1554,74 @@ async def schedule_upstream_recovery_wait(
     }
 
 
+# I9（fixplan 批 8，2026-09-27）：question 专用 wait 标记。kind 复用既有
+# kind='user' 路（TTL 语义即「等真人」），phase 单列便于观测方区分来源；
+# ref = question_id，解除统一走 clear_waits_matching_ref（同生共死）。
+QUESTION_WAIT_PHASE = "question"
+
+
+async def record_question_user_wait(
+    project_id: str,
+    agent_id: str,
+    *,
+    ref: str,
+    expires_at_ms: int,
+    note: str | None = None,
+    now_ms: int | None = None,
+) -> str | None:
+    """question 落库时同生的一条 ``agent_waits(kind='user')``（I9 门铃并集）。
+
+    病灶：等真人有两套门铃 —— ``agent_waits(kind='user')`` 存在且
+    TTL=3600s 但从未被 question 用过；``questions`` 表则对「等到什么时候」
+    零概念（pending 永久挂账）。修法 = question 落库同时落一条**有界的**
+    user 等待，expires_at 由调用方传（= QUESTION_UNATTENDED_TIMEOUT_S，
+    非 default_ttl_ms 的 3600s 默认）。
+
+    只 INSERT 单行，**不清**该 agent 既有等待（与 replace_waits 的全清
+    语义刻意不同——提问不该抹掉上一轮的合法停泊），同构
+    :func:`schedule_upstream_recovery_wait`。⚠ 已知边界：turn exit 的
+    replace_waits 会把 kind='user' 一并清掉（不属 preserved external），
+    故此行的存活窗 = 提问 turn 本身 + 无 turn-exit 的场景（崩溃/被掐）；
+    跨 turn 的裁决由 question 侧双触发负责，不依赖本行。
+
+    Returns wait id；失败返回 None（best-effort——门铃登记缺席退化为旧行为，
+    不阻断提问本身）。
+    """
+    if not project_id or not agent_id or not ref:
+        return None
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    wid = str(uuid.uuid4())
+    await _ensure_schema(project_id)
+    try:
+        await execute_by_project(
+            project_id,
+            "INSERT INTO agent_waits "
+            "(id, agent_id, project_id, kind, ref, wake_on, expires_at, "
+            "obligation_version, phase, note, created_at, cleared_at) "
+            "VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, ?, NULL)",
+            [
+                wid,
+                agent_id,
+                project_id,
+                ref,
+                json.dumps(DEFAULT_WAKE_ON.get("user", ["timeout"])),
+                int(expires_at_ms),
+                QUESTION_WAIT_PHASE,
+                note,
+                now,
+            ],
+        )
+    except ProjectDbError as e:
+        log.warning(
+            "question_user_wait_insert_failed",
+            agent_id=agent_id,
+            ref=ref,
+            error=str(e),
+        )
+        return None
+    return wid
+
+
 def _norm_token(value: str | None) -> str:
     return (value or "").strip().lower()
 

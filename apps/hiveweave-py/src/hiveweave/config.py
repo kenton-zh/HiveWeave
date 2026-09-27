@@ -167,6 +167,18 @@ class Settings(BaseSettings):
     # 逗号分隔正整数，首项应为 1（第 0 轮 = 基础 TTL）。
     wait_timer_backoff_multipliers: str = "1,4,24,96"
 
+    # I9（fixplan 批 8，2026-09-27）：question 无人值守阈值 / 等待硬上限（秒）。
+    # 锚点 = 上游 DSH packages/jobs/tool-jobs/src/index.ts:59-61 的「默认 + 硬顶」
+    # 对（waitTimeoutMs default 30s / maxWaitTimeoutMs Hard cap）——取「硬顶」
+    # 档校准值，**不取 30s 默认**（30s 会把「人正在看」误判成无人值守）：
+    #   - question_unattended_timeout_s=600：pending 超 600s 无人应答 ⇒ 按
+    #     options[0]（推荐项）裁决继续（触发 A）；
+    #   - question_wait_cap_s=3600：硬上限，复用平台既有 user-wait 档
+    #     （wait_ttl_user_ms=3600s）。两者关系（阈值 ≤ 硬顶）由
+    #     tools/question.py 导入期自检约束（默认 > 上限直接抛，照抄上游 :202）。
+    question_unattended_timeout_s: int = 600
+    question_wait_cap_s: int = 3600
+
     # Attestation max age (ms) — Phase 3
     attestation_max_age_ms: int = 24 * 60 * 60 * 1000
 

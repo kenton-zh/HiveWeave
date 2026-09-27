@@ -194,6 +194,26 @@ async def stop_project_cleanly(project_id: str) -> dict:
         close_reason="off_duty_close: run closed by project stop (agent cancelled)",
     )
 
+    # I9（批 8 触发 B）：下班/停止时所有未收口 question（pending + 在途被
+    # cancel 的）立即按默认项裁决（resolved_by='lifecycle_stop'）+ 落
+    # wake=1 inbox —— activate 的 pre-park 会把它并进复工 briefing（交接
+    # 摘要）。与上面 run 收尾同位：排在 agent 全部 cancel 之后，此后不再
+    # 有会回答/裁决 question 的在跑写方。
+    try:
+        from hiveweave.tools.question import adjudicate_project_questions
+
+        adjudicated = await adjudicate_project_questions(
+            project_id, reason="lifecycle_stop"
+        )
+        result["questions_adjudicated"] = len(adjudicated)
+    except Exception as e:
+        log.warning(
+            "stop_project_question_adjudicate_failed",
+            project_id=project_id,
+            error=str(e),
+        )
+        result["questions_adjudicated"] = 0
+
     log.info("stop_project_cleanly_done", project_id=project_id, **result)
     return result
 
@@ -205,6 +225,20 @@ async def deliver_resume_briefings(project_id: str) -> dict:
     (or deactivate that failed mid-way) so activate never stampede-wakes.
     """
     ids = await _project_agent_ids(project_id)
+    # I9（批 8 触发 A 补票）：停机期间 expires_at 已过仍 pending 的 question
+    # （进程重启丢了内存裁决钟）在此按 resolved_by='timeout' 补裁决。排在
+    # pre-park **之前** —— 裁决产出的 wake=1 inbox 会被 park 进当轮复工
+    # briefing（交接摘要），提问 agent 复工即知默认项裁决结果。
+    try:
+        from hiveweave.tools.question import adjudicate_expired_questions
+
+        await adjudicate_expired_questions(project_id)
+    except Exception as e:
+        log.warning(
+            "resume_question_catchup_failed",
+            project_id=project_id,
+            error=str(e),
+        )
     # Safety net: coalesce leftover wake=1 unread even if deactivate skipped park
     pre_parked = await park_project_inbox(project_id, ids)
     inbox = InboxService()
