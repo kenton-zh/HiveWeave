@@ -546,9 +546,16 @@ async def check_attestation_reuse_binding(
     same_agent = bool(expected_agent_id) and row_agent == str(expected_agent_id)
     aid = str(row.get("id") or "")
     if not same_agent:
+        # I12(P2-2) 批 4：凭证 id 与 task id **分列** —— 旧文案把凭证 id 塞进
+        # 「task_id mismatch:」后面的唯一 <id> 槽，读起来像 task id（模型拿
+        # 到后无法区分该拿哪个去纠正）。三个具名值各自独立可 grep：
+        # attestation_id=（凭证 id）· attestation_task_id=（凭证绑定的 task）
+        # · task_id=（本次提交/豁免的 task）。
         return (
             False,
-            f"Attestation task_id mismatch: {aid} "
+            "Attestation task_id mismatch: "
+            f"attestation_id={aid} attestation_task_id={row_task} "
+            f"task_id={expected_task_id} "
             "(different agent and different task)",
         )
     ch = str(row.get("commit_hash") or "").strip()
