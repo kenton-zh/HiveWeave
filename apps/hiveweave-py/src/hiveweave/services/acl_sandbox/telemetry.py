@@ -33,6 +33,20 @@ def record_fail_closed(api_name: str = "") -> None:
         _inc(f"fail_closed_api:{api_name}")
 
 
+def record_seal_degraded() -> None:
+    """批 3（I2）：封条读回失败但令牌无交集 ⇒ 降级放行（enforce 档）。"""
+    _inc("seal_degraded_count")
+
+
+def record_seal_degraded_shadow() -> None:
+    """批 3（I2）：shadow 档观测 —— 本可降级放行的封条读回失败次数。
+
+    shadow 判据（fixplan §一）：一轮真实项目触发 ≥3 次且零反例 ⇒ 才许切
+    enforce；触发不足 ⇒ 延长一轮，条目维持 🟡 不得标 ✅。
+    """
+    _inc("seal_degrade_shadow_count")
+
+
 def record_rejection(hit: bool) -> None:
     """hit=True 命中拒绝方言（非零退出 + 拒绝特征）；否则记录一次运行。"""
     _inc("runs_total")
@@ -65,6 +79,9 @@ def snapshot() -> dict:
         runs = _counters.get("runs_total", 0.0)
         return {
             "fail_closed_count": int(_counters.get("fail_closed_count", 0.0)),
+            "seal_degraded_count": int(_counters.get("seal_degraded_count", 0.0)),
+            "seal_degrade_shadow_count": int(
+                _counters.get("seal_degrade_shadow_count", 0.0)),
             "rejection_hits": int(_counters.get("rejection_hits", 0.0)),
             "runs_total": int(runs),
             "rejection_hit_rate": (

@@ -811,30 +811,62 @@ def test_known_platform_faults_are_annotated(rel_path, needle):
     tree = ast.parse(path.read_text(encoding="utf-8"))
 
     # 1) 用 needle 定位**唯一**一个目标构造点（needle 是文档化的定位锚）
+    # 批 3（I2，2026-09-27）：封条读回的 raise 已换成 `SealReadbackError`
+    # （platform_side=True 收进其 `__init__` 单点硬编码，由
+    # `test_i2_seal_readback_narrowing.py::test_seal_readback_error_type_contract`
+    # 钉住）⇒ locator 接纳两类构造名。
     located: list[int] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+        # 批 3（I2）：封条读回点是 `await _handle_readback_failure(
+        # SealReadbackError(...))` **表达式语句**（裁决助手内部 raise）——
+        # 不是 ast.Raise。两类节点都扫：ast.Raise（裸构造）与 ast.Expr
+        # （await 包裹的裁决调用，内含 Awaited Call）。
+        call: ast.Call | None = None
+        if isinstance(node, ast.Raise):
+            inner = node.exc.value if isinstance(node.exc, ast.Await) else node.exc
+            call = inner if isinstance(inner, ast.Call) else None
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Await):
+            inner = node.value.value
+            call = inner if isinstance(inner, ast.Call) else None
+        if call is None:
             continue
-        call = node.exc
         fname = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
-        if fname != "SandboxUnavailableError":
+        # 封条读回的构造统一收进 `SealReadbackError(...)`，经裁决助手
+        # `_handle_readback_failure(...)` 包裹；其余锚点仍是裸
+        # `SandboxUnavailableError(...)`。
+        if fname not in (
+            "SandboxUnavailableError", "SealReadbackError",
+            "_handle_readback_failure",
+        ):
             continue
         text = ast.unparse(call)
         if needle in text:
             located.append(call.lineno)
     assert len(located) == 1, (
-        f"{rel_path} 里锚点 {needle!r} 应恰好定位 1 个 `SandboxUnavailableError` "
-        f"构造点，实测 {len(located)} 个（{located}）—— 锚点漂移时本守卫会静默失效"
+        f"{rel_path} 里锚点 {needle!r} 应恰好定位 1 个构造点 "
+        f"（SandboxUnavailableError/SealReadbackError），实测 {len(located)} 个"
+        f"（{located}）—— 锚点漂移时本守卫会静默失效"
     )
 
-    # 2) 断言**那一个**构造点带 platform_side=True
+    # 2) 断言**那一个**构造点带 platform_side=True。两种已声明形态免查：
+    #    · SealReadbackError —— platform_side=True 由其 `__init__` 单点硬编码
+    #      （test_i2_seal_readback_narrowing.py::test_seal_readback_error_type_contract
+    #      钉住）；
+    #    · `_handle_readback_failure(...)` 包裹 —— 内层必是 SealReadbackError。
     target_line = located[0]
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+        call: ast.Call | None = None
+        if isinstance(node, ast.Raise):
+            inner = node.exc.value if isinstance(node.exc, ast.Await) else node.exc
+            call = inner if isinstance(inner, ast.Call) else None
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Await):
+            inner = node.value.value
+            call = inner if isinstance(inner, ast.Call) else None
+        if call is None or not isinstance(call.func, ast.Name):
             continue
-        call = node.exc
-        if not isinstance(call.func, ast.Name):
-            continue
+        if call.func.id in ("SealReadbackError", "_handle_readback_failure") \
+                and call.lineno == target_line:
+            return
         if call.func.id != "SandboxUnavailableError" or call.lineno != target_line:
             continue
         ok = any(

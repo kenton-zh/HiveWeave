@@ -44,8 +44,12 @@ def is_platform_side(exc: BaseException) -> bool:
       · `token.py` `no logon SID in token groups`
       · `grant.py` / `spawn.py` / `token.py` `pywin32 unavailable`
       · `service.py` `workspace 根无真实主体写 ACE`（**部署前提**，见下）
-      · `service.py` `seal read-back failed`（两处：git 引导文件 / 配置载体
-        —— 平台自己刚 `created`/写过该文件，有信息优势）
+      · `service.py` `seal read-back failed`（git 引导文件 / 配置载体 / `.git`
+        根 / hooks —— **全部保留标注**，含 `.git` 根：封条紧跟平台自己的
+        `git init`/seal 之后，构造点对「刚封完读回仍泄漏」有信息优势。
+        ⚠ 本文件旧版 docstring 曾写「`.git` 根已摘掉标注」—— 与 e01d4e9d
+        定案及守卫 `test_no_platform_side_on_state_observation_sites` 的
+        docstring 矛盾，2026-09-27 批 3 审计 P2-5 订正）
       · `integration.py` `pwsh not found`（经 `PwshUnavailableError`）
 
     ⚠⚠ **标注标准（2026-09-17 第四轮审计 HIGH 定案）** —— 只有构造点对该故障

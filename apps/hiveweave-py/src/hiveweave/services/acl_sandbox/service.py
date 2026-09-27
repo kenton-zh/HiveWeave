@@ -657,6 +657,59 @@ def _agent_aces_leaking(path: str, *, allow_create_sid: str | None = None) -> li
 _SEAL_WRITE_BITS = GRANT_MASK | WRITE_DAC | WRITE_OWNER
 
 
+# ── 批 3（I2，2026-09-27）：封条读回失败的爆炸半径裁决 ──────────────────
+#
+# 事故（09-27 s3-clone_13，PLATFORM-ISSUES I2）：`.git/config` 被 git
+# lock+rename 换新后**继承回 git_main_sid 写位**，而 seal 的摘除集不含
+# git_main_sid ⇒ 摘不掉 ⇒ 读回永远失败 ⇒ **整项目 84% 的 shell** 永久
+# fail-closed（53 步 / 9 agent，换后端进程仍无效 —— 状态在磁盘 ACL）。
+#
+# 修法两层（风险序：先保护、再观测、才放宽 —— fixplan §一）：
+#   ① **自愈对称**（repair，非放宽）：`seal_file` 的摘除集并上 git_main_sid
+#      （与 hooks 分支的同族先例一致）。读回判据查 `S-1-4-` 全族，摘除集
+#      必须同族对称，否则「摘了个寂寞」⇒ 稳态自愈：seal 每轮把换新 config
+#      上的 MAIN 拷贝摘掉，墙不再形成。
+#   ② **爆炸半径收窄**（放宽类，**带 shadow**）：读回失败时按**状态判据**
+#      裁决 —— 本命令受限令牌携带的 SID（`policy.write_sids`）与泄漏 SID
+#      **无交集** ⇒ 该令牌结构上写不了封条面，降级放行不放大风险
+#      （git_main_sid 仅 MAIN 边界令牌携带，见 `policy.build_write_sids`）；
+#      **有交集 ⇒ 无论档位一律 fail-closed**。
+# 档位 env `HIVEWEAVE_SEAL_READBACK_DEGRADE`（缺省 shadow）：
+#   · `shadow`  = 只记日志+遥测，仍 fail-closed（观测期判据：目标路径触发
+#     ≥3 轮真实项目且零反例才许切 enforce —— fixplan §一 shadow 判据）；
+#   · `enforce` = 无交集降级放行（降级通道生效）；
+#   · `off`     = 恒 fail-closed（旧行为，应急回滚闸）。
+SEAL_READBACK_DEGRADE_ENV = "HIVEWEAVE_SEAL_READBACK_DEGRADE"
+
+
+class SealReadbackError(SandboxUnavailableError):
+    """封条读回复核失败 —— 携带泄漏 SID 集，供爆炸半径裁决（批 3 / I2）。
+
+    `platform_side=True` 语义不变（构造点有信息优势：平台自己刚做过 seal，
+    上一刻它还是干净的 —— 见 `is_platform_side` 标注标准 (b)）。
+    """
+
+    def __init__(self, message: str, *, leaking_sids: list[str], path: str):
+        super().__init__(message, platform_side=True)
+        self.leaking_sids = sorted(leaking_sids)
+        self.seal_path = path
+
+
+def _seal_readback_mode() -> str:
+    raw = (os.environ.get(SEAL_READBACK_DEGRADE_ENV) or "").strip().lower()
+    return raw if raw in ("shadow", "enforce", "off") else "shadow"
+
+
+def _seal_leak_intersects_token(policy, leaking_sids: list[str]) -> bool:
+    """状态判据：泄漏 SID 是否与**本命令受限令牌**携带的 SID 有交集。
+
+    令牌 SID 集就是 `factory.create(policy.write_sids, …)` 里那份 ——
+    无交集 ⇒ 该令牌对封条面**没有任何写权**（OS 层结构保证，不靠读命令文本），
+    降级放行不放大风险。有交集 ⇒ fail-closed。
+    """
+    return bool(set(leaking_sids) & set(policy.write_sids))
+
+
 def _grant_aces(path: str) -> list[tuple[int, int, int, str]]:
     """[(ace_type, flags, mask, sid)] —— 供 service 层判「封条是否已生效」。"""
     from hiveweave.services.acl_sandbox.grant import WriteGrant
@@ -719,8 +772,65 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     changed: list[str] = []
     sids = _seal_subject_sids(policy)
 
+    async def _handle_readback_failure(exc: SealReadbackError) -> None:
+        """批 3（I2）：读回失败的爆炸半径裁决（状态判据，非命令文本）。
+
+        ① 类级自愈（审计 P2-4）：先把泄漏 SID 本身并进摘除集重试一次 seal
+        —— 能力 SID 是平台自制的，摘除恒安全；治的不只 git_main_sid 一种
+        （陈旧项目/已删 worktree 的旧 SID 同族同墙）。
+        ② 仍泄漏 ⇒ 有交集任何档位 fail-closed；无交集 ⇒ shadow 只观测仍
+        fail-closed，enforce 降级放行（不进 `changed` —— 那是「实际改动」
+        的语义，审计 P2-1）。
+        """
+        if exc.leaking_sids:
+            try:
+                await agrant.seal_agent_aces_async(
+                    exc.seal_path, set(exc.leaking_sids))
+            except Exception as retry_exc:  # noqa: BLE001 — 自愈失败走原判
+                log.warning("acl_sandbox.seal_selfheal_failed",
+                            path=exc.seal_path, error=str(retry_exc)[:200])
+            else:
+                if not _agent_aces_leaking(exc.seal_path):
+                    log.info("acl_sandbox.seal_selfhealed",
+                             path=exc.seal_path, stripped=exc.leaking_sids)
+                    changed.append(f"selfheal:{exc.seal_path}")
+                    return
+        if _seal_leak_intersects_token(policy, exc.leaking_sids):
+            raise exc
+        mode = _seal_readback_mode()
+        if mode == "enforce":
+            log.warning(
+                "acl_sandbox.seal_degraded_pass",
+                path=exc.seal_path, leaking=exc.leaking_sids,
+                entry=getattr(policy, "entry", ""),
+                action=(
+                    "本命令受限令牌不携带泄漏 SID（状态判据），降级放行 —— "
+                    "该封条面本轮未封住，但此令牌对其无写权"
+                ),
+            )
+            telemetry.record_seal_degraded()
+            return
+        if mode == "shadow":
+            log.warning(
+                "acl_sandbox.seal_degrade_shadow",
+                path=exc.seal_path, leaking=exc.leaking_sids,
+                entry=getattr(policy, "entry", ""),
+                action=(
+                    "shadow：本可降级放行（令牌与泄漏 SID 无交集），"
+                    "仍 fail-closed —— 满 3 轮真实项目零反例后切 enforce"
+                ),
+            )
+            telemetry.record_seal_degraded_shadow()
+        raise exc
+
     async def seal_file(path: str, *, lock_against_delete: bool = False
                         ) -> None:
+        """封单个 git 引导文件。
+
+        批 3（I2）：返回后该文件读回**必须**干净 —— 摘不掉时经
+        `_handle_readback_failure` 裁决（类级自愈 → 分档），自愈成功即
+        干净放行；仍泄漏且裁决放行是 enforce 档的事，本函数不吞。
+        """
         created = False
         if not os.path.exists(path):
             if os.path.basename(path) not in _PLACEHOLDER_CARRIERS:
@@ -735,17 +845,25 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
                     f"cannot create git bootstrap placeholder {path}: {exc}. "
                     f"agent 可自行新建该文件并让平台 git 读它 ⇒ 拒绝继续",
                 ) from exc
+        # 批 3 / I2 自愈对称：摘除集并上 git_main_sid —— 读回判据查 `S-1-4-`
+        # 全族，摘除集必须同族对称（hooks 分支的同族先例）。事故形态：config
+        # 被 git lock+rename 换新 ⇒ 继承回 git_main_sid 写位 ⇒ 摘除集缺它 ⇒
+        # 读回永远失败 ⇒ 整项目 shell 永久 fail-closed。⚠ **`.git` 根**的 seal
+        # 不能并（下方 :git_dir seal）：根上的两条 MAIN ACE 是批 A 第 0 步
+        # **故意授的**，并进去会让 seal 每轮摘→re-grant 每轮重灌（大树上
+        # SetNamedSecurityInfo 急切传播，很贵）。
         wrote = await agrant.seal_agent_aces_async(
-            path, sids, lock_against_delete=lock_against_delete)
+            path, sids | {git_main_sid(project)},
+            lock_against_delete=lock_against_delete)
         # 读回复核（§4.11 同族纪律）：摘完必须**读到干净**，否则 fail-closed。
         # 没有这步，「摘了个寂寞」与「已封」在日志上长得一样。
         leaking = _agent_aces_leaking(path)
         if leaking:
-            raise SandboxUnavailableError(
+            await _handle_readback_failure(SealReadbackError(
                 f"seal read-back failed: {path} 仍有能力 SID 写位 {leaking} "
                 f"—— git 引导文件未封住，拒绝继续执行 agent 命令",
-                platform_side=True,
-            )
+                leaking_sids=leaking, path=path,
+            ))
         if wrote or created:
             changed.append(f"{'create+' if created else ''}seal:{path}")
 
@@ -810,11 +928,11 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
     leaking_root = _agent_aces_leaking(
         git_dir, allow_create_sid=git_main_sid(project))
     if leaking_root:
-        raise SandboxUnavailableError(
+        await _handle_readback_failure(SealReadbackError(
             f"seal read-back failed: {git_dir} 仍可被 agent 写 {leaking_root} "
             f"—— 配置载体可被 lock+rename 替换，拒绝继续执行 agent 命令",
-            platform_side=True,
-        )
+            leaking_sids=leaking_root, path=git_dir,
+        ))
     # git 真正需要 agent 写的子目录（agent 自己的 add/commit 落在 worktree gitdir
     # + 共享 objects/refs/logs；**不含** `.git` 根、不含 `info/`、不含 `hooks/`）
     for name in ("objects", "refs", "logs"):
@@ -860,11 +978,11 @@ async def _seal_git_bootstrap_files(policy, agrant: _AsyncGrant) -> list[str]:
         changed.append("seal:hooks")
         leaking_hooks = _agent_aces_leaking(hooks_dir)
         if leaking_hooks:
-            raise SandboxUnavailableError(
+            await _handle_readback_failure(SealReadbackError(
                 f"seal read-back failed: {hooks_dir} 仍有能力 SID 写位 "
                 f"{leaking_hooks} —— hooks 是执行载体，拒绝继续执行 agent 命令",
-                platform_side=True,
-            )
+                leaking_sids=leaking_hooks, path=hooks_dir,
+            ))
 
     # ③ 每个 worktree 的 gitdir：本身要继续可写（agent 的 index/index.lock 在
     #    那里），故这里封的 `config.worktree` / `commondir` **只是提高门槛**：
