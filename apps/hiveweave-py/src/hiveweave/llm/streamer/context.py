@@ -460,6 +460,7 @@ class ContextMixin:
         transcript: str,
         session_id: str | None = None,
         agent_id: str | None = None,
+        tools: list[dict] | None = None,
     ) -> str | None:
         """One-shot non-tool LLM call. Empty/error → None (caller hard-trims).
 
@@ -467,6 +468,14 @@ class ContextMixin:
         进 llm_usage（request_type="compaction_working_set"，含实测耗时）；
         缺省维持旧行为（不记账）。由 ``_pressure_compact_if_needed`` 从
         tool_loop 透传。
+
+        ``tools``（批 10 / I5，2026-09-27）：旁路请求**不再丢工具表** ——
+        照抄 ``conversation/compaction.py`` P1-2 的同构形态（真实 tools 进
+        ``build_body``），与主链路同源 ⇒ 不换缓存域。消息体仍是独立的
+        transcript 形态（有意不带主前缀：压力路径再把全量上下文重发一遍
+        与「缩工作集」的目标相悖），故缓存对齐只做工具表这半。
+        模型真回了 tool_call 时只读 ``message.content`` ⇒ 空 → 返回 None
+        → 调用方硬裁兜底，路径本来就有，无新增风险。
         """
         prompt = (
             "Summarize the following in-progress agent tool-loop history.\n"
@@ -483,7 +492,11 @@ class ContextMixin:
             stream=False,
             temperature=0.3,
             max_tokens=WORKING_SET_SUMMARY_MAX_TOKENS,
-            tools=None,
+            # 批 10 / I5（2026-09-27）：`tools=None` ⇒ 请求级工具表与主链路
+            # 不同 ⇒ 缓存域切换（报告 I5：turn_summary 13 条命中率 7.4%）。
+            # 本请求与主链路同 session（build_headers 已对齐），补上同源
+            # tools 后不再平白换域。
+            tools=tools,
         )
         client = provider.build_client()
         try:
@@ -530,6 +543,7 @@ class ContextMixin:
         summarize: Callable[[str], Awaitable[str | None]] | None = None,
         session_id: str | None = None,
         agent_id: str | None = None,
+        tools: list[dict] | None = None,
     ) -> list[dict]:
         """DSH-style step-boundary compact: prune, then LLM-summarize old head.
 
@@ -538,6 +552,10 @@ class ContextMixin:
 
         ``agent_id``（批 D 第 2 步任务 5）：透传给 ``_summarize_working_set_head``
         做记账归属；缺省不记账（保持旧调用方行为）。
+
+        ``tools``（批 10 / I5）：透传给 ``_summarize_working_set_head``，
+        工作集头摘要请求与主链路同源工具表（不换缓存域）；缺省 None 保持
+        旧调用方行为（summarize 回调路径不用 tools）。
         """
         messages = self._drop_orphan_tool_artifacts(messages)
         _usable, pressure_at, retain_at = self._working_set_budgets(provider)
@@ -580,7 +598,7 @@ class ContextMixin:
                 else:
                     summary_text = await self._summarize_working_set_head(
                         provider, transcript, session_id=session_id,
-                        agent_id=agent_id,
+                        agent_id=agent_id, tools=tools,
                     )
             except Exception as e:
                 log.warning("working_set_summarize_failed", error=str(e))
@@ -734,6 +752,7 @@ class ContextMixin:
         reason: str = "max_rounds",
         budget_deadline: float | None = None,
         stall_reason: str | None = None,
+        tools: list[dict] | None = None,
     ) -> str:
         """回合强制收尾的总结调用（真实原因由 ``reason`` 说明）。
 
@@ -750,6 +769,21 @@ class ContextMixin:
         agent SAFETY_TIMEOUT 强杀（2026-08-08 审计发现——三道预算闸口的
         结构保证会被这条收尾路径打穿）。剩余不足时跳过总结走 fallback；
         允许时等待时长也钳在预算内。
+
+        ``tools``（批 10 / I5，2026-09-27）：旁路收尾总结**不再丢工具表**
+        —— messages 本就带完整主链路前缀，唯独 `tools=None` 让请求级工具
+        表与主链路不同 ⇒ 第一个不同 token 提前到 tools 段 ⇒ 整段前缀缓存
+        失效（实测 request_type="turn_summary" 13 条命中率仅 7.4%，多条与
+        上一请求仅隔 10–31s，远在缓存窗口内 ⇒ 不是过期，是换域）。
+        「禁用工具」语义改走**对话内撤工具**形态（上游 pi
+        `packages/ai/src/api/anthropic-messages.ts:1126-1127`「tools stay
+        declared and are withdrawn by tool_removal; the request-level list
+        therefore only grows」在本仓 OpenAI 兼容 wire 上的适配：无
+        tool_removal 块类型 ⇒ 请求级 tools 保真，撤工具由 summary prompt
+        的「Respond with text ONLY / Do NOT attempt any tool calls」在对话
+        内完成）。响应只读 ``message.content`` ⇒ 模型真回 tool_call 时
+        content 为空 → 落既有 fallback 文案，无新增风险。缺省 None 保持
+        旧调用方行为。
         """
         if budget_deadline is not None:
             remain_s = budget_deadline - time.monotonic()
@@ -832,7 +866,9 @@ class ContextMixin:
             messages=summary_messages,
             stream=False,
             temperature=0.3,
-            tools=None,
+            # 批 10 / I5（2026-09-27）：保主链路同源工具表，不换缓存域。
+            # 「禁用工具」由 summary prompt 在对话内撤（见 docstring）。
+            tools=tools,
         )
 
         client = provider.build_client()

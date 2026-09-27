@@ -609,6 +609,8 @@ class ToolLoopMixin:
                 # 批 D 第 2 步任务 5：记账归属 —— 工作集压力摘要的旁路
                 # LLM 调用进 llm_usage（request_type=compaction_working_set）。
                 agent_id=agent_id,
+                # 批 10 / I5：工作集头摘要请求带主链路同源工具表（不换缓存域）。
+                tools=tools,
             )
             messages = self._trim_context_if_needed(messages, provider)
             # P1-1②另半（2026-09-21）：**run 内每次请求前也对比一次** —— 否则
@@ -1378,6 +1380,8 @@ class ToolLoopMixin:
                         reason="stall_break",
                         budget_deadline=hard_deadline,
                         stall_reason=stall_reason,
+                        # 批 10 / I5：旁路总结带主链路同源工具表（不换缓存域）。
+                        tools=tools,
                     )
                     final_text = self._strip_placeholder(summary)
                     if not final_text:
@@ -1475,6 +1479,8 @@ class ToolLoopMixin:
                                 agent_id, provider, messages, on_delta,
                                 reason="no_text",
                                 budget_deadline=hard_deadline,
+                                # 批 10 / I5：同上，不换缓存域。
+                                tools=tools,
                             )
                             # FIX(text-acc): 同 max_rounds 路径，只用 summary
                             final_text = self._strip_placeholder(summary)
@@ -1607,6 +1613,8 @@ class ToolLoopMixin:
             agent_id, provider, messages, on_delta,
             reason="max_rounds",
             budget_deadline=hard_deadline,
+            # 批 10 / I5：同上，不换缓存域。
+            tools=tools,
         )
         # FIX(text-acc): 只用 summary，不拼接 text_acc。
         # summary 是专门的 LLM 调用，已概括全部进展。拼接 text_acc 会引入
