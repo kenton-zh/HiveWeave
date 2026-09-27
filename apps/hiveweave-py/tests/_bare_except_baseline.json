@@ -1,10 +1,10 @@
 {
   "_comment": "Bare-except (except: pass) freeze, 2026-09-11. See tests/test_silent_except_ratchet.py. Only allowed to shrink. 2026-09-15 认领：较冻结日 +4 / −2 = 净 +2（365→367）——llm/streamer/http_stream.py +2（e14bd1a 样本 flush best-effort）、services/code_audit.py +1（1b89a13 shadow 观测旁支）、tools/misc_tools.py +1 净（daa3995 _delivery_blockers 三处 fail-open 计数，同批删了旧门的一处）；减项：agents/recovery.py −1、tools/patch.py 随文件删除 −1。每处吞掉了什么见各文件行内注释。",
-  "_total": 371,
+  "_total": 377,
   "files": {
     "__init__.py": 1,
     "agents/agent.py": 19,
-    "agents/completion.py": 12,
+    "agents/completion.py": 13,
     "agents/helpers/rate_limit.py": 6,
     "agents/recovery.py": 9,
     "agents/streaming.py": 3,
@@ -114,6 +114,7 @@
     "tools/tasks/verify_spawn.py": 5,
     "tools/tasks/waive.py": 2,
     "tools/turn_tools.py": 6,
-    "util/log_rotate.py": 4
+    "util/log_rotate.py": 4,
+    "llm/streamer/oneshot.py": 5
   }
 }

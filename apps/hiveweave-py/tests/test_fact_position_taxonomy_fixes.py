@@ -399,7 +399,7 @@ def test_shell_fact_flag_whitelist_is_single_and_covers_dialect():
         "「戳说在沙箱里而进程从未启动」在数据里不可判"
     )
 
-    # ── AST 判据：白名单的**真实引用点**必须恰好是「1 处定义 + 2 处出口」──
+    # ── AST 判据：白名单的**真实引用点**必须恰好是「1 处定义 + 4 处出口」──
     tree = _ast.parse((_SRC / "tools" / "bash.py").read_text("utf-8"))
     # 定义点 = 被赋值的目标名（AnnAssign/Assign 的 Name 存进 _SHELL_FACT_FLAG_KEYS）
     defs = 0
@@ -411,9 +411,14 @@ def test_shell_fact_flag_whitelist_is_single_and_covers_dialect():
             else:
                 refs.append(node.lineno)
     assert defs == 1, f"白名单定义点应恰有 1 处，实测 {defs}"
-    assert len(refs) == 2, (
-        f"白名单**引用**点应为 2 处出口（_shell_tool_impl / run_command_tool），"
-        f"实测 {len(refs)} 处 @ {refs} —— 有人又各列了一份清单"
+    # 批 1（I1，2026-09-27）：`_fact_stamp`（重建 dict 出口的唯一取键实现）
+    # 与 `_native_shaped` 的 F4 透传都改为遍历本清单 ⇒ 引用点 2→4。四处
+    # **全部是「遍历唯一清单」的合规形态**，不是「各列一份清单」的复发 ——
+    # 复发形态（换个名字另立清单）由上面的 keys 覆盖断言 + 本 defs==1 钉死。
+    assert len(refs) == 4, (
+        f"白名单**引用**点应为 4 处出口（_shell_tool_impl / run_command_tool / "
+        f"_native_shaped / _fact_stamp），实测 {len(refs)} 处 @ {refs} —— "
+        f"数量漂移时人工核对是否为新出口漏接或清单分叉"
     )
 
 

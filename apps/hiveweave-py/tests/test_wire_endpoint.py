@@ -128,4 +128,14 @@ def test_agent_uses_shared_extractor_not_vision_copy():
     src = Path(__file__).resolve().parents[1] / "src" / "hiveweave" / "agents" / "agent.py"
     text = src.read_text(encoding="utf-8")
     assert "from hiveweave.services.vision import extract_nonstream_text" not in text
-    assert "from hiveweave.llm.wire_endpoint import extract_nonstream_text" in text
+    # 批 B+C（ab2bcc2，2026-09-26）：_review_llm_callback 重构为 oneshot
+    # **流式**路径（增量累积 content，无非流式解析）⇒ agent.py 与 oneshot
+    # 都不再 import 共享解析器。守卫保留两半：① agent.py 不回 vision 旧
+    # 拷贝（上方断言）；② oneshot 不得 import vision 的解析（流式路径
+    # 无需非流式解析器，引 vision 即旧病复发）。
+    oneshot = (
+        Path(__file__).resolve().parents[1] / "src" / "hiveweave"
+        / "llm" / "streamer" / "oneshot.py"
+    ).read_text(encoding="utf-8")
+    assert "from hiveweave.services.vision import" not in oneshot
+    assert "extract_nonstream_text" not in oneshot

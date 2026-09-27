@@ -160,17 +160,20 @@ async def test_ws_idle_images_reach_agent_chat_as_internal_format():
     msg, args, kwargs = agent.chat_calls[0]
     envelope = json.loads(msg)
     assert envelope["content"] == "看这张图"
-    # 图以内部格式随 opts 传入（data URL 前缀已剥）
-    assert args == ({"images": [{"media_type": "image/png", "data": "AAAA"}]},)
+    # 图以内部格式随 opts 传入（data URL 前缀已剥）；批 6（I15）起用户入口
+    # 显式带 source:"chat"（缺省值不许是业务值——漏传必须落 unknown）。
+    assert args == (
+        {"source": "chat", "images": [{"media_type": "image/png", "data": "AAAA"}]},
+    )
     assert kwargs == {}
 
 
 async def test_ws_idle_no_images_single_arg_call_unchanged():
-    """无图路径回归：保持原单参调用，opts 不出现。"""
+    """无图路径回归：批 6 起单参形态 = 显式 source 的 opts（无 images 键）。"""
     agent = _make_ws_idle_agent()
     await _run_ws_chat_push({"message": "纯文本"}, agent)
     msg, args, kwargs = agent.chat_calls[0]
-    assert args == () and kwargs == {}
+    assert args == ({"source": "chat"},) and kwargs == {}
 
 
 async def test_ws_idle_bad_images_trigger_no_images_call():
@@ -181,7 +184,7 @@ async def test_ws_idle_bad_images_trigger_no_images_call():
         agent,
     )
     _msg, args, kwargs = agent.chat_calls[0]
-    assert args == () and kwargs == {}
+    assert args == ({"source": "chat"},) and kwargs == {}
 
 
 # ── 3. REST send_chat：图随 opts 穿到 agent.chat ──────────────
@@ -257,16 +260,23 @@ async def test_rest_send_chat_images_reach_agent_chat_as_internal_format():
     assert len(agent.chat_calls) == 1
     msg, args, kwargs = agent.chat_calls[0]
     assert json.loads(msg)["content"] == "看图"
-    # api/chat.py 经 **chat_extra 传 keyword opts；内部格式不丢不变形
+    # api/chat.py 经 **chat_extra 传 keyword opts；内部格式不丢不变形；
+    # 批 6（I15）：REST 入口显式 source:"chat"
     assert args == ()
-    assert kwargs == {"opts": {"images": [{"media_type": "image/png", "data": "AAAA"}]}}
+    assert kwargs == {
+        "opts": {
+            "source": "chat",
+            "images": [{"media_type": "image/png", "data": "AAAA"}],
+        }
+    }
 
 
 async def test_rest_send_chat_no_images_single_arg_call_unchanged():
+    """无图路径：批 6 起单参形态 = 仅显式 source 的 opts。"""
     agent = _make_rest_agent()
     await _run_rest_send_chat({"agentId": "agent-1", "message": "纯文本"}, agent)
     _msg, args, kwargs = agent.chat_calls[0]
-    assert args == () and kwargs == {}
+    assert args == () and kwargs == {"opts": {"source": "chat"}}
 
 
 # ── 4. _build_messages：opts.images 上本轮 user 消息 ──────────

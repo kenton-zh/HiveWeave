@@ -385,4 +385,7 @@ async def test_vision_analyze_image_forces_supports_images() -> None:
             },
         )
     assert "canvas" in text
-    assert captured["cfg"]["supports_images"] is True
+    # 契约迁移（vision.py 注释）：provider_factory 只认 is_image_supported()
+    # 自动探测，不读 model_config["supports_images"] ⇒ 强设已摘（写了是死
+    # 代码）。新契约 = cfg 原样透传，不得被强设为 True。
+    assert captured["cfg"]["supports_images"] is False
