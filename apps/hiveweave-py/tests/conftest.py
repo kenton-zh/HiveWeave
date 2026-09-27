@@ -116,19 +116,117 @@ def _isolate_meta_db(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "meta_db_path", str(tmp_path / "meta-db.db"))
 
 
-@pytest.fixture(autouse=True)
-async def _close_db_connections_after_test():
-    yield
-    try:
-        from hiveweave.db.project import close_all
+def _aiosqlite_worker_alive(conn) -> bool:
+    """aiosqlite 连接的 worker 线程是否还活着（读私有属性，仅测试清理用）。
 
-        await close_all()
+    aiosqlite 0.22 的 ``Connection._thread`` 是**非守护** worker，逐条消费
+    ``_tx`` 队列并把结果经 ``future.get_loop().call_soon_threadsafe`` 送回。
+    """
+    t = getattr(conn, "_thread", None)
+    return bool(t is not None and t.is_alive())
+
+
+def _force_stop_aiosqlite_conn(conn) -> None:
+    """同步停掉一条 aiosqlite 连接，**绝不 await**。
+
+    为什么不能 await close()：worker 线程已死（它要 resolve 的 future 绑在
+    已关闭的旧测试 loop 上）时，``await conn.close()`` 会把 close 操作排进
+    一个永远无人消费的队列，future 永不 resolve —— 调用方在
+    ``run_until_complete`` 里永久挂起（IocpProactor._poll 无超时阻塞），
+    这正是 test_evidence_landing_and_gate_receipts.py 整文件跑必挂死的
+    终端表现。这里只入队 stop 哨兵并断开 sqlite 句柄引用（句柄交给 GC），
+    语义是「测试进程马上续跑，不需要优雅关闭」。
+    """
+    try:
+        conn.stop()
     except Exception:
         pass
     try:
-        from hiveweave.db.meta import close_meta_db
+        if not _aiosqlite_worker_alive(conn):
+            conn._connection = None
+    except Exception:
+        pass
 
-        await close_meta_db()
+
+@pytest.fixture(autouse=True)
+async def _close_db_connections_after_test():
+    yield
+    # ── per-project 连接缓存 ──────────────────────────────────
+    try:
+        from hiveweave.db import project as project_db_mod
+        from hiveweave.db.project import close_all
+
+        def _all_cached_conns() -> list:
+            conns = list(project_db_mod._cache.values())
+            for pool in project_db_mod._readonly_pools.values():
+                conns.extend(slot.conn for slot in pool)
+            return conns
+
+        cached = _all_cached_conns()
+        if cached and not all(_aiosqlite_worker_alive(c) for c in cached):
+            # 有 worker 已死的僵尸连接：await close（含 close_all 内部）必挂
+            # → 同步止损。（正常路径不会走到这里——每条连接每用例后都被
+            # close_all 关掉，worker 不会活过自己的 loop；这是对泄漏路径的
+            # 兜底。）
+            for c in cached:
+                _force_stop_aiosqlite_conn(c)
+        else:
+            try:
+                await close_all()
+            except Exception:
+                pass
+            # close_all 可能半途失败（如某把模块级锁跨 loop RuntimeError）
+            # 而留下未关连接 → 兜底止损（对已关连接是幂等 no-op）。
+            for c in _all_cached_conns():
+                _force_stop_aiosqlite_conn(c)
+        # 结束态恒定：任何 per-project 连接/锁都不活过用例边界
+        # （与 close_all 的清库语义对齐，含驱逐标记）。
+        project_db_mod._cache.clear()
+        project_db_mod._agent_cache.clear()
+        project_db_mod._write_locks.clear()
+        project_db_mod._project_ws_cache.clear()
+        project_db_mod._readonly_pools.clear()
+        project_db_mod._readonly_rr.clear()
+        project_db_mod._evicted_workspaces.clear()
+    except Exception:
+        pass
+    # ── meta DB 单例 ──────────────────────────────────────────
+    # 挂根修复（2026-09-26，test_evidence_landing_and_gate_receipts 整文件
+    # 跑必挂死）：review 路径 publish_fact → fact_bus._schedule_persist 起的
+    # fire-and-forget 落库任务会在 call 阶段拿到 meta._init_lock 开 meta 库；
+    # pytest-asyncio 1.4 每个 stage 用 run_until_complete 跑，stage 自己的
+    # task 一完成 loop 立即停 —— 这个后台任务冻死在 init 临界区里（持锁）。
+    # 下一个用例 teardown 的 close_meta_db 在**旧 loop 绑定的锁**上争用 ⇒
+    # RuntimeError("... is bound to a different event loop")，被下面的
+    # except 吞掉 ⇒ _db 泄漏进下一用例；其 worker 处理孤儿队列项时对已关
+    # loop call_soon_threadsafe ⇒ RuntimeError ⇒ worker 线程死亡；再下一个
+    # 用例 teardown await _db.close() ⇒ 死 worker 永不 resolve ⇒ 全进程挂死。
+    # 治法 = 不让任何 meta 连接/锁活过用例边界：
+    try:
+        from hiveweave.db import meta as meta_mod
+
+        db = meta_mod._db
+        if db is None or _aiosqlite_worker_alive(db):
+            try:
+                await meta_mod.close_meta_db()
+            except Exception:
+                pass
+        # close_meta_db 可能因跨 loop 的 _init_lock RuntimeError 整体被跳过
+        # （worker 还活着但锁争用失败）：只要 _db 还在就同步止损，
+        # 绝不让连接跨用例存活。
+        db = getattr(meta_mod, "_db", None)
+        if db is not None:
+            _force_stop_aiosqlite_conn(db)
+            meta_mod._db = None
+        meta_mod._migrated = False
+        # 幽灵任务可能把 _init_lock 锁死/绑死在已关闭的旧 loop 上 —— 换新锁
+        # 根治「bound to a different event loop」。冻结任务最终 release 的
+        # 是旧锁对象，与新锁互不干扰。
+        meta_mod._init_lock = asyncio.Lock()
+        # 同理兜底 project 侧的模块级锁（当前文件实测未绑定，纯保险）。
+        from hiveweave.db import project as project_db_mod
+
+        project_db_mod._ensure_lock = asyncio.Lock()
     except Exception:
         pass
     # 兜底：取消本测试 loop 上仍 pending 的后台任务（测试内 start 了
