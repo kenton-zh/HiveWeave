@@ -25,8 +25,8 @@ from hiveweave.tools.base import tool
 from hiveweave.tools.bash import (
     MAX_TIMEOUT_S,
     TOOL_DEFAULT_TIMEOUT_MS,
-    _enforcement_stamp,
     _executed_stamp,
+    _fact_stamp,
     _truncate_output,
 )
 from hiveweave.tools.result import ToolResult, finalize_fact_dict
@@ -119,6 +119,9 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
             out_b, err_b = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout_s
             )
+        # I1（2026-09-27）：卷余量三正交位随结果上报（与 bash 侧同一族）。
+        from hiveweave.services.disk_guard import facts_flag, finish as _disk_finish
+
         return {
             "output": out_b.decode("utf-8", errors="replace")
                       + ("\n" if out_b else "")
@@ -127,6 +130,7 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
             "stderr": err_b.decode("utf-8", errors="replace"),
             "exit_code": proc.returncode,
             "timed_out": False,
+            **facts_flag(_disk_finish(proc)),
         }
     except asyncio.TimeoutError:
         try:
@@ -276,7 +280,7 @@ async def python_script_execute(
             # 出口 —— 戳丢了 agent 就看不到"这次到底在不在沙箱里"）。
             return ToolResult.err(
                 "python_script: background unsupported",
-                **_enforcement_stamp(result),
+                **_fact_stamp(result),
             )
         result = {
             "output": "",
@@ -295,7 +299,7 @@ async def python_script_execute(
             # 的口径不同源 ⇒ 加固面 `git_hardened`（不含 "enforcement" 前缀）
             # 在本工具被**静默丢掉**。这正是本仓反复栽的「每处各列一份清单」
             # 形态：两份清单必然各自演化。
-            **_enforcement_stamp(result),
+            **_fact_stamp(result),
         }
     except SandboxUnavailableError as e:
         # fail-closed：判定为受限但受限路径起不来 ⇒ 干净拒绝，绝不落原生
@@ -325,7 +329,7 @@ async def python_script_execute(
     # ⚠ M3（2026-09-17 审计必修）：改用 `bash._enforcement_stamp`，键名以
     # `policy.SPAWN_STAMP_KEYS` 为唯一登记点 —— 原先的本地前缀过滤会把
     # `git_hardened` 静默排除（本工具此前与该键**永不同源**）。
-    _stamp = _enforcement_stamp(result)
+    _stamp = _fact_stamp(result)
 
     if result.get("error"):
         # 位要跟着走（M2/T2）：`finalize_tool_result` 的归因阶梯**位优先于文本**，

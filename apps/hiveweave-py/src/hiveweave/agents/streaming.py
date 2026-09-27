@@ -413,6 +413,16 @@ async def on_tool_call(
                 #   executed    = 命令到底有没有启动（执行）
                 # 缺键 ⇒ None ⇒ NULL（不适用/未判定），**不回填成 1**。
                 executed=result.get("executed"),
+                # I1（2026-09-27）卷余量三正交位 —— **这是它们唯一的落库消费者**
+                #（独立审计 ①-2 实测：工具出口把键带上来还不够，这里不读 ⇒
+                # `record_step_end(disk_* = None)` ⇒ COALESCE 保留 NULL ⇒
+                # 三列在生产里**恒 NULL**，本批功能等于零）。
+                # 三列互相独立、绝不嵌套：**写了多少 ≠ 是否触顶 ≠ 树有没有回收**。
+                # 缺键 ⇒ None ⇒ NULL（不适用/未监控），**不回填 0** ——
+                # 0 是「观测到否」，与「没观测」不同形（P0-2 同族纪律）。
+                disk_bytes_written=result.get("disk_bytes_written"),
+                disk_limit_hit=result.get("disk_limit_hit"),
+                proc_tree_reaped=result.get("proc_tree_reaped"),
             )
         except Exception as e:
             log.debug("run_ledger.step_end_failed", error=str(e))

@@ -796,6 +796,28 @@ PROJECT_DB_TABLES = [
     """ALTER TABLE run_steps ADD COLUMN exit_code INTEGER""",
     """ALTER TABLE run_steps ADD COLUMN output_empty INTEGER""",
     """ALTER TABLE run_steps ADD COLUMN truncated INTEGER""",
+    # I1（2026-09-27，报告 P0-0）：卷余量护栏的**三个正交事实位**。
+    #
+    # 病灶：叶子 agent 的一条无界写盘命令把宿主卷写掉 188 GB 到 ENOSPC，
+    # 平台自身 92 分钟写不进库 —— 而 run_steps 里**没有任何位**能表达
+    # 「这一步写了多少 / 是否触顶 / 进程树有没有回收」⇒ 事后只能靠读文案。
+    #
+    # 三列**互相独立、绝不嵌套**（DSH `docs/defensive-patterns.md:7-9`）：
+    #   disk_bytes_written — 该步骤期间**同卷可用空间的下降量**（卷级近似，
+    #                       不是对被测进程的精确记账）；NULL = 未观测。
+    #   disk_limit_hit     — 1 = 低于危险线并被护栏强制中止；0 = 观测全程且
+    #                       未触发；NULL = 未被监控（非 command 类/未挂上）。
+    #   proc_tree_reaped   — 1 = 触顶后**确认**进程树已消失；0 = kill 请求发出
+    #                       但超时仍未确认；NULL = 没发生过 kill（未观测）。
+    #
+    # ⚠ 三条都不能合并成一个标志：**「写了多少」≠「是否触顶」**（可能没触顶
+    #   却写了 50 GB）；**「触顶了」≠「树已回收」**（kill 请求 ≠ 树没了）。
+    #   嵌进一个标志 ⇒ 调用方会把「被截断的 run」读成「干净成功」。
+    # ⚠ **不写 DEFAULT**（同 exit_code 三列的纪律）：NULL = 未观测，与
+    #   0「观测到否」不同形；带 DEFAULT 会让存量行被回填成假事实。
+    """ALTER TABLE run_steps ADD COLUMN disk_bytes_written INTEGER""",
+    """ALTER TABLE run_steps ADD COLUMN disk_limit_hit INTEGER""",
+    """ALTER TABLE run_steps ADD COLUMN proc_tree_reaped INTEGER""",
     # F11（平台修复计划 2026-08-30）：缓存治理 — 冷启动标记的 ALTER 已移至
     # CREATE TABLE llm_usage 之后（见列表末尾）。迁移顺序铁律：任何
     # ALTER TABLE <表> ADD COLUMN 必须排在该表的 CREATE TABLE 之后 ——
@@ -1004,6 +1026,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
         # 38 条 AttributeError」继续与业务失败同形、假成功继续不可机检。
         "exception_type", "is_platform_bug", "exit_code", "output_empty",
         "truncated",
+        # I1（2026-09-27）：卷余量护栏三正交位。登记进启动自检 ⇒ 迁移断裂
+        # （ALTER 排错位被吞 / 旧库没跑 ALTER）在启动时 fail-loud，而不是让
+        # 「护栏触顶了却查不到」静默退化成本条要治的那种假归因。
+        "disk_bytes_written", "disk_limit_hit", "proc_tree_reaped",
     },
     # meeting_utterances.abstain_reason（2026-09-18）：区分「主动弃权」与
     # 「被轮次预算掐断/超时/异常」。登记进自检 ⇒ 迁移断裂会在启动时 fail-loud，

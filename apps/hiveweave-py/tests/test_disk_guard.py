@@ -144,6 +144,11 @@ def test_trip_kills_tree_and_sets_all_three_facts(tmp_path):
         while time.monotonic() < deadline and proc.poll() is None:
             time.sleep(0.1)
         assert proc.poll() is not None, "触顶后进程必须终止"
+        # `tree_reaped` 由**独立回收线程**写（审计 ②-5：kill 不阻塞 watcher）
+        # ⇒ 要等它落值，不能立刻断言（`None` = 尚未确认，不是 False）
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and facts.tree_reaped is None:
+            time.sleep(0.1)
         assert facts.tree_reaped is True, "进程确实退出后必须报已回收"
     finally:
         if proc.poll() is None:
@@ -232,3 +237,98 @@ def test_funnel_watch_attached_when_process_starts(tmp_path):
         proc.kill()
         proc.wait(timeout=10)
         dg.finish(proc)
+
+
+# ── 落库面：三个正交位必须有列 + 必须登记进启动自检 ────────────
+
+
+def test_disk_facts_flag_is_orthogonal():
+    """`facts_flag` 只输出**观测到**的位，三键互相独立（不合并成一个布尔）。"""
+    f = dg.DiskFacts(volume="D:\\", watched=True)
+    assert dg.facts_flag(f) == {}, "全未观测 ⇒ 空（不是一串 False）"
+    f.hit_limit = True
+    f.tree_reaped = False
+    assert dg.facts_flag(f) == {"disk_limit_hit": True, "proc_tree_reaped": False}
+    # 未观测的进程 ⇒ 什么都别报（护栏没挂上 ≠ 磁盘没问题）
+    assert dg.facts_flag(dg.DiskFacts(volume="D:\\")) == {}
+
+
+def test_disk_columns_declared_and_self_checked():
+    """⚠ 清单只登记一处：列的 DDL 与启动自检清单必须同时有（否则迁移断裂静默）。"""
+    from hiveweave.db import schema
+
+    ddl = "\n".join(schema.PROJECT_DB_TABLES)
+    for col in ("disk_bytes_written", "disk_limit_hit", "proc_tree_reaped"):
+        assert f"ADD COLUMN {col} " in ddl or f"ADD COLUMN {col}(" in ddl, (
+            f"{col} 未在 PROJECT_DB_TABLES 里声明（迁移不会跑 ⇒ 列永远缺）"
+        )
+        assert col in schema.PROJECT_DB_COLUMN_CHECKS["run_steps"], (
+            f"{col} 未登记进 PROJECT_DB_COLUMN_CHECKS ⇒ 迁移断裂不会 fail-loud"
+        )
+
+
+# ── 重建层不丢键（审计 ①-1 的实测形态）───────────────────────
+
+
+def test_native_shaped_does_not_drop_disk_keys():
+    """`_native_shaped` 是**重建 dict** ⇒ 新事实位必须随归一化活下来。
+
+    2026-09-27 独立审计实测：它原先**手写** `("denied_by", "blocked_by_environment",
+    "sealed_by")` 三键清单 ⇒ 本批 `disk_*` 三键被静默吃掉 ⇒ 生产恒 NULL。
+    已改为遍历唯一清单 `_SHELL_FACT_FLAG_KEYS`。
+    """
+    from hiveweave.tools.bash import _native_shaped
+
+    out = _native_shaped({
+        "exit_code": 0, "stdout": "x", "stderr": "", "timed_out": False,
+        "disk_bytes_written": 123, "disk_limit_hit": True, "proc_tree_reaped": False,
+    })
+    assert out["disk_bytes_written"] == 123
+    assert out["disk_limit_hit"] is True
+    assert out["proc_tree_reaped"] is False, "False（观测到否）必须带过"
+
+
+def test_fact_stamp_is_superset_and_skips_none():
+    """工具出口的取键函数：**遍历唯一清单**，是 `_enforcement_stamp` 的超集。"""
+    from hiveweave.tools.bash import _fact_stamp
+
+    stamp = _fact_stamp({
+        "disk_bytes_written": 1,
+        "disk_limit_hit": False,
+        "proc_tree_reaped": None,
+        "enforcement": "confined",
+        "exit_code": 0,
+    })
+    assert stamp["disk_bytes_written"] == 1
+    assert stamp["disk_limit_hit"] is False, "False 不能与 None 混同"
+    assert "proc_tree_reaped" not in stamp, "None = 未观测 ⇒ 键不出现"
+    assert stamp["enforcement"] == "confined", "superset：spawn 面戳不能丢"
+
+
+def test_execute_bash_success_carries_disk_facts(monkeypatch, tmp_path):
+    """**端到端穿层**：工具出口也是重建 dict ⇒ 三键必须到达回执。
+
+    这是独立审计 ①-1 用的实测手法（那段 monkeypatch 实证发现键在出口被丢）。
+    不拉起真命令：把更深的 `_run_sandboxed` 换掉，只验「重建层是否透传」。
+    """
+    import asyncio
+
+    from hiveweave.tools import bash as B
+
+    async def _fake_run_sandboxed(*_a, **_k):
+        return {
+            "exit_code": 0,
+            "output": "hi", "stdout": "hi", "stderr": "",
+            "timed_out": False,
+            "disk_bytes_written": 4096, "disk_limit_hit": False,
+            "proc_tree_reaped": None,
+        }
+
+    monkeypatch.setattr(B, "_run_sandboxed", _fake_run_sandboxed)
+    res = asyncio.run(
+        B.execute_bash("echo hi", str(tmp_path), str(tmp_path), timeout_ms=5000)
+    )
+    assert res.get("success") is True
+    assert res.get("disk_bytes_written") == 4096, "出口把键吃掉了（审计 ①-1 复发）"
+    assert res.get("disk_limit_hit") is False, "False（观测到否）必须穿过去"
+    assert "proc_tree_reaped" not in res, "None = 未观测 ⇒ 键不出现"

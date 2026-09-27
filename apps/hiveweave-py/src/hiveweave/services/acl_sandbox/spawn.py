@@ -309,6 +309,7 @@ class ConfinedRunner:
         start = time.monotonic()
         out_buf: list[bytes] = []
         err_buf: list[bytes] = []
+        _disk_facts = None
         try:
             while True:
                 rc = win32event.WaitForSingleObject(spawned.h_proc, 50)
@@ -326,7 +327,7 @@ class ConfinedRunner:
             spawned.close()
             # 收尾必须无条件执行：不注销会话 + 不补终读数 = 三个正交事实位
             # 永远取不到（审计 ①-3：没有消费者的机制等于没有）。
-            disk_guard.finish(spawned)
+            _disk_facts = disk_guard.finish(spawned)
         return {
             "exit_code": exit_code,
             # P6-a(TEST_DSH_62)：受限子进程按系统 ANSI 代码页写本地化报错，
@@ -334,6 +335,10 @@ class ConfinedRunner:
             "stdout": decode_subprocess_output(b"".join(out_buf)),
             "stderr": decode_subprocess_output(b"".join(err_buf)),
             "timed_out": timed_out,
+            # I1（2026-09-27）：三正交位**随回执上报**（受限侧同样要能看见
+            # 「这一步写了多少 / 是否触顶 / 树有没有回收」）。消费链：
+            # `_native_shaped` 归一化 → `_SHELL_FACT_FLAG_KEYS` → run_steps。
+            **disk_guard.facts_flag(_disk_facts),
         }
 
     # ── 长驻命令（dev server / unbounded job） ──────────────

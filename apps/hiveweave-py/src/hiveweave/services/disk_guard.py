@@ -87,6 +87,27 @@ class DiskPressureError(OSError):
     """
 
 
+def facts_flag(facts: "DiskFacts | None") -> dict[str, Any]:
+    """把 :class:`DiskFacts` 翻成工具回执里的**三个独立键**（未观测 ⇒ 空）。
+
+    ⚠ **绝不合并成一个「磁盘有问题」布尔**：三件事互相正交（见模块 docstring）——
+    「写了多少」≠「是否触顶」≠「树是否回收」。合并就会让调用方把「被截断的
+    run」读成「干净成功」（DSH `docs/defensive-patterns.md:7-9` 的戒律）。
+
+    ``None``（未观测）的位**不出现**在返回里，与 ``False``（观测到否）不同形。
+    """
+    if facts is None or not facts.watched:
+        return {}
+    out: dict[str, Any] = {}
+    if facts.bytes_written is not None:
+        out["disk_bytes_written"] = facts.bytes_written
+    if facts.hit_limit is not None:
+        out["disk_limit_hit"] = facts.hit_limit
+    if facts.tree_reaped is not None:
+        out["proc_tree_reaped"] = facts.tree_reaped
+    return out
+
+
 def denial_flags(exc: BaseException) -> dict[str, Any]:
     """工具层用：把「卷预检拒绝」翻成**拒因事实位**（不是该异常 ⇒ 空 dict）。
 
@@ -312,8 +333,13 @@ class _Session:
 _sessions: dict[int, _Session] = {}
 _sessions_lock = threading.Lock()
 _watcher: threading.Thread | None = None
+#: ⚠ 每次启动 watcher **新建**一个 Event 并把**它作为参数**传进去（而不是用
+#: 模块级全局）：`reset_for_tests` 里「set 旧 event → join(超时 2s) → 清全局」
+#: 的顺序会让**没退出的旧线程**在新一轮又看到「未 set」的全局 event 而继续循环
+#: ⇒ 两个 watcher 并存（2026-09-27 自查发现的竞态）。参数化后旧线程只认旧
+#: event（已 set）⇒ 必然退出，与新线程无共享状态。
+_watcher_stop: threading.Event | None = None
 _watcher_lock = threading.Lock()
-_stop = threading.Event()
 
 
 def _trip(session: _Session, reading: VolumeReading) -> None:
@@ -332,11 +358,34 @@ def _trip(session: _Session, reading: VolumeReading) -> None:
         path=session.path,
     )
     if pid is not None:
-        _kill_tree(pid)
-        session.facts.tree_reaped = _await_reaped(lambda: _session_alive(session))
+        # ⚠ kill + 等树消失**绝不能占用 watcher 线程**（审计 ②-5）：`_kill_tree`
+        # 带 10 s 超时、`_await_reaped` 又最多等 10 s ⇒ 一次触顶最长阻塞全局
+        # 巡检 **~20 s**，期间**其它所有会话都不被检查** = 「一个受害者拖住全体」。
+        # 实测后果：并发跑测试时，一个正被回收的进程会让后续触顶检测延迟到超时
+        # 窗口之外（2026-09-27 出现偶发红）。⇒ 丢独立线程，watcher 立刻回去巡检。
+        threading.Thread(
+            target=_kill_and_reap,
+            args=(session, pid),
+            name="disk-guard-kill",
+            daemon=True,
+        ).start()
     else:
         # 拿不到 pid ⇒ **不许猜**（记 None = 未观测，而不是 False）
         session.facts.tree_reaped = None
+
+
+def _kill_and_reap(session: _Session, pid: int) -> None:
+    """在**独立线程**里杀树并确认回收（不阻塞 watcher）。
+
+    `tree_reaped` 由本线程写：语义上「确认回收」本来就发生在 kill 之后，
+    提前写 True 会是**假事实**。读取方（`finish`/`facts_flag`）见到 `None`
+    即「尚未确认」——与「没发生过 kill」在事实位上刻意不同形。
+    """
+    try:
+        _kill_tree(pid)
+        session.facts.tree_reaped = _await_reaped(lambda: _session_alive(session))
+    except Exception as exc:  # noqa: BLE001 —— 回收线程自己不能死得无声
+        log.warning("disk_guard.reap_failed", pid=pid, error=str(exc))
 
 
 def _await_reaped(
@@ -351,19 +400,22 @@ def _await_reaped(
     return not is_alive()
 
 
-def _watch_loop() -> None:
+def _watch_loop(stop: threading.Event) -> None:
     """全局单轮询线程：**按卷去重**查询，一个卷每次周期只读一次盘。
+
+    ``stop`` 由 :func:`_ensure_watcher` 每次新建并参数化传入（见模块级注释的
+    竞态说明）。
 
     ⚠ 等待时长取**当前所有会话里最短的那个 interval**，不用模块级全局值 ——
     否则「一条命令的短周期」会永久改变全平台巡检节奏（审计 ②-6）。
     """
-    while not _stop.is_set():
+    while not stop.is_set():
         with _sessions_lock:
             sessions = list(_sessions.values())
         if not sessions:
-            _stop.wait(DEFAULT_CHECK_INTERVAL_S)
+            stop.wait(DEFAULT_CHECK_INTERVAL_S)
             continue
-        _stop.wait(min(s.interval_s for s in sessions))
+        stop.wait(min(s.interval_s for s in sessions))
         by_volume: dict[str, VolumeReading | None] = {}
         for session in sessions:
             # ⚠ 顺序要紧：**先判存活、后判已触顶**。反过来的话，触顶会话会被
@@ -389,13 +441,14 @@ def _watch_loop() -> None:
 
 
 def _ensure_watcher() -> None:
-    global _watcher
+    global _watcher, _watcher_stop
     with _watcher_lock:
         if _watcher is not None and _watcher.is_alive():
             return
-        _stop.clear()
+        stop = threading.Event()
+        _watcher_stop = stop
         _watcher = threading.Thread(
-            target=_watch_loop, name="disk-guard-watcher", daemon=True
+            target=_watch_loop, args=(stop,), name="disk-guard-watcher", daemon=True
         )
         _watcher.start()
 
@@ -507,17 +560,27 @@ def finish(proc: Any) -> DiskFacts | None:
 
 
 def reset_for_tests() -> None:
-    """测试夹具用：停线程、清会话（interval 已随会话，不需要单独还原）。"""
-    global _watcher
-    _stop.set()
+    """测试夹具用：停线程、清会话。
+
+    ⚠ 顺序（修 2026-09-27 自查发现的竞态）：先**取出**引用并清空全局，再 set
+    旧 event、最后 join。旧线程只认**它自己那个** event ⇒ 即使 join 超时，
+    它也不会看到「被清空」的状态而继续循环（旧实现在 join 超时后清全局 event
+    ⇒ 旧线程复活 ⇒ 两个 watcher 并存）。
+    """
+    global _watcher, _watcher_stop
     with _watcher_lock:
-        thread = _watcher
-        _watcher = None
-    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        stop, thread = _watcher_stop, _watcher
+        _watcher, _watcher_stop = None, None
+    if stop is not None:
+        stop.set()
+    if (
+        thread is not None
+        and thread.is_alive()
+        and thread is not threading.current_thread()
+    ):
         thread.join(timeout=2.0)
     with _sessions_lock:
         _sessions.clear()
-    _stop.clear()
 
 
 def active_sessions() -> int:
@@ -536,6 +599,7 @@ __all__ = [
     "VolumeReading",
     "active_sessions",
     "denial_flags",
+    "facts_flag",
     "facts_of",
     "finish",
     "precheck",

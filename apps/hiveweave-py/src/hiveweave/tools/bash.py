@@ -865,6 +865,9 @@ _SHELL_FACT_FLAG_KEYS: tuple[str, ...] = (
     # 批 D 第 2 步（P2-20）：命令三正交位。⚠ 不登记此处 = 字段在这一层被
     # 过滤掉（2026-09-01 两次实战教训：单测全绿、生产字段恒 None）。
     "exit_code", "output_empty", "truncated",
+    # I1（2026-09-27）：卷余量三正交位（与上面三列**同一族纪律** —— 登记
+    # 点不止此处，`_native_shaped` 重建 dict 时也要带过来，否则又白做）。
+    "disk_bytes_written", "disk_limit_hit", "proc_tree_reaped",
     # 0-3 + #1 + F5：spawn 面戳（决策面 4 键 + 加固面 git_hardened +
     # 执行面 executed）。从 policy 派生而非再列一遍 —— 见上方补正。
     *ALL_SPAWN_STAMP_KEYS,
@@ -884,6 +887,29 @@ def _enforcement_stamp(result: dict) -> dict[str, Any]:
     `ALL_SPAWN_STAMP_KEYS`），见该常量的 2026-09-17 补正。
     """
     return {k: result[k] for k in ALL_SPAWN_STAMP_KEYS if k in result}
+
+
+def _fact_stamp(result: dict) -> dict[str, Any]:
+    """把结果里**所有已观测**的事实位原样搬到出口（唯一的取键实现）。
+
+    ⚠ 为什么需要它（2026-09-27 独立审计 ①-1，**运行时实证**）：`execute_bash` /
+    `execute_run_command` / `python_script_execute` 三个工具出口都是**重建新
+    dict**，而它们此前只展开 `_enforcement_stamp(result)`（= spawn 面 6 键）
+    ⇒ 任何**不在这 6 键里**的事实位都在出口被**静默吃掉**。本批新增的
+    `disk_*` 三键就整批阵亡（实测 `execute_bash` 成功返回的 keys 里没有
+    `disk_bytes_written` / `disk_limit_hit` / `proc_tree_reaped`，而更深的
+    `_run_native` 明明带出来了）⇒ `run_steps` 三列在生产里**恒 NULL**。
+
+    ⚠ **不许逐处补键名**（那正是「每处各列一份清单」的病灶，本仓栽过多次）。
+    唯一清单 = `_SHELL_FACT_FLAG_KEYS`；它已包含 `*ALL_SPAWN_STAMP_KEYS`
+    ⇒ 本函数是 `_enforcement_stamp` 的**超集**，出口可直接替换调用它。
+
+    空值（None）不搬：**缺席 = 未观测**，与 `False`「观测到否」不同形
+    （落库走 COALESCE，None 保留既有值）。
+    """
+    return {
+        k: result[k] for k in _SHELL_FACT_FLAG_KEYS if result.get(k) is not None
+    }
 
 
 def _executed_stamp(exc: BaseException) -> dict[str, Any]:
@@ -925,9 +951,15 @@ def _native_shaped(result: dict) -> dict[str, Any]:
     if result.get("fact") is not None:
         out["fact"] = result["fact"]
     out.update(_enforcement_stamp(result))
-    # P0-3：拒绝成因三键随归一化活下来（本函数是**重建**新 dict，
-    # 不带过来就等于位又被这一层吃掉 —— 与 fact 同款教训）。
-    for _k in ("denied_by", "blocked_by_environment", "sealed_by"):
+    # 事实位随归一化活下来（本函数是**重建**新 dict，不带过来 = 位被这一层
+    # 悄悄吃掉 —— 本仓在「归一化抹掉事实位」上栽过多次）。
+    #
+    # ⚠ 2026-09-27（I1 落库）改为**遍历唯一清单**，不再手写第二份：
+    # 这里原先是硬编码 `("denied_by", "blocked_by_environment", "sealed_by")`
+    # 三个键 ⇒ 每加一个新事实位都要记得回来改这里，而**忘了改的表现是
+    # 「单测全绿、生产恒 None」**（最贵的那种）。本批的 `disk_*` 三键差点
+    # 就是被这行吃掉的（落库自查时发现）。清单只登记一处 = `_SHELL_FACT_FLAG_KEYS`。
+    for _k in _SHELL_FACT_FLAG_KEYS:
         if result.get(_k) is not None:
             out[_k] = result[_k]
     return out
@@ -2519,6 +2551,11 @@ async def _run_native(
     # 成功路径仍返回合并 output（保持原有行为）；失败路径用分离的
     # stdout/stderr 各自取尾部 4KB（P2-1 fix）。
     combined = stdout + ("\n" + stderr if stdout and stderr else stderr)
+    # I1（2026-09-27）：卷余量三正交位**随结果上报**（这是它们唯一的消费点 ——
+    # 没有消费者的事实位就是日志，见上方 2440 的自陈）。
+    from hiveweave.services.disk_guard import facts_flag, finish as _disk_finish
+
+    _disk = facts_flag(_disk_finish(proc))
     return {
         "output": combined,
         "stdout": stdout,
@@ -2527,6 +2564,7 @@ async def _run_native(
         "timed_out": False,
         "error": None,
         "git_hardened": _git_hardened,
+        **_disk,
     }
 
 
@@ -2906,7 +2944,7 @@ async def execute_bash(
             "success": False, "output": "",
             "error": f"Error: {result['error']}\n{cwd_hint}",
             "fact": "runner_failed",
-            **_enforcement_stamp(result),
+            **_fact_stamp(result),
         })
 
     if result["timed_out"]:
@@ -2917,7 +2955,7 @@ async def execute_bash(
                      f"{int(timeout_s or 0)} seconds\n{cwd_hint}",
             "timeout_kind": "command",
             "timeout_ms": int((timeout_s or 0) * 1000),
-            **_enforcement_stamp(result),
+            **_fact_stamp(result),
         }
 
     output = _truncate_output(result["output"])
@@ -2940,7 +2978,7 @@ async def execute_bash(
                 "exit_code": 0,
                 "output_empty": _output_empty,
                 "truncated": _truncated,
-                **_enforcement_stamp(result)}
+                **_fact_stamp(result)}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 失败时把 stdout/stderr 各自的尾部 4KB 放进 error 字段。
@@ -2971,7 +3009,7 @@ async def execute_bash(
         "truncated": _truncated,
         # F4：命令执行了但失败（非零退出 = command_failed，不是 runner 失败）
         "fact": "command_failed",
-        **_enforcement_stamp(result),
+        **_fact_stamp(result),
     })
 
 
@@ -3099,7 +3137,7 @@ async def execute_run_command(
         return finalize_fact_dict({"success": False, "output": "",
                 "error": f"Error: {result['error']}",
                 "fact": "runner_failed",
-                **_enforcement_stamp(result)})
+                **_fact_stamp(result)})
 
     if result["timed_out"]:
         # F7：command 超时（命令跑起来但未按时完成）。
@@ -3107,7 +3145,7 @@ async def execute_run_command(
                 "error": f"Error: Command timed out after {timeout_s} seconds",
                 "timeout_kind": "command",
                 "timeout_ms": int((timeout_s or 0) * 1000),
-                **_enforcement_stamp(result)}
+                **_fact_stamp(result)}
 
     output = _truncate_output(result["output"])
     exit_code = result["exit_code"]
@@ -3122,7 +3160,7 @@ async def execute_run_command(
                 "error": None, "exit_code": 0,
                 "output_empty": _output_empty,
                 "truncated": _truncated,
-                **_enforcement_stamp(result)}
+                **_fact_stamp(result)}
 
     body = output if output.strip() else "(no output)"
     # P2-1 fix: 同 execute_bash — 失败时返回 stdout/stderr 各自尾部 4KB。
@@ -3149,7 +3187,7 @@ async def execute_run_command(
         "truncated": _truncated,
         # F4：命令执行了但失败（非零退出 = command_failed）
         "fact": "command_failed",
-        **_enforcement_stamp(result),
+        **_fact_stamp(result),
     })
 
 

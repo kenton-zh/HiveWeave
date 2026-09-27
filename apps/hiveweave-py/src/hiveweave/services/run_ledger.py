@@ -547,6 +547,12 @@ class RunLedger:
         exit_code: int | None = None,
         output_empty: bool | None = None,
         truncated: bool | None = None,
+        # I1（2026-09-27）：卷余量护栏三正交位 —— 互相独立，绝不嵌套。
+        # `disk_bytes_written` 是**卷级近似**（同卷可用空间下降量），单位字节；
+        # `disk_limit_hit` = 触顶并被强制中止；`proc_tree_reaped` = kill 后确认树消失。
+        disk_bytes_written: int | None = None,
+        disk_limit_hit: bool | None = None,
+        proc_tree_reaped: bool | None = None,
     ) -> None:
         """Record the end of a step.
 
@@ -616,6 +622,7 @@ class RunLedger:
                 executed, denied_by, blocked_by_environment, sealed_by,
                 exception_type, is_platform_bug, exit_code, output_empty,
                 truncated,
+                disk_bytes_written, disk_limit_hit, proc_tree_reaped,
             )):
                 sql = (
                     "UPDATE run_steps SET status = ?, result_hash = ?, "
@@ -639,7 +646,12 @@ class RunLedger:
                     "is_platform_bug = COALESCE(?, is_platform_bug), "
                     "exit_code = COALESCE(?, exit_code), "
                     "output_empty = COALESCE(?, output_empty), "
-                    "truncated = COALESCE(?, truncated) "
+                    "truncated = COALESCE(?, truncated), "
+                    # I1：卷余量三正交位（同款 COALESCE —— None = 未观测，
+                    # 保留既有值；False 必须写成 0，不与 None 混同）。
+                    "disk_bytes_written = COALESCE(?, disk_bytes_written), "
+                    "disk_limit_hit = COALESCE(?, disk_limit_hit), "
+                    "proc_tree_reaped = COALESCE(?, proc_tree_reaped) "
                     "WHERE id = ?"
                 )
                 params = [
@@ -668,6 +680,11 @@ class RunLedger:
                     exit_code,
                     None if output_empty is None else (1 if output_empty else 0),
                     None if truncated is None else (1 if truncated else 0),
+                    # I1：卷余量三正交位。`disk_bytes_written` 是字节数（原样传，
+                    # 不转 bool）；后两者同「None=未观测 / False→0」纪律。
+                    disk_bytes_written,
+                    None if disk_limit_hit is None else (1 if disk_limit_hit else 0),
+                    None if proc_tree_reaped is None else (1 if proc_tree_reaped else 0),
                     step_id,
                 ]
             # M3 有界重试：仅对 sqlite3.OperationalError（锁竞争/瞬断，db 层
