@@ -178,7 +178,26 @@ class TaskEventRelay:
         # （41 实测：VERIFY blocked 后 192min 死寂，creator 的 [TASK BLOCKED]
         # 以 wake=0 躺在收件箱里无人看见）。其余事件维持 FYI。
         wake_flag = event_type == "task.blocked"
+        # I10 批9：completionDelivery 移植（DSH tool-jobs index.ts:59-64
+        # 默认 'wakeup'）——收件人是「当前唯一可推进者」时该投递升级为
+        # 唤醒（判据纯状态，带短 TTL 缓存，一批事件只算一次）。s3-clone_13
+        # 实测：空转窗内 [TASK CLOSED] 以 wake=0 躺进唯一可推进者的收件箱。
+        # 只置旗不直接 trigger —— 本路径是 30s 批量兜底，直接唤会有风暴面；
+        # 定向唤醒由 run 收口路径（idle_wakeup.maybe_wake_sole_advancer）负责。
+        sole_advancer_id: str | None = None
+        if not wake_flag:
+            try:
+                from hiveweave.services.idle_wakeup import sole_advancer_cached
+
+                sole = await sole_advancer_cached(project_id)
+                sole_advancer_id = (sole or {}).get("agent_id")
+            except Exception as e:
+                log.debug("relay_sole_advancer_check_failed", error=str(e))
         for recipient_id in recipients:
+            recipient_wake = wake_flag or (
+                sole_advancer_id is not None
+                and recipient_id == sole_advancer_id
+            )
             idem_key = f"task_event:{event_id}:{recipient_id}"
             try:
                 await inbox.send_message(
@@ -189,7 +208,7 @@ class TaskEventRelay:
                     priority="normal",
                     task_id=task_id,
                     idempotency_key=idem_key,
-                    wake=wake_flag,
+                    wake=recipient_wake,
                 )
             except Exception as e:
                 log.debug(

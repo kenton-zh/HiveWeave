@@ -89,6 +89,14 @@ SILENCE_THRESHOLD_MS = int(
 SILENCE_NOTIFY_MS = int(
     os.environ.get("HIVEWEAVE_SILENCE_NOTIFY_MS", "1800000") or "1800000"
 )           # 失联持续 30 min：只打日志，不 inbox 上级
+# I10 批9：看门狗「无事可做」独立档 —— 组织内不存在任何可推进状态
+# （无非终态任务且无未满足 agent_waits，见 _project_has_advancable_state）
+# 时，沉默唤醒阈值换用本长档；有人待办仍用 SILENCE_THRESHOLD_MS（10min
+# 档，P0-1 项目根仲裁形态同归短档）。判据纯状态。只加长、不下调 ——
+# 与上方耦合注释不冲突（STREAMING_ZOMBIE 下限约束只对下调有意义）。
+SILENCE_NOTHING_TODO_MS = int(
+    os.environ.get("HIVEWEAVE_SILENCE_NOTHING_TODO_MS", "1800000") or "1800000"
+)        # 30 min — 全员无待办档（与有人待办档区分）
 SILENCE_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000  # legacy floor; M7 uses backoff below
 # TEST21 M7: exponential notify cooldown 10min → 30min → 2h
 SILENCE_NOTIFY_BACKOFF_MS = (
@@ -1966,6 +1974,47 @@ class GameTimeService:
                     retry=retry_counts[aid], error=str(e),
                 )
 
+    async def _project_has_advancable_state(self, project_id: str) -> bool:
+        """I10「无事可做」档判据（纯状态）：项目内存在可推进状态。
+
+        = 存在非终态任务（TERMINAL_STATUSES，ADR-001 R1 唯一终态常量）
+          或存在未满足等待（agent_waits.cleared_at IS NULL；含少量已被
+          TTL 超时但 clear_expired 未扫到的行）
+          或存在未读 expect_report ask（批 9 审计 P2-2 口径对齐：ask 债
+          与 compute_sole_advancer/has_open_work 同为义务 —— 缺它会让
+          ask-only 组织的兜底从 10min 短档退化为 30min 长档；项目级近似
+          判据=「未读 ask 存在」，偏「有事」一侧，方向 fail-safe：宁可早醒）。
+          —— 偏「有事」一侧，走有人待办短档。
+        查询异常按 True（有事可做 ⇒ 短档）—— 看门狗本就是兜底唤醒源，
+        本判据只允许「更晚醒」，不允许读失败变成新的静默面。
+        """
+        from hiveweave.services.tasks.constants import TERMINAL_STATUSES
+
+        try:
+            neg = ",".join("?" for _ in TERMINAL_STATUSES)
+            rows = await _query(
+                project_id,
+                "SELECT "
+                "(SELECT COUNT(*) FROM tasks WHERE is_archived = 0 "
+                f" AND status NOT IN ({neg})) AS open_tasks, "
+                "(SELECT COUNT(*) FROM agent_waits WHERE cleared_at IS NULL) "
+                "AS open_waits, "
+                "(SELECT COUNT(*) FROM inbox WHERE expect_report = 1 "
+                " AND read = 0 AND from_agent_id NOT IN ('user', 'system')) "
+                "AS open_asks",
+                list(TERMINAL_STATUSES),
+            )
+        except Exception as e:
+            log.debug("advancable_state_check_failed",
+                      project_id=project_id, error=str(e))
+            return True
+        r = rows[0] if rows else {}
+        keys = r.keys() if hasattr(r, "keys") else {}
+        open_tasks = int(r["open_tasks"] or 0) if "open_tasks" in keys else 0
+        open_waits = int(r["open_waits"] or 0) if "open_waits" in keys else 0
+        open_asks = int(r["open_asks"] or 0) if "open_asks" in keys else 0
+        return open_tasks > 0 or open_waits > 0 or open_asks > 0
+
     async def _check_silent_agents(self, project_id: str) -> None:
         """Watchdog: agent 沉默观测 — 检测"无任何产出"的失联 agent（每 2 分钟）。
 
@@ -2094,6 +2143,14 @@ class GameTimeService:
         # wait 豁免穿透探针缓存（有 live wait 且有债的 agent 落入检测时，
         # 复用探针结果避免下方重复查 obligations）
         duty_probes: dict[str, dict] = {}
+
+        # I10 批9：阈值分档 —— 每 pass 算一次「组织是否存在可推进状态」
+        # （纯状态：非终态任务 / 未满足 agent_waits，两个 COUNT）。
+        # 有人待办 ⇒ SILENCE_THRESHOLD_MS 档；全员无待办 ⇒
+        # SILENCE_NOTHING_TODO_MS 长档（无事可做时不再按 10min 节奏
+        # 空转唤醒）。P0-1 项目根仲裁形态（root_arbitration）在 agent
+        # 循环内并入短档，不受长档拖慢。
+        org_has_work = await self._project_has_advancable_state(project_id)
 
         for a in agents:
             aid = a["id"]
@@ -2258,7 +2315,19 @@ class GameTimeService:
             baseline = last_output.get(aid) or int(a["created_at"] or now_ms)
             silent_ms = now_ms - baseline
 
-            if silent_ms < SILENCE_THRESHOLD_MS:
+            # I10 批9：分档阈值 —— 有人待办（组织有可推进状态，或本
+            # agent 走 P0-1 项目根仲裁）⇒ 有人待办档；全员无待办 ⇒
+            # 「无事可做」长档。
+            if org_has_work or root_arbitration:
+                silence_threshold_ms = SILENCE_THRESHOLD_MS
+                threshold_kind = "has_pending_work"
+            else:
+                silence_threshold_ms = max(
+                    SILENCE_NOTHING_TODO_MS, SILENCE_THRESHOLD_MS
+                )
+                threshold_kind = "nothing_todo"
+
+            if silent_ms < silence_threshold_ms:
                 # 有产出 → 若此前举过红框则广播 ok 解除
                 if tracker["flagged"]:
                     tracker["flagged"] = False
@@ -2293,7 +2362,9 @@ class GameTimeService:
                 )
                 log.warning("silence_watchdog_trigger",
                             project_id=project_id, agent_id=aid,
-                            name=a["name"], silent_minutes=minutes)
+                            name=a["name"], silent_minutes=minutes,
+                            threshold_ms=silence_threshold_ms,
+                            threshold_kind=threshold_kind)
                 try:
                     await status_event_bus.publish_stream_event(aid, {
                         "type": "agent_health",

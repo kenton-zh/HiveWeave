@@ -1437,3 +1437,24 @@ async def handle_completion(
         await agent._retrigger_for_open_tasks(turn_after_hint)
     else:
         await agent._maybe_self_retrigger()
+
+    # I10 批9：run 正常完成的收口点 —— 评估「下一个该谁动」。
+    # 病灶（s3-clone_13）：最后一个 run 正常完成后组织空转 14.9 分钟，
+    # 唯一兜底是 silence_watchdog（阈值即空转粒度）。判据纯状态
+    # （tasks 非终态 + agent_waits 未满足 + 各 agent 活跃度，见
+    # services/idle_wakeup.py）：存在唯一可推进者 ⇒ 直接唤醒；
+    # 无待办 ⇒ 恒不触发（防循环第一道闸）；同 agent 连唤有上限
+    # （DSH maxConsecutiveWakes 同型）。gate 停泊 / stall 停泊不是
+    # 正常完成（exit_decision.ok=False / disposition=blocked），不评估。
+    if exit_decision.ok and not _stall_parked:
+        try:
+            from hiveweave.services.idle_wakeup import maybe_wake_sole_advancer
+
+            await maybe_wake_sole_advancer(
+                agent.project_id,
+                exclude_agent_ids=frozenset({agent.id}),
+                source="run_completion",
+            )
+        except Exception as e:
+            # 批 9 审计 P3-1：主路径系统性失效必须可见，debug 不够。
+            log.warning("idle_wakeup_run_completion_failed", error=str(e))
