@@ -100,11 +100,17 @@ async def _run_native_argv(argv: list[str], cwd: str, timeout_s: int | None) -> 
         # （不是崩溃 —— 消费者全用 `.get()`，详见 `bash.py:898` 处的实测说明）。
         # 本条自 M2/T2 起就存在，只是守卫此前**只扫 bash.py**
         # 而看不见它（扫描范围缺口，本轮一并补上）。
+        from hiveweave.services.disk_guard import denial_flags
+
         return finalize_fact_dict({
             "output": "", "stdout": "", "stderr": "",
             "exit_code": None, "timed_out": False,
             "fact": "runner_failed",
             "error": f"Failed to spawn python: {exc}",
+            # I1（2026-09-27）：卷预检拒绝 ⇒ 与「没有解释器」分档
+            #（`DiskPressureError` 继承 OSError，会落到这个 except）。
+            # 不加这一步，两条路又会变成「同一异常两种归因」（P0-2 同形）。
+            **denial_flags(exc),
         })
     try:
         if timeout_s is None or timeout_s <= 0:

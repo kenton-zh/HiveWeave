@@ -248,6 +248,22 @@ def _spawn_sync(token, command: str | None = None, cwd: str = ".", env: dict | N
     return _Spawned(h_proc, pid, job, out_r, err_r)
 
 
+def _spawned_alive(spawned: "_Spawned") -> bool:
+    """受限进程的存活判据（注入给 ``disk_guard`` 用）。
+
+    ⚠ 为什么必须注入：受限 spawn 返回的是**句柄包装**（``_Spawned``），既没有
+    ``poll()`` 也没有 ``returncode`` ⇒ ``disk_guard`` 自带的判据会一律读成
+    「已退出」，监控**静默失效**（失效方向还是「以为死了」⇒ 不再巡检查卷）。
+    """
+    try:
+        return (
+            win32event.WaitForSingleObject(spawned.h_proc, 0)
+            != win32event.WAIT_OBJECT_0
+        )
+    except Exception:  # noqa: BLE001 —— 句柄已关/无效 ⇒ 视为已退出（保守：不再 kill）
+        return False
+
+
 class ConfinedRunner:
     """受限命令执行器：前台有界池 + 长驻全局 watcher。"""
 
@@ -271,6 +287,24 @@ class ConfinedRunner:
 
     def _run_foreground_sync(self, token, command, cwd, env, timeout_s, argv=None) -> dict[str, Any]:
         spawned = _spawn_sync(token, command, cwd, env, argv=argv)
+        # I1（2026-09-27，报告 P0-0）：**受限路径也必须挂卷监控**。
+        #
+        # 为什么这是必须的（独立审计 ①-1 抓出的缺口）：受限 spawn 走
+        # `CreateProcessAsUserW`，**完全绕过** `util/win_subprocess` 那个 spawn
+        # 漏斗 ⇒ 只在漏斗上挂护栏，会漏掉**沙箱开启时**的全部 agent 命令 ——
+        # 而被审事故的形态（叶子跑 `python -m unittest discover` 写满宿主卷
+        # 188 GB 到 ENOSPC，平台自身 92 分钟写不进库）**正是这一类**。
+        # 「护栏挂在唯一漏斗上」这句话在沙箱开启时不成立。
+        #
+        # `is_alive` / `pid` 必须显式传：`_Spawned` 不支持 poll()/returncode。
+        from hiveweave.services import disk_guard
+
+        disk_guard.watch(
+            spawned,
+            cwd,
+            is_alive=lambda: _spawned_alive(spawned),
+            pid=spawned.pid,
+        )
         timed_out = False
         start = time.monotonic()
         out_buf: list[bytes] = []
@@ -290,6 +324,9 @@ class ConfinedRunner:
             exit_code = win32process.GetExitCodeProcess(spawned.h_proc)
         finally:
             spawned.close()
+            # 收尾必须无条件执行：不注销会话 + 不补终读数 = 三个正交事实位
+            # 永远取不到（审计 ①-3：没有消费者的机制等于没有）。
+            disk_guard.finish(spawned)
         return {
             "exit_code": exit_code,
             # P6-a(TEST_DSH_62)：受限子进程按系统 ANSI 代码页写本地化报错，

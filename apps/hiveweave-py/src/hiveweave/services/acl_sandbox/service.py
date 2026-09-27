@@ -1249,6 +1249,21 @@ async def spawn_confined(
     if argv is None and command is None:
         raise ValueError("spawn_confined requires command or argv")
 
+    # I1（2026-09-27，报告 P0-0）：受限路径的**启动前卷预检**。
+    #
+    # ⚠ 为什么必须在这里补：受限 spawn 走 `CreateProcessAsUserW`（见
+    # `acl_sandbox/spawn.py`），**完全绕过** `util/win_subprocess` 那个 spawn
+    # 漏斗 ⇒ 只在漏斗上挂预检，会漏掉**沙箱开启时**的全部 agent 命令 —— 而被审
+    # 事故的形态（叶子跑 `python -m unittest discover` 写满宿主卷 188 GB 到
+    # ENOSPC）正是这一类。挂在本函数 = 一处接线覆盖所有受限调用方
+    #（bash / python_script / dev_server / game_time / sentinel）。
+    # 早拒也比「跑到一半把卷写满、连平台都写不进库」便宜得多。
+    from hiveweave.services import disk_guard as _dg
+
+    _allowed, _reading, _remedy = _dg.precheck(workdir)
+    if not _allowed:
+        raise _dg.DiskPressureError(_remedy)
+
     decision_explicit = decision is not None
     if decision is None:
         # 经模块属性调用（不是 import 名）：判定点是全平台唯一的接缝。

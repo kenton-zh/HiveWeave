@@ -526,6 +526,11 @@ def _kill_pid(pid: int) -> None:
             ["taskkill", "/F", "/T", "/PID", str(n)],
             capture_output=True,
             timeout=10,
+            # I1（2026-09-27，独立审计 ②-2）：**平台自身的清理动作不设卷闸**。
+            # 与 `disk_guard._kill_tree` 同一待遇 —— 低盘恰恰是最需要杀进程的时刻，
+            # 此时被自己的预检拦住 = 护栏把清理路径也锁死（而且调用方多为
+            # `except Exception` 吞掉 ⇒ 表现为「kill 静默失效」）。
+            _disk_guard=False,
         )
     else:
         import signal

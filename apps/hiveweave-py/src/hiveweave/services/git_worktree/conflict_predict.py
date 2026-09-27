@@ -102,7 +102,15 @@ async def _merge_tree(base: str, branch: str, cwd: str,
             stderr=asyncio.subprocess.STDOUT,
             **kwargs,
         )
-    except FileNotFoundError:
+    except OSError as exc:
+        # I1（2026-09-27，独立审计必修）：同 `git_cmd._git` —— 必须接 `OSError`。
+        # `DiskPressureError`（卷预检拒绝）继承 `OSError`；不接就会逃逸，
+        # 让调用方拿到「半截序列」。（返回值仍用 `-1`：低盘时 git 确实不可用，
+        # 与「找不到 git」在**调用方处置上同路** —— 都该走降级路径。）
+        from hiveweave.services.disk_guard import DiskPressureError
+
+        if isinstance(exc, DiskPressureError):
+            return -1, f"git refused (disk pressure): {exc}"
         return -1, "git not found on PATH"
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=GIT_TIMEOUT)

@@ -415,11 +415,68 @@ def _with_git_hardening(
     return out
 
 
+# ── 卷余量护栏接入（I1 / 报告 P0-0，2026-09-27）───────────────
+#
+# 本模块是全仓**唯一 spawn 漏斗** ⇒ 护栏挂这里就等于挂在**所有**子进程上，
+# 不需要逐点替换（本仓纪律：机制挂唯一出口；逐点替换必然漏点）。
+#
+# 为什么必须挂在 spawn 层：本次事故（叶子 agent 的 `unittest discover` 把宿主卷
+# 写掉 188 GB 到 ENOSPC，导致平台自身 92 分钟写不进库）的**写入者是子进程**，
+# 不经过任何平台写入点 ⇒ 现役的「工具输出上限」（只盖平台自己写盘）拦不住。
+# 详见 `services/disk_guard.py`。
+
+#: 内部开关（从 kwargs 读出后**必须移除**，不能透传给 subprocess）。
+_DISK_GUARD_KW = "_disk_guard"
+
+
+def _pop_disk_guard(kwargs: dict[str, Any]) -> bool:
+    """读出内部开关并从 kwargs 移除。默认开启。
+
+    ``_disk_guard=False`` 有两个正当用途：① 护栏自己的 kill 动作
+    （``taskkill`` 若被监控，会在卷已满的时刻立刻触顶并递归触发）；② 测试夹具
+    需要绕过预检做阳性对照。
+    """
+    return bool(kwargs.pop(_DISK_GUARD_KW, True))
+
+
+def disk_guard_precheck(kwargs: dict[str, Any]) -> None:
+    """① 启动前预检：余量低于下限 ⇒ raise :class:`DiskPressureError`。
+
+    该异常继承 ``OSError`` ⇒ shell 工具已有的出口会把它落成 ``runner_failed``
+    （= 「命令从未执行」这一格），**语义正好**，调用链上不需要新增分支。
+    """
+    from hiveweave.services import disk_guard
+
+    cwd = kwargs.get("cwd")
+    allowed, _reading, remedy = disk_guard.precheck(cwd if cwd else os.getcwd())
+    if not allowed:
+        raise disk_guard.DiskPressureError(remedy)
+
+
+def disk_guard_watch(proc: Any, kwargs: dict[str, Any]) -> None:
+    """② 运行中监控：挂失败**不得**把命令带崩（护栏不是新的失败源）。"""
+    try:
+        from hiveweave.services import disk_guard
+
+        cwd = kwargs.get("cwd")
+        disk_guard.watch(proc, cwd if cwd else os.getcwd())
+    except Exception as exc:  # noqa: BLE001 —— 观测失败要留痕，但不能阻断命令
+        log.warning("win_subprocess.disk_guard_watch_failed", error=str(exc))
+
+
 def hidden_run(*args: Any, **kwargs: Any) -> Any:
-    """subprocess.run with forced hidden console on Windows."""
+    """subprocess.run with forced hidden console on Windows.
+
+    ⚠ 本函数**只做启动前卷预检**（I1），不做运行中监控：``subprocess.run`` 是
+    阻塞式、拿不到可 kill 的句柄。需要运行中监控的路径（能跑长命令的
+    bash / python_script）走 :func:`hidden_exec` / :func:`hidden_popen`。
+    """
     import subprocess
 
     kwargs = _with_git_hardening(args, kwargs)
+    guard = _pop_disk_guard(kwargs)
+    if guard:
+        disk_guard_precheck(kwargs)
     return subprocess.run(*args, **_with_hidden_startupinfo(kwargs))
 
 
@@ -428,7 +485,13 @@ def hidden_popen(*args: Any, **kwargs: Any) -> Any:
     import subprocess
 
     kwargs = _with_git_hardening(args, kwargs)
-    return subprocess.Popen(*args, **_with_hidden_startupinfo(kwargs))
+    guard = _pop_disk_guard(kwargs)
+    if guard:
+        disk_guard_precheck(kwargs)
+    proc = subprocess.Popen(*args, **_with_hidden_startupinfo(kwargs))
+    if guard:
+        disk_guard_watch(proc, kwargs)
+    return proc
 
 
 async def hidden_exec(*args: Any, **kwargs: Any) -> Any:
@@ -436,7 +499,13 @@ async def hidden_exec(*args: Any, **kwargs: Any) -> Any:
     import asyncio
 
     kwargs = _with_git_hardening(args, kwargs)
-    return await asyncio.create_subprocess_exec(*args, **_with_hidden_startupinfo(kwargs))
+    guard = _pop_disk_guard(kwargs)
+    if guard:
+        disk_guard_precheck(kwargs)
+    proc = await asyncio.create_subprocess_exec(*args, **_with_hidden_startupinfo(kwargs))
+    if guard:
+        disk_guard_watch(proc, kwargs)
+    return proc
 
 
 async def hidden_shell(*args: Any, **kwargs: Any) -> Any:
@@ -447,4 +516,10 @@ async def hidden_shell(*args: Any, **kwargs: Any) -> Any:
     import asyncio
 
     kwargs = _with_git_hardening(args, kwargs, always=True)
-    return await asyncio.create_subprocess_shell(*args, **_with_hidden_startupinfo(kwargs))
+    guard = _pop_disk_guard(kwargs)
+    if guard:
+        disk_guard_precheck(kwargs)
+    proc = await asyncio.create_subprocess_shell(*args, **_with_hidden_startupinfo(kwargs))
+    if guard:
+        disk_guard_watch(proc, kwargs)
+    return proc

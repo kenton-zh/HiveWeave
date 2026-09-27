@@ -28,16 +28,24 @@ DENIED = "Out-File: Access to the path '{}' is denied."
 OUTSIDE = r"D:\tmp\check_design_console.txt"
 
 
-# ── ① 枚举：闭合 4 格（§1 验收 4）────────────────────────────
+# ── ① 枚举：与 Literal **同源**（不是手写第二份清单）──────────
 
 
-def test_denied_by_kinds_is_exactly_four():
-    assert set(DENIED_BY_KINDS) == {
-        "outside_boundary",
-        "sealed_git",
-        "no_write_sid",
-        "unknown_acl",
-    }
+def test_denied_by_kinds_matches_literal():
+    """`DENIED_BY_KINDS` 必须与 `DeniedBy` Literal 逐值一致。
+
+    2026-09-27（I1 卷余量护栏）订正：本条原写「**恰好 4 格**」并**手写** 4 个值
+    ⇒ 新增第 5 格 `disk_pressure` 时被改红。病灶不是「忘了改测试」，而是
+    **同一份清单写了两处**（本仓反复栽的形态：每处各列一份清单 ⇒ 必然各自演化）。
+    改为从 Literal 派生 ⇒ 以后加值**只登记一处**。
+    """
+    from typing import get_args
+
+    from hiveweave.tools.result import DeniedBy
+
+    assert set(DENIED_BY_KINDS) == set(get_args(DeniedBy))
+    # 第 5 格（I1 / P0-0）：卷余量不足 —— 来源层与其余三格不同（命令**启动前**的预检）
+    assert "disk_pressure" in DENIED_BY_KINDS
 
 
 # ── ② 分层分类器：状态层 → 证据层 → 不足不猜 ────────────────

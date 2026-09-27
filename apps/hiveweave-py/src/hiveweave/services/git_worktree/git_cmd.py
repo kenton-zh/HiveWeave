@@ -42,7 +42,19 @@ async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
             stderr=asyncio.subprocess.STDOUT,
             **kwargs,
         )
-    except FileNotFoundError:
+    except OSError as exc:
+        # I1（2026-09-27，独立审计必修）：**必须接 `OSError`，不能只接
+        # `FileNotFoundError`**。`disk_guard` 的卷预检拒绝（`DiskPressureError`）
+        # 继承 `OSError` ⇒ 原先会从这里**逃逸出去**。
+        #
+        # 危害不是「报错」，而是**多步 git 序列中途中断、后续清理被跳过**：
+        # 例如 `_abort_landed_merge` 里 `reset --hard ORIG_HEAD` 被拒 ⇒
+        # 后面那句 `merge --abort` 兜底**永远到不了** ⇒ worktree 留在**半合并态**。
+        # 而「可用空间 < 4 GiB」恰恰是事故善后期最常见的那一刻。
+        from hiveweave.services.disk_guard import DiskPressureError
+
+        if isinstance(exc, DiskPressureError):
+            return False, f"git refused (disk pressure): {exc}"
         return False, "git not found on PATH"
 
     try:
@@ -109,7 +121,19 @@ def _git_sync(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
             timeout=timeout,
             **kwargs,
         )
-    except FileNotFoundError:
+    except OSError as exc:
+        # I1（2026-09-27，独立审计必修）：**必须接 `OSError`，不能只接
+        # `FileNotFoundError`**。`disk_guard` 的卷预检拒绝（`DiskPressureError`）
+        # 继承 `OSError` ⇒ 原先会从这里**逃逸出去**。
+        #
+        # 危害不是「报错」，而是**多步 git 序列中途中断、后续清理被跳过**：
+        # 例如 `_abort_landed_merge` 里 `reset --hard ORIG_HEAD` 被拒 ⇒
+        # 后面那句 `merge --abort` 兜底**永远到不了** ⇒ worktree 留在**半合并态**。
+        # 而「可用空间 < 4 GiB」恰恰是事故善后期最常见的那一刻。
+        from hiveweave.services.disk_guard import DiskPressureError
+
+        if isinstance(exc, DiskPressureError):
+            return False, f"git refused (disk pressure): {exc}"
         return False, "git not found on PATH"
     except TimeoutExpired:
         # 与 `_git` 对齐的文案（`_git` 那条由 `asyncio.wait_for` 分支给）

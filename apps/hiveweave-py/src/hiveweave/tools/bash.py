@@ -996,13 +996,28 @@ async def _run_sandboxed(
                 "exit_code": None, "timed_out": False, "error": str(exc),
                 "executed": False, "fact": "runner_failed",
             })
-        return await spawn_confined(
-            argv=argv,
-            timeout_s=timeout_s or 0,
-            long_running=long_running,
-            env_extra=env_extra,
-            **ctx.confined_kwargs(),
-        )
+        from hiveweave.services.disk_guard import DiskPressureError, denial_flags
+
+        try:
+            return await spawn_confined(
+                argv=argv,
+                timeout_s=timeout_s or 0,
+                long_running=long_running,
+                env_extra=env_extra,
+                **ctx.confined_kwargs(),
+            )
+        except DiskPressureError as exc:
+            # I1（2026-09-27，报告 P0-0）：受限路径的**卷预检拒绝** —— 必须与
+            # native 侧**同形**（未启动 + 拒因 + 处方），否则同一件事在两条路上
+            # 又给出两种归因（那正是 P0-2 的形态）。
+            # `denied_by='disk_pressure'` 让下游把「磁盘满了」与「沙箱拒绝」分开：
+            # 后者的处方是「换落点 / 申请豁免」，而这里**申请也没用**（要清理该卷）。
+            return finalize_fact_dict({
+                "output": "", "stdout": "", "stderr": "",
+                "exit_code": None, "timed_out": False, "error": str(exc),
+                "executed": False, "fact": "runner_failed",
+                **denial_flags(exc),
+            })
 
     routed = await spawn_agent_command(
         entry=entry,
@@ -2469,11 +2484,19 @@ async def _run_native(
             "fact": "runner_failed",
             "error": f"Failed to spawn shell: {exc}"})
     except OSError as exc:
+        # I1（2026-09-27，报告 P0-0）：卷余量预检拒绝也落在这里
+        # （`DiskPressureError` 继承 `OSError`）⇒ **必须显式分档**，否则
+        # 「磁盘满了」与「没有这个程序」在下游长得一模一样 —— 那正是 P0-2
+        # 「同一异常两条路两种归因」的形态，不能自己再犯一次。
+        # 该异常的 message 已**自带处方**（清理该卷 / 换卷），无需在此重写文案。
+        from hiveweave.services.disk_guard import denial_flags
+
         return finalize_fact_dict({
             "output": "", "stdout": "", "stderr": "",
             "exit_code": None, "timed_out": False,
             "fact": "runner_failed",
-            "error": f"Failed to spawn shell: {exc}"})
+            "error": f"Failed to spawn shell: {exc}",
+            **denial_flags(exc)})
 
     try:
         if timeout_s is None or timeout_s <= 0:

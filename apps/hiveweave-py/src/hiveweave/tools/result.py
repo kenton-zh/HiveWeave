@@ -63,6 +63,11 @@ _BLOCKED_FACT_KINDS: frozenset[str] = frozenset(
 #                      这类 PROTECTED 子面）⇒ 报给协调者/换落点，别去申请豁免
 #   unknown_acl      — 证据不足 ⇒ **不许猜**（猜错比不知道更贵：会把 agent
 #                      指向错误的处方，这正是本条的病灶：57.6% 的假越界）
+#   disk_pressure    — **卷余量不足**（I1 / 报告 P0-0，2026-09-27）：与 ACL 无关，
+#                      是宿主容量问题 ⇒ 处方是「清理该卷 / 换卷」，**报给平台运维
+#                      而不是"换落点"**。单列一档是因为：它由**命令启动前的预检**
+#                      产生（`services/disk_guard.py`），与上面三类的来源层不同，
+#                      混进 `unknown_acl` 会把「磁盘满了」诊断成「权限问题」。
 #
 # ⚠ 为什么单独一个枚举而不是塞进 `FactKind`：`FactKind` 四格是**归因归属**
 # （谁的锅），本枚举是同一格内的**成因细分**（同样是"平台的锅"，但处方不同）。
@@ -72,9 +77,16 @@ DeniedBy = Literal[
     "sealed_git",
     "no_write_sid",
     "unknown_acl",
+    "disk_pressure",
 ]
 DENIED_BY_KINDS: frozenset[str] = frozenset(
-    ("outside_boundary", "sealed_git", "no_write_sid", "unknown_acl")
+    (
+        "outside_boundary",
+        "sealed_git",
+        "no_write_sid",
+        "unknown_acl",
+        "disk_pressure",
+    )
 )
 #: `sealed_by` 列的值前缀（机制名 + 封条目标路径），如
 #: `acl_lockdown:D:\proj\.git\config`。§1 验收 5 按 `LIKE 'acl_lockdown%'` 判。
