@@ -998,6 +998,33 @@ PROJECT_DB_TABLES = [
     """,
     # 迁移：旧库补列（ALTER 失败 = 列已存在，被 ensure_project_db 吞掉）
     """ALTER TABLE meeting_utterances ADD COLUMN abstain_reason TEXT NOT NULL DEFAULT ''""",
+    # I14（fixplan 批 5，2026-09-27）：user_pings 收进正典清单 —— 此前它的
+    # DDL 在 api/communications.py::_ensure_user_pings_table（**读接口自己
+    # CREATE TABLE**），全仓零 INSERT、不在本清单 ⇒ 门禁看不见它（「清单当
+    # 枚举源却无机制保证清单自身完备」的实证）。
+    # ⚠ 陈述订正（批 5 独立审计 P1，2026-09-27）：「建表永远只有一条路径」
+    # **不是现状** —— service 侧存在双 declaring 幂等兜底（mcp_servers /
+    # agent_waits）与真旁路表（audit_retry / audit_cache / tool_attestations /
+    # inbox_triage_batches，挂账见
+    # tests/test_i14_user_pings_canonical.py::_BYPASS_TABLE_ALLOWLIST），
+    # 由该文件的 AST 门禁管住「新增旁路」。本清单的正典地位靠「反向断言
+    # （库表 ≡ 清单，管正典路径自身漂移）+ AST 门禁（管旁路）」两道合力，
+    # 不是靠本注释自证。
+    # 列形状 = 旧自建路径原样迁移（存量库由旧路径建的表与新库形状一致，无
+    # 迁移需求）。⚠ 现状：读方真实存在（GET /api/user-pings + 前端 pending
+    # 面板/OrgTree 徽标），**写方全仓为零** —— ping 生产特性尚未立项，见
+    # tests/test_every_project_db_table_has_writer.py 的白名单条目。
+    """
+    CREATE TABLE IF NOT EXISTS user_pings (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        from_agent_id TEXT,
+        message TEXT,
+        is_read INTEGER DEFAULT 0,
+        created_at INTEGER,
+        read_at INTEGER
+    )
+    """,
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────

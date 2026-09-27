@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import time
-import uuid
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -108,32 +107,10 @@ async def create_communication(body: CommunicationCreate) -> dict:
 
 
 # ── User pings ───────────────────────────────────────────────
-
-
-async def _ensure_user_pings_table(agent_or_project_key: str, *, project_id: str | None = None) -> None:
-    """确保 user_pings 表存在（per-project DB）。"""
-    sql = (
-        "CREATE TABLE IF NOT EXISTS user_pings ("
-        "id TEXT PRIMARY KEY, "
-        "project_id TEXT, "
-        "from_agent_id TEXT, "
-        "message TEXT, "
-        "is_read INTEGER DEFAULT 0, "
-        "created_at INTEGER, "
-        "read_at INTEGER"
-        ")"
-    )
-    if project_id:
-        workspace = await meta_db.get_project_workspace(project_id)
-        if not workspace:
-            return
-        from hiveweave.db.project import ensure_project_db
-
-        conn = await ensure_project_db(workspace)
-        await conn.execute(sql)
-        await conn.commit()
-    else:
-        await project_db.execute(agent_or_project_key, sql, [])
+# I14（fixplan 批 5）：本模块**不再自建表** —— user_pings 的 DDL 已收进
+# db/schema.py::PROJECT_DB_TABLES，建表永远只有一条路径
+# （db/project.py::ensure_project_db）。读接口此前自己 CREATE TABLE 的
+# `_ensure_user_pings_table` 已删除。
 
 
 @router.get("/api/user-pings")
@@ -147,7 +124,6 @@ async def list_user_pings(
         return {"pings": []}
     try:
         if projectId:
-            await _ensure_user_pings_table(projectId, project_id=projectId)
             workspace = await meta_db.get_project_workspace(projectId)
             if not workspace:
                 return {"pings": []}
@@ -164,7 +140,6 @@ async def list_user_pings(
             await cursor.close()
         else:
             assert agentId is not None  # 上面已确认 projectId or agentId
-            await _ensure_user_pings_table(agentId)
             sql = "SELECT * FROM user_pings WHERE from_agent_id = ?"
             params = [agentId]
             if unreadOnly:

@@ -20,8 +20,24 @@ per-project DB 的唯一权威源，见 ``db/project.py:215`` 的建表循环）
 **交接状态（批次 5 ⇄ 批次 7 · 已收口）**：``modules`` 表按 A 方案保留（形状见
 ``docs/AI工程组织_MVP蓝图.md:283-287``，含 ``parent_module_id`` 自引用模块树），
 写侧由**批次 7** 在 ``services/modules.py::create_module`` 落地（INSERT INTO
-modules）。因此 ``modules`` 已从 ``_KNOWN_WRITERLESS_PENDING`` 白名单**移出**，
-白名单现在为空 —— 门禁覆盖全部正典表，无豁免。
+modules）。因此 ``modules`` 已从 ``_KNOWN_WRITERLESS_PENDING`` 白名单**移出**。
+**现状（I14 · 批 5，2026-09-27）**：白名单仅剩 ``user_pings``（读方真实、写方
+特性未立项，见白名单处注释）。
+
+**反向断言（I14 · 批 5，2026-09-27）**：本门禁原先只单向保证「清单里的表都有
+写入方」，**清单外的表根本不看** —— ``user_pings`` 正是钻了这个盲区（读接口
+自建表 + 零 INSERT + 不在清单 ⇒ 门禁全绿）。
+``test_project_db_has_no_tables_outside_canonical_list`` 补上另一方向：
+**测试库经正典路径建出的表 ≡ ``PROJECT_DB_TABLES``，多出来的表一律打红**。
+
+⚠ **反向断言的真实边界（批 5 独立审计 P1，2026-09-27 —— 诚实标注）**：
+本断言只对「**正典路径建出的库**」有效 —— 旁路 CREATE TABLE（api/services
+自建，正是 user_pings 的原始形态）在测试里**不执行**，表不会 materialize
+进测试库 ⇒ 断言看不见它们。**「清单漏项 ⇒ 建表走旁路 ⇒ 在这里暴露」这条
+因果链不成立**。旁路建表由**静态 AST 门禁**管：
+``test_i14_user_pings_canonical.py::test_no_bypass_create_table_outside_schema_module``
+（src/ 内 CREATE TABLE 只许在 db/schema.py 或挂账白名单）。两个方向各有
+分工：本断言管正典路径自身漂移，AST 门禁管旁路建表。
 
 ⚠ **已知边界（P2-4.2，2026-09-12 —— 诚实标注，不是待办）**：本门禁是
 **静态扫描**，只认字符串**字面量**里的 INSERT 形态。若有人用拼接构造 SQL
@@ -147,10 +163,15 @@ def test_canonical_tables_extracted():
 # 这些表的存在是有意为之（先建对形状、接线随后），不是遗漏；
 # 门禁对它们放行，但仍会在它们之外的任何新死表上打红。
 #
-# **当前为空**：批次 7 已在 ``services/modules.py`` 落地 ``modules`` 的写入方
-# （``create_module`` 的 INSERT INTO modules），按批次 5 的交接约定把它移出。
-# 空集合 = 门禁覆盖全部正典表，没有豁免。
-_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset()
+# user_pings（I14 · fixplan 批 5，2026-09-27）：DDL 已收进 PROJECT_DB_TABLES
+# （原先是 api/communications.py 读接口自建，门禁看不见）。**读方真实存在**：
+# GET /api/user-pings、POST /api/user-pings/{id}/read、前端 pending 面板与
+# OrgTree「需关注」徽标都在消费它。**写方全仓为零**：ping 的生产特性从未立项
+# （没有任何代码路径 INSERT INTO user_pings），表按设计保持空 ⇒ 属「形状先建、
+# 写侧未落地」而非下一个 modules 死表。接管状态：无既定批次——若将来落地
+# ping 生产特性请接上 INSERT 并把本条目移出；若读侧也被判废弃，则应把 DDL
+# 从正典清单整体摘除（二选一，不许长期挂账）。
+_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset({"user_pings"})
 
 
 def test_every_project_db_table_has_a_writer():
@@ -199,3 +220,53 @@ def test_gate_detects_a_simulated_dead_table():
     assert not writers_real.get("__no_such_table_written_anywhere__")
     # 且真表确实有写入方（证明判定不是恒真）
     assert writers_real.get("tasks"), "tasks 应该被多处 INSERT"
+
+
+# ── 反向断言（I14 · fixplan 批 5，2026-09-27）─────────────────
+# 正向门禁只看「清单 → 库」：清单里的表必须有写入方。
+# 这里补「库 → 清单」：**库里的表必须都在清单里**。多出来的表 = 有人绕开
+# 正典建表路径（读接口/服务自建 CREATE TABLE），清单门禁对它们全盲 ——
+# user_pings 就是实证（自建 + 零 INSERT + 不在清单，门禁曾长期全绿）。
+
+
+async def _tables_in_fresh_project_db(workspace) -> set[str]:
+    """走正典路径（``ensure_project_db``）建一个全新的 per-project DB，
+    返回其中实际存在的用户表（排除 ``sqlite_%`` 内部表，如 AUTOINCREMENT
+    伴生的 ``sqlite_sequence``）。"""
+    from hiveweave.db.project import ensure_project_db
+
+    conn = await ensure_project_db(str(workspace))
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    # 连接留在 project_db._cache 里，由 conftest 的
+    # _close_db_connections_after_test 统一收尾（tmp_path 每测试唯一，无跨
+    # 测试污染）。
+    return {r[0] for r in rows}
+
+
+async def _extra_tables_in_project_db(workspace) -> set[str]:
+    """反向断言核心：库中实际存在的表 − 正典清单。非空 = 清单漏项/旁路建表。"""
+    return await _tables_in_fresh_project_db(workspace) - _canonical_table_names()
+
+
+async def test_project_db_has_no_tables_outside_canonical_list(tmp_path):
+    """反向断言：正典路径建出的库，其表集合必须 ≡ PROJECT_DB_TABLES。
+
+    多出来的表一律打红 —— 本断言管「**正典路径自身漂移**」（如有人在
+    ensure_project_db 里硬写 CREATE TABLE、或把 DDL 误塞进 PROJECT_DB_INDEXES）。
+    ⚠ 它**管不到**旁路建表（service/api 自建的 CREATE TABLE 在测试里不执行、
+    表不会进测试库）—— 那一半由静态 AST 门禁
+    ``test_i14_user_pings_canonical.py::test_no_bypass_create_table_outside_schema_module``
+    负责（批 5 审计 P1）。
+    """
+    extra = await _extra_tables_in_project_db(tmp_path)
+    assert not extra, (
+        f"per-project DB 里出现了正典清单之外的表：{sorted(extra)}。\n"
+        "正典建表路径 = db/schema.py::PROJECT_DB_TABLES →\n"
+        "db/project.py::ensure_project_db。请二选一：\n"
+        "① 把该表 DDL 收进 PROJECT_DB_TABLES（并补写入方或挂白名单写明理由）；\n"
+        "② 删掉旁路 CREATE TABLE，让表回到正典路径。"
+    )
