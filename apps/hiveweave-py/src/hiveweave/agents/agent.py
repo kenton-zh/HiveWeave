@@ -262,6 +262,59 @@ def _task_merge_already_recorded(task: dict | None) -> bool:
     return evidence_merge_recorded(task)
 
 
+def _activation_trigger_fields(
+    opts: dict, *, agent_id: str = "", preview: str = ""
+) -> tuple[str, str | None]:
+    """I15(P2-5) 批 6：激活记录 (trigger_type, trigger_source) 的唯一派生点。
+
+    ① **缺省值不许是业务值**：source 缺失/空 ⇒ ``"unknown"`` + 告警日志。
+    旧实现 ``opts.get("source")`` 空值兜底成 "chat"，把「漏传」永久伪装成
+    「用户发的」—— ``"chat"`` 只有在用户入口（api/chat.py / realtime/channels.py /
+    services/user_message.py / steer）**显式传**它时才是业务值；
+    ``unknown`` 出现非零行 = 有调用方漏传，可被机器查出。
+
+    ② **trigger_source 空串/NULL 择一 ⇒ 统一 NULL**（列 DDL 可空）：
+    「没填」不许被 ``IS NOT NULL`` 读成「填了」。修法同时修了根因 ——
+    旧代码 ``trigger = opts.get("trigger")`` 读到的是**布尔** True，
+    ``isinstance(trigger, dict)`` 恒 False、分支是死代码，来源实际在
+    ``opts["from_agent_id"]``（trigger.py / offturn.py 的传参位置）。
+    2026-09-27 只读普查（83 库 / 11,991 行）：trigger_source 100% 空串、
+    零 NULL、零非空值，即此根因 + ``or ""`` 兜底的合成结果。
+
+    ③ **三组「双机制并存、只启用其一」留一裁决**（同一意图不许有两条
+    都「能用」的路；判据同 F6：双写点必然漏点）：
+    · **门铃**：留 ``agent_waits(kind='user')``（有界 TTL + 唤醒/清除契约，
+      本文件 chat() 的 apply_wake_admit_wait_clear 即其消费点）；question
+      降为发问 UX 入口，等待/超时/裁决语义全部下沉 agent_waits ——
+      由 I9（批 8）落地双写 + 双触发 + 事实位。本批不动 tools/question.py。
+    · **验收**：回合作内「>20 行二道审计」唯一路径 = ``request_code_audit``
+      （在用、有出口合同、接提示词纪律）；``verify_spawn`` /
+      ``verification_cases`` 重定位为「任务级独立验证」，仅中层/CEO 的
+      REVIEW 流程显式选用，**不建自动默认入口**（⚠ 本裁决只针对「自动默认
+      入口」——verify_spawn 本体的活动调用方（post-approve verify /
+      stalled 重派 / QA 阻塞重试）**不受影响，勿删**；本批未改其行为）。
+      表保留（verify_merge / attestation 仍有消费方）。
+    · **招聘**：唯一招聘执行通道 = ``hire_agent``（HR 独占 + STAFFING
+      权限硬门已在）；``staffing_demands`` 收窄为**缺口观测信号**（唯一
+      生产者 = verify_spawn 无 QA 阻塞登记），不建「先 demand 后 hire」
+      第二道流程，避免同一招聘意图出现双写点。
+    """
+    opts = opts or {}
+    raw_source = str(opts.get("source") or "").strip()
+    if raw_source:
+        trigger_type = raw_source
+    else:
+        trigger_type = "unknown"
+        log.warning(
+            "activation_source_missing",
+            agent_id=agent_id,
+            trigger=bool(opts.get("trigger")),
+            preview=str(preview or "")[:80],
+        )
+    trigger_source = str(opts.get("from_agent_id") or "").strip() or None
+    return trigger_type, trigger_source
+
+
 async def broadcast_agent_health(
     agent_id: str, health: str, message: str = ""
 ) -> None:
@@ -871,18 +924,18 @@ class Agent:
             # `NameError`（2026-09-23 线上实测：所有 agent turn 在首请求前崩）。
             # 守卫见 tests/test_p1_5_upstream_retry_budget.py 的 F/G/H。
 
-            # Create activation record
-            trigger = opts.get("trigger") or {}
-            trigger_type = (opts.get("source") or "chat")
-            trigger_source = ""
-            if isinstance(trigger, dict):
-                trigger_source = trigger.get("from_agent_id") or trigger.get("source") or ""
+            # Create activation record —— 派生唯一入口 _activation_trigger_fields
+            # （I15(P2-5) 批 6 值域治理 + 三组双机制留一裁决，注释在该函数）。
+            trigger_type, trigger_source = _activation_trigger_fields(
+                opts, agent_id=self.id, preview=str(message or "")
+            )
             inbox_ids = opts.get("inbox_msg_ids") or []
             try:
                 self._current_activation_id = await self._run_ledger.create_activation(
                     agent_id=self.id,
                     trigger_type=trigger_type,
-                    trigger_source=trigger_source,
+                    trigger_source=trigger_source,  # None ⇒ NULL（I15 ②；
+                    # run_ledger 形参已翻 `str | None = None`，落库直绑无中间层）
                     trigger_detail=message[:200],
                     inbox_msg_ids=inbox_ids,
                     interrupted_run_id=interrupted_run_id,
@@ -965,7 +1018,10 @@ class Agent:
           队列失效时**禁止**回退 chat()（会造出无签收的幻影回合），
           直接丢弃返回 {"ok": False}，未读交由正式 trigger 投递。
         """
-        opts = opts or {}
+        # steer 是用户插话通道（phoenix 用户 steer / [INBOX] 预览残留回收），
+        # 未显式传 source 时按用户消息报 "chat" —— I15：缺省不许落
+        # "unknown"（unknown 只留给真正的漏传，见 _activation_trigger_fields）。
+        opts = {"source": "chat", **(opts or {})}
         q = self._steer_q
         if self.status == AgentState.PROCESSING and q is not None:
             q.put_nowait(message)
@@ -1004,7 +1060,9 @@ class Agent:
                     dropped += 1
                     continue
                 self._message_queue.append(
-                    (_rest, {}, int(time.time() * 1000))
+                    # 真实用户 steer 残留回放按用户消息报 "chat"（I15：
+                    # 回放 opts 不得为空 ⇒ unknown；[INBOX] 残留在上面已丢弃）。
+                    (_rest, {"source": "chat"}, int(time.time() * 1000))
                 )
                 reclaimed += 1
         except asyncio.QueueEmpty:

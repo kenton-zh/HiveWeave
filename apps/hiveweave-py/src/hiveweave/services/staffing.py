@@ -4,6 +4,11 @@ When the system detects a staffing gap (e.g., VERIFY blocked because no
 QA exists), it creates a staffing demand. HR can query open demands to
 know exactly what to hire, rather than relying on inbox notifications
 that might be missed.
+
+I15(P2-5) 批 6 · 双机制留一裁决（③招聘）：唯一招聘执行通道 = hire_agent
+（HR 独占 + STAFFING 权限硬门）；本服务收窄为「缺口观测信号」（唯一生产者
+= verify_spawn 无 QA 阻塞登记），不建「先 demand 后 hire」第二道流程。
+完整裁决见 agents/agent.py::_activation_trigger_fields 注释。
 """
 
 from __future__ import annotations

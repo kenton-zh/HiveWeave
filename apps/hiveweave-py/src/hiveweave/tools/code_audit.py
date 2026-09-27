@@ -266,6 +266,10 @@ def _soft_fail_result(result: dict) -> ToolResult:
     )
 
 
+# I15(P2-5) 批 6 · 双机制留一裁决（②验收）：回合作内「>20 行二道审计」的
+# 唯一路径 = 本工具 request_code_audit；verify_spawn / verification_cases
+# 重定位为「任务级独立验证」，仅中层/CEO 的 REVIEW 流程显式选用，不建自动
+# 默认入口。完整裁决见 agents/agent.py::_activation_trigger_fields 注释。
 @tool(
     "request_code_audit",
     "One-shot second-pass LLM audit of your worktree git diff. "

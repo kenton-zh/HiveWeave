@@ -482,7 +482,8 @@ async def agent_ws(websocket: WebSocket, agent_id: str) -> None:
                 return
 
             # 调用 agent.chat
-            result = await agent.chat(message)
+            # I15(P2-5)：WS 用户直聊显式报 source="chat"（缺省 ⇒ unknown+告警）。
+            result = await agent.chat(message, {"source": "chat"})
 
             if result.get("error") == "busy":
                 await _safe_send_agent_error(
@@ -591,7 +592,8 @@ async def chat_ws(websocket: WebSocket) -> None:
                 )
                 return
 
-            result = await agent.chat(message)
+            # I15(P2-5)：WS 用户直聊显式报 source="chat"（缺省 ⇒ unknown+告警）。
+            result = await agent.chat(message, {"source": "chat"})
 
             if result.get("error") == "busy":
                 await _safe_send_agent_error(

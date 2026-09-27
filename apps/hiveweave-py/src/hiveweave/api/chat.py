@@ -262,7 +262,11 @@ async def send_chat(body: ChatSendBody) -> dict:
     from hiveweave.services.vision import parse_user_images
 
     user_images = parse_user_images(body.images) if body.images else []
-    chat_extra = {"opts": {"images": user_images}} if user_images else {}
+    # I15(P2-5)：REST 用户直聊显式报 source="chat" —— "chat" 只许在用户
+    # 入口显式传；缺省会落 "unknown"+告警（见 agent._activation_trigger_fields）。
+    chat_extra: dict = {"opts": {"source": "chat"}}
+    if user_images:
+        chat_extra["opts"]["images"] = user_images
     result = await agent.chat(user_msg_str, **chat_extra)
     if result.get("error") == "busy":
         # force_reset + sleep + 重试

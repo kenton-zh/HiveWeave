@@ -104,7 +104,11 @@ async def test_idle_with_images_passes_parsed_images(saved_calls):
         )
     assert result["outcome"] == "started"
     assert saved_calls[0]["images"] == ["data:image/png;base64,AAA"]
-    assert agent.chat.await_args.args[1] == {"images": fake_imgs}
+    # I15(P2-5)：共用入口显式报 source="chat"（缺省不许落 unknown）
+    assert agent.chat.await_args.args[1] == {
+        "source": "chat",
+        "images": fake_imgs,
+    }
 
 
 async def test_busy_queues_via_inbox_and_skips_chat(saved_calls):

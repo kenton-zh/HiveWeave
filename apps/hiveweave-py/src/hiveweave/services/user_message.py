@@ -186,10 +186,12 @@ async def deliver_user_message(
     from hiveweave.services.vision import parse_user_images
 
     user_images = parse_user_images(images) if images else []
+    # I15(P2-5)：三端共用入口显式报 source="chat"（surface 细分 web|ball|feishu
+    # 仍记 chat_messages.metadata.source；缺省 ⇒ unknown+告警）。
+    chat_opts: dict = {"source": "chat"}
     if user_images:
-        result = await agent.chat(user_msg, {"images": user_images})
-    else:
-        result = await agent.chat(user_msg)
+        chat_opts["images"] = user_images
+    result = await agent.chat(user_msg, chat_opts)
 
     if result.get("error") == "busy":
         return {

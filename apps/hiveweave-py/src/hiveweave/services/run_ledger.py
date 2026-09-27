@@ -144,7 +144,11 @@ class RunLedger:
         self,
         agent_id: str,
         trigger_type: str,
-        trigger_source: str = "",
+        # I15（批 6，2026-09-27）：「没填」必须是 NULL，不是空串 —— 空串让
+        # `IS NOT NULL AND LENGTH(TRIM(col))>0` 判据把「没填」读成「填了」。
+        # 缺省 None（唯一调用方 agents/agent.py 走 _activation_trigger_fields
+        # 显式传值），落库原样 NULL。
+        trigger_source: str | None = None,
         trigger_detail: str = "",
         inbox_msg_ids: list[str] | None = None,
         interrupted_run_id: str | None = None,
