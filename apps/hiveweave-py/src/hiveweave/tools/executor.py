@@ -3609,7 +3609,17 @@ class ToolExecutor:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("tool.dispatch_failed", tool=name, error=str(exc))
-            return self._error(f"Error: {type(exc).__name__}: {exc}")
+            # 批 2（I3+I4）：兜底不再裸 `self._error` 早返回（无 blocked/fact、
+            # 绕过唯一漏斗 = L9-1）—— 走两处兜底的唯一实现统一盖戳，与
+            # pipeline 同一次改动（拆开 = 位在但生产者不在）。
+            from hiveweave.tools.fact_positions import dispatch_failure_result
+
+            result = dispatch_failure_result(name, exc)
+            # 样本/事件通道与正常路径对齐：unclassified_sample 由 hooks 落
+            # agent_events（漏斗只放进 dict，不猜 agent_id）。
+            result = await _f10_result_hooks(result, name, tool_args, agent_id)
+            await _emit_tool_execute_after(agent_id, name, tool_args, result)
+            return result
 
         # 4. Normalize result shape — R7: 统一工具返回契约
         # 所有工具必须返回 {success, output, error} 三字段。此处作为单一保障点，

@@ -531,7 +531,9 @@ def _stamp_source_kind(fn: ast.AST, name: str) -> set[str]:
     """`name` 在函数内的**赋值来源种类** —— 结构化判定，不做字符串匹配。
 
     返回集合，可能含：
-      · `"helper"`    —— 表达式里调用了 `_enforcement_stamp`
+      · `"helper"`    —— 表达式里调用了 `_fact_stamp`（批 I1 2026-09-27 起的
+        唯一登记点，`bash.py::_fact_stamp` 是 `_enforcement_stamp` 的超集：
+        全部 spawn 戳 + `disk_*` 三键）或旧名 `_enforcement_stamp`
       · `"decision"`  —— 表达式里调用了 `<x>.stamp()`（入口自身的判定）
       · `"prefix"`    —— 表达式里出现 `"enforcement"` 字符串字面量
 
@@ -554,7 +556,9 @@ def _stamp_source_kind(fn: ast.AST, name: str) -> set[str]:
             if not isinstance(sub, ast.Call):
                 continue
             f = sub.func
-            if isinstance(f, ast.Name) and f.id == "_enforcement_stamp":
+            if isinstance(f, ast.Name) and f.id in (
+                "_fact_stamp", "_enforcement_stamp",
+            ):
                 kinds.add("helper")
             elif isinstance(f, ast.Attribute) and f.attr == "stamp":
                 kinds.add("decision")

@@ -534,7 +534,12 @@ async def execute_registered_tool(
             result = await tool_def.execute_fn(params, agent_id, workspace_path)
     except Exception as exc:  # noqa: BLE001
         log.error("pipeline.execute_failed", tool=tool_name, error=str(exc))
-        return ToolResult.err(f"Error: {type(exc).__name__}: {exc}").to_dict()
+        # 批 2（I3+I4）：兜底不再裸 `ToolResult.err` 早返回（无 blocked/fact、
+        # 绕过下方唯一漏斗 = L9-1）—— 与 executor 兜底共用同一实现统一盖戳
+        # （两处必须同一次改动，拆开 = 位在但生产者不在）。
+        from hiveweave.tools.fact_positions import dispatch_failure_result
+
+        return dispatch_failure_result(tool_name, exc)
 
     # 6. Normalize result shape — **单一漏斗**（L3，2026-09-11）
     #

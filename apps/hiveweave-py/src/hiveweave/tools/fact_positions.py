@@ -951,6 +951,63 @@ def finalize_tool_result(
     return finalize_fact_dict(out)
 
 
+# ── 批 2（I3+I4，fixplan 2026-09-27）：两处 dispatch 兜底的唯一实现 ──
+
+
+def dispatch_failure_result(tool_name: str, exc: BaseException) -> dict:
+    """异常逃出工具实现时的**统一盖戳出口**（两处兜底共用，禁止再各写一份）。
+
+    消费的两侧（**必须同一次改动**，拆开 = 位在但生产者不在）：
+      · ``tools/executor.py::ToolExecutor.execute`` 第 3 步（``_dispatch`` 外层）
+      · ``tools/pipeline.py::execute_registered_tool`` 第 5 步（``execute_fn`` 外层）
+
+    此前两处各自裸返回（``self._error(...)`` / ``ToolResult.err(...).to_dict()``）
+    —— 无 ``blocked``、无 ``fact``、绕过唯一漏斗 ⇒ 同一个
+    ``SandboxUnavailableError`` 在 python_script 路落
+    ``runner_failed=1/executed=0``、在 pwsh 路落全 NULL（I3 卡片实测的两本账），
+    且早于 ``finalize_tool_result`` 返回 = L9-1 的「兜底出口不盖戳」。
+
+    ## 归因（fixplan 批 2 方法②：沙箱类异常由单点判据判，不由类名/文案推）
+
+    - **沙箱类**（``SandboxUnavailableError``）→
+      :func:`hiveweave.services.acl_sandbox.errors.is_platform_side` 查异常链里
+      构造点的亲笔签名（``platform_side`` / ``api_name`` / ``PwshUnavailableError``）：
+      - 平台侧 ⇒ ``blocked=True + fact="runner_failed"``（命令从未执行；
+        ``executed`` 戳随异常透传 —— ``spawn_agent_command`` 已打上）；
+      - 非平台侧 ⇒ ``blocked=True + fact="outcome_unknown"``（「这次调用没有
+        结果」，**不声称**平台故障 —— 本异常是一切异常的容器，真代码 bug 也被
+        包进来；硬编码 ``runner_failed`` 会替 bug 卸责，让 agent 放弃自查）。
+      两格都是 ``_BLOCKED_FACT_KINDS`` 允许的取值。
+    - **其余异常** ⇒ **不猜**：裸 ``ToolResult.err`` 交 :func:`finalize_tool_result`
+      归因阶梯 —— 非 blocked 失败按**位层**归因；位缺失经其 fail-soft 兜底
+      落 ``outcome_unknown`` + 未分类样本（文本签名/超时层仅 blocked 分支
+      可达，见漏斗内注释），不会炸运行时。
+
+    两种都**必须**再过 :func:`finalize_tool_result`：与正常路径共用同一收口
+    （E23 分母计数 + 派生键展开 + 声明冲突观测）—— 兜底绕过漏斗正是本批
+    要消灭的形态。
+    """
+    from hiveweave.services.acl_sandbox.errors import (
+        SandboxUnavailableError,
+        is_platform_side,
+    )
+    # 延迟导入：bash.py 模块级反向导入本模块（classify_error_text），
+    # 顶层导入会成环；调用期两侧都已初始化，安全。
+    from hiveweave.tools.bash import _executed_stamp
+    from hiveweave.tools.result import ToolResult
+
+    message = f"Error: {type(exc).__name__}: {exc}"
+    if isinstance(exc, SandboxUnavailableError):
+        stamped = ToolResult.blocked_err(
+            message,
+            fact="runner_failed" if is_platform_side(exc) else "outcome_unknown",
+            **_executed_stamp(exc),
+        )
+    else:
+        stamped = ToolResult.err(message)
+    return finalize_tool_result(tool_name, stamped)
+
+
 # ── 启动断言（机械 gate，import 期执行）─────────────────────────
 #
 # 对齐 DSH `packages/AGENTS.md:145`：

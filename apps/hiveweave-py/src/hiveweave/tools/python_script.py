@@ -308,10 +308,17 @@ async def python_script_execute(
         # 它已在该异常上记了「命令从未启动」（`executed=False`）。不带过来，
         # 这条出口就只有"被拒绝"而没有"根本没跑"这两个正交事实中的后一个，
         # 下游会把 `confined` 读成"在沙箱里跑过"。
-        return ToolResult.err(
-            f"python_script: sandbox unavailable: {e}",
-            fact="runner_failed",
-            **_executed_stamp(e),
+        #
+        # 批 2（I3，2026-09-27）：归因**不得硬编码** —— 本异常是一切异常的
+        # 容器（`service.py` 把真代码 bug 也包进来），写死 runner_failed 会把
+        # TypeError 之类真缺陷说成"平台故障"，让 agent 放弃自查（I3 卡片实测：
+        # 本工具与 pwsh 路各落一本账）。与 bash/dev_server 同族出口对齐：
+        # `errors.is_platform_side` 单点判定（异常链亲笔签名），判不出 ⇒
+        # outcome_unknown（「这次没有结果」，不替 agent 卸责）。
+        from hiveweave.services.acl_sandbox.errors import is_platform_side
+
+        return e.to_tool_result(
+            platform_side=is_platform_side(e), **_executed_stamp(e)
         )
     except Exception as e:
         return ToolResult.err(f"python_script: execution failed: {e}")
