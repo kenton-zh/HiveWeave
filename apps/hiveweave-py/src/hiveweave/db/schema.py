@@ -73,6 +73,19 @@ META_DB_TABLES = [
         tool_call_rounds INTEGER,
         model_family TEXT DEFAULT '',
         thinking_mode TEXT DEFAULT '',
+        -- I6（fixplan 批 11，2026-09-27）：全仓**唯一价格源**。单位 =
+        -- USD / 1M tokens（与上游 pi ``model.cost.{input,output,cacheRead,
+        -- cacheWrite}`` 同口径，cache_warmer.DEFAULT_PRICES 的文档锚也是这档）。
+        -- ⚠ **NULL = 价格不可得（未配置）**，与 0.0「免费模型（真实可得，
+        -- 价为零）」**不同形** —— cache_warmer 据此 fail-closed：任一必需价
+        -- NULL ⇒ 不武装（I6 验收：不武装且 reason 可判定，不许「看起来在跑」）。
+        -- 此前无任何价格数据 ⇒ 续暖判据恒用 DEFAULT_PRICES 硬编码 Anthropic
+        -- 档价，把 11.9 万 token 的 DeepSeek 前缀按 Sonnet 档判「不到 5 美分
+        -- 门槛」⇒ 40 次武装 / 0 次触发（s3-clone_13 实测）。
+        price_input REAL,
+        price_output REAL,
+        price_cache_read REAL,
+        price_cache_write REAL,
         is_active INTEGER DEFAULT 1,
         created_at INTEGER,
         updated_at INTEGER
@@ -1075,6 +1088,21 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     # （ALTER 排错位被吞 / 旧库没跑 ALTER）在启动时 fail-loud，而不是让
     # pending question 继续「无界挂账 + 裁决无事实位可查」。
     "questions": {"expires_at", "timed_out_at", "resolved_by"},
+}
+
+# ── Meta DB 建表自检（I6，fixplan 批 11，2026-09-27）────────────
+# llm_models 四个价格列的迁移断裂防护。⚠ **刻意不进 PROJECT_DB_COLUMN_CHECKS**：
+# llm_models 是 **Meta DB** 全局表，per-project DB 里**没有**它 —— 登进
+# PROJECT 侧自检会让每个项目库建连时 ``PRAGMA table_info(llm_models)`` 落空
+# （PRAGMA 对不存在的表返回空集、不报错）⇒ 全部列判 missing ⇒ **恒 fail-loud
+# 假阳性炸掉所有项目库**。故立 Meta 侧同构自检（消费方 = db/meta.py::
+# init_meta_db，启动时执行），fail-loud 语义与 PROJECT 侧一致：价格列缺失 =
+# 唯一价格源断裂 = cache_warmer 全量退化为「价格不可得 ⇒ 永不武装」，
+# 必须启动即崩而不是静默丢功能。
+META_DB_COLUMN_CHECKS: dict[str, set[str]] = {
+    "llm_models": {
+        "price_input", "price_output", "price_cache_read", "price_cache_write",
+    },
 }
 
 # ── Meta DB 索引 ────────────────────────────────────────────

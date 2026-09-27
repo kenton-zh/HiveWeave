@@ -115,6 +115,24 @@ _inner_drift: dict[str, dict[str, Any]] = {}
 #: 不要照抄这个数。
 _HIT_OK_MIN_RATIO = 0.05
 
+# I7 决策侧（fixplan 批 11，2026-09-27）：最近一次已上报 readout 的留档副本
+# （含 ``final`` / ``idle_ms`` / ``model_changed``）。``report_cache_readout``
+# 对 ``_last_verdict`` 是**一次性消费**（pop，防重试循环重复报告）——那个语义
+# 不动；这里只留**副本**，供 ``services/cache_warmer`` 的武装决策取 idle 归因
+# （cache_warmer 在 ``on_agent_settled`` 读，agent.py 不参与传参）。`reset_probe` 清。
+_last_readout: dict[str, dict[str, Any]] = {}
+
+
+def last_cache_readout(agent_id: str) -> dict[str, Any] | None:
+    """该 agent 最近一次已上报的 cache readout（只读副本；无则 None）。
+
+    I7 决策侧入口：``cache_warmer.on_agent_settled`` 据此把「上次未命中的
+    归因档位（``final``）与唤醒间隔（``idle_ms``）」纳入武装/放弃决策记录，
+    使「间隔类 miss」与「前缀漂移类 miss」在**决策面**也不再同桶。
+    """
+    readout = _last_readout.get(agent_id)
+    return dict(readout) if readout is not None else None
+
 
 def reset_probe(agent_id: str | None = None) -> None:
     """清空探针基准（测试隔离用）。agent_id 为 None 时全量重置。"""
@@ -122,10 +140,12 @@ def reset_probe(agent_id: str | None = None) -> None:
         _last_request.clear()
         _last_verdict.clear()
         _inner_drift.clear()
+        _last_readout.clear()
     else:
         _last_request.pop(agent_id, None)
         _last_verdict.pop(agent_id, None)
         _inner_drift.pop(agent_id, None)
+        _last_readout.pop(agent_id, None)
 
 
 def _h(data: Any) -> str:
@@ -423,6 +443,9 @@ def report_cache_readout(
         int(round(_gap_s * 1000)) if isinstance(_gap_s, (int, float)) else None
     )
     result["model_changed"] = "model_changed" in (last.get("drifts") or [])
+    # I7 决策侧：留档副本供 cache_warmer 武装决策取 idle 归因（见其定义处
+    # 注释；一次性消费语义不受影响 —— _last_verdict 仍在此处已被 pop）。
+    _last_readout[agent_id] = dict(result)
     log = logger.bind(agent_id=agent_id)
     log.info(
         "prompt_prefix_probe_result",

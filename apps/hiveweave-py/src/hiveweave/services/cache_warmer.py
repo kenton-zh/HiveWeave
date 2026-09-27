@@ -72,20 +72,83 @@ _WARM_MARGIN_MS = 10_000
 #: observe 与 arm 的最大间隔（本仓适配项，理由见模块头 §5）。
 WARM_SNAPSHOT_MAX_AGE_MS = 15 * 60_000
 
-# TODO(批 G 遗留)：本仓 llm_models / global_settings **无单价列**
-# （schema.py llm_models 无 price 字段），无法按模型取价。保守默认取
-# Anthropic Sonnet 档公开价（$/1M tokens：input 3 / cache_write 3.75 /
-# cache_read 0.30 / output 15）—— 上游 pi 的 $0.05 阈值就是按这档价
-# 校准的工作点（idle 续暖的最小有值前缀 ≈ 23 万 token；更便宜模型在该
-# 阈值下几乎不会 idle 续暖，TTL 开关才是它们的主杠杆）。单价**高估**会
-# 多花续暖钱、**低估**会漏暖——取上游同档最不意外。llm_models 加 price
-# 列后，compute_warm_decision 的 prices 参数直接接 DB 值替换本表。
+# I6（fixplan 批 11，2026-09-27）：唯一价格源已立 —— ``llm_models`` 四列
+# 单价（``price_input`` / ``price_output`` / ``price_cache_read`` /
+# ``price_cache_write``，单位 USD/1M tokens，NULL = 不可得；语义见
+# db/schema.py 建表注释）。运行时价格经 ``extract_model_prices`` 从
+# model_config（ModelService 行）提取，**真实价**传入 compute_warm_decision。
+# ⚠ ``DEFAULT_PRICES`` 不再是运行时回退：价格不可得 ⇒ **不武装**
+# （fail-closed，I6 验收①），不许再用硬编码 Anthropic 档价「看起来在跑」
+# （病灶：40 次武装 / 0 次触发 —— 11.9 万 token 的 DeepSeek 前缀被按
+# Sonnet 档价判「不到 $0.05 门槛」，恒差约一倍）。本表只保留两个角色：
+# ① ``compute_warm_decision(prices=None)`` 的纯函数缺省（决策数学测试的
+# 校准锚，与上游 pi 按 Sonnet 档校准的 $0.05 阈值同工作点）；② 文档锚
+# （单价高估会多花续暖钱、低估会漏暖 —— 上游同档最不意外）。
 DEFAULT_PRICES: dict[str, float] = {
     "input": 3.0,
     "output": 15.0,
     "cache_read": 0.30,
     "cache_write": 3.75,
 }
+
+# I6：llm_models 价格列 ↔ compute_warm_decision prices 键 的唯一映射。
+_MODEL_PRICE_COLUMNS: dict[str, str] = {
+    "input": "price_input",
+    "output": "price_output",
+    "cache_read": "price_cache_read",
+    "cache_write": "price_cache_write",
+}
+#: 判定经济性**必需**的价：input / output / cache_read 缺一不可。
+#: ``cache_write`` 可缺省（NULL）⇒ 以 0.0 参与决策数学，对 0 写价回退用
+#: input 价（pi ``price(model, "cacheWrite" || "input")`` :381-386 同回退；
+#: openai 系隐式缓存本就无写溢价）。低估 miss 成本只会**漏暖**（保守向），
+#: 高估才会多花钱 —— 故宁可要求配置，不做臆测回填。
+_REQUIRED_PRICE_KEYS = ("input", "output", "cache_read")
+
+
+def extract_model_prices(
+    model_config: dict | None,
+) -> tuple[dict[str, float] | None, list[str]]:
+    """从 llm_models 行（model_config）提取单价表（I6 唯一价格源入口）。
+
+    返回 ``(prices, missing_required)``：
+    - ``missing_required`` 为空 ⇒ ``prices`` 可用（键 = input/output/
+      cache_read/cache_write，float，单位 USD/1M tokens）；
+    - 非空 ⇒ ``prices`` 为 None ⇒ 调用方**不得武装**（fail-closed），
+      ``missing_required`` 逐个列出缺失的**必需**列名（可从回执判定缺什么）。
+
+    判定规则：
+    - 必需价（input/output/cache_read）任一 **NULL/缺失/非数值/负数/NaN/inf**
+      ⇒ 不可得；
+    - ``price_cache_write`` 为 NULL ⇒ 以 0.0 参与（决策数学回退 input 价）；
+    - **0.0 是合法值**（免费模型，价格真实可得），与 NULL（不可得）不同形
+      —— 全零价表 ⇒ 决策数学 economics_available=False ⇒ stop（免费模型
+      无钱可省，与 pi 全零价同判）。
+    """
+    if not isinstance(model_config, dict):
+        return None, list(_REQUIRED_PRICE_KEYS)
+    prices: dict[str, float] = {}
+    missing: list[str] = []
+    for key in ("input", "output", "cache_read", "cache_write"):
+        raw = model_config.get(_MODEL_PRICE_COLUMNS[key])
+        if raw is None:
+            if key in _REQUIRED_PRICE_KEYS:
+                missing.append(_MODEL_PRICE_COLUMNS[key])
+            else:
+                prices[key] = 0.0
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            missing.append(_MODEL_PRICE_COLUMNS[key])
+            continue
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            missing.append(_MODEL_PRICE_COLUMNS[key])
+            continue
+        prices[key] = v
+    if missing:
+        return None, missing
+    return prices, []
 
 
 def get_cache_warming_delay_ms(ttl_ms: int) -> int | None:
@@ -174,6 +237,30 @@ def compute_warm_decision(
     }
 
 
+def _not_armed(
+    agent_id: str, reason: str, *, level: str = "info", **fields: Any
+) -> None:
+    """武装放弃的**显式回执**（I6 验收①：「为何不武装」必须可从回执判定）。
+
+    统一事件 ``cache_warmer_not_armed``，``reason`` 闭合枚举：
+    - ``prices_unavailable``        价格不可得（I6 fail-closed；``missing``
+      逐列列出缺失的必需价格列）
+    - ``cache_lifetime_unavailable`` 协议无 TTL 证据（同 pi "cache lifetime
+      unavailable" → stop 语义）
+    - ``ttl_below_margin``          TTL ≤ 10s 余量线（``get_cache_warming_delay_ms``
+      ⇒ None）
+    - ``not_replayable_thinking``   anthropic + thinking 重放不安全（pi
+      ``isReplayable``，本仓保守全跳过）
+    - ``ttl_exceeds_idle_horizon``  delay > idle 安全上限（1h 档「只写不续」，
+      AI_MEMORY 拍板：1h 档防坍缩全靠 TTL 本身，不推翻）
+    - ``no_snapshot`` / ``snapshot_stale``  例行观测缺失（debug 级）
+    """
+    emit = log.info if level == "info" else log.debug
+    emit(
+        "cache_warmer_not_armed", agent_id=agent_id, reason=reason, **fields
+    )
+
+
 class _WarmRun:
     """一个 agent 的在武装续暖任务（对应 pi ``ActiveRun`` 的 idle 子集）。"""
 
@@ -184,6 +271,7 @@ class _WarmRun:
         "messages",
         "tools",
         "prompt_tokens",
+        "prices",
         "ttl_ms",
         "delay_ms",
         "started_at",
@@ -199,6 +287,7 @@ class _WarmRun:
         messages: list[dict],
         tools: list[dict] | None,
         prompt_tokens: int,
+        prices: dict[str, float],
         ttl_ms: int,
         delay_ms: int,
         started_at: float,
@@ -209,6 +298,10 @@ class _WarmRun:
         self.messages = messages
         self.tools = tools
         self.prompt_tokens = prompt_tokens
+        # I6：武装时点钉住的真实单价表（ModelService 行提取；武装 gate 已
+        # 保证非 None）。决策到点用**武装时同源**的价，不在循环里重读 DB
+        # （价格配置变更下轮武装生效，与快照「恰如落库时」同一纪律）。
+        self.prices = prices
         self.ttl_ms = ttl_ms
         self.delay_ms = delay_ms
         self.started_at = started_at
@@ -263,7 +356,11 @@ class CacheWarmer:
         """run 收尾武装续暖（pi ``onAgentSettled`` 的 idle 语义）。
 
         快照过旧（> ``WARM_SNAPSHOT_MAX_AGE_MS``）或开关关 ⇒ 不武装。
-        任何失败静默（软失败契约）。
+        I6（批 11）：**价格不可得 ⇒ 不武装**（economics fail-closed）——
+        此前 economics_available 只用来选 stop 文案，40 次武装全部空转。
+        I7（批 11）：武装决策记录纳入 idle 归因（probe 留档 readout 的
+        ``final`` / ``idle_ms``），「间隔类 miss」与「前缀漂移类 miss」在
+        决策面可分。任何失败静默（软失败契约）。
         """
         try:
             from hiveweave.config import settings
@@ -272,6 +369,7 @@ class CacheWarmer:
                 return
             snap = self._latest.get(agent_id)
             if not snap:
+                _not_armed(agent_id, "no_snapshot", level="debug")
                 return
             age_ms = (time.monotonic() - float(snap.get("ts") or 0.0)) * 1000.0
             if age_ms > WARM_SNAPSHOT_MAX_AGE_MS:
@@ -280,13 +378,33 @@ class CacheWarmer:
                     agent_id=agent_id,
                     age_ms=int(age_ms),
                 )
+                _not_armed(
+                    agent_id,
+                    "snapshot_stale",
+                    level="debug",
+                    age_ms=int(age_ms),
+                    max_age_ms=WARM_SNAPSHOT_MAX_AGE_MS,
+                )
                 return
+            # I7 决策侧：上次未命中的 idle 归因（probe 一次性消费后的留档
+            # 副本；无 ⇒ None，**不臆测**）。只进决策记录，不新设硬门 ——
+            # 决策规则仍用 pi 校准常量（0.15 / $0.05），防止无数据自研调参。
+            try:
+                from hiveweave.llm.streamer.probe import last_cache_readout
+
+                _readout = last_cache_readout(agent_id) or {}
+            except Exception:  # noqa: BLE001 — 归因缺失不阻塞武装
+                _readout = {}
+            last_miss_final = _readout.get("final")
+            last_miss_idle_ms = _readout.get("idle_ms")
             api_format = str((snap.get("model_config") or {}).get("provider_type") or "")
             ttl_ms = estimate_prompt_cache_ttl_ms(api_format)
             if ttl_ms is None:
+                _not_armed(agent_id, "cache_lifetime_unavailable", api_format=api_format)
                 return  # "cache lifetime unavailable" → 不续
             delay_ms = get_cache_warming_delay_ms(ttl_ms)
             if delay_ms is None:
+                _not_armed(agent_id, "ttl_below_margin", ttl_ms=ttl_ms)
                 return
             # ⭐ P1-1（审计 2026-09-26）：delay 超过 idle 安全上限 ⇒ **不武装**。
             # 病灶：默认 long_ttl=True ⇒ anthropic TTL=1h ⇒ delay=54min >
@@ -295,10 +413,11 @@ class CacheWarmer:
             # 还误导。1h 档的前缀存活靠 HIVEWEAVE_CACHE_CONTROL_LONG_TTL
             # 断点长 TTL 本身（写 1h 条目），不需要也不该续暖；idle 续暖
             # 仅对 delay ≤ 30min 的档位（当前即 5min 档）生效。
+            # ⚠ I7 生效决策「1h TTL 档只写不续」不许推翻（AI_MEMORY 拍板）。
             if delay_ms > MAX_IDLE_WARMING_AGE_MS:
-                log.info(
-                    "cache_warmer_skip_ttl_exceeds_idle_horizon",
-                    agent_id=agent_id,
+                _not_armed(
+                    agent_id,
+                    "ttl_exceeds_idle_horizon",
                     ttl_ms=ttl_ms,
                     delay_ms=delay_ms,
                     idle_horizon_ms=MAX_IDLE_WARMING_AGE_MS,
@@ -310,6 +429,34 @@ class CacheWarmer:
             if api_format == "anthropic" and bool(
                 (snap.get("model_config") or {}).get("supports_thinking")
             ):
+                _not_armed(
+                    agent_id,
+                    "not_replayable_thinking",
+                    api_format=api_format,
+                )
+                return
+            # ⭐ I6（批 11）：价格不可得 ⇒ **不武装**（fail-closed）。此前
+            # economics_available 只在到点后选 stop 文案 ⇒ 武装回执全绿、
+            # 调查者以为机制在跑（40 武装 / 0 触发实测）。missing 逐列列出
+            # 缺哪个必需价 ⇒ 回执可判定、可指导配置 llm_models 单价列。
+            prices, missing_prices = extract_model_prices(snap.get("model_config"))
+            if prices is None:
+                _not_armed(
+                    agent_id,
+                    "prices_unavailable",
+                    missing=missing_prices,
+                    model=str(
+                        (snap.get("model_config") or {}).get("model_id") or ""
+                    ),
+                    # 批 11 审计 P2-1：设置页价格输入尚不存在，hint 指向
+                    # 真实可用的 API 路径（前端补齐后再改回 UI 指引）。
+                    hint=(
+                        "为该模型配置单价（USD/1M tokens）："
+                        "PATCH /api/models/{model_id} body "
+                        "{priceInput, priceOutput, priceCacheRead, "
+                        "priceCacheWrite}"
+                    ),
+                )
                 return
             self.cancel(agent_id)  # 替换旧武装（先清计时器）
             run = _WarmRun(
@@ -319,6 +466,7 @@ class CacheWarmer:
                 messages=list(snap["messages"]),
                 tools=snap.get("tools"),
                 prompt_tokens=int(snap.get("prompt_tokens") or 0),
+                prices=prices,
                 ttl_ms=ttl_ms,
                 delay_ms=delay_ms,
                 started_at=time.monotonic(),
@@ -331,6 +479,10 @@ class CacheWarmer:
                 ttl_ms=ttl_ms,
                 delay_ms=delay_ms,
                 prompt_tokens=run.prompt_tokens,
+                # I7 决策侧：上次未命中归因（final=None ⇒ 无 readout 留档，
+                # 而非「无 miss」）。决策面据此区分「间隔类」与「前缀漂移类」。
+                last_miss_final=last_miss_final,
+                last_miss_idle_ms=last_miss_idle_ms,
             )
         except Exception as e:  # noqa: BLE001 — 续暖不得影响收口路径
             log.debug("cache_warmer_arm_failed", agent_id=agent_id, error=str(e))
@@ -391,8 +543,10 @@ class CacheWarmer:
                     )
                     self._runs.pop(run.agent_id, None)
                     return
+                # I6（批 11）：真实单价进决策（武装 gate 已保证 run.prices
+                # 非 None）—— 不再落回 DEFAULT_PRICES 硬编码 Anthropic 档价。
                 decision = compute_warm_decision(
-                    run.prompt_tokens, phase=run.phase
+                    run.prompt_tokens, prices=run.prices, phase=run.phase
                 )
                 if decision["action"] != "warm":
                     reason = (
@@ -407,6 +561,12 @@ class CacheWarmer:
                         expected_savings=round(
                             float(decision["expected_savings"]), 6
                         ),
+                        # I6：决策面回执带经济性位与真实价（可从回执判定
+                        # 「按什么价算的」；免费模型全零价 ⇒ economics False）。
+                        economics_available=bool(
+                            decision["economics_available"]
+                        ),
+                        prices=run.prices,
                     )
                     self._runs.pop(run.agent_id, None)
                     return

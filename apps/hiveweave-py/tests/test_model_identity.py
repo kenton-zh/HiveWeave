@@ -21,7 +21,8 @@ _COLS = (
     "id, name, model_id, base_url, api_key, provider_type, context_window, "
     "max_output_tokens, supports_thinking, thinking_format, default_reasoning_effort, "
     "temperature, is_active, fallback, tier, created_at, updated_at, "
-    "supports_vision, top_p, top_k, tool_call_rounds, model_family, thinking_mode"
+    "supports_vision, top_p, top_k, tool_call_rounds, model_family, thinking_mode, "
+    "price_input, price_output, price_cache_read, price_cache_write"
 )
 
 
@@ -35,6 +36,8 @@ def _mk_row(
         1, updated_at,
         # 新增可空列（模型配置重构）：默认值 = 存量行行为
         0, None, None, None, "", "",
+        # I6 价格四列（2026-09-27）：NULL = 不可得（存量行行为）
+        None, None, None, None,
     )
 
 
@@ -47,7 +50,7 @@ async def test_get_by_name_deterministic_latest_active():
         conn.execute(f"CREATE TABLE llm_models ({_COLS})")
         conn.executemany(
             f"INSERT INTO llm_models ({_COLS}) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 _mk_row("uuid-old-active", "deepseek-v4-flash", 1, 100),
                 _mk_row("uuid-new-active", "deepseek-v4-flash", 1, 300),
@@ -90,7 +93,7 @@ async def test_get_by_name_tie_breaks_by_id():
         conn.execute(f"CREATE TABLE llm_models ({_COLS})")
         conn.executemany(
             f"INSERT INTO llm_models ({_COLS}) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 _mk_row("uuid-a", "deepseek-v4-flash", 1, 100, name="平局名称"),
                 _mk_row("uuid-b", "deepseek-v4-flash", 1, 100, name="平局名称"),

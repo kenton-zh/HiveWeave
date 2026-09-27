@@ -24,7 +24,7 @@ from pydantic import BaseModel
 import structlog
 
 from hiveweave.llm.provider import _apply_opencode_gateway_headers
-from hiveweave.services.model import ModelService
+from hiveweave.services.model import InvalidModelConfig, ModelService
 
 log = structlog.get_logger(__name__)
 
@@ -564,6 +564,12 @@ class ModelCreate(BaseModel):
     thinkingMode: str | None = None  # ''=跟随默认 | 'on' | 'off'
     isActive: bool | None = None
     tier: str | None = None  # management | executor (None = 未分类)
+    # I6（批 11）：单价（USD / 1M tokens）。NULL = 价格不可得（cache_warmer
+    # 对不可得 fail-closed 不武装）；0.0 = 免费模型（合法值，与 NULL 不同形）。
+    priceInput: float | None = None
+    priceOutput: float | None = None
+    priceCacheRead: float | None = None
+    priceCacheWrite: float | None = None
 
 
 class ModelUpdate(BaseModel):
@@ -588,6 +594,11 @@ class ModelUpdate(BaseModel):
     thinkingMode: str | None = None  # ''=跟随默认 | 'on' | 'off'
     isActive: bool | None = None
     tier: str | None = None  # management | executor (None = 未分类)
+    # I6：单价四列（同上；PATCH 显式 null 穿透 ⇒ 清回「不可得」）。
+    priceInput: float | None = None
+    priceOutput: float | None = None
+    priceCacheRead: float | None = None
+    priceCacheWrite: float | None = None
 
 
 def _normalize_attrs(body: BaseModel, *, for_update: bool = False) -> dict:
@@ -621,6 +632,11 @@ def _normalize_attrs(body: BaseModel, *, for_update: bool = False) -> dict:
         "modelFamily": "model_family",
         "thinkingMode": "thinking_mode",
         "isActive": "is_active",
+        # I6（批 11）：单价四列 camelCase → snake_case
+        "priceInput": "price_input",
+        "priceOutput": "price_output",
+        "priceCacheRead": "price_cache_read",
+        "priceCacheWrite": "price_cache_write",
     }
     out: dict = {}
     for k, v in data.items():
@@ -679,6 +695,15 @@ def _model_response(model: dict) -> dict:
         "is_active": model.get("is_active"),
         "isActive": model.get("is_active"),
         "tier": model.get("tier"),
+        # I6（批 11）：单价四列双向回显（NULL = 不可得，前端据此提示未配置）
+        "price_input": model.get("price_input"),
+        "priceInput": model.get("price_input"),
+        "price_output": model.get("price_output"),
+        "priceOutput": model.get("price_output"),
+        "price_cache_read": model.get("price_cache_read"),
+        "priceCacheRead": model.get("price_cache_read"),
+        "price_cache_write": model.get("price_cache_write"),
+        "priceCacheWrite": model.get("price_cache_write"),
         "created_at": model.get("created_at"),
         "createdAt": model.get("created_at"),
         "updated_at": model.get("updated_at"),
@@ -749,6 +774,11 @@ async def create_model(body: ModelCreate) -> dict:
                 )
             except Exception as e:
                 log.warning("create_model_self_test_failed", error=str(e))
+    except InvalidModelConfig as e:
+        # 批 11 审计 P2-2：价格等用户手输数字的校验失败必须 422 带原文，
+        # 不许吞成裸 500（价格是第一个常规触发面）。
+        log.warning("create_model_invalid_config", error=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         log.error("create_model_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create model")
@@ -771,6 +801,10 @@ async def _update_model(model_id: str, body: ModelUpdate) -> dict:
     attrs = _normalize_attrs(body, for_update=True)
     try:
         await _model.update(model_id, attrs)
+    except InvalidModelConfig as e:
+        # 批 11 审计 P2-2：同 create——校验失败 422 带原文。
+        log.warning("update_model_invalid_config", model_id=model_id, error=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         log.error("update_model_failed", model_id=model_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to update model")

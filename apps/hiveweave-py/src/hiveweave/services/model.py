@@ -29,10 +29,39 @@ _DEFAULT_MAX_OUTPUT = 8_192
 
 _VALID_THINKING_MODES = ("", "on", "off")
 
-# SELECT 列表共用的扩展列（2026-08-26 模型配置重构新增）
+# SELECT 列表共用的扩展列（2026-08-26 模型配置重构新增；2026-09-27 I6 并入
+# 单价四列 —— get / find_by_name / list_all / list_active_full 四条读路都要
+# 带出价格，cache_warmer 的 model_config 才有唯一价格源可用）。
 _EXT_COLUMNS = (
-    "supports_vision, top_p, top_k, tool_call_rounds, model_family, thinking_mode"
+    "supports_vision, top_p, top_k, tool_call_rounds, model_family, thinking_mode, "
+    "price_input, price_output, price_cache_read, price_cache_write"
 )
+
+# I6（fixplan 批 11，2026-09-27）：单价四列 —— 全仓唯一价格源（单位 =
+# USD / 1M tokens）。NULL = 价格不可得（未配置），0.0 = 免费模型（真实
+# 可得）；消费方 cache_warmer.extract_model_prices 据此 fail-closed。
+# 列语义详见 db/schema.py llm_models 建表注释。
+_PRICE_KEYS = ("price_input", "price_output", "price_cache_read", "price_cache_write")
+
+
+def _normalize_price(value) -> float | None:
+    """单价归一：None 直通（= 不可得，落 NULL）；数值须为有限非负。
+
+    负价 / NaN / inf 是配置错误（会静默扭曲成本判据），在 Service 层
+    拒绝（InvalidModelConfig），绝不 clamp 后落库 —— 与物理不变量校验
+    （_validate_invariant）同一治本立场。
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as e:
+        raise InvalidModelConfig(f"价格须为数值（USD/1M tokens），实得 {value!r}") from e
+    if v != v or v in (float("inf"), float("-inf")):
+        raise InvalidModelConfig(f"价格须为有限数值，实得 {value!r}")
+    if v < 0:
+        raise InvalidModelConfig(f"价格不可为负（单位 USD/1M tokens），实得 {v}")
+    return v
 
 
 def _normalize_thinking_mode(value) -> str:
@@ -155,6 +184,11 @@ class ModelService:
             supports_thinking = 1
         elif thinking_mode == "off":
             thinking_format = FORMAT_OFF
+        # I6：单价四列（None = 不可得 → NULL；非法值在归一化时拒绝）
+        price_input = _normalize_price(attrs.get("price_input"))
+        price_output = _normalize_price(attrs.get("price_output"))
+        price_cache_read = _normalize_price(attrs.get("price_cache_read"))
+        price_cache_write = _normalize_price(attrs.get("price_cache_write"))
 
         # 物理不变量：max_output_tokens 必须严格小于 context_window。
         # 治本：非法配置在落库前拒绝，绝不 clamp 后悄悄写入。
@@ -167,14 +201,17 @@ class ModelService:
             "thinking_format, default_reasoning_effort, temperature, "
             "supports_vision, top_p, top_k, tool_call_rounds, "
             "model_family, thinking_mode, "
+            "price_input, price_output, price_cache_read, price_cache_write, "
             "is_active, tier, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?)",
             [model_pk, name, model_id, base_url, api_key,
              provider_type,
              context_window, max_output, supports_thinking,
              thinking_format, default_reasoning_effort, temperature,
              supports_vision, top_p, top_k, tool_call_rounds,
              model_family, thinking_mode,
+             price_input, price_output, price_cache_read, price_cache_write,
              is_active, tier, now_ms, now_ms])
         log.info("model_created", model_pk=model_pk, name=name, model_id=model_id)
         return {"id": model_pk, "name": name, "model_id": model_id}
@@ -257,6 +294,14 @@ class ModelService:
             if key in attrs:
                 fields.append(f"{key} = ?")
                 params.append(attrs[key])
+        # I6：单价四列同「可空数值」语义（键存在即写，None = 清回 NULL =
+        # 价格不可得）。⚠ 与 top_p 的差异：API 层对 update 用 exclude_unset
+        # （不是 exclude_none），显式 null 会穿透到这 ⇒ 用户可经 PATCH 把
+        # 价格清回「不可得」（cache_warmer 随之 fail-closed 不武装）。
+        for key in _PRICE_KEYS:
+            if key in attrs:
+                fields.append(f"{key} = ?")
+                params.append(_normalize_price(attrs[key]))
         if "model_family" in attrs and attrs["model_family"] is not None:
             fields.append("model_family = ?")
             params.append(attrs["model_family"] or "")

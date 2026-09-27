@@ -40,6 +40,12 @@ MODEL = {
     "provider_type": "openai-compatible",
     "context_window": 128_000,
     "max_output_tokens": 8_192,
+    # I6（批 11）：价格不可得 ⇒ 不武装（fail-closed）。本文件既有武装路径
+    # 用例按 DEFAULT_PRICES 同档配置单价，决策数学与批 G 逐字不变。
+    "price_input": 3.0,
+    "price_output": 15.0,
+    "price_cache_read": 0.30,
+    "price_cache_write": 3.75,
 }
 
 MESSAGES = [
@@ -390,6 +396,7 @@ def _make_run(agent_id: str, messages: list[dict]) -> cw._WarmRun:
         messages=messages,
         tools=TOOLS,
         prompt_tokens=300_000,
+        prices=dict(cw.DEFAULT_PRICES),
         ttl_ms=10_500,
         delay_ms=500,
         started_at=_time.monotonic(),
@@ -464,6 +471,7 @@ async def test_warm_usage_maps_anthropic_cache_read(fresh_warmer):
         messages=list(MESSAGES),
         tools=TOOLS,
         prompt_tokens=300_000,
+        prices=dict(cw.DEFAULT_PRICES),
         ttl_ms=10_500,
         delay_ms=500,
         started_at=0.0,

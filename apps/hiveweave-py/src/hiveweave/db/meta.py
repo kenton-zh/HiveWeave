@@ -15,12 +15,24 @@ import structlog
 from pathlib import Path
 from typing import Any
 
-from hiveweave.db.schema import META_DB_TABLES, META_DB_INDEXES
+from hiveweave.db.schema import (
+    META_DB_COLUMN_CHECKS,
+    META_DB_INDEXES,
+    META_DB_TABLES,
+)
 from hiveweave.config import settings as app_settings
 
 log = structlog.get_logger(__name__)
 
 _db: aiosqlite.Connection | None = None
+
+
+class MetaDbError(RuntimeError):
+    """Meta DB schema 自检失败（迁移断裂 ⇒ 关键列缺失）—— fail-loud。
+
+    与 db/project.py::ProjectDbError 同构：启动即崩比静默断账好
+    （TEST_DSH_37 P0-① 教训）。
+    """
 
 # R1: 保护 init_meta_db 的懒初始化，避免并发调用创建多个连接
 _init_lock = asyncio.Lock()
@@ -56,6 +68,13 @@ _META_MIGRATIONS: list[tuple[str, str, str]] = [
     ("llm_models", "model_family", "TEXT DEFAULT ''"),
     # '' = 跟随默认(现状) / 'on' / 'off'；用户意图，与 supports_thinking 能力位分离
     ("llm_models", "thinking_mode", "TEXT DEFAULT ''"),
+    # I6（fixplan 批 11，2026-09-27）：全仓唯一价格源四列（单位 = USD / 1M
+    # tokens，NULL = 不可得）。语义与消费方见 db/schema.py llm_models 建表
+    # 注释；存量老库由此补列，正典 DDL 已含（新库不跑）。
+    ("llm_models", "price_input", "REAL"),
+    ("llm_models", "price_output", "REAL"),
+    ("llm_models", "price_cache_read", "REAL"),
+    ("llm_models", "price_cache_write", "REAL"),
     # Bug K fix: per-project is_started flag (上班/下班)
     ("projects", "is_started", "INTEGER DEFAULT 0"),
     # P1 (spec §5.5b①)：外部只读参考目录（JSON 数组；file.py 读白名单扩展）
@@ -163,6 +182,28 @@ async def _migrate_meta_schema(conn: aiosqlite.Connection) -> None:
     _migrated = True
 
 
+async def _assert_meta_columns(conn: aiosqlite.Connection) -> None:
+    """Meta 侧建表自检（I6，fixplan 批 11）：关键列缺失 = 迁移断裂 = fail-loud。
+
+    与 db/project.py 对 ``PROJECT_DB_COLUMN_CHECKS`` 的消费同构
+    （TEST_DSH_37 P0-① 防护）：价格列缺失 ⇒ 唯一价格源断裂 ⇒ cache_warmer
+    全量退化为「价格不可得 ⇒ 永不武装」，必须启动即崩而不是静默丢功能。
+    ⚠ 为什么在 Meta 侧单独立检而不用 PROJECT_DB_COLUMN_CHECKS：llm_models
+    是 Meta 表，per-project DB 没有它 —— 见 db/schema.py::META_DB_COLUMN_CHECKS。
+    """
+    for table, required_cols in META_DB_COLUMN_CHECKS.items():
+        cur = await conn.execute(f"PRAGMA table_info({table})")
+        rows = await cur.fetchall()
+        cols = {row[1] for row in rows}
+        missing = required_cols - cols
+        if missing:
+            raise MetaDbError(
+                f"meta schema self-check failed: table '{table}' missing "
+                f"column(s) {sorted(missing)} — migration broken, "
+                f"price source would silently degrade (I6 fail-loud)"
+            )
+
+
 async def init_meta_db() -> None:
     """Initialize Meta DB — create tables and indexes if not exist.
 
@@ -199,6 +240,9 @@ async def init_meta_db() -> None:
 
         # Migrate: drop legacy tables + add missing columns
         await _migrate_meta_schema(_db)
+
+        # 建表自检（I6）：关键列缺失 = 迁移断裂，fail-loud（启动即崩）。
+        await _assert_meta_columns(_db)
 
         await _db.commit()
 
