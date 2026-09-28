@@ -190,6 +190,12 @@ apps/web/scripts/refactor-*
 .e2e-sandbox/
 .cursor/
 .superpowers/
+# ZCode（第三方 IDE）—— 同族：平台私有，非项目源码。
+# ⚠ `.zcodeignore` 是**那个工具自己的**排除清单（面向 ZCode，不面向 git），
+#   别误当成本仓 `.gitignore` 的副本；`.zcode/plans/*.md` 是它的会话计划稿。
+#   判据同 `.trae/`：clone 下来没有它们照样能构建/运行/测试。
+.zcode/
+.zcodeignore
 
 # Agent test playgrounds (nested git repos used by agent teams during tests —
 # committing them creates broken gitlinks without .gitmodules)
