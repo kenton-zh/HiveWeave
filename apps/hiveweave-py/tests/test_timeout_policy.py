@@ -89,6 +89,8 @@ def test_webfetch_declares_cooperative_timeout():
     assert declared_timeout_s("question") == 600.0
     assert declared_timeout_s("game_run_case") == 600.0
     assert declared_timeout_s("game_run_case_main") == 600.0
+    # A2（2026-09-28）：code audit 归 600s 重档，免被 300s 僵尸扫静默扫断
+    assert declared_timeout_s("request_code_audit") == 600.0
 
 
 @pytest.mark.asyncio

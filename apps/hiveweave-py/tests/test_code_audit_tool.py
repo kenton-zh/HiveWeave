@@ -10,6 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _audit_gate_on(monkeypatch):
+    """钉住 on 态机制（code_audit 通知钉卡）；off 语义由 test_submit_audit_gate_flag.py 负责。"""
+    from hiveweave.config import settings
+    monkeypatch.setattr(settings, "submit_audit_gate", "on")
+
 HEAD_SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
 
 
@@ -651,11 +658,12 @@ async def test_collect_worktree_diff_resolves_master_base():
         return table.get(tuple(args), (False, ""))
 
     with patch("hiveweave.services.git_worktree._git", new=fake_git):
-        diff = await collect_worktree_diff(r"C:\fake\wt")
+        res = await collect_worktree_diff(r"C:\fake\wt")
 
     assert ("diff", "master...HEAD") in calls
     assert ("diff", "main...HEAD") not in calls
-    assert "== diff master...HEAD ==" in diff
+    assert "== diff master...HEAD ==" in res.text
+    assert res.truncated is False  # T2：小 diff 不误标截断
 
 
 @pytest.mark.asyncio
@@ -670,12 +678,13 @@ async def test_collect_worktree_diff_no_base_keeps_head_and_untracked():
         (("diff", "master...HEAD"), (True, "SHOULD NOT BE USED")),
     )
     with patch("hiveweave.services.git_worktree._git", new=git):
-        diff = await collect_worktree_diff(r"C:\fake\wt")
+        res = await collect_worktree_diff(r"C:\fake\wt")
 
-    assert "== diff HEAD (uncommitted) ==" in diff
-    assert "== untracked fresh.py" in diff  # 文件不存在 → unreadable 标记兜底
-    assert "main...HEAD" not in diff
-    assert "master...HEAD" not in diff
+    assert "== diff HEAD (uncommitted) ==" in res.text
+    assert "== untracked fresh.py" in res.text  # 文件不存在 → unreadable 标记兜底
+    assert "main...HEAD" not in res.text
+    assert "master...HEAD" not in res.text
+    assert res.truncated is False
 
 
 @pytest.mark.asyncio
@@ -695,10 +704,11 @@ async def test_collect_worktree_diff_base_resolve_failure_fails_open():
             side_effect=RuntimeError("boom"),
         ),
     ):
-        diff = await collect_worktree_diff(r"C:\fake\wt")
+        res = await collect_worktree_diff(r"C:\fake\wt")
 
-    assert "== diff HEAD (uncommitted) ==" in diff
-    assert "main...HEAD" not in diff
+    assert "== diff HEAD (uncommitted) ==" in res.text
+    assert "main...HEAD" not in res.text
+    assert res.truncated is False
 
 
 # ── Peer model pick ──────────────────────────────────────────

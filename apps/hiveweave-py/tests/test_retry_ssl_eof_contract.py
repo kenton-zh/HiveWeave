@@ -7,9 +7,10 @@
 - 18% 的重试链打光预算 -> 原 MAX_RETRIES=2 过紧。
 
 本测试锁定三件事：
-1. 重试预算 = 5（DSH 同量级）。
+1. 重试预算 = 8（T33 2026-09-29 有意变更：任务口径「6 → 8」按总尝试计；
+   主链路已升级为波次级无界骑乘，本值现为通用/辅助路径的有界默认）。
 2. SSL EOF 在「消息分类」与「异常分类」两条路径都判为可重试。
-3. 不过度匹配：普通业务文本不得被误判可重试（否则永久错误白重试 5 次）。
+3. 不过度匹配：普通业务文本不得被误判可重试（否则永久错误白重试）。
 """
 
 from __future__ import annotations
@@ -34,8 +35,8 @@ REAL_SSL_EOF = (
 
 
 def test_retry_budget_matches_dsh():
-    """预算 5 次 —— 原 2 次导致 18% 重试链失败。"""
-    assert MAX_RETRIES == 5
+    """有界预算 8 次 —— T33 有意变更（原 5；主链路另为无界骑乘）。"""
+    assert MAX_RETRIES == 8
 
 
 def test_real_ssl_eof_is_retryable_by_message():

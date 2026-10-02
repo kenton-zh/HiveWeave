@@ -265,15 +265,67 @@ def test_span_advisory_fires_beyond_guidance():
 
 
 def test_span_advisory_skips_coordinator_add():
+    """修法②后 adding_coordinator 不再短路，但仍在指导值内 → 静默。"""
     from hiveweave.services.org_invariants import span_advisory
 
-    # Adding a coordinator IS the layering remedy — never nudged
     assert (
         span_advisory(
-            agents=_with_kids(7), parent_id="arch-1", adding_coordinator=True
+            agents=_with_kids(2), parent_id="arch-1", adding_coordinator=True
         )
         is None
     )
+
+
+def test_span_advisory_coordinator_add_evaluates_subtree():
+    """修法②：加中层那一刻恰是评估「加得够不够」的时刻——辖下总人数
+    仍超指导值时照常提示，文案为「加了这个中层后…仍有 N 人」。"""
+    from hiveweave.services.org_invariants import span_advisory
+
+    note = span_advisory(
+        agents=_with_kids(7), parent_id="arch-1", adding_coordinator=True
+    )
+    assert note is not None
+    assert "SPAN ADVISORY" in note
+    assert "辖下" in note
+    assert "仍有" in note  # adding_coordinator 场景的专属措辞
+    assert "直属" not in note  # 直属判据对加中层仍跳过
+
+
+def test_span_advisory_subtree_fires_when_direct_within_guidance():
+    """修法①：直属 ≤7 但辖下（含 indirect）超 7 —— subtree 判据单独触发。
+
+    形态：arch-1 直属 = eng-1 + 5 叶（+1 招聘 = 7，直属判据沉默），
+    eng-1 名下再挂 3 叶 → arch-1 辖下 9 人，+1 招聘 = 10 → 触发。
+    """
+    from hiveweave.services.org_invariants import span_advisory
+
+    agents = _with_kids(5)  # eng-1 + 5 叶都挂 arch-1（直属 6）
+    for i in range(3):
+        agents.append(
+            {
+                "id": f"grand-{i}",
+                "name": f"隔层花{i}",
+                "role": f"子模块{i}工程师",
+                "permission_type": "executor",
+                "parent_id": "eng-1",
+                "status": "active",
+                "short_id": f"G{i}",
+            }
+        )
+    note = span_advisory(agents=agents, parent_id="arch-1")
+    assert note is not None
+    assert "辖下（含间接下属）将达 10 人" in note
+    assert "的直属将达" not in note  # 直属 7 ≤ 7，直属判据不重复发声
+
+
+def test_span_advisory_flat_overflow_single_note():
+    """扁平组织直属超编时直属与 subtree 是同一事实，只发一条不重复刷屏。"""
+    from hiveweave.services.org_invariants import span_advisory
+
+    note = span_advisory(agents=_with_kids(7), parent_id="arch-1")
+    assert note is not None
+    assert note.count("SPAN ADVISORY") == 1
+    assert "直属将达 9" in note
 
 
 def test_span_advisory_transfer_exclude_keeps_count_stable():
@@ -336,3 +388,143 @@ def test_qa_depth_advisory_sufficient_depth_none():
     tasks = [{"title": "VERIFY: m1", "status": "created", "kind": "verify"}]
     assert qa_depth_advisory(agents=agents, tasks=tasks) is None
     assert qa_depth_advisory(agents=agents, tasks=None) is None
+
+
+# ── B3 ⑤：org_shape_signals（1 业务中层 + ≥6 叶子形态）─────────────
+
+
+def _coord(
+    id: str, name: str, parent: str | None, short: str, role: str = "技术负责人"
+) -> dict:
+    return {
+        "id": id,
+        "name": name,
+        "role": role,
+        "permission_type": "coordinator",
+        "parent_id": parent,
+        "status": "active",
+        "short_id": short,
+    }
+
+
+def _leaf(id: str, name: str, parent: str, short: str) -> dict:
+    return {
+        "id": id,
+        "name": name,
+        "role": f"模块{short}工程师",
+        "permission_type": "executor",
+        "parent_id": parent,
+        "status": "active",
+        "short_id": short,
+    }
+
+
+def test_org_shape_signals_single_coordinator_many_leaves():
+    from hiveweave.services.org_invariants import org_shape_signals
+
+    agents = [
+        _coord("ceo", "归零", None, "A1", role="ceo"),
+        _coord("mid", "知远", "ceo", "A2"),
+    ] + [_leaf(f"e{i}", f"花{i}", "mid", f"E{i}") for i in range(6)]
+    signals = org_shape_signals(agents=agents)
+    assert len(signals) == 1
+    assert "ORG SHAPE SIGNAL" in signals[0]
+    assert "知远" in signals[0]
+    assert "6 个叶子" in signals[0]
+    assert "非阻塞" in signals[0]
+
+
+def test_org_shape_signals_healthy_orgs_silent():
+    from hiveweave.services.org_invariants import org_shape_signals
+
+    # 两个中层分摊 6 叶 → 不触发
+    two_mid = [
+        _coord("ceo", "归零", None, "A1", role="ceo"),
+        _coord("m1", "知远", "ceo", "A2"),
+        _coord("m2", "云帆", "ceo", "A3"),
+    ] + [_leaf(f"e{i}", f"花{i}", "m1" if i < 3 else "m2", f"E{i}") for i in range(6)]
+    assert org_shape_signals(agents=two_mid) == []
+    # 1 中层只有 5 叶 → 不触发
+    small = [_coord("ceo", "归零", None, "A1", role="ceo"), _coord("m", "知远", "ceo", "A2")] + [
+        _leaf(f"e{i}", f"花{i}", "m", f"E{i}") for i in range(5)
+    ]
+    assert org_shape_signals(agents=small) == []
+    assert org_shape_signals(agents=None) == []
+
+
+# ── B3 ③④：charter paradigm/faces → 最低中层数 + 非阻塞校验 ────────
+
+
+def test_min_business_coordinators_mapping():
+    from hiveweave.services.org_invariants import min_business_coordinators
+
+    assert min_business_coordinators("solo") == 1
+    assert min_business_coordinators("flat_squad") == 1
+    assert min_business_coordinators("tech_lead") == 1
+    assert min_business_coordinators("pipeline") == 1
+    assert min_business_coordinators("pm_architect") == 2
+    assert min_business_coordinators("pod") == 2  # 未声明 pod 数 → 下限 2
+    assert min_business_coordinators("pod", pod_count=3) == 3
+    assert min_business_coordinators("unknown_paradigm") is None
+    assert min_business_coordinators("") is None
+
+
+def test_charter_shape_advisory_fires_on_faces_mismatch():
+    from hiveweave.services.org_invariants import charter_shape_advisory
+
+    agents = [
+        _coord("ceo", "归零", None, "A1", role="ceo"),
+        _coord("m1", "知远", "ceo", "A2"),
+    ]
+    note = charter_shape_advisory(
+        charter={"paradigm": "tech_lead", "faces": 4}, agents=agents
+    )
+    assert note is not None
+    assert "4 个" in note
+    assert "1 个业务中层" in note
+    assert "合并理由" in note
+    assert "非阻塞" in note
+
+
+def test_charter_shape_advisory_silent_states():
+    from hiveweave.services.org_invariants import charter_shape_advisory
+
+    agents = [
+        _coord("ceo", "归零", None, "A1", role="ceo"),
+        _coord("m1", "知远", "ceo", "A2"),
+        _coord("m2", "云帆", "ceo", "A3"),
+        _coord("m3", "青苔", "ceo", "A4"),
+        _coord("m4", "流火", "ceo", "A5"),
+    ]
+    # 中层数 ≥ faces → 沉默
+    assert (
+        charter_shape_advisory(
+            charter={"paradigm": "tech_lead", "faces": 4}, agents=agents
+        )
+        is None
+    )
+    # paradigm 自身声明多中层（pm_architect → 2）→ 跳过
+    assert (
+        charter_shape_advisory(
+            charter={"paradigm": "pm_architect", "faces": 4},
+            agents=agents[:2],
+        )
+        is None
+    )
+    # faces ≤ 1 → 沉默
+    assert (
+        charter_shape_advisory(
+            charter={"paradigm": "tech_lead", "faces": 1}, agents=agents[:2]
+        )
+        is None
+    )
+    # 旧 charter：无 paradigm/faces 字段 → 跳过校验（不拦旧数据）
+    assert charter_shape_advisory(charter={"title": "old"}, agents=agents[:2]) is None
+    assert charter_shape_advisory(charter=None, agents=agents) is None
+    # 未知范式 → 跳过
+    assert (
+        charter_shape_advisory(
+            charter={"paradigm": "death_star", "faces": 9}, agents=agents[:2]
+        )
+        is None
+    )

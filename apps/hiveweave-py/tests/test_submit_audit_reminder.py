@@ -11,6 +11,10 @@
 (f) attestationIds 含 code_audit kind → 被过滤，其余保留
 (g) TOOL_EXECUTE_AFTER hook handler 单测（成功记账 / 失败与无关工具忽略 / 坏输入不抛 / 账本异常吞掉）
 (h) ToolExecutor.execute 发射 hook 触发 handler
+
+批3（2026-09-29）：SUBMIT_AUDIT_GATE 默认 off ⇒ 成功回执的审计软提醒一并
+静默（审计归 QA 里程碑）。本文件钉的是提醒**机制**——fixture 显式
+flag=on 运行；off 静默行为由 tests/test_submit_audit_gate_flag.py 钉。
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ _REMINDER_MARKER = "[CODE AUDIT REMINDER]"
 @pytest.fixture(autouse=True)
 def code_audit_env(monkeypatch):
     """真实 services/code_audit 模块 + 按 agent 隔离账本 + reset_ledger 调用计数。"""
+    from hiveweave.config import settings
     from hiveweave.services import code_audit
 
     code_audit.reset_ledger(_AGENT)
@@ -43,6 +48,7 @@ def code_audit_env(monkeypatch):
         real_reset(agent_id)
 
     monkeypatch.setattr(code_audit, "reset_ledger", _spy_reset)
+    monkeypatch.setattr(settings, "submit_audit_gate", "on")
     yield state
     real_reset(_AGENT)
 

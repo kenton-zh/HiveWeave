@@ -210,6 +210,9 @@ TOOL_CAPABILITY: dict[str, frozenset[Capability]] = {
     "check_agent_progress": frozenset({Capability.SOURCE_READ}),
     "get_platform_state": frozenset({Capability.SOURCE_READ}),
     "get_tasks": frozenset({Capability.SOURCE_READ}),
+    # wait_on = 自我停泊登记（T16）：声明等待契约后回合安全挂起，事件到点唤醒。
+    # 全家族可用（_BASE_TOOLS 成员）；不写任何交付状态，属只读+自登记语义。
+    "wait_on": frozenset({Capability.SOURCE_READ}),
     "view_org_chart": frozenset({Capability.SOURCE_READ}),
     "git_worktree_list": frozenset({Capability.SOURCE_READ}),
     "git_worktree_status": frozenset({Capability.SOURCE_READ}),

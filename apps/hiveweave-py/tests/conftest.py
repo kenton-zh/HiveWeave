@@ -69,6 +69,24 @@ def _isolate_hiveweave_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_self_repeat_streaks():
+    """T9（2026-09-29）：每个用例前清空同参连击记忆。
+
+    ``_SELF_REPEAT_STREAKS`` 是进程级 per-agent 状态；不 reset 的话，
+    不同测试文件对同一 ``(agent_id, tool, args)`` 的多次 ``execute()``
+    会在进程内连击累计 —— 第 5 次触发 T9 拒绝，把与 T9 无关的用例
+    （如 test_i3_i4_unified_stamp 对 "a1"/run_tests 的 5 次连调）打红。
+    """
+    try:
+        from hiveweave.tools import executor as _exec_mod
+
+        _exec_mod.reset_self_repeat_streaks_for_tests()
+    except Exception:
+        pass
+    yield
+
+
 # ── meta DB 隔离（2026-09-23）──────────────────────────────────
 # 病灶：`tests/test_modules_tree.py::_make_project` 与
 # `tests/test_memory_sinking.py::_make_project` 都直接

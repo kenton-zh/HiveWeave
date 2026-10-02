@@ -142,31 +142,46 @@ async def test_every_policy_judge_matches_prescription_set(monkeypatch):
     这样「说明书说 A、判据做 B」的漂移会被打红，而无需对文案做子串断言
     （本仓禁文本判据 —— 换措辞即绕过的判据不是约束）。
     """
+    from hiveweave.config import settings
     from hiveweave.services.attestation import POLICY_REQUIRED_KINDS
     from hiveweave.services.tasks.policy import submit_expectations
 
+    # T42：本测试钉的是「说明书 == 判据」不被静默漂移。flag off（默认）时
+    # code_audit kind 被门禁与说明书**同源**剥离（另见
+    # test_t42_submit_gate_policy_strip.py），原始策略表口径需在 flag=on
+    # （门激活）下对照 —— 该状态下 strip 恒等。
     hard = {p: k for p, k in POLICY_REQUIRED_KINDS.items() if k}
     assert hard, "策略表为空，测试失去意义"
-    for policy, kinds in hard.items():
-        exp = submit_expectations({"id": "t", "policy_id": policy, "tags": []})
-        presc = set(exp["attestation_kinds"])
-        assert presc == set(kinds), (policy, presc, kinds)
+    with patch.object(settings, "submit_audit_gate", "on"):
+        for policy, kinds in hard.items():
+            exp = submit_expectations(
+                {"id": "t", "policy_id": policy, "tags": []}
+            )
+            presc = set(exp["attestation_kinds"] or ())
+            assert presc == set(kinds), (policy, presc, kinds)
 
-        rows = {f"a{i}": _row(k, id=f"a{i}") for i, k in enumerate(sorted(kinds))}
-        rows["surplus"] = _row("_surplus_probe")
-        svc = _svc_with_rows(monkeypatch, rows)
-        ids = list(rows)
-        ok, err = await svc.verify_ids("p", ids, expected_kinds=presc)
-        assert ok, f"{policy}: 集合+surplus 应通过，实得 {err}"
+            rows = {
+                f"a{i}": _row(k, id=f"a{i}")
+                for i, k in enumerate(sorted(kinds))
+            }
+            rows["surplus"] = _row("_surplus_probe")
+            svc = _svc_with_rows(monkeypatch, rows)
+            ids = list(rows)
+            ok, err = await svc.verify_ids("p", ids, expected_kinds=presc)
+            assert ok, f"{policy}: 集合+surplus 应通过，实得 {err}"
 
-        if presc:
-            drop = sorted(presc)[0]
-            kept = [
-                f"a{i}" for i, k in enumerate(sorted(kinds)) if k != drop
-            ]
-            svc2 = _svc_with_rows(monkeypatch, rows)
-            ok2, err2 = await svc2.verify_ids("p", kept, expected_kinds=presc)
-            assert not ok2, f"{policy}: 缺 {drop} 必须拒，实得 {err2}"
+            if presc:
+                drop = sorted(presc)[0]
+                kept = [
+                    f"a{i}"
+                    for i, k in enumerate(sorted(kinds))
+                    if k != drop
+                ]
+                svc2 = _svc_with_rows(monkeypatch, rows)
+                ok2, err2 = await svc2.verify_ids(
+                    "p", kept, expected_kinds=presc
+                )
+                assert not ok2, f"{policy}: 缺 {drop} 必须拒，实得 {err2}"
 
 
 @pytest.mark.asyncio

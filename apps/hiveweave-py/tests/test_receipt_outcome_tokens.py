@@ -99,8 +99,12 @@ async def test_merge_nothing_to_merge_token(tmp_path: Path):
     assert result.get("already_up_to_date") is True
     msg = str(result.get("message") or "")
     assert msg.startswith("outcome=nothing_to_merge:"), msg
-    # noop 防重复文案保留（test_verify_approve_and_untracked_merge 同款钉子）
-    assert "COMPLETE" in msg and "do not call git_worktree_merge again" in msg
+    # T22-①（S16）：nothing_to_merge = 没有发生任何合并。回执禁称
+    # COMPLETE（曾致 CEO 误判已合并、45 分钟双等死锁），必须陈述事实
+    # 并给核实处方。
+    assert "COMPLETE" not in msg, msg
+    assert "没有发生任何合并" in msg, msg
+    assert "git_worktree_status" in msg, msg
 
 
 # ── 2. git_worktree_status found 语义 ─────────────────────

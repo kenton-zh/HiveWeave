@@ -330,6 +330,17 @@ class HealthSupervisor:
         # 闭式）不同源也**不应**同源；守卫 verify_commit_license 的
         # 判据 (c) 排除 return True/None 正是为此。
         if not obligations and not inbound_ask and not waits:
+            # TEST_DSH_77：三空 ≠ 无活 —— 中层休眠形态（下属全员闲置 +
+            # 零派活）只在闭式 has_open_work 可见，不复核会在降级兜底
+            # 路径二次蒸发（与 game_time._check_silent_agents 的 Gate B
+            # 同构）。fail-closed：不豁免（纳入检测）。
+            try:
+                from hiveweave.services.task import TaskService
+
+                if await TaskService().has_open_work(project_id, agent_id):
+                    return False
+            except Exception:
+                return False
             return True
         return False
 

@@ -120,25 +120,41 @@ async def test_seed_language_falls_back_to_zh_when_meta_missing():
         assert await _resolve_seed_language("proj-x") == "zh"
 
 
-# ── H8: commit_turn hard rule present in identity + executor prompts ────────
+# ── H8: 回合出口纪律 —— T16 二期 auto 语义（commit_turn 提示词教学退役）──────
+# 旧版在 identity 里钉 🔴 HARD RULE 教学段；批 7 按「事实单源」删除该段。
+# T16 二期：TURN_EXIT_MODE=auto 下 commit_turn 从模型工具面下架（平台程序化
+# 收口），prompts 全部改教新语义——「干到干完」自然停 + `wait_on(refs)` 显式
+# 挂起；本绊线反向钉死：prompts 不得再出现任何 commit_turn 教学。
+# commit_turn 工具本体仍在注册表（legacy 分支在用），schema description 不动。
 
 
-def test_identity_prompt_has_commit_turn_hard_rule():
+def test_exit_discipline_auto_identity_keeps_wait_on_pointer():
     from hiveweave.prompts.identity import build_identity_prompt
+    from hiveweave.tools.executor import get_tool_description
 
+    # legacy owner 侧仍在：commit_turn schema description 保持 legacy 语义
+    desc = get_tool_description("commit_turn")
+    assert "MANDATORY end-of-turn" in desc
+    assert "MUST commit_turn" in desc
+    assert "Assistant text is NOT a return value" in desc
+
+    # identity：旧教学段不得复活（T16 二期：任何 commit_turn 字样禁绝），
+    # 出口指针改为新语义——干到干完 + wait_on
     prompt = build_identity_prompt("developer", "executor", "背景", name="n")
-    assert "HARD RULE" in prompt
-    assert "every turn MUST `commit_turn`" in prompt
-    assert "first turn included, no exception" in prompt
-    assert "TURN EXIT BLOCKED" in prompt
+    assert "commit_turn" not in prompt
+    assert "HARD RULE" not in prompt
+    assert "first turn included, no exception" not in prompt
+    assert "wait_on" in prompt
+    assert "干到干完" in prompt
 
 
-def test_executor_script_mentions_commit_turn():
+def test_executor_script_exit_discipline_auto_semantics():
     from hiveweave.prompts.executor import build_executor_script
 
     script = build_executor_script("developer", "n")
-    assert "commit_turn" in script
-    assert "TURN EXIT BLOCKED" in script
+    assert "commit_turn" not in script
+    assert "wait_on" in script
+    assert "干到干完" in script
 
 
 # ── H4: obligation hygiene ───────────────────────────────────────────────────

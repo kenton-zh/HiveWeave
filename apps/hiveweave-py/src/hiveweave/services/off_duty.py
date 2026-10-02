@@ -15,6 +15,19 @@ log = structlog.get_logger(__name__)
 
 OFF_DUTY_REPLY = "我已下班，上班后再聊 😊"
 
+#: 落库/流式统一挂的前缀（T13，2026-09-29）：这条应答是**平台**自动回的，
+#: 不代表任何 AI 处理过用户消息。78 实测 kickoff 同秒撞上下班态，纯文案
+#: 以 assistant role 落库后，后续轮次把原始规格误读成「已关闭轮次」的事。
+#: 前缀显式声明「未进入处理 + 需重新发送」，让任何后续读者（模型/人）
+#: 不会把这条当成「用户请求已被 assistant 处理完毕」的信号。
+OFF_DUTY_NOTICE_PREFIX = (
+    "[SYSTEM NOTICE — 项目当前下班，此条为平台自动应答，"
+    "不是 AI 对你消息的处理结果；你的消息未进入处理，"
+    "上班后请重新发送]"
+)
+#: 实际落库与流式广播的内容 = 前缀 + 原友好文案（UI 气泡直接可见）。
+OFF_DUTY_NOTICE_REPLY = f"{OFF_DUTY_NOTICE_PREFIX}{OFF_DUTY_REPLY}"
+
 
 async def is_project_off_duty(project_id: str | None) -> bool:
     """True when project missing or ``is_started`` is falsy."""
@@ -38,6 +51,11 @@ async def is_agent_off_duty(agent_id: str) -> bool:
 async def send_off_duty_auto_reply(agent_id: str) -> dict:
     """Persist assistant off-duty reply and push stream events for live UI.
 
+    T13（2026-09-29）：role 仍为 ``assistant``（UI 主栏过滤依赖它——role=system
+    会被面板谓词滤掉），但落库带 ``metadata.platform_notice=True`` 标记 +
+    content ``[SYSTEM NOTICE …]`` 前缀——平台通告语义，防止后续读者把它当成
+    「用户请求已被 assistant 处理完毕」的信号（78 实测 kickoff 规格被截胡）。
+
     Returns the saved chat_messages row dict ``{id, role, content, created_at}``.
     """
     chat = ChatMessageService()
@@ -45,11 +63,15 @@ async def send_off_duty_auto_reply(agent_id: str) -> dict:
         {
             "agent_id": agent_id,
             "role": "assistant",
-            "content": OFF_DUTY_REPLY,
+            "content": OFF_DUTY_NOTICE_REPLY,
             "is_streaming": False,
             "is_background": False,
             "is_read": True,
-            "metadata": {"source": "system", "kind": "off_duty_auto_reply"},
+            "metadata": {
+                "source": "system",
+                "kind": "off_duty_auto_reply",
+                "platform_notice": True,
+            },
         }
     )
 
@@ -64,14 +86,14 @@ async def send_off_duty_auto_reply(agent_id: str) -> dict:
                 "id": saved["id"],
                 "agentId": agent_id,
                 "role": "assistant",
-                "content": OFF_DUTY_REPLY,
+                "content": OFF_DUTY_NOTICE_REPLY,
             },
         )
         await status_event_bus.publish_stream_event(
             agent_id,
             {
                 "type": "text_delta",
-                "content": OFF_DUTY_REPLY,
+                "content": OFF_DUTY_NOTICE_REPLY,
                 "agentId": agent_id,
             },
         )
@@ -79,7 +101,7 @@ async def send_off_duty_auto_reply(agent_id: str) -> dict:
             agent_id,
             {
                 "type": "done",
-                "content": OFF_DUTY_REPLY,
+                "content": OFF_DUTY_NOTICE_REPLY,
                 "agentId": agent_id,
             },
         )

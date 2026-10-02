@@ -100,7 +100,10 @@ def _audit_env(tmp_path, prior_exit_code: int | None, prior_task: str | None):
         return prior_row
 
     async def fake_collect(worktree):
-        return ""  # 空 diff
+        # T2：collect_worktree_diff 返回 WorktreeDiff（text + truncated）。
+        from hiveweave.services.code_audit import WorktreeDiff
+
+        return WorktreeDiff(text="", truncated=False)  # 空 diff
 
     created: list[dict] = []
 

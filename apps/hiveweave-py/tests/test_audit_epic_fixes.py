@@ -747,36 +747,79 @@ def _norm(text: str) -> str:
 
 
 def test_identity_prompt_auto_retry_wording():
+    """批 7 瘦身：identity 的审计软失败跟进教学已删。本绊线钉：identity 侧
+    不以任何口径复活重试/waive 跟进教学。
+
+    2026-09-29 逐提交审计门拆除（配对批次，HIVEWEAVE_SUBMIT_AUDIT_GATE
+    默认 off）后，审计处方不再住 submit_task schema——owner 侧断言随之撤销，
+    由 test_submit_audit_gate_flag.py 按 flag 语义钉工具面。"""
     from hiveweave.prompts.identity import build_identity_prompt
 
     text = _norm(
         build_identity_prompt("开发工程师", "executor", "", name="阿蓝")
     )
-    assert "平台会自动排队重试并回填通知，等待即可" in text
-    assert "多次自动重试仍失败时才考虑 waive" in text
-    # 旧口径必须消失
+    # identity 侧：教学段删除后不得以任何口径复活
+    assert "平台会自动排队重试并回填通知，等待即可" not in text
+    assert "多次自动重试仍失败时才考虑 waive" not in text
     assert "仍失败就请协调者 waive" not in text
+    # 逐提交审计门退役后，identity 不复活任何「submit 等审计」教学
+    assert "SYSTEM AUDIT" not in text
+    assert "审计两条路" not in text
 
 
-def test_executor_prompt_auto_retry_wording():
+def test_executor_prompt_self_test_discipline_wording():
+    """逐提交审计门拆除（2026-09-29，配对批次有意变更）：executor 剧本审计节
+    改钉「自测纪律」契约——质量责任 = 自己的任务测试（submitGate 要求的，
+    真实通过并附证据）+ 自审；代码级审计是 QA 里程碑职责，不在提交路径上，
+    不要主动 request_code_audit 预审。
+
+    旧「两条路 / SYSTEM AUDIT 派单 / waiting_on 收尾」教学必须全部消失。"""
     from hiveweave.prompts.executor import build_executor_script
 
     for role in ("开发工程师", "测试工程师"):
         text = _norm(build_executor_script(role, "阿蓝"))
-        assert "平台会自动排队后台重试" in text, role
-        assert "无需申请豁免" in text, role
-        assert "多次自动重试（5 次）仍失败" in text, role
-        # 旧口径：教 agent 在 llm_failed 后主动请上级 waive —— 必须消失
-        assert "请他对这条任务" not in text, role
+        # 新契约：自测纪律 + 审计归 QA 里程碑
+        assert "自测纪律" in text, role
+        assert "代码级审计" in text, role
+        assert "里程碑" in text, role
+        # request_code_audit 只以「不要主动用 / QA 的工具」否定语境出现
+        assert "request_code_audit" in text, role
+        assert "不要**主动 `request_code_audit`" in text, role
+        # 旧口径：submit 触发审计门的整套教学 —— 必须消失
+        assert "CODE AUDIT DISCIPLINE" not in text, role
+        assert "SYSTEM AUDIT" not in text, role
+        assert "审计两条路" not in text, role
+        assert "零等待直过" not in text, role
+        assert "白烧" not in text, role
+        assert "工具级硬顶" not in text, role
+        assert "ref=<审计任务id>" not in text, role
+        assert "BEFORE submit_task" not in text, role
+        assert "平台会自动排队后台重试" not in text, role
+        assert "无需申请豁免" not in text, role
+        assert "多次自动重试（5 次）仍失败" not in text, role
 
 
 def test_coordinator_prompt_auto_retry_wording():
     from hiveweave.prompts.coordinator import build_coordinator_script
 
     text = _norm(build_coordinator_script("后端负责人", "阿蓝"))
-    assert "无需申请豁免" in text
-    assert "reasonKind=tool_failure" in text
-    assert "自动排队后台重试" in text
+    # 2026-09-29 审计门拆除：submit 不再触发代码审计，里程碑代码级审计归 QA 按需执行
+    assert "代码级审计" in text
+    assert "QA 的里程碑职责" in text
+    assert "request_code_audit" in text
+    # 旧「两条路 / 等审计 / 时延口径 / 软失败指针」必须消失
+    assert "CODE AUDIT DISCIPLINE" not in text
+    assert "审计两条路" not in text
+    assert "零等待直过" not in text
+    assert "SYSTEM AUDIT" not in text
+    assert "工具级硬顶" not in text
+    assert "不要因此重试" not in text
+    assert "按审计回执自带的处方走" not in text
+    assert "审计软失败" not in text
+    # 更早退役的旧散文保持不复活
+    assert "多次自动重试" not in text
+    assert "无人值守" not in text
+    assert "无需申请豁免" not in text
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,8 @@ _review_llm_post_with_retry（预算帽 110s）。批 B（审计 P0·L6）把 on
 链路整体流式化（llm/streamer/oneshot），旧函数删除，重试语义**重定义**：
 
 - 重试只对「连接失败 / 立即拒绝」（HTTP 429/5xx、connect 类异常、流未开口）
-  生效，最多额外 1 次；429/503 尊重 Retry-After（帽 MAX_DELAY_MS=30s）；
+  生效，最多额外 1 次；429/503 尊重 Retry-After（帽随
+  retry_max_delay_ms()，T33 2026-09-29 起默认 45s，env 可调）；
 - 退避会顶破剩余总时长预算 → 放弃重试直接上抛（本文件钉住）；
 - idle / 首 chunk / 总时长判死与流开口后的死亡一律不重试
   （行为回归在 test_oneshot_stream.py）。

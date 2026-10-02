@@ -412,7 +412,9 @@ async def test_submit_creates_review_obligation():
             "hiveweave.services.tasks.submit._query",
             AsyncMock(
                 side_effect=[
-                    [{"evidence": "{}"}],
+                    # T18：rows0 SELECT 现含 evidence+tags+title（审计卡溯源键
+                    # 保护要判卡片）；stub 镜像生产 SELECT 列。
+                    [{"evidence": "{}", "tags": "[]", "title": "feat"}],
                     [{
                         "assignee_id": "exec1",
                         "creator_id": "ceo1",
@@ -421,6 +423,8 @@ async def test_submit_creates_review_obligation():
                         "title": "feat",
                         # #11：stub 必须镜像生产的 SELECT 列（submit_task 读 kind）
                         "kind": None,
+                        # T18：pin SELECT 现含 evidence（审计卡 reviewer 解析读溯源）
+                        "evidence": "{}",
                     }],
                 ]
             ),

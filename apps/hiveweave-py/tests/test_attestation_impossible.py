@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from hiveweave.config import settings
 from hiveweave.db import project as project_db
 from hiveweave.services import attestation as att_module
 from hiveweave.services import task as task_module
@@ -109,7 +110,11 @@ async def env():
         with patch(
             "hiveweave.db.meta.get_project_workspace",
             fake_get_project_workspace,
-        ):
+        ), patch.object(settings, "submit_audit_gate", "on"):
+            # 批3：本文件钉的是「impossible 事实位消化」机制——默认要求
+            # code_audit 的旧门形态。SUBMIT_AUDIT_GATE 默认 off 后机制保留
+            # 可回切，故 fixture 显式 flag=on（off 行为见
+            # tests/test_submit_audit_gate_flag.py）。
             yield {"workspace_path": workspace_path, "repo_path": repo_path}
 
         async with project_db._ensure_lock:

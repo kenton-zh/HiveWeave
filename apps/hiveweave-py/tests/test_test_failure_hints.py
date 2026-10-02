@@ -9,7 +9,11 @@
 1. `_maybe_append_test_anchor_hint`（B-1 P1-1 ②，既有）：
    测试类命令 + 权限/拒绝类失败 ⇒ 指**可写锚点**（$env:TEMP 私有目录、共享缓存换 cache-dir）；
 2. `_maybe_append_node_isolation_hint`（#18，2026-09-16）：
-   node 测试运行器 + **EPERM** ⇒ 指**同进程隔离**（`--experimental-test-isolation=none`）。
+   node 测试运行器 + **EPERM** ⇒ 指**同进程隔离**（`--experimental-test-isolation=none`）；
+3. `_maybe_append_spawn_eperm_hint`（T35，D85 实测）：
+   回执含 **spawn 痕迹 + EPERM** ⇒ 一次交底 **Windows 沙箱 spawn 边界**
+   （cmd.exe/.cmd shim 与沙箱内子进程不可用；直调目标 exe 不受影响；
+   依赖安装走平台白名单通道或 vendor），幂等。
 
 ⚠ 两条都是**失败提示（advisory）**：只用"命令里有什么 + 输出里有什么"这两个**观测**事实，
 不做门禁、不推断意图 ⇒ 文本判据在这里是**可接受**的（本仓禁用文本判据针对的是**门禁**）。
@@ -24,6 +28,7 @@ import pytest
 
 from hiveweave.tools.bash import (
     _maybe_append_node_isolation_hint,
+    _maybe_append_spawn_eperm_hint,
     _maybe_append_test_anchor_hint,
     _maybe_append_test_hints,
 )
@@ -31,6 +36,7 @@ from hiveweave.tools.bash import (
 _ANCHOR = "Sandbox anchor hint"
 _NODE_NOTE = "Sandbox pipe boundary"
 _ISOLATION_FLAG = "--experimental-test-isolation=none"
+_SPAWN_NOTE = "Windows sandbox spawn boundary"
 
 
 # ── 老提示（回归保护：此前无守卫）────────────────────────────────
@@ -48,13 +54,89 @@ def test_anchor_hint_still_fires_for_pytest_permission_wall():
     [
         ("node --test t.js", "1 failing: expected 1 to equal 2"),
         ("pytest -q", ""),
-        ("", "spawn EPERM"),
         ("git status", "fatal: not a git repository"),
     ],
 )
 def test_no_hint_when_nothing_matches(command: str, error: str):
-    """反向对照：**没命中就一个字都不加**（提示必须是零扰动的旁支）。"""
+    """反向对照：**没命中就一个字都不加**（提示必须是零扰动的旁支）。
+
+    ⚠ 有意变更（T35）：原参数表里的 `("", "spawn EPERM")` 不再"零扰动"——
+    spawn 类 EPERM 现在正是 spawn 边界处方的触发面（与命令文本无关），该形态
+    移入下方 `test_spawn_eperm_prescription_*` 正向用例。
+    """
     assert _maybe_append_test_hints(command, error) == error
+
+
+# ── T35（D85）：spawn 类 EPERM ⇒ Windows 沙箱 spawn 边界处方 ────────────
+
+
+@pytest.mark.parametrize(
+    "command,error",
+    [
+        ("npm install", "Error: spawnSync C:/WINDOWS/system32/cmd.exe EPERM"),
+        ("node --test t.js", "error: 'spawn EPERM'\n  code: 'EPERM'"),
+        ("pnpm build", "Error: spawn cmd.exe EPERM"),
+        ("uv run pytest -q", "operation not permitted: spawn python EPERM"),
+    ],
+)
+def test_spawn_eperm_prescription_fires(command: str, error: str):
+    """★ T35 验收：回执 error 含 spawn 痕迹 + EPERM ⇒ 必须追加沙箱 spawn 边界处方。
+
+    D85 实测：agent 在回执只有 node 报错时烧 3+ 轮自行摸边界（cmd.exe shim
+    被拦 / node 直跑放行 / 子进程 spawn 全拦）——处方把边界与出路一次交底。
+    判据与命令文本无关（error 面观测），空 command 也必须命中。
+    """
+    for msg in (error, _maybe_append_test_hints(command, error)):
+        out = _maybe_append_spawn_eperm_hint(command, msg)
+        assert _SPAWN_NOTE in out, out
+        # 处方三要素：不可用面 / 不受影响面 / 依赖安装出路
+        assert "cmd.exe" in out and "node.exe" in out, out
+    # 必须同时断"链真的接了它"（生产走链，不走单函数）
+    chain = _maybe_append_test_hints(command, error)
+    assert _SPAWN_NOTE in chain, (
+        f"spawn 处方没接进链（生产路径不过这个函数）：{chain[:200]!r}"
+    )
+
+
+def test_spawn_eperm_prescription_idempotent():
+    """幂等：同回执（已带处方的文本再进链/再进函数）不重复追加。"""
+    once = _maybe_append_test_hints("npm install", "Error: spawn cmd.exe EPERM")
+    assert once.count(_SPAWN_NOTE) == 1, once
+    twice = _maybe_append_test_hints("npm install", once)
+    assert twice == once, "同回执被重复追加处方"
+    also_once = _maybe_append_spawn_eperm_hint("npm install", once)
+    assert also_once == once
+
+
+def test_spawn_eperm_prescription_not_fired_on_other_failures():
+    """反向对照：普通失败 / 文件锁型 EPERM（无 spawn 痕迹）⇒ 不追加 spawn 处方。
+
+    文件锁型 EPERM 的正确出路是锚点提示（换 cache/temp），给它 spawn 处方
+    会把人推向错误方向（F1 审计同款误诊防线）。
+    """
+    for command, error in (
+        ("npm test", "1 failing: expected 1 to equal 2"),
+        ("git status", "fatal: not a git repository"),
+        ("pytest -q", "Error: EPERM: operation not permitted, unlink "
+                      "'<ws>/node_modules/.cache/x'"),
+        ("", ""),
+    ):
+        out = _maybe_append_spawn_eperm_hint(command, error)
+        assert _SPAWN_NOTE not in out, (command, error, out)
+
+
+def test_spawn_prescription_coexists_with_node_note_and_lock_stays_anchor_only():
+    """★ 组合面不回归：node --test 撞 spawn EPERM ⇒ 两条处方并存（互补不互斥）；
+    文件锁型 EPERM ⇒ 仍然只有锚点提示、绝不出 spawn 处方（F1 基线保持）。"""
+    spawn_out = _maybe_append_test_hints("node --test t.js", "error: 'spawn EPERM'")
+    assert _NODE_NOTE in spawn_out and _SPAWN_NOTE in spawn_out, spawn_out
+    lock_err = ("Error: EPERM: operation not permitted, unlink "
+                "'<ws>/node_modules/.cache/x'")
+    lock_out = _maybe_append_test_hints("node --test t.js", lock_err)
+    assert _ANCHOR in lock_out, lock_out
+    assert _SPAWN_NOTE not in lock_out, (
+        "文件锁型 EPERM 被误诊成 spawn 边界（会让人放弃换 cache/temp 的正确修法）"
+    )
 
 
 # ── #18 新提示 ──────────────────────────────────────────────────

@@ -336,9 +336,13 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
 )
 
-# A plausible short-id / dotted UUID reference: 8-32 hex chars (short prefix
-# or full UUID with dashes stripped). Anything else is NOT a task id — skip
-# the DB round-trip entirely (avoids hangs on non-task refs like "task-1").
+# A plausible short-id / dotted UUID reference: 8-32 hex chars **after
+# dash-stripping** — short prefixes with or without the dash the platform's
+# own 12-char slices carry (`str(uuid)[:12]` = "xxxxxxxx-xxx", A1 批2).
+# Always test ``raw.replace("-", "")`` against this regex. Anything else is
+# NOT a task id — skip the DB round-trip entirely (avoids hangs on non-task
+# refs like "task-1"; their dash-stripped forms contain non-hex chars and
+# correctly fail here, so synthetic ids are never corrupted).
 _HEX_REF_RE = re.compile(r"^[0-9a-fA-F]{8,32}$")
 
 
@@ -372,7 +376,13 @@ async def canonical_task_id(project_id: str, task_id: str | None) -> str | None:
     # Not a UUID-shaped reference (short prefix or full UUID) — return the raw
     # value unchanged WITHOUT a DB round-trip. Guard prevents hangs when a
     # non-task ref (e.g. "task-1") flows through a canonicalization call.
-    if not _HEX_REF_RE.fullmatch(raw):
+    # A1 批2: dash-strip BEFORE the shape test so the platform's own 12-char
+    # slices ("xxxxxxxx-xxx", minted by the legacy platform_state ledger and
+    # still present in historical rows) reach the DB resolution + full-id
+    # equality below instead of failing open as raw here (evidence-gate
+    # deadlock). Non-UUID refs stay raw: their dash-stripped forms are not
+    # hex ("t-invalidate-3" → "tinvalidate3") and correctly fail the test.
+    if not _HEX_REF_RE.fullmatch(raw.replace("-", "")):
         return raw
     try:
         from hiveweave.services.task import TaskService
@@ -392,6 +402,54 @@ async def _task_ids_equal(project_id: str, a: str | None, b: str | None) -> bool
     if ca is not None and cb is not None:
         return ca == cb
     return _norm_task_ref(a) == _norm_task_ref(b)
+
+
+async def require_canonical_task_id(
+    project_id: str, task_id: str | None
+) -> str | None:
+    """Resolve a task reference to the canonical id for attestation writes.
+
+    Write-side (fail-closed) counterpart of :func:`canonical_task_id`:
+
+    - empty → ``None``;
+    - full UUID → canonical form (lowercase, dash-stripped), no DB call;
+    - UUID-shaped short prefix (8-31 hex after dash-strip, dashed or not) →
+      resolved via ``TaskService.require_task_id``; failure → ``ValueError``
+      whose receipt carries the copy-the-full-id prescription (A1 批2 ——
+      带横线 12 字符切片曾原样透传入库，判等侧解析不开 ⇒ 证据门死锁);
+    - non-UUID synthetic ids ("task-1") → raw passthrough (legacy semantics,
+      never dash-stripped).
+
+    Every attest-class write path funnels through
+    :meth:`AttestationService.create`, which gates here — so
+    attest_doc_review / waive / impossible / soft-fail share one judge.
+    """
+    if not task_id:
+        return None
+    raw = str(task_id).strip()
+    if not raw:
+        return None
+    if _is_full_uuid(raw):
+        return _norm_task_ref(raw)
+    if not _HEX_REF_RE.fullmatch(raw.replace("-", "")):
+        return raw
+    from hiveweave.services.task import TaskService
+
+    resolved = None
+    resolve_err = None
+    try:
+        resolved = await TaskService().require_task_id(project_id, raw)
+    except Exception as e:  # noqa: BLE001 — 拒绝回执要带真实解析错误
+        resolve_err = str(e)
+    if not resolved:
+        raise ValueError(
+            f"attestation task_id unresolvable — '{raw}' is neither a full id "
+            "nor a resolvable short prefix in this project. Copy the FULL id "
+            "from the task ledger (get_tasks / get_platform_state ledger) — "
+            "do not truncate — and retry with the full id."
+            + (f" ({resolve_err})" if resolve_err else "")
+        )
+    return _norm_task_ref(resolved)
 
 
 class AmbiguousAttestationId(ValueError):
@@ -769,31 +827,15 @@ class AttestationService:
         if stdout_hash is None and stdout is not None:
             stdout_hash = hash_stdout(stdout)
 
-        # 40 轮第 4 步（凭证 task_id 写入侧校验）：UUID 形态的截断 id 必须
-        # 补全为完整 UUID 后落库——门禁按 task_id 比对凭证归属，截断值会
-        # 「凭证属于别的任务」误判（41 实测 4 次）。补全失败（任务不存在/
-        # 歧义）→ fail-loud 拒绝写入，回执给 expected/actual 两侧值。
-        # 非 UUID 形态（合成 id 如 "task-1"）保持原样（canonical 既有语义）。
+        # 40 轮第 4 步（凭证 task_id 写入侧校验）+ A1 批2：所有 UUID 形态的
+        # 截短 id（含平台旧切片铸造的带横线 "xxxxxxxx-xxx" 形态）必须在落库
+        # 前归一成完整 id——门禁按 task_id 比对凭证归属，截短值会「凭证属于
+        # 别的任务」误判（41 实测 4 次）。解析失败（任务不存在/歧义）→
+        # fail-closed 拒绝写入，回执附「复制完整 id 重试」处方；非 UUID 形态
+        # （合成 id 如 "task-1"）保持原样（canonical 既有语义）。守门单点在
+        # require_canonical_task_id，attest 类工具入口共用同一判据。
         if task_id:
-            raw_tid = str(task_id).strip()
-            if _HEX_REF_RE.fullmatch(raw_tid) and not _is_full_uuid(raw_tid):
-                from hiveweave.services.task import TaskService
-
-                resolved = None
-                resolve_err = None
-                try:
-                    resolved = await TaskService().require_task_id(
-                        project_id, raw_tid
-                    )
-                except Exception as e:  # noqa: BLE001
-                    resolve_err = str(e)
-                if not resolved:
-                    raise ValueError(
-                        "attestation task_id unresolvable — expected full "
-                        f"UUID in project, actual '{raw_tid}'"
-                        + (f" ({resolve_err})" if resolve_err else "")
-                    )
-                task_id = resolved
+            task_id = await require_canonical_task_id(project_id, task_id)
         art = None
         if artifact_hashes is not None:
             art = (
@@ -802,11 +844,9 @@ class AttestationService:
                 else artifact_hashes
             )
         ch = commit_hash if commit_hash is not None else commit
-        # Root cause: store the canonical full UUID so later exact-match gates
-        # (submit verify, review evidence, core-interaction) never fail on a
-        # short-id prefix the agent passed at creation time.
-        if task_id:
-            task_id = await canonical_task_id(project_id, task_id)
+        # task_id 已在上面的 require_canonical_task_id 守门处归一成 canonical
+        # 完整 id（或合成 id 原样透传）——后续精确判等门（submit verify /
+        # review evidence / core-interaction）不再撞创建时传入的短前缀。
         await execute_by_project(
             project_id,
             "INSERT INTO tool_attestations "
@@ -861,9 +901,12 @@ class AttestationService:
         await cur.close()
         if row:
             return dict(row)
-        # Unique prefix among this project's rows (8-32 hex). Exact-first
-        # above: an 8-char primary key is never LIKE-matched.
-        if not _HEX_REF_RE.fullmatch(raw):
+        # Unique prefix among this project's rows (8-32 hex after dash-strip —
+        # models truncate attestation ids the same way they truncate task ids,
+        # dashed 12-char slices included; the LIKE clauses below already try
+        # both dashed and undashed forms). Exact-first above: an 8-char
+        # primary key is never LIKE-matched.
+        if not _HEX_REF_RE.fullmatch(raw.replace("-", "")):
             return None
         like = raw.lower() + "%"
         cur = await conn.execute(
@@ -2118,8 +2161,14 @@ def policy_required_kinds_label(policy_id: str) -> str:
     供 ``get_tasks`` / ``get_platform_state`` 每行透出（``evidence=``），
     把 submitGate 契约前置到任务列表可见 —— 而不是等提交被拒才看到。
     soft policy（无 kind 要求）返回空串（行上不显示）。
+    T42：经 ``strip_code_audit_kind_for_gate`` 与门禁同源 —— flag off 时
+    code_audit kind 不是可达契约，标签不得展示。
     """
-    kinds = required_attestation_kinds(policy_id or "")
+    from hiveweave.services.code_audit import strip_code_audit_kind_for_gate
+
+    kinds = strip_code_audit_kind_for_gate(
+        required_attestation_kinds(policy_id or "")
+    )
     if kinds is None:
         return ""
     return ",".join(sorted(kinds))
@@ -2499,8 +2548,14 @@ async def check_task_attestations(
     policy_id = ledger_policy_id(
         task, tags=tags if isinstance(tags, list) else None
     )
-    needed = required_attestation_kinds(policy_id)
-    from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+    # T42：flag off ⇒ 任务级 submitGate 政策里的 code_audit kind 结构性剥离
+    # （与 submit preflight 同源同判据，S19 收口）。
+    from hiveweave.services.code_audit import (
+        drop_code_audit_kind_if_soft,
+        strip_code_audit_kind_for_gate,
+    )
+
+    needed = strip_code_audit_kind_for_gate(required_attestation_kinds(policy_id))
 
     # 报告 Layer 6 第 4 行（安全修复）：此处原先在漏斗之外再用
     # ``drop_impossible_attestation_kinds(needed, evidence)`` 消费「物理无法

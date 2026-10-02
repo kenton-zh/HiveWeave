@@ -2,7 +2,7 @@
 
 面（DSH 参照哲学：死亡可接受、恢复靠 durable 触发、任务保持 claimed）：
 1. 上游死亡 → durable 重醒已排（复用 agent_waits kind=timer + phase=
-   upstream_recovery；60s/180s/600s 退避封顶 3 次，次数持久化）；
+   upstream_recovery；60s/180s/600s 退避封顶 6 次——T33.3 可续期，次数持久化）；
 2. 非上游死亡 → 不排；
 3. 通知去重窗：300s 内 2 死 → 给 CEO 一条 ORG_ESCALATION 汇总；窗内只发
    一条；重醒耗尽升级独立于此窗（每 agent 30min 一条）；
@@ -172,14 +172,25 @@ async def test_real_contract_true_for_region_and_5xx_exhaustion():
     assert not is_upstream_death(PermanentError("balance", status=402))
 
 
-async def test_backoff_ladder_persisted_and_exhausts_after_three(seeded_project):
-    """60s/180s/600s 退避、次数持久化（含已清除行）、第 4 次耗尽不排。"""
+async def test_backoff_ladder_persisted_and_exhausts_after_six(seeded_project):
+    """60s/180s/600s×4 退避、次数持久化（含已清除行）、第 7 次耗尽不排。
+
+    T33.3（2026-09-29）有意变更：封顶 3 → 6 可续期（每次续期幂等）。
+    """
     from hiveweave.services.wait_contract import (
         schedule_upstream_recovery_wait,
         wait_contract_service,
     )
 
-    expected = [(1, 60_000), (2, 180_000), (3, 600_000)]
+    # T33.3（2026-09-29）：封顶 3 → 6 可续期；退避第 3 次起饱和 600s。
+    expected = [
+        (1, 60_000),
+        (2, 180_000),
+        (3, 600_000),
+        (4, 600_000),
+        (5, 600_000),
+        (6, 600_000),
+    ]
     for attempt, delay in expected:
         # 排在过去（created + delay < now）→ 立即可被 clear_expired 触发
         past = int(time.time() * 1000) - delay - 10_000
@@ -191,10 +202,10 @@ async def test_backoff_ladder_persisted_and_exhausts_after_three(seeded_project)
         assert out["delay_ms"] == delay
         cleared = await wait_contract_service.clear_expired(PROJECT_ID, AGENT_ID)
         assert [w["id"] for w in cleared] == [out["wait_id"]]
-    out4 = await schedule_upstream_recovery_wait(
+    out7 = await schedule_upstream_recovery_wait(
         PROJECT_ID, AGENT_ID, run_id="r1", now_ms=past
     )
-    assert out4 == {"scheduled": False, "exhausted": True, "attempt": 3}
+    assert out7 == {"scheduled": False, "exhausted": True, "attempt": 6}
 
 
 async def test_no_stacked_wake_while_pending(seeded_project):
@@ -400,7 +411,7 @@ async def test_wake_source_for_pending_detects_upstream_recovery():
     from hiveweave.agents.trigger import wake_source_for_pending
 
     digest = (
-        "[WAIT_TIMEOUT] Your wait (timer:" + WAKE_TEXT + "(attempt=1/3)) expired. "
+        "[WAIT_TIMEOUT] Your wait (timer:" + WAKE_TEXT + "(attempt=1/6)) expired. "
         "ask_outstanding=False. Resume work or re-establish a wait. "
         "details={'wait_ref': '...', 'wait_kind': 'timer', "
         "'wakeup_reason': 'upstream_recovery', 'merged_wait_ids': ['x']}"

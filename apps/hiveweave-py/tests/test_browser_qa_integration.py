@@ -86,7 +86,10 @@ def test_ceo_and_hr_know_browser_qa():
     hr = build_coordinator_script("hr", "天线")
     assert "browse" in hr and "qa" in hr
     assert "测试工程师" in hr
-    assert "从上到下匹配" in hr
+    # 批 7 瘦身：HR 纪律技能匹配表（slug 枚举，owner=skill_registry）已删；
+    # HR 段单源保留「纪律技能自主决定 + 测试岗必绑 browse/qa」两条行为契约。
+    assert "自主决定" in hr
+    assert "测试岗必绑" in hr
 
 
 def test_identity_requires_browse_for_ui_e2e():

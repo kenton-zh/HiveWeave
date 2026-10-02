@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -24,16 +25,26 @@ from hiveweave.services import failure_signature as fs_mod
 
 
 def test_p2_2_positive_dialect_section_carries_lastexitcode_prescription():
-    """正：方言段固定「判成败看 $LASTEXITCODE」+ if(<cmd>) 等价处方。"""
-    from hiveweave.prompts.executor import _SHELL_DIALECT_SECTION
+    """正：$LASTEXITCODE 处方唯一 owner = bash 工具描述常量（批7 迁移）。
 
-    assert "$LASTEXITCODE" in _SHELL_DIALECT_SECTION
-    assert "if (git cat-file -e" in _SHELL_DIALECT_SECTION, (
+    2026-09-28 批7 提示词瘦身：方言段 20→3 行，`$LASTEXITCODE` 独有知识
+    从 prompts/executor.py 的 `_SHELL_DIALECT_SECTION` 迁入
+    `tools/bash.py::BASH_TOOL_DESCRIPTION`（工具 schema 通道，与代码同
+    commit）。方言段只留 pwsh 指认 + unix 拦截句。归因口径
+    （command_failed ≠ 方言问题）的 owner = fact 位/回执与 qa_lead 剧本，
+    不再进 executor 散文 —— 相应旧断言随迁移一并删除（有意变更）。
+    """
+    from hiveweave.prompts.executor import _SHELL_DIALECT_SECTION
+    from hiveweave.tools.bash import BASH_TOOL_DESCRIPTION
+
+    # 方言段瘦身后仍保留 pwsh 指认 + 「拦截并附等价写法」句
+    assert "PowerShell (pwsh)" in _SHELL_DIALECT_SECTION
+    assert "等价写法" in _SHELL_DIALECT_SECTION
+    # $LASTEXITCODE 独有知识的唯一 owner = 工具描述常量
+    assert "$LASTEXITCODE" in BASH_TOOL_DESCRIPTION
+    assert "if (git cat-file -e" in BASH_TOOL_DESCRIPTION, (
         "必须点名本次实锤的 `if (git cat-file -e …)` 陷阱形态"
     )
-    # 归因口径：command_failed（自测失败）不计方言问题
-    assert "command_failed" in _SHELL_DIALECT_SECTION
-    assert "不是方言问题" in _SHELL_DIALECT_SECTION
 
 
 def test_p2_2_positive_section_injected_into_both_shell_roles():
@@ -53,6 +64,9 @@ def test_p2_2_negative_detect_untranslated_unix_untouched():
 
     判据：`detect_untranslated_unix` 只存在于 tools/bash.py 的检测侧，
     方言段文本不得引用/改写它（修法明确只动提示词文本）。
+    2026-09-28 批7 收窄：`$LASTEXITCODE` 处方已合法迁入
+    `BASH_TOOL_DESCRIPTION` 常量（描述层，模型可见面）——「检测代码不得
+    混入提示词处方」的断言随之收窄到检测函数源码本身。
     """
     from hiveweave.prompts.executor import _SHELL_DIALECT_SECTION
     from hiveweave.tools import bash as bash_mod
@@ -61,10 +75,12 @@ def test_p2_2_negative_detect_untranslated_unix_untouched():
         "检测函数必须原样存在"
     )
     assert "detect_untranslated_unix" not in _SHELL_DIALECT_SECTION
-    src = Path(bash_mod.__file__).read_text(encoding="utf-8")
-    assert "$LASTEXITCODE" not in src, (
-        "检测代码里不得混入提示词处方（提示词层修复，不动检测）"
+    assert "$LASTEXITCODE" not in inspect.getsource(
+        bash_mod.detect_untranslated_unix
+    ), (
+        "检测代码里不得混入提示词处方（处方 owner = 工具描述常量）"
     )
+    assert "$LASTEXITCODE" in bash_mod.BASH_TOOL_DESCRIPTION
 
 
 # ── P2-4：worktree husk 具名恢复码 + 持锁者探针 ──────────────────────

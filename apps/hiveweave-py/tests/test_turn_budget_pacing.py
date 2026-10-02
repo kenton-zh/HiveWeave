@@ -22,8 +22,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import hiveweave.llm.streamer.tool_loop as tool_loop_module
+from hiveweave.config import settings
 from hiveweave.llm.streamer.core import Streamer
 from hiveweave.llm.streamer.tool_exec import ToolExecMixin
+
+
+@pytest.fixture(autouse=True)
+def _pin_legacy_turn_exit_mode(monkeypatch):
+    """本文件全部用例钉 legacy 回合出口模式（T16 二期补钉）。
+
+    本文件守的是 **legacy 墙钟预算** 疏通层（pacing 提示 / 硬预算收口
+    文案 / 轮闸），这些闸口在 auto 下按设计整体退役（``_turn_budget_armed``
+    = False ⇒ hard_deadline=None ⇒ 全部闸口跳过）。conftest 的
+    ``_isolate_hiveweave_env`` 会剥掉进程 env，开发机 ``.env`` 的
+    ``HIVEWEAVE_TURN_EXIT_MODE=auto`` 渗入后这些用例全数空转假红——
+    被测行为 owner 是 legacy 分支，就地钉住，不随灰度漂。
+    """
+    monkeypatch.setattr(settings, "turn_exit_mode", "legacy")
+    yield
 
 
 class _FakeClock:

@@ -620,13 +620,15 @@ class CacheWarmer:
         # 条目、尾部全价，warmCost 系统性低估 10-20×（$0.05 闸门失真）。
         # 哨兵是每请求的临时副本（不入库、不回写），快照按「恰如落库时」
         # 钉形状是对的；重放时套同一条规则即与线上 wire 形状逐字节一致。
-        # ⚠ 常量从 llm/streamer/constants 导入（与 http_stream 同源），
-        # 勿另立文案。
-        from hiveweave.llm.streamer.constants import CONTINUE_SENTINEL
+        # ⚠ 文案从 llm/streamer/constants 的 continue_sentinel_text() 取
+        # （与 http_stream 同源同函数），勿另立文案。
+        from hiveweave.llm.streamer.constants import continue_sentinel_text
 
         warm_messages = list(run.messages)  # 不改写快照
         if warm_messages and warm_messages[-1].get("role") != "user":
-            warm_messages.append({"role": "user", "content": CONTINUE_SENTINEL})
+            warm_messages.append(
+                {"role": "user", "content": continue_sentinel_text()}
+            )
         body = provider.build_body(
             messages=warm_messages,
             stream=False,

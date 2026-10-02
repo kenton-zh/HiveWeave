@@ -258,10 +258,13 @@ async def test_merge_same_commit_with_unrelated_untracked_ok(tmp_path: Path):
     )
     assert result.get("success") is True, result
     assert result.get("already_up_to_date") is True
-    # noop 回执必须带"勿重复调用"指引（TEST_DSH_31: 云栖 noop 后 10 分钟内
-    # 重复调 merge 4 次，换姿势重试浪费 4 个 LLM 轮次）
+    # T22-①（S16）：nothing_to_merge = 没有发生任何合并 —— 回执只陈述
+    # 事实 + 核查处方（TEST_DSH_31 的防重试教育由事实与处方承载；
+    # 曾自称「The merge is COMPLETE」导致 CEO/牧云 45 分钟双等死锁）。
     msg = str(result.get("message") or "")
-    assert "COMPLETE" in msg and "do not call git_worktree_merge again" in msg
+    assert "COMPLETE" not in msg, msg
+    assert "没有发生任何合并" in msg, msg
+    assert "git_worktree_status" in msg, msg
 
 
 @pytest.mark.asyncio

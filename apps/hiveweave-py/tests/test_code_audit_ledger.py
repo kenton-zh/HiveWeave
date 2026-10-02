@@ -21,6 +21,13 @@ import asyncio
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _audit_gate_on(monkeypatch):
+    """钉住 on 态机制（code_audit 通知钉卡）；off 语义由 test_submit_audit_gate_flag.py 负责。"""
+    from hiveweave.config import settings
+    monkeypatch.setattr(settings, "submit_audit_gate", "on")
+
+
 @pytest.fixture
 def isolated_ledger(tmp_path, monkeypatch):
     """Point the Meta DB at a temp path, (re)initialize it, and empty the
