@@ -803,6 +803,24 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
 
     # ②.5 P0-3: clean .stale-* rename-aside residue + process-aware husk removal
     if wt_root.is_dir():
+        # P1-6（AGENTS.md 锁死契约）：.stale-* aside 是 worktree 目录的整体
+        # 改名，内含被封条的 `.git` gitdir 指针 ⇒ 删前必须解锁，否则
+        # PermissionError 被 ignore_errors 吞成静默残留。best-effort，
+        # 失败留痕不挡清理（与 _rmtree_husk 内的解锁同款）。
+        if any(
+            c.name.startswith(".stale-") for c in wt_root.iterdir() if c.is_dir()
+        ):
+            try:
+                from hiveweave.services.acl_sandbox.service import (
+                    unlock_git_lockdown,
+                )
+
+                unlock_git_lockdown(workspace_path)
+            except Exception as exc:  # noqa: BLE001 — 解锁失败不挡清理，留痕
+                log.debug(
+                    "git_worktree.reconcile_stale_unlock_failed",
+                    root=workspace_path, error=str(exc),
+                )
         for child in sorted(wt_root.iterdir()):
             if not child.is_dir():
                 continue
@@ -815,6 +833,15 @@ async def reconcile_worktrees(workspace_path: str) -> dict:
                     log.info(
                         "git_worktree.reconcile_stale_dir_removed",
                         workspace=workspace_path, dir=str(child),
+                    )
+                else:
+                    # P1-6：删不净必须留痕（此前是静默 no-op）——锁死的
+                    # aside 永久残留会让下轮 reconcile 空转。
+                    log.warning(
+                        "git_worktree.reconcile_stale_dir_survived",
+                        workspace=workspace_path, dir=str(child),
+                        hint="Stale aside dir locked (check the .git pointer "
+                        "seal / holding process).",
                     )
                 continue
             # Husk: dir exists, no .git, not registered

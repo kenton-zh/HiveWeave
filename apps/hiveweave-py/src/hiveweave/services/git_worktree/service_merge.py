@@ -545,13 +545,18 @@ class MergeMixin:
                 # TEST_DSH_62 P5/L8：merge 回执文本带稳定 outcome token
                 # （merged / already_merged / nothing_to_merge 三语义），
                 # 模型唯一可见通道是文本——不加结构化字段。
+                # T22-①（S16）：回执只陈述事实，禁称 COMPLETE —— 0 commit
+                # ahead = 没有任何合并发生。此前「The merge is COMPLETE」
+                # 让 CEO 误以为已合并、executor 以为 CEO 已 merge，45 分钟
+                # 双等死锁。事实 + 核查处方（prompt-authoring §3）。
                 "message": (
                     f"outcome=nothing_to_merge: branch {branch} has 0 "
                     f"commits ahead of {target_branch} — nothing to merge. "
-                    f"The worktree is already up to date with {target_branch}."
-                    " The merge is COMPLETE — do not call "
-                    "git_worktree_merge again; the task auto-closes after "
-                    "the grace period."
+                    f"当前分支相对 {target_branch} 零提交"
+                    "（nothing to merge）——没有发生任何合并。"
+                    "若你预期合并已发生：检查分支名与 worktree 状态"
+                    "（git_worktree_list / git_worktree_status），"
+                    "或向任务相关方确认。"
                 ),
                 "branch": branch,
                 "ahead": 0,

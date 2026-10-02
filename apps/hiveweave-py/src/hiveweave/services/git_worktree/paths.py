@@ -91,30 +91,83 @@ def _has_git(path: str) -> bool:
     return (Path(path) / ".git").exists()
 
 
+def _project_root_guess(path: Path) -> str:
+    """从 worktree 路径反推项目根（解锁用，best-effort）。
+
+    规范形 ``<proj>/.hiveweave/worktrees/<sid>`` → 取 ``.hiveweave`` 祖先的
+    父目录。反推不到（畸形路径）时退回路径自身 —— ``unlock_git_lockdown``
+    对无 ``.git`` 目录的路径是安全 no-op。
+    """
+    for anc in path.parents:
+        if anc.name.lower() == ".hiveweave":
+            return str(anc.parent)
+    return str(path)
+
+
 def _force_clear_path(path: str) -> bool:
     """Remove a path so ``git worktree add`` can reuse it.
 
     Windows often leaves a non-git husk (e.g. only ``node_modules``) that
-    ``rmtree(..., ignore_errors=True)`` cannot fully delete while files are
-    locked — then ``worktree add`` fails with "already exists" and we stamp
-    a false ``worktree_error``. Rename-aside lets add proceed.
+    cannot be fully deleted while files are locked — then ``worktree add``
+    fails with "already exists" and we stamp a false ``worktree_error``.
+    Rename-aside lets add proceed.
+
+    P1-6（2026-10-02 实测：SandboxUnavailable / worktree_rebuild / cwd 不存在
+    连环）两条硬规矩：
+
+    1. **AGENTS.md Git/ACL 锁死契约**：本路径删的是 ``.git`` 附近路径
+       （worktree 内含被封条的 ``.git`` gitdir 指针）⇒ rmtree 前必须先
+       ``unlock_git_lockdown()``，否则轻则 PermissionError、重则半删出
+       「gitdir 指针空壳」→ 该 agent 工具面全灭（沙箱校验 fail-closed）。
+       解锁 best-effort：失败降级继续但记 warning（真实判据是随后的删除状态）。
+    2. **去掉 ``ignore_errors=True`` 的静默语义**：显式捕获异常 + 删后验证。
+       Windows 文件锁（agent 进程还活着）删不掉/移不走是合法路径 ⇒ 走
+       「rename-aside 也失败 ⇒ 返回 False」，让上层（service_create 的
+       repair / relocation 分支）报错，绝不静默宣称已清。
     """
     p = Path(path)
     if not p.exists():
         return True
-    shutil.rmtree(path, ignore_errors=True)
+    try:
+        from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
+
+        unlock_git_lockdown(_project_root_guess(p))
+    except Exception as exc:  # noqa: BLE001 — 解锁失败不挡清理，留痕即可
+        log.warning(
+            "git_worktree.force_clear_unlock_failed",
+            path=path,
+            root=_project_root_guess(p),
+            error=str(exc),
+        )
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        log.warning(
+            "git_worktree.force_clear_rmtree_failed",
+            path=path,
+            error=str(exc),
+        )
     if not p.exists():
         return True
     try:
         dest = p.parent / f".stale-{p.name}-{int(time.time() * 1000)}"
         p.rename(dest)
-        shutil.rmtree(dest, ignore_errors=True)
-        log.info(
-            "git_worktree.stale_path_moved_aside",
-            path=path,
+    except OSError as exc:
+        # rename-aside 也失败 ⇒ 上层报错（repair / relocation），不静默。
+        log.error("git_worktree.force_clear_failed", path=path, error=str(exc))
+        return False
+    try:
+        shutil.rmtree(dest)
+    except OSError as exc:
+        log.warning(
+            "git_worktree.force_clear_aside_rmtree_failed",
             aside=str(dest),
-            aside_gone=not dest.exists(),
+            error=str(exc),
         )
-    except Exception as e:
-        log.warning("git_worktree.force_clear_failed", path=path, error=str(e))
+    log.info(
+        "git_worktree.stale_path_moved_aside",
+        path=path,
+        aside=str(dest),
+        aside_gone=not dest.exists(),
+    )
     return not Path(path).exists()

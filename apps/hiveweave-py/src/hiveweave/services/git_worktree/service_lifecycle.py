@@ -386,8 +386,21 @@ class LifecycleMixin:
                 ["worktree", "remove", fwd_path, "--force"], workspace_path
             )
         if not ok:
-            # Worktree may not be registered — delete directory manually
-            shutil.rmtree(path, ignore_errors=True)
+            # Worktree may not be registered — delete directory manually.
+            # P1-6：去掉 ignore_errors=True 的静默语义 —— 失败显式捕获留异常
+            # 明细；删没删净由下方 ①' 后置条件实测（removed=False 透出），
+            # 此处只补「为什么没删掉」的归因线索。锁死解锁已在上方 ① 前做。
+            # 先 stat：remove 报失败但目录实际已消失时，不再记假警告。
+            if Path(path).exists():
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    log.warning(
+                        "git_worktree.delete_manual_rmtree_failed",
+                        short_id=short_id,
+                        path=path,
+                        error=str(exc),
+                    )
             await _git(["worktree", "prune"], workspace_path)
 
         # ①' **后置条件：目录到底还在不在**（0-2，独立审计 Q7③ 修正）。
