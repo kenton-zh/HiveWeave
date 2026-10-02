@@ -1,0 +1,33 @@
+{
+  "_comment": "批5 prompts 四类绊线基线（tests/test_prompt_sync_tripwires_b5.py）。family_tool_gap = 该 family 渲染提示词点名、但不在 permission allowlist 的已注册工具差集：只允许缩（清掉点名/补授权后 --write）；增长 = :483 型矛盾或新的否定语境点名，须 --allow-grow 显式登记。channel_unconstructed_markers = prompts 提到、后端无构造点的标记（现存违规登记，修源后删除该条）。数值 allowlist 与非工具白名单在本文件内（带 owner 注记），不入 JSON。",
+  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_prompt_sync_tripwires_b5 --write [--allow-grow]",
+  "family_tool_gap": {
+    "ceo": [
+      "hire_agent",
+      "run_tests"
+    ],
+    "coordinator_builder": [
+      "hire_agent",
+      "message_user",
+      "run_smoke"
+    ],
+    "executor_base": [
+      "dispatch_task",
+      "message_user",
+      "request_code_audit",
+      "review_task",
+      "save_charter",
+      "waive_attestation"
+    ],
+    "hr": [
+      "apply_patch",
+      "dispatch_task",
+      "edit_file",
+      "message_user",
+      "review_task",
+      "save_charter",
+      "waive_attestation"
+    ]
+  },
+  "channel_unconstructed_markers": {}
+}

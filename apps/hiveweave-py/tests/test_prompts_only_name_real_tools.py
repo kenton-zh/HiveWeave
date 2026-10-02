@@ -210,7 +210,10 @@ def test_extractor_ignores_enum_values_and_config_keys():
     人一次性加进白名单 —— 门禁就死了）。这里钉死精确口径。
     """
     for noisy in (
-        "每轮必须 `commit_turn(phase=in_progress|waiting|blocked|done_slice)` 收尾",
+        # T16 二期新形态：真工具名 + 参数形状出现在叙述里（无调用动词），
+        # 抽取口径同样不得把它当「被要求调用」—— 真工具名进反引号叙述
+        # 是合法写法，粗口径会把它和调用式命令混为一谈。
+        "等人决策：优先 `ask_agent` + `wait_on(refs=[{kind:agent, ref:花名}])`",
         "派 QA 时用 `submitGate=module_visual`",
         "`unit` → 可 consume `test_run`",
         "系统会自动给任务带一份交付契约（`contract_json`）",

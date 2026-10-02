@@ -640,8 +640,9 @@ def test_matrix16_no_bypass_recipes_in_prompts():
         hit = _find_severity_block_recipe(desc)
         assert hit is None, f"TOOL_PARAM_SCHEMAS 描述残留披露：{hit!r}"
     # 阳性对照：扫描真的在读文件内容 —— (a) 档合法取值应能扫到
+    # （旧金丝 `test_run:` 随批 7 identity 瘦身移除；改钉红线保留的 shared 通道段）
     identity = (prompts_dir / "identity.py").read_text(encoding="utf-8")
-    assert "test_run:" in identity
+    assert ".hiveweave/shared/" in identity
 
 
 def test_matrix16_conjunction_detector_positive_controls():

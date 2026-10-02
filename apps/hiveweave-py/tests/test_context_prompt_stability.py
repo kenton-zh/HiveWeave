@@ -5,6 +5,8 @@
   更新通知依赖；删掉 set_agent_*_version 调用会卡死该通知）。
 - T4.3：``policy_required_kinds_label`` 与 verify_ids 的 kind 口径一致
   （soft → 空串；required → 排序逗号清单；未知 policy → fail-close 哨兵）。
+- T42：label 与门禁同源 —— flag off（默认）时 code_audit kind 被结构性
+  剥离，标签不再展示；flag=on 还原全清单（审计门回切语义）。
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hiveweave.config import settings
 from hiveweave.services.attestation import policy_required_kinds_label
 
 
@@ -24,10 +27,17 @@ def test_label_soft_policy_is_empty():
 
 def test_label_required_policy_lists_sorted_kinds():
     assert policy_required_kinds_label("generic_tests") == "test_run"
-    assert (
-        policy_required_kinds_label("code_audit_visual")
-        == "browse_e2e,code_audit"
-    )
+    # T42：off（默认）⇒ code_audit kind 不是可达契约，标签随之剥离
+    assert policy_required_kinds_label("code_audit_visual") == "browse_e2e"
+    assert policy_required_kinds_label("code_audit") == ""
+    assert policy_required_kinds_label("code_audit_unit") == "test_run"
+    # on ⇒ 旧门回切，标签还原全清单（与 flag=on 的门禁同源）
+    with patch.object(settings, "submit_audit_gate", "on"):
+        assert (
+            policy_required_kinds_label("code_audit_visual")
+            == "browse_e2e,code_audit"
+        )
+        assert policy_required_kinds_label("code_audit") == "code_audit"
 
 
 def test_label_unknown_policy_fails_closed_with_sentinel():

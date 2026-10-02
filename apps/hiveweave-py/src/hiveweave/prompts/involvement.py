@@ -19,6 +19,14 @@ from __future__ import annotations
 # 但 streamer 在 charter 完全缺失 / legacy 自由文本时回落为 high。
 DEFAULT_LEVEL: str = "high"
 
+# ── 单源加冕（批 7 提示词瘦身，2026-09-28）─────────────────────
+# G5 · 决策路由唯一源：下面 _LEVEL_BEHAVIORS 是「哪个级别的决策问谁」的唯一
+# 权威表述。identity/_DECISION_BLOCK 与 coordinator/executor 剧本只留触发点
+# 指针（「按 User Involvement 级别路由，见动态注入段」），不复述级别行为。
+# G6 · waive 纪律通用表述唯一源：_INVARIANT 是「让渡决策权≠让渡诚实义务 +
+# waive 逐条边界」的唯一通用表述。identity/_ETHOS_BLOCK 等只留触发点一句
+# （「CEO 对该任务已 waive_attestation 除外」），不复述全文。
+
 
 _LEVEL_BEHAVIORS: dict[str, str] = {
     "high": (

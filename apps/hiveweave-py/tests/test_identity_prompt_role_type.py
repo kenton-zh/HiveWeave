@@ -110,12 +110,28 @@ def test_generic_coordinator_is_designer_and_seamer():
     assert "定稿前不得向 HR 招人、不得派活" in text
     assert "player-coach" not in text
     assert "自己写骨架" not in text
-    # 接缝之外的实现必须下派；solo 单兵例外保留
+    # 接缝之外的实现必须下派；solo 单兵例外保留（批 7 改写后口径：solo 单兵（无下级））
     assert "接缝之外的实现必须派给下级 executor" in text
-    assert "solo 单兵例外" in text
+    assert "solo 单兵（无下级）" in text
     # Phase 0.5 改为设计先行 + 分两段汇报
     assert "Domain Design" in text
     assert "待审查定稿" in text
+
+
+def test_generic_coordinator_dispatch_first_iron_rule():
+    """T5（D77 实测）：设计稿 merge 后的下一步永远是 dispatch_task——骨架/harness/
+    环境准备是第一条 dispatched 任务的一部分，不是中层先做的事。
+
+    病灶：技术负责人以「MAIN 无骨架，派活前得先搭好」为由连续三回合不 dispatch，
+    自己写骨架撞沙箱、环境探查烧完预算。铁律句必须钉在 Generic 中层剧本 Phase 0.5
+    （定稿动作序列）末尾，且点名该合理化借口。
+    """
+    text = build_coordinator_script(ARCHITECT, "青梧")
+    assert "下一步永远是 `dispatch_task`" in text
+    assert "骨架、harness、环境准备" in text
+    assert "不是你先做的事" in text
+    # 合理化借口必须被点名反驳（负面规则带正面替代）
+    assert "不是自己动手的理由" in text
 
 
 def test_ceo_script_no_player_coach_leftover():
@@ -167,7 +183,9 @@ def test_identity_hire_config_permission_type_only_uses_coordinator_script():
     )
     assert "You are a COORDINATOR" in text
     assert ARCHITECT in text
-    assert "{kind:agent" in text
+    # 批 7 瘦身 + T16 二期：identity 的 kind 形状枚举已删（owner =
+    # wait_on 工具说明 + 校验回执），共享块只留指针句。
+    assert "合法 kind 与条目形状以 `wait_on` 工具说明与校验回执为准" in text
     assert "## Permission Level: coordinator" in text
 
 
@@ -227,3 +245,20 @@ def test_generic_executor_probe_self_check_rule_present():
     assert "探针自检" in script
     assert "故障时它会转红" in script
     assert "平台只给骨架与纪律" in script
+
+
+def test_identity_pins_assistant_text_channel_discipline():
+    """T42（S19 屿洲实测）：长回合里模型把排查过程流式写进 assistant 正文，
+    UI 一团乱麻。钉 content 通道纪律句：正文 = 状态与结论，过程叙述写
+    work_log，不在正文直播排查。共享效率块（全角色）+ executor 剧本半句。"""
+    key = "不要在正文里直播排查过程"
+    for role, role_type in ((ARCHITECT, "coordinator"), ("签到排行榜工程师", "executor")):
+        text = build_identity_prompt(role, role_type, "", name="青梧")
+        assert key in text, role
+        # 三段式正文契约与 work_log 出路必须同句在场（缺一即退化为空洞禁令）
+        assert "正文只放：当前状态、关键发现、下一步" in text, role
+        assert "写 work_log" in text, role
+    # executor 剧本的同款半句（generic executor 的 Communication Style 段）
+    script = build_executor_script("开发工程师", "阿蓝")
+    assert "不在正文里直播" in script
+    assert "排查过程写 work_log" in script

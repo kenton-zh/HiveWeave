@@ -1,10 +1,10 @@
 {
  "_comment": "文本判据棘轮冻结清单（2026-09-14）。见 tests/test_text_judge_ratchet.py。只允许缩减；新增需人判档位后显式登记。table 档 = 名单型文本表（精确率高，零容忍）；regex 档 = 模块级 re.compile 常量（含解析用正则，口径偏宽）。⚠ 白名单里的 B/C 档是允许的；A 档（自由自然语言）是待清理债务。⚠ 本棘轮只覆盖模块级顶层赋值，不覆盖局部变量/行内字面量/复合语句内赋值/海象 —— 见 test_text_judge_ratchet.py docstring「不覆盖什么」。",
  "_regenerate": "cd apps/hiveweave-py && uv run python -m tests.test_text_judge_ratchet --write",
- "_total": 156,
+ "_total": 164,
  "_by_tier": {
-  "table": 26,
-  "regex": 130
+  "table": 30,
+  "regex": 134
  },
  "_suffixes": [
   "_NEEDLES",
@@ -28,6 +28,8 @@
   "api/auth.py",
   "api/chat.py",
   "api/debug.py",
+  "api/projects.py",
+  "conversation/store.py",
   "conversation/token_utils.py",
   "llm/error_codes.py",
   "llm/provider.py",
@@ -58,6 +60,7 @@
   "services/tasks/migrate_verify_kind.py",
   "services/tasks/timeline.py",
   "services/tasks/verdict_claim_check.py",
+  "services/user_directive_sla.py",
   "services/venv_setup.py",
   "services/wait_contract.py",
   "services/worktree_review.py",
@@ -75,7 +78,7 @@
  "entries": {
   "agents/agent.py::_MAIN_LOOP_UPSTREAM_KEYWORDS": {
    "tier": "table",
-   "line": 144
+   "line": 139
   },
   "agents/trigger.py::_WATCHDOG_CONTEXT_MARKERS": {
    "tier": "table",
@@ -93,6 +96,18 @@
    "tier": "regex",
    "line": 428
   },
+  "api/projects.py::_MULTI_SURFACE_KEYWORDS": {
+   "tier": "table",
+   "line": 142
+  },
+  "api/projects.py::_SOLO_SIGNAL_KEYWORDS": {
+   "tier": "table",
+   "line": 133
+  },
+  "conversation/store.py::FAILED_TURN_CONTENT_MARKERS": {
+   "tier": "table",
+   "line": 68
+  },
   "conversation/token_utils.py::_CJK_RE": {
    "tier": "regex",
    "line": 66
@@ -103,55 +118,55 @@
   },
   "llm/provider.py::_IMAGE_CAPABILITY_DENIAL_PHRASES": {
    "tier": "table",
-   "line": 265
+   "line": 284
   },
   "llm/retry.py::UPSTREAM_STREAM_ERROR_KEYWORDS": {
    "tier": "table",
-   "line": 221
+   "line": 336
   },
   "llm/retry.py::_CAPACITY_NEEDLES": {
    "tier": "table",
-   "line": 129
+   "line": 244
   },
   "llm/retry.py::_COMPILED_REGION_PATTERNS": {
    "tier": "table",
-   "line": 242
+   "line": 357
   },
   "llm/retry.py::_COMPILED_RETRYABLE_PATTERNS": {
    "tier": "table",
-   "line": 111
+   "line": 226
   },
   "llm/retry.py::_REGION_FASTFAIL_PATTERNS": {
    "tier": "table",
-   "line": 234
+   "line": 349
   },
   "llm/retry.py::_RETRYABLE_MESSAGE_PATTERNS": {
    "tier": "table",
-   "line": 84
+   "line": 199
   },
   "llm/retry.py::_STREAM_IDLE_EXHAUSTED_TEXT_NEEDLES": {
    "tier": "table",
-   "line": 347
+   "line": 462
   },
   "llm/retry.py::_WINDOW_NEEDLES": {
    "tier": "table",
-   "line": 181
+   "line": 296
   },
   "prompts/identity.py::_CHINESE_TRAINED_MARKERS": {
    "tier": "table",
-   "line": 72
+   "line": 79
   },
   "services/attestation.py::_AUDIT_VERDICT_RE": {
    "tier": "regex",
-   "line": 2746
+   "line": 2796
   },
   "services/attestation.py::_FACT_NEED_RE": {
    "tier": "regex",
-   "line": 1849
+   "line": 1899
   },
   "services/attestation.py::_HEX_REF_RE": {
    "tier": "regex",
-   "line": 342
+   "line": 346
   },
   "services/attestation.py::_TEST_COMMAND_RE": {
    "tier": "regex",
@@ -161,17 +176,21 @@
    "tier": "regex",
    "line": 335
   },
+  "services/code_audit.py::_AUDIT_COT_OPENING_RE": {
+   "tier": "regex",
+   "line": 852
+  },
   "services/code_audit.py::_SEVERITY_ANY_MARKER_RE": {
    "tier": "regex",
-   "line": 719
+   "line": 739
   },
   "services/code_audit.py::_SEVERITY_BRACKET_RE": {
    "tier": "regex",
-   "line": 682
+   "line": 702
   },
   "services/code_audit.py::_SEVERITY_PREFIX_RE": {
    "tier": "regex",
-   "line": 672
+   "line": 692
   },
   "services/command_guard.py::_REGEX_META": {
    "tier": "regex",
@@ -267,7 +286,7 @@
   },
   "services/git_worktree/constants.py::_CONFLICT_MARKER_RE": {
    "tier": "regex",
-   "line": 205
+   "line": 224
   },
   "services/git_worktree/constants.py::_SLUG_INVALID": {
    "tier": "regex",
@@ -283,7 +302,7 @@
   },
   "services/git_worktree/constants.py::_TASK_BRANCH_RE": {
    "tier": "regex",
-   "line": 219
+   "line": 238
   },
   "services/git_worktree/constants.py::_UNTRACKED_FILE_LINE_RE": {
    "tier": "regex",
@@ -335,11 +354,11 @@
   },
   "services/git_worktree/reconcile.py::_HW_SID_BRANCH_RE": {
    "tier": "regex",
-   "line": 27
+   "line": 28
   },
   "services/git_worktree/service_merge.py::_TASK_BRANCH_RE": {
    "tier": "regex",
-   "line": 1266
+   "line": 1368
   },
   "services/mcp_supervisor.py::_SAFE_RE": {
    "tier": "regex",
@@ -359,7 +378,7 @@
   },
   "services/policy.py::_HW_WRITE_MARKERS": {
    "tier": "table",
-   "line": 259
+   "line": 269
   },
   "services/process_registry.py::_APP_SERVER_FAMILY_RE": {
    "tier": "regex",
@@ -391,7 +410,7 @@
   },
   "services/process_registry.py::_JEST_RE": {
    "tier": "regex",
-   "line": 727
+   "line": 732
   },
   "services/process_registry.py::_KILL_VERB_RE": {
    "tier": "regex",
@@ -407,7 +426,7 @@
   },
   "services/process_registry.py::_PYTEST_RE": {
    "tier": "regex",
-   "line": 728
+   "line": 733
   },
   "services/process_registry.py::_RESERVED_PORT_REF_RE": {
    "tier": "regex",
@@ -431,11 +450,11 @@
   },
   "services/process_registry.py::_VITEST_RE": {
    "tier": "regex",
-   "line": 726
+   "line": 731
   },
   "services/run_ledger.py::_UPSTREAM_DEATH_TEXT_NEEDLES": {
    "tier": "table",
-   "line": 105
+   "line": 112
   },
   "services/skill_registry.py::_API_KEY_ENV_RE": {
    "tier": "regex",
@@ -451,7 +470,7 @@
   },
   "services/tasks/acceptance.py::_WS_RE": {
    "tier": "regex",
-   "line": 63
+   "line": 82
   },
   "services/tasks/migrate_verify_kind.py::_LEGACY_VERIFY_TITLE_RE": {
    "tier": "regex",
@@ -464,6 +483,18 @@
   "services/tasks/verdict_claim_check.py::_CLAIM_PATTERNS": {
    "tier": "table",
    "line": 29
+  },
+  "services/user_directive_sla.py::_EN_VERB_RE": {
+   "tier": "regex",
+   "line": 78
+  },
+  "services/user_directive_sla.py::_HAS_CONTENT_RE": {
+   "tier": "regex",
+   "line": 68
+  },
+  "services/user_directive_sla.py::_WHITELIST_RE": {
+   "tier": "regex",
+   "line": 58
   },
   "services/venv_setup.py::_SAFE_DEP_RE": {
    "tier": "regex",
@@ -491,155 +522,159 @@
   },
   "tools/bash.py::SELF_DESTRUCTIVE_PATTERNS": {
    "tier": "table",
-   "line": 1055
+   "line": 1235
   },
   "tools/bash.py::_ACCESS_DENIED_RE": {
    "tier": "regex",
-   "line": 124
+   "line": 216
   },
   "tools/bash.py::_ALLOWED_HW_SUBDIRS": {
    "tier": "regex",
-   "line": 1124
+   "line": 1304
   },
   "tools/bash.py::_AMPERSAND_RE": {
    "tier": "regex",
-   "line": 1758
+   "line": 1950
   },
   "tools/bash.py::_ANSI_ESCAPE_RE": {
    "tier": "regex",
-   "line": 136
+   "line": 228
   },
   "tools/bash.py::_APP_SERVER_TOKEN_RE": {
    "tier": "regex",
-   "line": 195
+   "line": 287
   },
   "tools/bash.py::_ATTEST_FOOTER_RE": {
    "tier": "regex",
-   "line": 3556
+   "line": 3789
   },
   "tools/bash.py::_BLOCKING_VERB_RE": {
    "tier": "regex",
-   "line": 184
+   "line": 276
   },
   "tools/bash.py::_CLOSED_PIPE_TAIL_RE": {
    "tier": "regex",
-   "line": 2037
+   "line": 2229
   },
   "tools/bash.py::_COMMAND_TASK_ID_RE": {
    "tier": "regex",
-   "line": 3232
+   "line": 3465
   },
   "tools/bash.py::_DEV_SERVER_TRIGGER_RE": {
    "tier": "regex",
-   "line": 143
+   "line": 235
   },
   "tools/bash.py::_FLASK_TOKEN_RE": {
    "tier": "regex",
-   "line": 199
+   "line": 291
   },
   "tools/bash.py::_GUNICORN_TOKEN_RE": {
    "tier": "regex",
-   "line": 200
+   "line": 292
   },
   "tools/bash.py::_HIVEWEAVE_FILE_OPS": {
    "tier": "regex",
-   "line": 1082
+   "line": 1262
   },
   "tools/bash.py::_HIVEWEAVE_REF": {
    "tier": "regex",
-   "line": 1094
+   "line": 1274
   },
   "tools/bash.py::_HIVEWEAVE_TEST_EXCLUDE_RE": {
    "tier": "regex",
-   "line": 1100
+   "line": 1280
   },
   "tools/bash.py::_HW_LOGS_REF": {
    "tier": "regex",
-   "line": 1133
+   "line": 1313
   },
   "tools/bash.py::_HW_MERGE_QUARANTINE_REF": {
    "tier": "regex",
-   "line": 1162
+   "line": 1342
   },
   "tools/bash.py::_HW_WRITE_MARKERS": {
    "tier": "table",
-   "line": 1144
+   "line": 1324
   },
   "tools/bash.py::_INLINE_EVAL_ESCAPE_ERR_RE": {
    "tier": "regex",
-   "line": 784
+   "line": 876
   },
   "tools/bash.py::_INLINE_NODE_EVAL_RE": {
    "tier": "regex",
-   "line": 779
+   "line": 871
   },
   "tools/bash.py::_NODE_TEST_CMD_RE": {
    "tier": "regex",
-   "line": 711
+   "line": 803
   },
   "tools/bash.py::_PIP3_CMD_RE": {
    "tier": "regex",
-   "line": 1633
+   "line": 1825
   },
   "tools/bash.py::_PY3_CMD_RE": {
    "tier": "regex",
-   "line": 1632
+   "line": 1824
   },
   "tools/bash.py::_READONLY_LIMIT_RE": {
    "tier": "regex",
-   "line": 2173
+   "line": 2365
   },
   "tools/bash.py::_READONLY_WC_RE": {
    "tier": "regex",
-   "line": 2177
+   "line": 2369
   },
   "tools/bash.py::_SHELL_KEYWORDS": {
    "tier": "table",
-   "line": 1764
+   "line": 1956
   },
   "tools/bash.py::_SHELL_META_RE": {
    "tier": "regex",
-   "line": 2180
+   "line": 2372
   },
   "tools/bash.py::_SPAWN_EPERM_RE": {
    "tier": "regex",
-   "line": 724
+   "line": 816
   },
   "tools/bash.py::_STATIC_SERVER_TOKEN_RE": {
    "tier": "regex",
-   "line": 201
+   "line": 293
   },
   "tools/bash.py::_TEST_CMD_RE": {
    "tier": "regex",
-   "line": 118
+   "line": 210
   },
   "tools/bash.py::_TRAILING_AMP_RE": {
    "tier": "regex",
-   "line": 189
+   "line": 281
   },
   "tools/bash.py::_UNIX_SHORT_FLAG_RE": {
    "tier": "regex",
-   "line": 1737
+   "line": 1929
   },
   "tools/bash.py::_UVICORN_HELP_RE": {
    "tier": "regex",
-   "line": 190
+   "line": 282
   },
   "tools/bash.py::_UVICORN_TOKEN_RE": {
    "tier": "regex",
-   "line": 194
+   "line": 286
   },
   "tools/executor.py::_SAFE_NAME_RE": {
    "tier": "regex",
-   "line": 60
+   "line": 84
   },
   "tools/executor.py::_SENSITIVE_KEY_RE": {
    "tier": "regex",
-   "line": 2744
+   "line": 2758
   },
   "tools/fact_positions.py::BAD_ARGS_SIGNATURES": {
    "tier": "table",
    "line": 160
+  },
+  "tools/fact_positions.py::DENIED_BY_SIGNATURES": {
+   "tier": "table",
+   "line": 479
   },
   "tools/fact_positions.py::RUNNER_FAILURE_SIGNATURES": {
    "tier": "table",

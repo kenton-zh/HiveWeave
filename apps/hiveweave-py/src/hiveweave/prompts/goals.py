@@ -10,8 +10,8 @@ format_goals_block 是纯字符串格式化：将 charter.goals dict 渲染为
     **Key Results:**
       - [status] text
     **User Involvement:** <involvement>
-    Route decisions matching the user-involvement scope to the user...
-    For decisions outside this scope, ask your superior...
+    决策路由按 User Involvement 段执行（路由规则单源 = involvement 动态块，
+    每轮随 context 注入，本段只留指针）。
 
 goals dirty 检查（每轮注入完整 workbook 还是跳过）由 caller 通过
 charter_service.goals_dirty(agent_id, project_id) 决定，本模块不访问 DB。
@@ -35,7 +35,7 @@ def format_goals_block(goals: dict[str, Any]) -> str:
       - keyResults:    关键结果列表（str 或 {"text","status"} 对象）
       - userInvolvement: 用户参与度描述
 
-    末尾附决策路由指令：user-involvement 范围内 → user；范围外 → superior。
+    末尾附决策路由指针：路由规则单源 = involvement 动态块（每轮注入）。
     """
     objective = _get_ci(goals, "objective", "")
     focus = _get_ci(goals, "focus", "")
@@ -57,10 +57,7 @@ def format_goals_block(goals: dict[str, Any]) -> str:
         f"**Current Focus:** {focus}\n"
         f"**Key Results:**\n{kr_lines}\n"
         f"**User Involvement:** {involvement}\n"
-        'Route decisions matching the user-involvement scope to the user '
-        '(via `question` or `send_message` to "user"). '
-        'For decisions outside this scope, ask your superior '
-        '(`send_message` with recipients=["上级花名"]).'
+        "决策路由按 User Involvement 段执行（范围给用户、范围外问上级）。"
     )
 
 
