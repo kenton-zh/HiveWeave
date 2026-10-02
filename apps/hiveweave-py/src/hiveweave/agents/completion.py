@@ -938,15 +938,32 @@ async def handle_completion(
             if open_obligations:
                 agent.disposition = "runnable"
             # Persist WHY for next wake (no auto-retrigger)
-            await agent._persist_gate_notice(
-                "TURN EXIT PARKED",
-                exit_decision.hint
-                or f"gates={exit_decision.violations}",
-                footer=(
+            # T16 补漏（上下文审计）：auto 下 exit_decision.hint 是 legacy
+            # commit_turn 处方墙 —— 通知体必须按模式分流。
+            from hiveweave.services.turn_exit_auto import build_auto_block_hint
+
+            _notice_body = (
+                build_auto_block_hint(list(exit_decision.violations))
+                if _auto_exit
+                else (exit_decision.hint or f"gates={exit_decision.violations}")
+            )
+            _park_footer = (
+                (
+                    "系统已按真实账本停泊，本轮不再自动续跑。"
+                    "下一外部事件到来时请按上述 GATE 推进，"
+                    "或 wait_on 登记等待后直接停止（平台自动收口）。"
+                )
+                if _auto_exit
+                else (
                     "系统已按真实账本停泊，本轮不再自动续跑。"
                     "下一外部事件到来时请按上述 GATE 推进，"
                     "或用 phase=waiting/blocked/in_progress 正确声明状态。"
-                ),
+                )
+            )
+            await agent._persist_gate_notice(
+                "TURN EXIT PARKED",
+                _notice_body,
+                footer=_park_footer,
             )
             log.warning(
                 "turn_exit_parked",
@@ -1001,10 +1018,14 @@ async def handle_completion(
             agent._turn_gate_count = 0
             agent._reply_reminder_count = 0
             agent.disposition = "blocked"
+            from hiveweave.services.turn_exit_auto import build_auto_block_hint
+
             await agent._persist_gate_notice(
                 "TURN EXIT BLOCKED — GATE UNRESOLVED",
-                exit_decision.hint
-                or f"gates={exit_decision.violations}",
+                # T16 补漏（上下文审计）：auto 下不用 legacy 处方墙作通知体。
+                build_auto_block_hint(list(exit_decision.violations))
+                if _auto_exit
+                else (exit_decision.hint or f"gates={exit_decision.violations}"),
                 footer=(
                     f"{_gate_footer_head}"
                     "disposition=blocked。"

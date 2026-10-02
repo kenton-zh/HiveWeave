@@ -232,6 +232,29 @@ def _build_auto_exit_hint(decision: Any, facts: Any) -> str:
     return "\n".join(lines)
 
 
+def build_auto_block_hint(violations: list[str]) -> str:
+    """auto 停泊/强挂通知的义务处方（qoder 上下文审计补漏）。
+
+    病灶：handle_completion 的 TURN EXIT PARKED / GATE UNRESOLVED 通知在
+    auto 下也直接嵌 ``exit_decision.hint`` —— 那是 legacy 门禁的
+    commit_turn 处方墙（turn_exit.build_gate_repair_hint），auto 工具面
+    根本没有该工具。本函数用同一份 ``_AUTO_VIOLATION_ACTIONS`` 处方表
+    生成 auto 版通知体，杜绝陈旧教学进上下文。
+    """
+    lines = [
+        "[TURN EXIT] 平台判定：当前不能收口——有未结算义务。",
+        "逐项处理下方义务；全部结算后**直接停止输出**"
+        "（平台自动收口；commit_turn 本模式已下架，不要尝试）。",
+        "确需挂起：wait_on(refs=[{\"kind\": \"task|agent|fact|user\", "
+        "\"ref\": \"<id>\"}]) 登记后停止。",
+    ]
+    for v in violations[:8]:
+        lines.append(
+            f"GATE={v} ACTION={_AUTO_VIOLATION_ACTIONS.get(v, '处理后直接停止')}"
+        )
+    return "\n".join(lines)
+
+
 def _build_minimal_blocking_instruction(violations: list[str]) -> str:
     """升级 hint（停止 #3 起）：最小指令 —— 只列阻塞点，不许继续干活。"""
     return (

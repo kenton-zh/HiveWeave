@@ -1672,3 +1672,21 @@ async def test_exit_contract_hint_legacy_keeps_commit(auto_mode, env, monkeypatc
     assert hint
     assert "仅需提交 commit_turn 收尾" in hint, hint
     assert "commit_turn(phase='done_slice'|'waiting'|'blocked'" in hint, hint
+
+
+# ── T16 补漏（第三轮上下文审计）：停泊/强挂通知体不得嵌 legacy 处方墙 ──
+
+
+def test_auto_block_hint_uses_wait_on_prescriptions():
+    """auto 通知体处方表：wait_on 话术 + 下架点名，无 legacy commit_turn 处方。"""
+    from hiveweave.services.turn_exit_auto import build_auto_block_hint
+
+    hint = build_auto_block_hint(
+        ["UNCOMMITTED_WORKTREE", "ASSIGNEE_MUST_SUBMIT", "UNKNOWN_GATE"]
+    )
+    assert "commit_turn 本模式已下架" in hint
+    assert "wait_on(refs=" in hint
+    assert "git_worktree_checkpoint" in hint  # 处方来自 auto 动作表
+    assert "submit_task" in hint
+    assert "每一轮必须像函数一样返回" not in hint  # legacy 处方墙头句
+    assert "then commit_turn" not in hint
