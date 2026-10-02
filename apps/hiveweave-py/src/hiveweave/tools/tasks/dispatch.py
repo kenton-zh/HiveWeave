@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from hiveweave.config import submit_audit_gate_enabled
 from hiveweave.services import task as _task_svc
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
@@ -19,6 +20,19 @@ _coerce_to_list = _helpers.coerce_to_list
 from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
+
+# T42：submitGate 枚举文案按 flag 装配（导入期定稿，与 create.py /
+# ``build_submit_task_description`` 同口径：改 env 重启生效）。off（默认）
+# 时 code_audit 系列 submitGate 挂了也会被门禁结构性剥离（T42）——模型
+# 可见面不再教（prompt-authoring skill §4：运行时门禁即契约）。
+_SUBMIT_GATE_ENUM_FULL = (
+    "docs | unit | module_visual"
+    + (
+        " | code_audit | code_audit+module_visual | code_audit+unit"
+        if submit_audit_gate_enabled()
+        else ""
+    )
+)
 
 # ── dispatch_task ───────────────────────────────────────
 
@@ -88,11 +102,32 @@ class DispatchTaskParams(BaseModel):
 
     target: str = Field(
         description="Target agent: name, short_id (e.g. A009), or UUID.",
-        json_schema_extra={"aliases": ["agentId", "subordinate", "agent_id", "to"]},
+        json_schema_extra={
+            "aliases": [
+                "agentId", "agent_id", "subordinate", "to", "toAgentId",
+                "to_agent_id", "recipient", "agent", "assignee",
+            ]
+        },
     )
-    task: str = Field(
-        description="Task description to dispatch to the subordinate.",
-        json_schema_extra={"aliases": ["description", "desc"]},
+    # A6（S14 实测 ×4 同秒 'task': Field required，批 2）：模型可见契约
+    # （executor.TOOL_PARAM_SCHEMAS 的手写层）给 task 宣传了 message /
+    # content / summary 别名，pydantic 强制面此前只认 task/description/
+    # desc —— 模型照契约传别名即撞 "Field required"。此处收编全部已宣传
+    # 名 + 常见易混名，让强制面 ⊇ 宣传面。task 同时改为「复用 taskId 时
+    # 可省」，新建路径由工具函数内的守卫回执兜底（带处方）。
+    task: str | None = Field(
+        default=None,
+        description=(
+            "Task description to dispatch to the subordinate. Required when "
+            "creating a NEW task (omit taskId); optional when reusing "
+            "taskId (the existing task keeps its own description)."
+        ),
+        json_schema_extra={
+            "aliases": [
+                "description", "desc", "message", "content", "summary",
+                "instructions", "taskDescription",
+            ]
+        },
     )
     expect_report: bool = Field(
         default=False,
@@ -140,8 +175,7 @@ class DispatchTaskParams(BaseModel):
         alias="submitGate",
         description=(
             "Required when creating a NEW task (omit taskId). "
-            "docs | unit | module_visual | code_audit | "
-            "code_audit+module_visual | code_audit+unit."
+            f"{_SUBMIT_GATE_ENUM_FULL}."
         ),
         json_schema_extra={"aliases": ["submitGate", "submit_gate", "gate"]},
     )
@@ -184,7 +218,9 @@ class DispatchTaskParams(BaseModel):
         description=(
             "Other task ids only (self-id rejected). Unmet → blocked "
             "(assignee recorded, not woken). VERIFY titles skip auto-block. "
-            "People-waiting is commit_turn, not this list."
+            "People-waiting is not this list — suspend via the turn's "
+            "park channel with kind=agent (wait_on(refs=[…]) in auto mode; "
+            "commit_turn(waiting, waiting_on=[…]) in legacy mode)."
         ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )
@@ -223,12 +259,15 @@ class DispatchTaskParams(BaseModel):
 @tool(
     "dispatch_task",
     "Deliver work NOW: ledger entry + inbox wake (unless blocked on depends_on). "
-    "Always pass submitGate (docs|unit|module_visual|code_audit|…) — required for "
+    "Always pass submitGate (docs|unit|module_visual"
+    + ("|code_audit" if submit_audit_gate_enabled() else "")
+    + "|…) — required for "
     "new tasks, ignored on taskId reuse. New tasks SHOULD also carry "
     "acceptanceCriteria=[{id, description, …}] (per-item DoD; without it review "
     "is free-text only). Unmet dependsOn also applies when reusing "
     "taskId (blocked, not woken). dependsOn = other task ids only "
-    "(self-id rejected); waiting on a person is commit_turn. "
+    "(self-id rejected); waiting on a person is "
+    "wait_on(refs=[{kind:agent,…}]). "
     "To re-assign/delegate an EXISTING task, pass taskId — this keeps a single "
     "ledger entry (assignee changes, no duplicate task). "
     "Only create a NEW task (omit taskId) when the work is genuinely new. "
@@ -238,11 +277,36 @@ class DispatchTaskParams(BaseModel):
     "Milestone MAIN QA: milestoneVerify=true (coordinator/CEO).",
     requires_workspace=False,
     security_level="standard",
+    # A6（批 2）：参数校验失败回执附带的**可抄正确形状样例**（pi
+    # validation.ts 模式；pipeline 的 parameter-error 回执自动附带）——
+    # "Field required" 类拒绝必须同时给「正确参数名长什么样」。
+    param_example=(
+        '{"target": "A009", "task": "Implement X: <one-paragraph scope>", '
+        '"submitGate": "unit", '
+        '"acceptanceCriteria": [{"id": "ac1", "description": "<per-item DoD>"}]} '
+        "— required: target, task, submitGate (task may be omitted only when "
+        "reusing an existing task via taskId)."
+    ),
 )
 async def dispatch_task_tool(
     params: DispatchTaskParams, agent_id: str, workspace: str, ctx=None
 ) -> ToolResult:
     """Dispatch a task to a subordinate."""
+    # A6（批 2）：参数形状错误在进任何服务/DB 之前给**自带处方**的回执。
+    # task 现为「复用 taskId 时可省」；新建任务缺 task 在这里硬拒并列出
+    # 必填/可选参数名 —— 不再让模型面对裸 pydantic 报错猜参数名。
+    if not params.task_id and not (params.task or "").strip():
+        return ToolResult.err(
+            "dispatch_task requires 'task' (the task description) when "
+            "creating a NEW task. Required: target, task, submitGate. "
+            "Optional: taskId, expectReport, artifactRefs, dependsOn, "
+            "acceptanceCriteria, verifiedFacts, tags, force. Example: "
+            'dispatch_task(target="A009", task="Implement X: ...", '
+            'submitGate="unit"). To re-delegate an EXISTING task, pass '
+            "taskId (task is then optional and the existing description "
+            "stays)."
+        )
+
     from hiveweave.services.dispatch import DispatchService
     from hiveweave.services.org_span import (
         validate_ceo_dispatch_target,
@@ -299,7 +363,7 @@ async def dispatch_task_tool(
         try:
             dup = await ts_dedup.find_similar_open_task(
                 project_id,
-                params.task[:100],
+                (params.task or "")[:100],
                 assignee_id=resolved_id,
                 include_unassigned=True,
             )
@@ -326,7 +390,7 @@ async def dispatch_task_tool(
             log.warning("dispatch_dedup_check_failed", error=str(e))
         try:
             cross_dup = await ts_dedup.find_similar_open_task(
-                project_id, params.task[:100], assignee_id=None
+                project_id, (params.task or "")[:100], assignee_id=None
             )
             if cross_dup and cross_dup.get("assignee_id") != resolved_id:
                 if not params.force:
@@ -514,7 +578,9 @@ async def dispatch_task_tool(
         )
     # verifiedFacts L1：派单方核验过的现场事实钉进任务描述——执行者免盲
     # 探索（40 轮实测：事实打包直派效率高一个数量级）。
-    dispatch_description = params.task
+    # A6（批 2）：task 在「复用 taskId 且未带描述」时为 None —— 复用路径
+    # 保留既有任务卡描述，派单消息正文允许为空（自动事实块仍会附上）。
+    dispatch_description = params.task or ""
     if params.verified_facts:
         facts = [str(f).strip() for f in params.verified_facts if str(f).strip()]
         if facts:
@@ -601,13 +667,25 @@ async def dispatch_task_tool(
         parent = result.get("parent_task_id") or ""
         # 45 轮批次6：批量派单叙事（旧文案单数 + 与 waiting_on 列表形
         # 不一致，模型被引导成一次只派一个子任务——45 轮潮汐反证并行
-        # 派 4 单无冲突，引导是唯一枷锁）。
-        output += (
-            " If more independent children remain, keep dispatching them"
-            " all this turn; then ONE commit_turn(waiting, waiting_on=["
-            "{kind:task, ref:<each task_id>}, ...]) covers every dispatch."
-            " Do not ask_agent the assignee to submit."
-        )
+        # 派 4 单无冲突，引导是唯一枷锁）。T16 残尾尾巴：收尾话术按模式
+        # 分流（auto ⇒ wait_on 批量 refs）。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            output += (
+                " If more independent children remain, keep dispatching them"
+                " all this turn; then ONE wait_on(refs=[{"
+                '"kind": "task", "ref": "<each task_id>"}, ...]) covers every'
+                " dispatch (commit_turn is delisted; stop after parking)."
+                " Do not ask_agent the assignee to submit."
+            )
+        else:
+            output += (
+                " If more independent children remain, keep dispatching them"
+                " all this turn; then ONE commit_turn(waiting, waiting_on=["
+                "{kind:task, ref:<each task_id>}, ...]) covers every dispatch."
+                " Do not ask_agent the assignee to submit."
+            )
         if not params.verified_facts:
             # 45 轮批次6：verifiedFacts 主动提示（42 轮 0/20 + 45 轮 0/18
             # 采用——schema 缺失与引导弱双重根因，本批双双补齐）。

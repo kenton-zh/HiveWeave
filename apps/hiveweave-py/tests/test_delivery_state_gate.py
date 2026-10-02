@@ -278,7 +278,9 @@ async def test_clean_ledger_unmarked_state_still_badges_unmarked(env, sent):
 @pytest.mark.asyncio
 async def test_mark_rejected_lists_blocker_and_persists_blocked(env):
     await _insert_task(env, "approved-open", "approved")
-    await _insert_unread(env, "unread-1", "agent-x")
+    # P1-5：未读 blocker 判据 = 发件人是人类 ⇒ 用「用户」（agent 发件人
+    # 不再误计，见 test_unread_agent_messages_are_not_human_blockers）。
+    await _insert_unread(env, "unread-1", "用户")
 
     result = await mark_delivery_complete_tool(
         MarkDeliveryCompleteParams(), env["agent_id"], "/ws", None
@@ -336,13 +338,85 @@ async def test_mark_tool_accepts_no_text_parameter():
 
 @pytest.mark.asyncio
 async def test_system_copies_do_not_count_as_unread(env):
-    """系统副本（from='system'/'用户'）不是 CEO 的账（TEST_DSH_32 P3 原判据）。"""
+    """from='system' 的未读副本（平台投递回执）不是 CEO 的账（TEST_DSH_32 P3）。"""
     await _insert_unread(env, "sys-1", "system")
-    await _insert_unread(env, "usr-1", "用户")
     result = await mark_delivery_complete_tool(
         MarkDeliveryCompleteParams(), env["agent_id"], "/ws", None
     )
     assert result.success is True, result.error
+
+
+@pytest.mark.asyncio
+async def test_unread_human_message_blocks_delivery_mark(env):
+    """P1-5 测试②：真未读人类消息（from='用户'）⇒ blocker 报。
+
+    修前 SQL 只排 'system'/'用户' 字面量 —— 人类消息被排除、agent 消息
+    反而被计入（判据整体写反）。现判据 = 发件人是人类。
+    """
+    await _insert_unread(env, "usr-1", "用户")
+    result = await mark_delivery_complete_tool(
+        MarkDeliveryCompleteParams(), env["agent_id"], "/ws", None
+    )
+    assert result.success is False
+    assert "未读人工消息" in (result.error or "")
+    blockers = await mt._delivery_blockers(env["agent_id"])
+    assert any(b["code"] == mt.POLICY_INBOX_UNREAD_HUMAN for b in blockers)
+
+
+# ── P1-5：INBOX_UNREAD_HUMAN 判据 = 发件人是人类（单一权威源）──────
+
+
+@pytest.mark.asyncio
+async def test_unread_agent_messages_are_not_human_blockers(env):
+    """P1-5 测试①：未读 **agent** 消息（from=UUID）⇒ blocker 不误报。
+
+    DSH_85 现场病灶：21/21 任务全 closed 仍 delivery_state=blocked
+    （INBOX_UNREAD_HUMAN），列出的发件人是中层 agent —— 修前 SQL 只排
+    'system'/'用户' 字面量，agent 消息全被当人工消息。
+    """
+    await _insert_unread(env, "ag-1", "agent-uuid-1111")
+    await _insert_unread(env, "ag-2", "agent-uuid-2222")
+    blockers = await mt._delivery_blockers(env["agent_id"])
+    assert all(b["code"] != mt.POLICY_INBOX_UNREAD_HUMAN for b in blockers), (
+        blockers
+    )
+
+
+@pytest.mark.asyncio
+async def test_unread_human_identity_variants_block(env):
+    """P1-5 测试②扩展：人类身份变体都算人工消息（权威集合单源）。
+
+    - from='user'（英文别名）；
+    - from=<UUID> + message_type='user_message'（类型标记位——人类直发
+      消息的真身形态之一，见 api/chat.py / services/user_message.py）。
+    """
+    conn = await project_db.get_project_db_by_project_id(env["project_id"])
+    now = 1
+    await conn.execute(
+        "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
+        "created_at) VALUES (?,?,?,?,0,?)",
+        ["usr-en", "user", env["agent_id"], "hello", now],
+    )
+    await conn.execute(
+        "INSERT INTO inbox (id, from_agent_id, to_agent_id, message, read, "
+        "created_at, message_type) VALUES (?,?,?,?,0,?,?)",
+        ["usr-type", "agent-uuid-3333", env["agent_id"], "queued", now,
+         "user_message"],
+    )
+    await conn.commit()
+    blockers = await mt._delivery_blockers(env["agent_id"])
+    human_blockers = [
+        b for b in blockers if b["code"] == mt.POLICY_INBOX_UNREAD_HUMAN
+    ]
+    assert len(human_blockers) == 1, blockers
+    assert "2" in human_blockers[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_empty_inbox_has_no_unread_blocker(env):
+    """P1-5 测试③：空收件 ⇒ 无 INBOX_UNREAD_HUMAN blocker。"""
+    blockers = await mt._delivery_blockers(env["agent_id"])
+    assert blockers == [], blockers
 
 
 # ── 4. 正向对照：标记成功 ⇒ 徽章变 complete；清回 NULL ⇒ 回到未标记 ──

@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from hiveweave.config import submit_audit_gate_enabled
 from hiveweave.services import task as _task_svc
 from hiveweave.services.param_shapes import coerce_list_param
 from hiveweave.tools.base import tool
@@ -20,6 +21,24 @@ _coerce_to_list = _helpers.coerce_to_list
 from hiveweave.tools.result import ToolResult
 
 log = structlog.get_logger(__name__)
+
+# T42：submitGate 枚举文案按 flag 装配（导入期定稿，与
+# ``build_submit_task_description`` 同口径：改 env 重启生效）。off（默认）
+# 时 code_audit 系列 submitGate 挂了也会被门禁结构性剥离（T42）——模型
+# 可见面不再教（prompt-authoring skill §4：运行时门禁即契约）。
+_SUBMIT_GATE_ENUM_FULL = (
+    "docs | unit | module_visual"
+    + (
+        " | code_audit | code_audit+module_visual | code_audit+unit"
+        if submit_audit_gate_enabled()
+        else ""
+    )
+)
+_SUBMIT_GATE_ENUM_SHORT = (
+    "docs|unit|module_visual|code_audit|…"
+    if submit_audit_gate_enabled()
+    else "docs|unit|module_visual|…"
+)
 
 # ── create_task ─────────────────────────────────────────
 
@@ -68,7 +87,7 @@ class CreateTaskParams(BaseModel):
         description=(
             "Other task ids only (self-id rejected). Unmet → blocked "
             "(not claimed/woken). VERIFY titles skip auto-block. "
-            "People-waiting is commit_turn, not this list."
+            "People-waiting is wait_on(refs=[{kind:agent,…}]), not this list."
         ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )
@@ -111,8 +130,7 @@ class CreateTaskParams(BaseModel):
         alias="submitGate",
         description=(
             "How this task will be evidenced at submit/review. Required. "
-            "docs | unit | module_visual | code_audit | "
-            "code_audit+module_visual | code_audit+unit."
+            f"{_SUBMIT_GATE_ENUM_FULL}."
         ),
         json_schema_extra={"aliases": ["submitGate", "submit_gate", "gate"]},
     )
@@ -156,8 +174,9 @@ class CreateTaskParams(BaseModel):
     "Ledger entry. Unassigned → status=created (draft). With assigneeId → claimed "
     "(assign=claim; no separate claim_task) unless depends_on is unmet (blocked). "
     "dependsOn = other task ids only (self-id rejected); waiting on a person "
-    "is commit_turn. Does NOT wake anyone — call dispatch_task to deliver. "
-    "submitGate is required (docs|unit|module_visual|code_audit|…). "
+    "is wait_on(refs=[{kind:agent,…}]). Does NOT wake anyone — call dispatch_task to deliver. "
+    "submitGate is required "
+    f"({_SUBMIT_GATE_ENUM_SHORT}). "
     "If you are delegating/transferring an EXISTING task to someone else, prefer "
     "dispatch_task(taskId=<existing_id>) instead — it re-assigns in a single ledger "
     "entry and avoids duplicate tasks with untracked free-text dependencies. "

@@ -66,6 +66,59 @@ async def park_project_inbox(project_id: str, agent_ids: list[str] | None = None
     return total
 
 
+async def _flush_inmemory_pending_usage(project_id: str, reason: str) -> int:
+    """批 2 A7（2026-09-28）：sweep 收口前交接本进程内存里的 pending usage。
+
+    ``sweep_stale_agent_runs`` 只动 DB 行；每轮 usage 平时躺在
+    ``agent._pending_usage`` 内存 sink 里，依赖恢复路径（cancel /
+    safety_timeout / error）flush。终止路径若两者都没走到（实例：agent
+    PROCESSING 但无活 LLM task 的状态脱钩 —— ``Agent.cancel`` 的
+    CancelledError handler 不会跑，内存账没人接），行被打成 interrupted
+    后就再无 flush 时机 ⇒ R11「interrupted 零账」的进程内来源。
+
+    因此在 DB sweep **之前**对内存里还挂着的本项目 agent 逐个补一次
+    flush（与 recovery 同一入口；幂等 —— sink 空 = no-op，连空 flush
+    日志都不留）。启动 sweep 不经过这里：那时 agent_manager 还是空的。
+
+    Returns flushed agent 数；全程 best-effort，绝不拦收尾主流程。
+    """
+    flushed = 0
+    try:
+        from hiveweave.agents.recovery import _flush_pending_usage
+        from hiveweave.agents.supervisor import agent_manager
+
+        for aid in await _project_agent_ids(project_id):
+            agent = agent_manager.get_agent(aid)
+            if agent is None:
+                continue  # 只剩 DB 行的上个进程 agent：内存账已随进程蒸发
+            if not getattr(agent, "_pending_usage", None):
+                continue  # 幂等：无账可交
+            # 活流不抢 sink：有活 LLM task 时 cancel/timeout/error 恢复账
+            # 会接手 flush；此处若在流中途摘走 sink，streamer 手里的
+            # ``usage_sink`` 还指着旧列表 —— 后续轮次会被孤儿化丢账。
+            _task = getattr(agent, "_llm_task", None)
+            if _task is not None and not _task.done():
+                continue
+            try:
+                await _flush_pending_usage(agent, reason=reason)
+                flushed += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "lifecycle_preflush_agent_failed",
+                    agent_id=aid, error=str(e),
+                )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "lifecycle_preflush_failed", project_id=project_id, error=str(e)
+        )
+    if flushed:
+        log.info(
+            "lifecycle_preflush_done", project_id=project_id,
+            agents=flushed, reason=reason,
+        )
+    return flushed
+
+
 async def close_running_runs(
     project_id: str,
     *,
@@ -84,6 +137,10 @@ async def close_running_runs(
     调用方必须给可区分来路的文案（off_duty_close / activate_reclaim），
     恢复 Trail 不能把本进程主动关闭误读成「进程死亡残留」。
 
+    批 2 A7（2026-09-28）：sweep 前先做一遍内存 pending usage 预 flush
+    （``_flush_inmemory_pending_usage``）—— cancel 恢复账没接住的进程内
+    账，行被打成 interrupted 后就永远没有 flush 时机了。
+
     Returns number of runs reaped；任何失败 best-effort 返回 0（下班/上班
     流程不能因收尾失败而中断）。
     """
@@ -93,6 +150,7 @@ async def close_running_runs(
         workspace_path = await meta_db.get_project_workspace(project_id)
         if not workspace_path:
             return 0
+        await _flush_inmemory_pending_usage(project_id, close_reason)
         return await sweep_stale_agent_runs(
             workspace_path, close_reason=close_reason)
     except Exception as e:

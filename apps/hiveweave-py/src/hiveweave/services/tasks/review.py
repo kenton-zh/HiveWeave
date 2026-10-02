@@ -180,6 +180,26 @@ class ReviewMixin:
             await _execute(project_id,
                 "UPDATE tasks SET evidence = ?, updated_at = ? WHERE id = ?",
                 [json.dumps(evidence), now_ms, task_id])
+            # T18 bug2：SYSTEM AUDIT 卡 approve 收口 —— 卡上代审产生的
+            # code_audit 凭证回写源任务（authorId=submitter 既有代审绑定
+            # 语义），源任务下次 submit 才能过门。best-effort：回写失败不
+            # 阻断 approve 本身（幂等由回写函数自查重保证）。
+            try:
+                from .audit_dispatch import (
+                    is_system_audit_card,
+                    rebind_audit_attestations_on_approve,
+                )
+
+                if is_system_audit_card(_review_task or {}):
+                    await rebind_audit_attestations_on_approve(
+                        project_id, _review_task or {}
+                    )
+            except Exception as e:
+                log.warning(
+                    "audit_card_attestation_rebind_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
             # Slice P0: mark contract verified so downstream ready gates unlock
             try:
                 task_row = await self.get_task(project_id, task_id)

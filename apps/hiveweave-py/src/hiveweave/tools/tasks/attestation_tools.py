@@ -231,11 +231,26 @@ async def attest_doc_review_tool(
                 except Exception:
                     pass
 
+    # A1 批2（写库归一化）：task ref 在工具入口先归一成完整 id——带横线/
+    # 截短前缀解析失败在此拒绝并附处方（完整 id 从 task 台账/get_tasks 复制，
+    # 勿截断，用完整 id 重试）；成功则落库与回执都用完整 id。守门判据与
+    # AttestationService.create 同点（require_canonical_task_id），不双标。
+    norm_task_id: str | None = params.task_id
+    if params.task_id:
+        from hiveweave.services.attestation import require_canonical_task_id
+
+        try:
+            norm_task_id = await require_canonical_task_id(
+                project_id, params.task_id
+            )
+        except ValueError as e:
+            return ToolResult.err(str(e))
+
     try:
         att_id, report = await create_doc_review(
             project_id,
             agent_id=agent_id,
-            task_id=params.task_id,
+            task_id=norm_task_id,
             files=files,
             workspace=check_ws,
             commit_hash=commit,
@@ -257,8 +272,9 @@ async def attest_doc_review_tool(
         extra = (
             f" source=main commit={(commit or '')[:12] or '?'}."
         )
+    bound = f" task_id={norm_task_id}" if norm_task_id else ""
     return ToolResult.ok(
-        f"doc_review attestation {att_id} recorded for [{paths}] "
+        f"doc_review attestation {att_id}{bound} recorded for [{paths}] "
         f"under {check_ws}.{extra} Pass attestationIds=[\"{att_id}\"] on "
         f"submit_task / keep in evidence for approve."
     )

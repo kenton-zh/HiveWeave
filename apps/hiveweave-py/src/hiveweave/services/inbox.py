@@ -67,6 +67,76 @@ def filter_actionable_pending(messages: list[dict] | None) -> list[dict]:
     return [m for m in (messages or []) if not is_fyi_task_event(m)]
 
 
+# ── P1-5（2026-10-02）：人类标识**单一权威判据** ─────────────────────────
+# 病根：散落各处的字面量集合口径互斥（misc_tools 的 INBOX_UNREAD_HUMAN 门
+# 只排 'system'/'用户' ⇒ agent 消息（from=UUID）全被当"人工消息"，DSH_85
+# 实测 21/21 任务全 closed 仍 delivery_state=blocked；outstanding-ask 家族
+# 又只排 'user'/'system' ⇒ 漏排 '用户' 等别名）。权威源 =
+# ``services/wake_policy``（``HUMAN_SENDER_IDS`` 别名集 +
+# ``HUMAN_MESSAGE_TYPES`` 类型标记）；本组函数是**唯一**消费入口，
+# 新调用点禁止再写发件人字面量集合。
+
+
+def sender_is_human(
+    from_agent_id: str | None, message_type: str | None = None
+) -> bool:
+    """inbox 行发件人是否人类 —— 行级判据唯一入口。
+
+    单源 = ``wake_policy.is_human_inbox_identity``（from ∈
+    ``HUMAN_SENDER_IDS``，或 ``message_type ∈ HUMAN_MESSAGE_TYPES``）。
+    inbox 表没有 metadata 列——人类直发消息的真身形态是
+    ``from_agent_id='用户'`` + ``message_type='user_message'``
+    （api/chat.py busy 路径 / services/user_message.py 投递口），
+    ``message_type`` 参数即承载"metadata 标记"位。
+    """
+    from hiveweave.services.wake_policy import is_human_inbox_identity
+
+    return is_human_inbox_identity(
+        from_agent_id=from_agent_id, message_type=message_type
+    )
+
+
+def _sql_ph(n: int) -> str:
+    return ",".join("?" * n)
+
+
+def human_sender_sql(table_prefix: str = "") -> tuple[str, list[str]]:
+    """「发件人是人类」SQL 判据碎片（与 :func:`sender_is_human` 同源）。
+
+    返回 ``(fragment, params)``：fragment =
+    ``(<prefix>from_agent_id IN (…) OR <prefix>message_type IN (…))``，
+    集合取自 wake_policy 权威常量。取反场景用 :func:`non_human_sender_sql`。
+    """
+    from hiveweave.services.wake_policy import (
+        HUMAN_MESSAGE_TYPES,
+        HUMAN_SENDER_IDS,
+    )
+
+    senders = sorted(HUMAN_SENDER_IDS)
+    types = sorted(HUMAN_MESSAGE_TYPES)
+    p = table_prefix
+    frag = (
+        f"({p}from_agent_id IN ({_sql_ph(len(senders))}) "
+        f"OR {p}message_type IN ({_sql_ph(len(types))}))"
+    )
+    return frag, [*senders, *types]
+
+
+def non_human_sender_sql(table_prefix: str = "") -> tuple[str, list[str]]:
+    """「发件人是 agent（非人类非系统）」SQL 判据碎片（outstanding-ask 家族）。
+
+    ask 债只对 agent 记账 ⇒ 排除人类（权威别名集，含旧字面量漏排的
+    ``'用户'`` 等）与 ``system``。行为与旧字面量
+    ``from_agent_id NOT IN ('user','system')`` 等价或更严（别名补齐）。
+    """
+    from hiveweave.services.wake_policy import HUMAN_SENDER_IDS
+
+    senders = sorted({*HUMAN_SENDER_IDS, "system"})
+    p = table_prefix
+    frag = f"{p}from_agent_id NOT IN ({_sql_ph(len(senders))})"
+    return frag, senders
+
+
 def unwrap_user_message_envelope(raw: str | None, *, from_agent_id: str = "", message_type: str = "") -> str:
     """Unwrap busy-queue / BUG-036 body ``{"from":…,"content":…}`` to plain text.
 
@@ -1322,13 +1392,16 @@ class InboxService:
         """
         await _ensure_schema(to_agent_id)
         try:
+            # P1-5：排除集合单源自 wake_policy（non_human_sender_sql），
+            # 不再写字面量 NOT IN ('user','system')（漏排 '用户' 等别名）。
+            _not_frag, _not_params = non_human_sender_sql()
             rows = await project_db.query(
                 to_agent_id,
                 "SELECT from_agent_id, reply_contract_id, read FROM inbox "
                 "WHERE to_agent_id = ? AND expect_report = 1 "
-                "AND from_agent_id NOT IN ('user', 'system') "
+                f"AND {_not_frag} "
                 "ORDER BY created_at DESC LIMIT 100",
-                [to_agent_id],
+                [to_agent_id, *_not_params],
             )
             if not rows:
                 return set()
@@ -1395,6 +1468,8 @@ class InboxService:
         """
         await _ensure_schema(to_agent_id)
         try:
+            # P1-5：排除集合单源自 wake_policy（non_human_sender_sql）。
+            _not_frag, _not_params = non_human_sender_sql("i.")
             rows = await project_db.query(
                 to_agent_id,
                 "SELECT i.id, i.from_agent_id, i.to_agent_id, i.message, i.read, "
@@ -1404,13 +1479,13 @@ class InboxService:
                 "substr(i.message, 1, 80) AS snippet "
                 "FROM inbox AS i "
                 "WHERE i.to_agent_id = ? AND i.expect_report = 1 "
-                "AND i.from_agent_id NOT IN ('user', 'system') "
+                f"AND {_not_frag} "
                 "AND ("
                 "  (i.reply_contract_id IS NOT NULL AND i.reply_contract_id NOT IN ("
                 "    SELECT DISTINCT reply_to FROM inbox WHERE reply_to IS NOT NULL))"
                 "  OR (i.reply_contract_id IS NULL AND i.read = 0)"
                 ") ORDER BY i.created_at DESC LIMIT ?",
-                [to_agent_id, int(limit)],
+                [to_agent_id, *_not_params, int(limit)],
             )
             msgs = [self._row_to_msg(r) for r in rows]
             from_ids = [

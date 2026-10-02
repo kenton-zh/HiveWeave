@@ -129,6 +129,8 @@ async def _send(
 
     返回 ``(result, save_mock)`` —— 徽章断言读 save_message 收到的 payload。
     from=system 的行不计入人工未读（TEST_DSH_32 P3 后直查 inbox 表）。
+    P1-5：判据 = 发件人是人类 ⇒ 插「用户」（旧 "peer-agent-x" 是修前
+    误计 agent 消息的化石——发件人字面量写错了语义仍碰巧过门）。
     """
     if unread > 0:
         conn = await project_db.ensure_project_db(ws)
@@ -137,7 +139,7 @@ async def _send(
             await conn.execute(
                 "INSERT INTO inbox (id, from_agent_id, to_agent_id, message,"
                 " read, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-                [f"unread-{i}", "peer-agent-x", CEO_ID, "pending reply", now],
+                [f"unread-{i}", "用户", CEO_ID, "pending reply", now],
             )
         await conn.commit()
     save_mock = AsyncMock()
@@ -274,14 +276,14 @@ async def test_mark_delivery_complete_refused_on_dirty_ledger(env):
 
 @pytest.mark.asyncio
 async def test_mark_delivery_complete_refused_on_unread_inbox(env):
-    """仅本人未读人工消息也足以拒绝标记。"""
+    """仅本人未读人工消息也足以拒绝标记（P1-5：发件人=人类「用户」）。"""
     conn = await project_db.ensure_project_db(env["workspace_path"])
     now = int(time.time() * 1000)
     for i in range(3):
         await conn.execute(
             "INSERT INTO inbox (id, from_agent_id, to_agent_id, message,"
             " read, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-            [f"unread-{i}", "peer-agent-x", CEO_ID, "pending reply", now],
+            [f"unread-{i}", "用户", CEO_ID, "pending reply", now],
         )
     await conn.commit()
 

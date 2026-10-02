@@ -145,6 +145,17 @@ def _is_placeholder(value: str) -> bool:
     return any(low.startswith(p) for p in _PLACEHOLDER_LEADS)
 
 
+def is_placeholder_text(value: str) -> bool:
+    """占位/空白文本判定（``_is_placeholder`` 的公开判据入口）。
+
+    P0-4：submit 入口把顶层 ``summary`` 从 deliveryContract 回执回填时，
+    「什么算占位」必须与本门同源（``_PLACEHOLDER_LEADS``）——拒收回执里的
+    可照抄示例也以同一判据自查（示例值不得落在占位前缀上，否则照抄必被
+    二次拒收）。禁止调用方另立前缀表。
+    """
+    return _is_placeholder(value)
+
+
 def delivery_contract_missing(evidence: dict[str, Any]) -> list[str]:
     """回执缺失/占位的字段名列表(空 list = 通过)。
 

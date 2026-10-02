@@ -73,6 +73,21 @@ async def verify_serialize_claim_blocked_message(
     bstatus = blocker.get("status")
     label = await resolve_verify_holder_assignee_label(blocker)
     tid8 = str(task_id or "")[:8]
+    # T16 残尾尾巴：退场处方按模式分流（auto ⇒ wait_on 挂任务/直接停）。
+    from hiveweave.config import turn_exit_mode
+
+    if turn_exit_mode() == "auto":
+        park_a = (
+            'wait_on(refs=[{"kind": "task", "ref": "<blocking task id>"}]) '
+            "or work other tasks, then stop"
+        )
+        park_b = (
+            'wait_on(refs=[{"kind": "task", "ref": "<blocking task id>"}]) '
+            "or work on your other tasks meanwhile, then stop"
+        )
+    else:
+        park_a = "commit_turn(waiting) or work other tasks"
+        park_b = "commit_turn(waiting) or work on your other tasks meanwhile"
     if bstatus == "blocked":
         return (
             f"Task {tid8} is a VERIFY task and blocked "
@@ -81,7 +96,7 @@ async def verify_serialize_claim_blocked_message(
             f"depends_on/timer). This task stays queued as "
             f"'created' — the platform wakes you via inbox "
             f"when MAIN frees ({VERIFY_LOCK_UNLOCK_HINT}). Do NOT retry "
-            f"claim_task; commit_turn(waiting) or work other tasks."
+            f"claim_task; {park_a}."
         )
     return (
         f"Task {tid8} is a VERIFY task and another "
@@ -90,8 +105,7 @@ async def verify_serialize_claim_blocked_message(
         f"one at a time). This task stays queued as 'created' "
         f"— the platform will wake you via inbox when MAIN "
         f"is free ({VERIFY_LOCK_UNLOCK_HINT}). Do NOT retry claim_task on it; "
-        f"commit_turn(waiting) or work on your other tasks "
-        f"meanwhile."
+        f"{park_b}."
     )
 
 

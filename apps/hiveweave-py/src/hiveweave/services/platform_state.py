@@ -64,7 +64,15 @@ def _entry(
 
 
 def _slice_id(value: Any) -> str:
-    """Existing compact slice: full id if ≤12 chars, else first 12. No minting."""
+    """Display-only compact slice: first 12 chars. No minting.
+
+    ⚠ A1 批2：只许用于**纯展示列**（agent 标签等从不回传工具调用的字段）。
+    任何会被 agent 复制回工具调用的 id 字段（task id 尤其——凭证/提交判等
+    的键）必须回传**完整 id**：12 字符切片（``"xxxxxxxx-xxx"``）曾被二次
+    分发进凭证判等，带横线形态解析不开 ⇒ 证据门死锁。判等侧容错见
+    ``attestation.canonical_task_id``；写库守门见
+    ``attestation.require_canonical_task_id``。
+    """
     s = str(value or "")
     return s[:12] if s else ""
 
@@ -82,9 +90,11 @@ def _depends_on_compact(raw: Any) -> list[str]:
         return []
     out: list[str] = []
     for item in parsed:
-        sid = _slice_id(item)
-        if sid:
-            out.append(sid)
+        # A1 批2：depends_on 是可回传字段（agent 复制进等待判定/派单），
+        # 回传完整 id，不再 _slice_id 截短。
+        tid = str(item or "").strip()
+        if tid:
+            out.append(tid)
     return out
 
 
@@ -111,7 +121,10 @@ def _live_execution(agent_id: str | None) -> str | None:
 
 def _compact_task(t: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": _slice_id(t.get("id")),
+        # A1 批2：task id 是凭证/提交判等的键，agent 会整串复制回工具调用
+        # ——必须回传完整 id。assignee/reviewer 是 agent 标签（寻址走
+        # short_id），纯展示列，保留切片。
+        "id": str(t.get("id") or ""),
         "title": t.get("title"),
         "status": t.get("status"),
         "role_hint": t.get("role_hint"),
@@ -131,12 +144,13 @@ def _compact_scope_task(
     if aid:
         assignee = short_by_id.get(str(aid)) or _slice_id(aid) or None
     return {
-        "id": _slice_id(t.get("id")),
+        # A1 批2：id / parent_task_id 可回传 → 完整 id（同 _compact_task）。
+        "id": str(t.get("id") or ""),
         "title": t.get("title"),
         "status": t.get("status"),
         "assignee_id": assignee,
         "assignee_execution": _live_execution(t.get("assignee_id")),
-        "parent_task_id": _slice_id(t.get("parent_task_id")) or None,
+        "parent_task_id": str(t.get("parent_task_id") or "") or None,
         "policy_id": t.get("policy_id"),
         # T4.3: submitGate 所需证据 kind 前置可见
         "required_evidence": _policy_required_evidence(t),
@@ -157,8 +171,13 @@ def _policy_required_evidence(task: dict[str, Any]) -> list[str] | None:
             ledger_policy_id,
             required_attestation_kinds,
         )
+        from hiveweave.services.code_audit import strip_code_audit_kind_for_gate
 
-        kinds = required_attestation_kinds(ledger_policy_id(task))
+        # T42：与门禁同源 —— flag off 时 code_audit kind 不再是可达契约，
+        # 行上不得继续展示（否则 executor 被教着去 request_code_audit）。
+        kinds = strip_code_audit_kind_for_gate(
+            required_attestation_kinds(ledger_policy_id(task))
+        )
         return sorted(kinds) if kinds is not None else None
     except Exception:
         return None
@@ -529,7 +548,9 @@ async def build_platform_state(
                 wait_ref = str(children[0].get("id"))
             if not wait_ref:
                 continue
-            sl = _slice_id(tid)
+            # A1 批2：mine_compact 行 id 现为完整 id，join 键必须同形——
+            # 不再 _slice_id 截短。
+            sl = str(tid or "")
             for row in mine_compact:
                 if (
                     row.get("id") == sl
@@ -877,7 +898,8 @@ async def build_platform_state(
                 {
                     "slice_id": slice_id_of(c),
                     "slice_status": c.get("slice_status"),
-                    "task_id": (t.get("id") or "")[:12],
+                    # A1 批2：可回传字段 → 完整 id（原 [:12] 切片同病同修）。
+                    "task_id": str(t.get("id") or ""),
                     "task_status": t.get("status"),
                     "pre_run_passed": (c.get("machine_pre_run") or {}).get(
                         "passed"

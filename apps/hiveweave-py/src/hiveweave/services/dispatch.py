@@ -548,6 +548,25 @@ class DispatchService:
             wake=False if is_blocked else None,
         )
 
+        # 4b) T19（S16 铁蛋/Iris）：出生即 blocked 的派单，上面的派单消息
+        # 按设计 wake=0（等依赖是合法等待，不做持续催办），但 assignee 必须
+        # **知情**——否则 claimed_at=NULL 不入义务表 + 沉默看门狗按合法 idle
+        # 豁免，「雇而未用 2h45m」零信号。补一条一次性轻量待命 wake
+        # （幂等键 born-blocked:{task_id}，任务一生一条；依赖解除时
+        # reconcile_blocked_tasks 自动唤醒）。形态不符（非 born-blocked）
+        # 时该函数自校验后静默不发。
+        if is_blocked:
+            try:
+                from hiveweave.agents.trigger import maybe_notify_born_blocked
+
+                await maybe_notify_born_blocked(project_id, task_id)
+            except Exception as e:
+                log.warning(
+                    "born_blocked_notify_failed",
+                    task_id=task_id,
+                    error=str(e),
+                )
+
         # 5) handoff 携带 task_id（如启用）
         handoff_id: str | None = None
         if create_handoff:

@@ -22,6 +22,23 @@ from .constants import _TRANSITIONS
 log = structlog.get_logger(__name__)
 
 
+def _illegal_transition_error(current: str, target: str) -> str:
+    """A4 附带项（D76 实测，批 2）：非法转移报错自带处方。
+
+    裸 ``Illegal transition: a → b`` 只给结论不给出口 —— agent 会原样重试
+    或用更糟的绕路（实测：把任务移回 running 再重提）。处方 = 事实（当前
+    状态的合法出口清单）+ 下一步（重试同一调用无效，先经合法出口推进）。
+    """
+    legal = sorted(_TRANSITIONS.get(current, set()))
+    exits = ", ".join(legal) if legal else "(none — terminal state)"
+    return (
+        f"Illegal transition: {current} → {target}. "
+        f"Legal exits from '{current}': {exits}. "
+        f"Retrying the same call will not help — move the task through a "
+        f"legal exit (or use the tool that owns that transition) first."
+    )
+
+
 class TransitionsMixin:
     """_transition / _transition_multi."""
 
@@ -54,7 +71,7 @@ class TransitionsMixin:
             raise ValueError(f"Task not found: {task_id}")
         current = rows[0]["status"]
         if target not in _TRANSITIONS.get(current, set()):
-            raise ValueError(f"Illegal transition: {current} → {target}")
+            raise ValueError(_illegal_transition_error(current, target))
         now_ms = int(time.time() * 1000)
         payload_obj: dict = {}
         if reason_code:
@@ -134,8 +151,12 @@ class TransitionsMixin:
                 stmts.append(wait_clear)
             # 新-①：唤醒行并入**同一次提交**（否则崩在「提交后、trigger 前」= 等待
             # 已清而唤醒永不发生）。单一实现见 `_durable_wake_stmts`。
+            # T22-②：透传 from→to，解除声明按事实终态条件化。
             stmts.extend(
-                await self._durable_wake_stmts(task_id, waiters, now_ms)
+                await self._durable_wake_stmts(
+                    task_id, waiters, now_ms,
+                    to_status=target, from_status=current,
+                )
             )
             await _execute_tx(project_id, stmts)
         await publish_task_event(
@@ -151,7 +172,9 @@ class TransitionsMixin:
         # P2-5: 主路径已在上面的事务里清完，这里先唤醒那批（提交后），
         # 再由 `_clear_task_wait_contracts` 兜底提交窗口内新建的等待行。
         await self._wake_task_waiters(project_id, task_id, waiters, in_tx=True)
-        await self._clear_task_wait_contracts(project_id, task_id)
+        await self._clear_task_wait_contracts(
+            project_id, task_id, to_status=target, from_status=current,
+        )
 
     async def _transition_multi(self, project_id: str, task_id: str,
                                *targets: str,
@@ -178,7 +201,7 @@ class TransitionsMixin:
         state = current
         for target in targets:
             if target not in _TRANSITIONS.get(state, set()):
-                raise ValueError(f"Illegal transition: {state} → {target}")
+                raise ValueError(_illegal_transition_error(state, target))
             state = target
         # Single UPDATE to final state — atomic, no intermediate visible
         now_ms = int(time.time() * 1000)
@@ -205,9 +228,13 @@ class TransitionsMixin:
         ]
         if wait_clear is not None:
             multi_stmts.append(wait_clear)
-        # 新-①：同上（multi 路径的 waiters 同样要 durable 唤醒）
+        # 新-①：同上（multi 路径的 waiters 同样要 durable 唤醒）。
+        # T22-②：透传 from→final。
         multi_stmts.extend(
-            await self._durable_wake_stmts(task_id, waiters, now_ms)
+            await self._durable_wake_stmts(
+                task_id, waiters, now_ms,
+                to_status=final, from_status=current,
+            )
         )
         await _execute_tx(project_id, multi_stmts)
         await publish_task_event(
@@ -220,5 +247,7 @@ class TransitionsMixin:
         # L2 fix: clear wait contracts on multi-step transitions too
         # (rework path uses _transition_multi, waiters need to be woken)
         await self._wake_task_waiters(project_id, task_id, waiters, in_tx=True)
-        await self._clear_task_wait_contracts(project_id, task_id)
+        await self._clear_task_wait_contracts(
+            project_id, task_id, to_status=final, from_status=current,
+        )
 

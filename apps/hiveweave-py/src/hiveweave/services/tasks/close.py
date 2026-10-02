@@ -740,22 +740,85 @@ class CloseMixin:
                 )
 
     async def _durable_wake_stmts(
-        self, task_id: str, waiters: list[dict], now_ms: int
+        self,
+        task_id: str,
+        waiters: list[dict],
+        now_ms: int,
+        *,
+        to_status: str | None = None,
+        from_status: str | None = None,
     ) -> list[tuple[str, list]]:
         """把「durable 唤醒行」构造成可并入**触发侧事务**的语句列表（新-①）。
 
         单一实现：4 个投放点（`archive_task` / `_transition` / `_transition_multi` /
         `_clear_task_wait_contracts` 兜底）都调用它 —— 各写一遍必然漂移。
-        按 **agent 去重**（同一 agent 可能对同一 task 留多条等待行，不去重会连叫多次）。
+        按 **agent 去重**（同一 agent 可能留多条等待行，不去重会连叫多次）。
+
+        T22-②（S16）：**解除声明必须以事实为条件**（判据 =
+        ``wait_contract.TASK_WAIT_SATISFIED_STATUSES``）——
+        - 任务真的到达终态（approved/closed/cancelled）才说
+          「[等待解除] …不必再等」；
+        - 非终态转换只说「[任务状态变更]」（如实给出 from→to），并给
+          「仍需等待请重新挂 waiting_on」的处方 —— 此前任何转换都自称
+          「已进入终态或有新进展…不必再等」，merge 未发生时也放人，
+          造成 CEO/牧云 45 分钟双等死锁。
         """
+        from hiveweave.services.wait_contract import TASK_WAIT_SATISFIED_STATUSES
+
+        satisfied = bool(to_status) and to_status in TASK_WAIT_SATISFIED_STATUSES
+        tid8 = task_id[:8]
+        # T16 残尾尾巴：续挂处方按模式分流（auto 下 commit_turn 已下架，
+        # 被唤醒者唯一合法续挂 = wait_on）。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            rewait_a = (
+                f"若仍需等本任务终态，请重新 wait_on(refs=[{{\"kind\": "
+                f"\"task\", \"ref\": \"{tid8}\"}}])（commit_turn 已下架），"
+                "或先 get_task 复核当前状态。"
+            )
+            rewait_b = (
+                f"若仍需等本任务终态，请重新 wait_on(refs=[{{\"kind\": "
+                f"\"task\", \"ref\": \"{tid8}\"}}])（commit_turn 已下架）。"
+            )
+        else:
+            rewait_a = (
+                f"若仍需等本任务终态，请重新 commit_turn(waiting, "
+                f"waiting_on=[{{kind:'task', ref:'{tid8}'}}])，"
+                "或先 get_task 复核当前状态。"
+            )
+            rewait_b = (
+                f"若仍需等本任务终态，请重新 commit_turn(waiting, "
+                f"waiting_on=[{{kind:'task', ref:'{tid8}'}}])。"
+            )
+        if satisfied:
+            msg = (
+                f"[等待解除] 任务 {tid8} 已到达事实终态"
+                f"（status={to_status}），你对该任务的等待已解除 —— "
+                "不必再等本任务，请转向其它任务。"
+            )
+        elif to_status:
+            msg = (
+                f"[任务状态变更] 任务 {tid8} 状态 "
+                f"{(from_status or '?')[:12]}→{to_status}"
+                "（非终态——本次没有合并/关闭事实）。"
+                "你挂起的任务等待已按该事件唤醒，是否继续等待由你判断："
+                f"{rewait_a}"
+            )
+        else:
+            msg = (
+                f"[任务状态变更] 任务 {tid8} 有状态变更"
+                "（细节见 task_events / get_task）。"
+                "你挂起的任务等待已按该事件唤醒，是否继续等待由你判断："
+                f"{rewait_b}"
+            )
         stmts: list[tuple[str, list]] = []
         for agent_id in sorted(
             {str(r.get("agent_id") or "") for r in waiters if r.get("agent_id")}
         ):
             stmt, _ts, _iid = build_inbox_wake_insert(
                 agent_id,
-                f"[等待解除] 任务 {task_id} 已进入终态或有新进展，你的等待已解除 —— "
-                "不必再等，请转向其它任务。",
+                msg,
                 task_id=task_id,
                 now_ms=now_ms,
             )
@@ -763,7 +826,12 @@ class CloseMixin:
         return stmts
 
     async def _clear_task_wait_contracts(
-        self, project_id: str, task_id: str
+        self,
+        project_id: str,
+        task_id: str,
+        *,
+        to_status: str | None = None,
+        from_status: str | None = None,
     ) -> None:
         """TEST17 fix: clear agent_waits referencing a task on any transition.
 
@@ -779,6 +847,9 @@ class CloseMixin:
         ——转换点会在 `_execute_tx` 里先清一遍，方法在多数情况下读到 0 行。
         保留它作为**残余兜底**：覆盖「进 tx 前的读」与「提交」之间新建的
         等待行（窗口极小但非零），语义与旧版逐字一致。
+
+        T22-②：``to_status``/``from_status`` 透传给唤醒文案 —— 解除声明
+        （「不必再等」）只在真终态出现，非终态转换只陈述状态变更。
         """
         try:
             waiters = await self._pending_task_waiters(project_id, task_id)
@@ -794,7 +865,8 @@ class CloseMixin:
             await _execute_tx(
                 project_id,
                 [stmt, *await self._durable_wake_stmts(
-                    task_id, waiters, int(time.time() * 1000)
+                    task_id, waiters, int(time.time() * 1000),
+                    to_status=to_status, from_status=from_status,
                 )],
             )
             await self._wake_task_waiters(
@@ -953,7 +1025,10 @@ class CloseMixin:
         # `inbox.demote_wake_for_task` 的降级条件互斥，否则刚落就会被降成 wake=0
         #（2026-09-21 实测踩过：durable 唤醒形同虚设）。
         archive_stmts.extend(
-            await self._durable_wake_stmts(task_id, waiters, now_ms)
+            await self._durable_wake_stmts(
+                task_id, waiters, now_ms,
+                to_status="cancelled", from_status=current,
+            )
         )
         await _execute_tx(project_id, archive_stmts)
         await publish_task_event(
@@ -1061,7 +1136,9 @@ class CloseMixin:
         # L3: wake waiters already cleared inside the transaction above,
         # then run the outside-tx residual net (waiters created mid-window).
         await self._wake_task_waiters(project_id, task_id, waiters, in_tx=True)
-        await self._clear_task_wait_contracts(project_id, task_id)
+        await self._clear_task_wait_contracts(
+            project_id, task_id, to_status="cancelled", from_status=current,
+        )
 
         # L1: detect reverse dependents — tasks whose depends_on contains
         # this task will have a dangling reference (cancelled ∉ completed).

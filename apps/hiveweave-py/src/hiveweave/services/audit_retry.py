@@ -548,8 +548,11 @@ class AuditRetryLoop:
                     project_id, row, "worktree 不可用"
                 )
                 return
+            # T2：返回类型改为 WorktreeDiff（text + truncated）；重跑哈希
+            # 取 text——与首次入队哈希同源（同为截断后文本），截断标注由
+            # run_code_audit 内部处理。
             diff = await collect_worktree_diff(worktree)
-            new_hash = hash_stdout(diff)
+            new_hash = hash_stdout(diff.text)
         except Exception as e:  # noqa: BLE001 — 哈希失败本轮跳过，不烧 attempts
             log.warning(
                 "audit_retry_rehash_failed", row_id=row_id, error=str(e)

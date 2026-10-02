@@ -98,10 +98,19 @@ async def _validate_span(
         allowed.append("上级")
     if allow_peer:
         allowed.append("同级")
+    # B5（2026-09-28）：失败回执 = 事实 + 下一步处方。跨级派活最常见的断点
+    # 是目标下属的直属中层尚未接活/开工；沟通路径无派活语义，不带此句。
+    dispatch_hint = (
+        "若目标下属的直属中层尚未接活/开工，先向你的直属下属"
+        "（该叶子的直属中层）本人派活，再由其转派。"
+        if action == "派活"
+        else ""
+    )
     return (
         f"拒绝跨级{action}：只能联系{'/'.join(allowed)}。"
         f"「{tname}」不在你的指挥链直达范围内。"
         "跨级请让直属上级转发，或走升级/transfer，不要直接打穿组织。"
+        f"{dispatch_hint}"
     )
 
 

@@ -18,7 +18,10 @@ from hiveweave.services.policy import is_test_engineer_role
 # the old MAX_DIRECT_REPORTS=7 hire gate stranded QA hires (TEST_DSH_36)
 # and froze HR when the 8th report was rejected. Beyond the guidance the
 # system still succeeds but returns span_advisory() — add a coordinator
-# layer and regroup leaves by functional module.
+# layer and regroup leaves by functional module. B3 修法①② (2026-09-28):
+# the advisory now uses TWO anchors — direct reports AND subtree size
+# (含 indirect) — and is evaluated on coordinator hires too (adding a
+# mid-layer is exactly the moment to check whether layers suffice).
 SPAN_GUIDANCE = 7
 
 _RESERVED_FLOWER_NAMES = frozenset({
@@ -194,6 +197,60 @@ def _executor_under_ceo_error(parent: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _is_business_coordinator(agent: dict[str, Any]) -> bool:
+    """业务中层 = active coordinator 且不是 CEO/HR（HR 不得有下属）。"""
+    perm = str(agent.get("permission_type") or "").strip().lower()
+    if perm != "coordinator":
+        return False
+    return _normalize_role_key(agent.get("role") or "") not in ("ceo", "hr")
+
+
+def count_business_coordinators(agents: list[dict[str, Any]] | None) -> int:
+    return sum(1 for a in _active(agents or []) if _is_business_coordinator(a))
+
+
+def _subtree_size(
+    agents: list[dict[str, Any]], pid: str, exclude_id: str | None
+) -> int:
+    """Active descendants of ``pid`` at any depth (excluding exclude_id)."""
+    children: dict[str, list[str]] = {}
+    for a in _active(agents):
+        par = str(a.get("parent_id") or "")
+        aid = str(a.get("id") or "")
+        if par and aid:
+            children.setdefault(par, []).append(aid)
+    seen: set[str] = set()
+    stack = list(children.get(pid, []))
+    while stack:
+        cur = stack.pop()
+        if not cur or cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(children.get(cur, []))
+    seen.discard(exclude_id or "")
+    return len(seen)
+
+
+def _span_subtree_text(
+    parent_name: str, n: int, *, adding_coordinator: bool
+) -> str:
+    head = "⚠️ SPAN ADVISORY（非阻塞提示，本次操作已生效）："
+    if adding_coordinator:
+        return (
+            f"{head}加了这个中层后 {parent_name} 辖下（含间接下属）仍有 {n} 人"
+            f"（组织设计指导值 ≤{SPAN_GUIDANCE}）。人数没有硬上限，"
+            "但可继续按功能模块评估是否再加一层 coordinator 中层分担；"
+            "请在回报中带上这个分层评估。"
+        )
+    return (
+        f"{head}{parent_name} 辖下（含间接下属）将达 {n} 人"
+        f"（组织设计指导值 ≤{SPAN_GUIDANCE}）。人数没有硬上限，"
+        "但单个中层辖下总人数偏多时，更好的结构是在其辖下再加一层 "
+        "coordinator 中层、把叶子按功能模块分组挂靠；"
+        "请在回报中带上这个分层建议。"
+    )
+
+
 def span_advisory(
     *,
     agents: list[dict[str, Any]],
@@ -203,13 +260,18 @@ def span_advisory(
 ) -> str | None:
     """Non-blocking hint when a parent would exceed the span guidance.
 
+    B3 修法①②（2026-09-28 报告 §2-B3）：判据从「直属人数」扩成双判据——
+    (a) 直属：parent 直辖 active 下属 +1 超 SPAN_GUIDANCE（原判据；
+        adding_coordinator 时跳过——加中层本身就是对直属超编的救治）；
+    (b) subtree：parent 辖下（含 indirect）总人数 +1 超 SPAN_GUIDANCE
+        ——锚到「辖下是否臃肿」，中层直属恒 1-7 不代表辖下不臃肿；
+        adding_coordinator 时同样评估（去掉旧短路：加中层那一刻恰是
+        评估「加得够不够」的时刻，文案自然变成「加了这个中层后
+        X 辖下仍 N 人」）。
     Hire/transfer always succeed; the caller appends the returned text to
-    the tool receipt so the agent knows to layer the org instead of piling
-    more direct reports onto one parent. Returns None within guidance or
-    when the added person is themselves a coordinator (that IS the remedy).
+    the tool receipt so the agent knows to layer the org. Non-blocking —
+    指导值，平台不拦（TEST_DSH_36 前车之鉴，不得改硬闸）。
     """
-    if adding_coordinator:
-        return None
     parent_id = (parent_id or "").strip()
     if not parent_id:
         return None
@@ -227,17 +289,34 @@ def span_advisory(
         for a in _active(agents)
         if (a.get("parent_id") or "") == pid and a.get("id") != exclude_id
     ]
-    resulting = len(kids) + 1
-    if resulting <= SPAN_GUIDANCE:
+    resulting_direct = len(kids) + 1
+    resulting_subtree = _subtree_size(agents, pid, exclude_id) + 1
+
+    notes: list[str] = []
+    direct_fires = resulting_direct > SPAN_GUIDANCE and not adding_coordinator
+    if direct_fires:
+        notes.append(
+            f"⚠️ SPAN ADVISORY（非阻塞提示，本次操作已生效）：{parent_name} "
+            f"的直属将达 {resulting_direct} 人（组织设计指导值 "
+            f"≤{SPAN_GUIDANCE}）。"
+            "人数没有硬上限，但直属偏多时更好的结构是再加一层 coordinator 中层、"
+            "把叶子按功能模块分组挂靠：先 hire_agent 一名 coordinator"
+            "（permissionType=coordinator，parentId=现上级），再用 transfer_agent "
+            "把相关模块的叶子挂到新中层名下。请在回报中带上这个分层建议。"
+        )
+    # Subtree criterion. Skip when it is the same fact as the direct note
+    # (no intermediate layer → subtree == direct, already reported).
+    if resulting_subtree > SPAN_GUIDANCE and not (
+        direct_fires and resulting_subtree == resulting_direct
+    ):
+        notes.append(
+            _span_subtree_text(
+                parent_name, resulting_subtree, adding_coordinator=adding_coordinator
+            )
+        )
+    if not notes:
         return None
-    return (
-        f"⚠️ SPAN ADVISORY（非阻塞提示，本次操作已生效）：{parent_name} "
-        f"的直属将达 {resulting} 人（组织设计指导值 ≤{SPAN_GUIDANCE}）。"
-        "人数没有硬上限，但直属偏多时更好的结构是再加一层 coordinator 中层、"
-        "把叶子按功能模块分组挂靠：先 hire_agent 一名 coordinator"
-        "（permissionType=coordinator，parentId=现上级），再用 transfer_agent "
-        "把相关模块的叶子挂到新中层名下。请在回报中带上这个分层建议。"
-    )
+    return "\n".join(notes)
 
 
 def staffing_advisory(
@@ -416,3 +495,112 @@ def qa_depth_advisory(
             "hiring another test_engineer QA for depth."
         )
     return None
+
+
+# ── B3 ③④⑤：charter 编制结构 / 项目级形态信号（2026-09-28）────────
+
+
+# charter 范式枚举（B3 修法③）。与 prompts/coordinator.py 的
+# Organizational Paradigm Library 六范式一一对应；存储/解析在
+# services/charter.py（[org-shape] 标记行，零 schema 变更）。
+CHARTER_PARADIGMS = frozenset(
+    {"solo", "flat_squad", "tech_lead", "pm_architect", "pod", "pipeline"}
+)
+
+
+def min_business_coordinators(
+    paradigm: str, pod_count: int | None = None
+) -> int | None:
+    """paradigm → 平台算出的最低业务中层数（B3 修法③）。
+
+    solo/flat_squad/tech_lead/pipeline → 1；pm_architect → 2；
+    pod → pod 数（未声明则取下限 2）。未知范式 → None（调用方跳过校验，
+    读旧 charter 无字段时不拦）。
+    """
+    p = (paradigm or "").strip().lower()
+    if p in ("solo", "flat_squad", "tech_lead", "pipeline"):
+        return 1
+    if p == "pm_architect":
+        return 2
+    if p == "pod":
+        try:
+            n = int(pod_count) if pod_count is not None else 0
+        except (TypeError, ValueError):
+            n = 0
+        return n if n >= 1 else 2
+    return None
+
+
+def org_shape_signals(*, agents: list[dict[str, Any]] | None) -> list[str]:
+    """项目级组织形态异常信号（B3 修法⑤，非阻塞）。
+
+    实测形态（2026-09-28 报告 §2-B3）：83.3% 项目收敛到「恰 1 个业务
+    中层」，其中 24 个项目呈「1 业务中层 + ≥6 叶子」——设计/派活/验收
+    单点化，是里程碑瓶颈的高发形态。返回人类可读信号行（空列表 = 健康）；
+    挂到组织视野回执（check_agent_status 全员视图）供 CEO 里程碑审查时
+    参考。fail-open：输入异常返回空列表，绝不 raise。
+    """
+    try:
+        active = _active(agents or [])
+        biz = [a for a in active if _is_business_coordinator(a)]
+        leaves = [
+            a
+            for a in active
+            if str(a.get("permission_type") or "").strip().lower() == "executor"
+        ]
+        if len(biz) == 1 and len(leaves) >= 6:
+            owner = biz[0].get("name") or biz[0].get("short_id") or "?"
+            return [
+                (
+                    f"⚠️ ORG SHAPE SIGNAL（非阻塞）：全项目只有 1 个业务中层"
+                    f"（{owner}）辖下共 {len(leaves)} 个叶子——设计/派活/验收"
+                    f"单点化，是里程碑瓶颈的高发形态。里程碑审查时评估按交付面"
+                    f"加层（hire coordinator + transfer 分组）；确需保持单中层"
+                    f"请在 charter 写明理由（指导值，平台不拦）。"
+                )
+            ]
+        return []
+    except Exception:
+        return []
+
+
+def charter_shape_advisory(
+    *,
+    charter: dict[str, Any] | None,
+    agents: list[dict[str, Any]] | None,
+) -> str | None:
+    """B3 修法④：faces × 中层数一致性非阻塞校验。禁止拒存，fail-open。
+
+    触发条件（全部满足才提示）：charter 带已解析的 paradigm/faces 字段
+    （services/charter.py read_charter 从 [org-shape] 标记行解析）；
+    faces ≥2；该 paradigm 未声明多中层（min_business_coordinators==1）；
+    现有业务中层数 M < faces。旧 charter（无字段/未知范式）直接返回
+    None——读旧 charter 无字段时跳过校验。
+    """
+    try:
+        if not isinstance(charter, dict):
+            return None
+        paradigm = str(charter.get("paradigm") or "").strip().lower()
+        if paradigm not in CHARTER_PARADIGMS:
+            return None
+        faces_raw = charter.get("faces")
+        if faces_raw is None:
+            return None
+        faces = int(faces_raw)
+        if faces <= 1:
+            return None
+        pod_raw = charter.get("pod_count")
+        pod = int(pod_raw) if pod_raw is not None else None
+        if (min_business_coordinators(paradigm, pod) or 1) > 1:
+            return None  # paradigm 本身声明了多中层
+        m = count_business_coordinators(agents or [])
+        if faces <= m:
+            return None
+        return (
+            f"⚠️ CHARTER SHAPE ADVISORY（非阻塞提示）：charter 声明了 {faces} 个"
+            f"独立交付面（paradigm={paradigm}），但当前只有 {m} 个业务中层"
+            f"——若确需一人多面/合并面，请在 charter 写明合并理由；"
+            f"否则按面配置中层（指导值，平台不拦）。"
+        )
+    except Exception:
+        return None

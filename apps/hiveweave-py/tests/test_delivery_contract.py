@@ -478,3 +478,63 @@ async def test_preflight_na_without_test_run_still_rejected(env):
     assert "delivery_contract_incomplete" in {
         i["code"] for i in res["issues"]
     }
+
+
+# ── P0-4：单一权威口径（顶层 summary 可选 + 回执回填）────────
+
+
+@pytest.mark.asyncio
+async def test_p0_4_top_level_summary_backfilled_from_receipt(env):
+    """P0-4 测试①：只带 deliveryContract.summary（无顶层 summary）⇒ 通过。
+
+    修前 pydantic 顶层 summary 必填 ⇒ 该形态在参数层就被拒（与 dc 门
+    互斥的另一套口径，实测同一 agent 78s 内拿到两种互斥处方）。现顶层
+    可选，缺失时从回执回填——存侧权威（回执 summary）不变。
+    """
+    _, tid, task = await _mk_task(env, contract=_dc_contract("tid12345"))
+    att_id = await attestation_service.create(
+        env["project_id"], agent_id=EXEC, kind="test_run",
+        task_id=tid, command_or_url="pytest -q", exit_code=0, stdout="ok",
+    )
+    res = await _preflight(
+        env, task,
+        {
+            "summary": None,
+            "delivery_contract": {
+                "summary": "回执摘要：改了 signup 模块",
+                "test": f"test_run:{att_id}",
+            },
+        },
+    )
+    assert res["issues"] == [], res["issues"]
+    # 回填进 evidence.summary（顶层缺失 ⇒ 回执 summary 即摘要）
+    assert res["evidence"]["summary"] == "回执摘要：改了 signup 模块"
+
+
+@pytest.mark.asyncio
+async def test_p0_4_summary_missing_single_authoritative_rejection(env):
+    """P0-4 测试②：顶层与回执 summary 都没有 ⇒ 拒，且处方**单一口径**。
+
+    - 非 dc 任务 ⇒ 新 ``summary_missing`` 恰一条（唯一必填路径 = 顶层
+      summary 参数）；
+    - dc 任务 ⇒ 只由 dc 门开火（回执自带可照抄模板，即唯一处方），
+      不叠加第二种报因——否则又是两种口径。
+    """
+    # 非 dc 任务：两者皆缺
+    _, tid, task = await _mk_task(env, contract=None)
+    res = await _preflight(env, task, {"summary": None})
+    codes = [i["code"] for i in res["issues"]]
+    assert "summary_missing" in codes
+    assert codes.count("summary_missing") == 1
+    issue = next(i for i in res["issues"] if i["code"] == "summary_missing")
+    assert "唯一必填路径" in issue["remedy"]
+
+    # dc 任务：两者皆缺 ⇒ 只有 dc 门一条处方
+    # （标题避开 dedup：create_task 会复用同名 open 任务，契约就丢了）
+    _, tid2, task2 = await _mk_task(
+        env, title="p0-4 dc summary task", contract=_dc_contract("x")
+    )
+    res2 = await _preflight(env, task2, {"summary": None})
+    codes2 = [i["code"] for i in res2["issues"]]
+    assert "summary_missing" not in codes2
+    assert "delivery_contract_incomplete" in codes2

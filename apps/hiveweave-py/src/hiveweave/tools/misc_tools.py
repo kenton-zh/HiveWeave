@@ -2336,6 +2336,10 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
       · ``LEDGER_FAIL_VERDICT``  —— 未解决的 FAIL 终验
       · ``LEDGER_APPROVED_OPEN`` —— approved 未 closed 的任务
       · ``INBOX_UNREAD_HUMAN``   —— **自己**未读的人工消息
+        （P1-5 2026-10-02：判据 = 发件人是人类，单源
+        ``services/inbox.sender_is_human``；agent 互发消息不构成"人工
+        未读"——修前 from=UUID 的 agent 消息全被误计，DSH_85 实测
+        21/21 任务 closed 仍 blocked）
       · ``EVIDENCE_NOT_LANDED``  —— VERIFY 证据文件未落到 MAIN 磁盘
         （TEST_DSH_64 #1，2026-09-19 补）：已 approved/closed 的 VERIFY
         任务在 ``evidence.files_changed`` 里声称的 ``.hiveweave/reports/``
@@ -2390,22 +2394,37 @@ async def _delivery_blockers(agent_id: str) -> list[dict[str, str]]:
     except Exception:  # noqa: BLE001 — approved 计数失败按无此 blocker（fail-open，见 docstring）
         pass
     try:
+        # P1-5（2026-10-02）：判据改为「发件人是人类」（单一权威源
+        # ``services/inbox.sender_is_human``）。修前 SQL 只排字面量
+        # 'system'/'用户' ⇒ agent 消息（from=UUID）全被当人工消息——
+        # DSH_85 实测 21/21 任务全 closed 仍 blocked（发件人=中层 agent）。
+        # 无 SQL 级人类过滤可表达函数判据 ⇒ 取未读窗口在 Python 侧过滤；
+        # 窗口 200 条是护栏（fail-open 家族：列举失败按无此 blocker）。
+        from hiveweave.services.inbox import _ensure_schema, sender_is_human
+
+        # SELECT 带 message_type（人类类型标记位）——存量老库先补列再查。
+        await _ensure_schema(agent_id)
         cur = await conn.execute(
-            "SELECT id, from_agent_id, substr(message, 1, 80) AS preview "
+            "SELECT from_agent_id, message_type, "
+            "substr(message, 1, 80) AS preview "
             "FROM inbox WHERE to_agent_id = ? AND read = 0 "
-            "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户') "
-            "ORDER BY created_at ASC LIMIT ?",
-            [agent_id, _DELIVERY_UNREAD_SAMPLE],
+            "ORDER BY created_at ASC LIMIT 200",
+            [agent_id],
         )
         rows = await cur.fetchall()
         await cur.close()
-        if rows:
+        human_rows = [
+            r for r in rows
+            if sender_is_human(r["from_agent_id"], r["message_type"])
+        ]
+        if human_rows:
             listing = "; ".join(
-                f"{str(r['from_agent_id'])[:8]}: {r['preview']}" for r in rows
+                f"{str(r['from_agent_id'])[:8]}: {r['preview']}"
+                for r in human_rows[:_DELIVERY_UNREAD_SAMPLE]
             )
             blockers.append({
                 "code": POLICY_INBOX_UNREAD_HUMAN,
-                "message": f"你还有 {len(rows)}+ 条未读人工消息（{listing}）",
+                "message": f"你还有 {len(human_rows)}+ 条未读人工消息（{listing}）",
             })
     except Exception:  # noqa: BLE001 — 未读列举失败按无此 blocker（fail-open，与前两条计数同语义，不猜）
         pass
@@ -2505,11 +2524,15 @@ async def _delivery_snapshot(agent_id: str) -> dict[str, Any]:
         if row:
             snap["tasks_total"] = int(row["total"] or 0)
             snap["tasks_closed"] = int(row["closed"] or 0)
+        # P1-5：unread_human 读数与 blocker 门同源（human_sender_sql，
+        # 判据=发件人是人类），修前此 COUNT 误计 agent 消息。
+        from hiveweave.services.inbox import human_sender_sql
+
+        _h_frag, _h_params = human_sender_sql()
         cur = await conn.execute(
-            "SELECT COUNT(*) AS c FROM inbox "
-            "WHERE to_agent_id = ? AND read = 0 "
-            "AND COALESCE(from_agent_id, '') NOT IN ('system', '用户')",
-            [agent_id],
+            f"SELECT COUNT(*) AS c FROM inbox "
+            f"WHERE to_agent_id = ? AND read = 0 AND {_h_frag}",
+            [agent_id, *_h_params],
         )
         row = await cur.fetchone()
         await cur.close()

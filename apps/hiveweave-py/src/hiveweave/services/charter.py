@@ -28,6 +28,84 @@ logger = structlog.get_logger()
 
 DEFAULT_USER_INVOLVEMENT = "宏观决策+技术选型"  # medium level (契约 14 RECONCILE)
 
+# ── B3 ③④：charter 编制结构声明（零 schema 变更）────────────────
+# dict 形态新增可选 paradigm / faces / pod_count 字段（B3 修法③，范式枚举
+# 与最低中层数换算在 org_invariants.CHARTER_PARADIGMS /
+# min_business_coordinators）。存储不加列：把声明编码成一行人类可读
+# 「[org-shape] paradigm=… faces=… pod=…」标记追加进既有 project_rules 列
+# （agent_charters 无 DDL）；read 侧 parse_org_shape 解析回结构化字段。
+# 用单行文本而非裸 JSON：project_rules 会被 agents/agent.py 原文注入各
+# agent 的 Project Rules 段，标记行对人可读、对 parse_org_shape 可逆。
+# 旧 charter 无标记 → 解析为 {} → 调用方跳过校验（不拦旧数据）。
+ORG_SHAPE_MARKER_PREFIX = "[org-shape]"
+
+
+def _org_shape_marker(paradigm: Any, faces: Any, pod_count: Any) -> str:
+    """dict 字段 → 单行 [org-shape] 标记；无可声明字段时返回空串。"""
+    parts: list[str] = []
+    if paradigm:
+        p = str(paradigm).strip().lower()
+        if p:
+            parts.append(f"paradigm={p}")
+    for label, val in (("faces", faces), ("pod", pod_count)):
+        if val is not None:
+            try:
+                parts.append(f"{label}={int(val)}")
+            except (TypeError, ValueError):
+                continue
+    if not parts:
+        return ""
+    return f"{ORG_SHAPE_MARKER_PREFIX} " + " ".join(parts)
+
+
+def parse_org_shape(*texts: str | None) -> dict[str, Any]:
+    """从 charter 文本（project_rules / content）解析 [org-shape] 标记行。
+
+    多个文本/多行标记时取**最后一个**有效声明（重存的新声明覆盖旧声明）。
+    键值不合法的 token 忽略；无任何标记返回 {}（旧 charter → 跳过校验）。
+    传多个文本时后面的参数优先（content 覆盖 project_rules）。
+    """
+    result: dict[str, Any] = {}
+    for text in texts:
+        if not text:
+            continue
+        for line in str(text).splitlines():
+            stripped = line.strip()
+            if not stripped.lower().startswith(ORG_SHAPE_MARKER_PREFIX):
+                continue
+            fields: dict[str, Any] = {}
+            for token in stripped[len(ORG_SHAPE_MARKER_PREFIX):].split():
+                key, _, raw = token.partition("=")
+                key = key.strip().lower()
+                if not raw:
+                    continue
+                if key == "paradigm":
+                    fields["paradigm"] = raw.strip().lower()
+                elif key == "faces":
+                    try:
+                        fields["faces"] = int(raw)
+                    except ValueError:
+                        continue
+                elif key == "pod":
+                    try:
+                        fields["pod_count"] = int(raw)
+                    except ValueError:
+                        continue
+            if fields:
+                result.update(fields)
+    return result
+
+
+def _next_charter_version(prev: Any) -> str:
+    """B4：charter 重存 = 新版本（minor 自增；不可解析回 1.0）。"""
+    try:
+        s = str(prev or "").strip()
+        if not s:
+            return "1.0"
+        return f"{round(float(s) + 0.1, 1):.1f}"
+    except (TypeError, ValueError):
+        return "1.0"
+
 
 class CharterService:
     """Manages project charters and enterprise goals with dirty-flag sync."""
@@ -42,7 +120,11 @@ class CharterService:
     ) -> str:
         """Save or update the project charter (DELETE + INSERT).
 
-        content: str (charter body) or dict {title, content, status, project_rules}.
+        content: str (charter body) or dict {title, content, status,
+        project_rules} plus optional org-shape declaration fields
+        ``paradigm`` / ``faces`` / ``pod_count``（B3 修法③；零 schema
+        变更 —— 编码成 [org-shape] 标记行追加进 project_rules 列）。
+        Re-saving bumps ``version`` (B4：charter 新版本，minor 自增).
         Returns the new charter ID.
 
         Writes to the per-project DB (agent_charters table). The project_id
@@ -53,11 +135,32 @@ class CharterService:
             body = content.get("content", "")
             status = content.get("status", "active")
             project_rules = content.get("project_rules", "")
+            paradigm = content.get("paradigm")
+            faces = content.get("faces")
+            pod_count = content.get("pod_count", content.get("pod"))
         else:
             title = "Project Charter"
             body = str(content)
             status = "active"
             project_rules = ""
+            paradigm = None
+            faces = None
+            pod_count = None
+
+        # B3 ③：org-shape 声明 → 单行标记追加进 project_rules（不拒存：
+        # 字段非法时 _org_shape_marker 自动丢弃该键，charter 照常保存）。
+        shape_marker = _org_shape_marker(paradigm, faces, pod_count)
+        if shape_marker:
+            project_rules = (
+                f"{project_rules}\n{shape_marker}"
+                if project_rules
+                else shape_marker
+            )
+            logger.info(
+                "charter.org_shape_declared",
+                project_id=project_id,
+                marker=shape_marker,
+            )
 
         charter_id = str(uuid.uuid4())
         now = int(time.time() * 1000)
@@ -74,6 +177,24 @@ class CharterService:
                 f"Workspace not found for project {routed_pid}"
             )
 
+        # B4：重存 = charter 新版本（minor 自增；首存为 1.0）。查询失败
+        # 不拦存（fail-open，回退 1.0）。
+        prev_version: Any = None
+        try:
+            conn = await get_project_db_by_project_id(routed_pid)
+            cursor = await conn.execute(
+                """SELECT version FROM agent_charters WHERE project_id = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                [routed_pid],
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None:
+                prev_version = row["version"]
+        except Exception as e:
+            logger.debug("charter.prev_version_lookup_failed", error=str(e))
+        version = _next_charter_version(prev_version)
+
         # DELETE + INSERT 单事务原子写（公共 tx helper 自带写锁 + 异常回滚）
         try:
             await execute_transaction_by_project(
@@ -86,10 +207,10 @@ class CharterService:
                     (
                         """INSERT INTO agent_charters
                            (id, project_id, agent_id, title, content, status,
-                            project_rules, created_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            project_rules, version, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         [charter_id, routed_pid, agent_id, title, body,
-                         status, project_rules, now, now],
+                         status, project_rules, version, now, now],
                     ),
                 ],
             )
@@ -104,14 +225,16 @@ class CharterService:
     async def read_charter(self, project_id: str) -> dict | None:
         """Read the current project charter from per-project DB.
 
-        Returns dict with 'formatted' or None.
+        Returns dict with 'formatted' plus（若 charter 声明了编制结构）
+        B3 ③④ 解析出的 ``paradigm`` / ``faces`` / ``pod_count`` 字段；
+        旧 charter 无标记 → 不含这些键（调用方跳过校验）。
         底层 get_project_db_by_project_id 失败时 raise ProjectDbError，由调用方处理。
         """
         conn = await get_project_db_by_project_id(project_id)
         try:
             cursor = await conn.execute(
                 """SELECT id, project_id, agent_id, title, content, status,
-                          project_rules, created_at, updated_at
+                          project_rules, version, created_at, updated_at
                    FROM agent_charters WHERE project_id = ?
                    ORDER BY created_at DESC LIMIT 1""",
                 [project_id],
@@ -123,6 +246,9 @@ class CharterService:
         if row is None:
             return None
         d = dict(row)
+        # B3 ③④：解析 [org-shape] 声明。content 优先（agent 在正文里
+        # 手写的声明覆盖 project_rules 里 dict 字段落盘的标记）。
+        d.update(parse_org_shape(d.get("project_rules"), d.get("content")))
         d["formatted"] = self._format_charter(d)
         return d
 

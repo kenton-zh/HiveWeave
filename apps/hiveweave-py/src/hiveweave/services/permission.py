@@ -35,6 +35,7 @@ _BASE_TOOLS = frozenset({
     "send_message", "message_superior", "message_subordinate",
     "message_peer", "message_team",
     "ask_agent", "notify_agent", "commit_turn", "defer_task_advance",
+    "wait_on",  # T16 auto 挂起工具（执行面全员放行；可见面在下面 discard + agent.py auto 接线）
     "lookup_dev_server",
     "read_roster", "update_roster", "write_work_log",
     "list_subordinates", "check_agent_status",
@@ -334,6 +335,11 @@ class PermissionService:
             names = READONLY_TOOLS
         # 工具表可见性跟硬门对齐：列在表里但 capability 不够的不要发给模型（撞门）。
         visible = {n for n in names if tool_hard_deny(agent, n) is None}
+        # T16 一期：wait_on 只在 auto 回合出口模式进模型工具面 —— 这里从
+        # 可见清单剔除（legacy 工具表逐字节不变），执行面仍放行（幻觉调用
+        # 拿到的是工具自身的模式回执而非权限拒绝）。auto 可见性由
+        # agent._get_tool_definitions 接线加回。
+        visible.discard("wait_on")
         # T3.2: 宿主不暴露的工具（Windows pwsh 宿主上的 bash/bash_main）
         # 不发给模型 —— tool_hard_deny 的 host 段已含同一判定，这里再过滤
         # 一道保证清单干净。

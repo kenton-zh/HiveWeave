@@ -1,6 +1,7 @@
 """Submit task + evidence workspace resolution."""
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -18,6 +19,29 @@ from .verify import normalize_verdict, verdict_evidence_gaps
 
 log = structlog.get_logger(__name__)
 
+# A4-2（D76 实测，批 2）：submit in-flight 防抖 —— 同任务并发的第二次
+# submit 在这把 per-task 锁上等待，拿到锁后重读状态走幂等出口，不再
+# 双转移 / 双写 evidence。进程内锁即可：读改写在单事件循环内由此串行化。
+_SUBMIT_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+_SUBMIT_LOCKS_MAX = 512
+
+
+def _task_submit_lock(project_id: str, task_id: str) -> asyncio.Lock:
+    key = (project_id, task_id)
+    lock = _SUBMIT_LOCKS.get(key)
+    if lock is None:
+        if len(_SUBMIT_LOCKS) >= _SUBMIT_LOCKS_MAX:
+            # 只清未被持有的锁（持锁中的条目绝不动）；单线程事件循环内
+            # 这段无 await，无并发窗口。
+            for stale in [
+                k for k, v in _SUBMIT_LOCKS.items() if not v.locked()
+            ]:
+                _SUBMIT_LOCKS.pop(stale, None)
+                if len(_SUBMIT_LOCKS) < _SUBMIT_LOCKS_MAX:
+                    break
+        lock = _SUBMIT_LOCKS.setdefault(key, asyncio.Lock())
+    return lock
+
 
 class SubmitMixin:
     """submit_task / _resolve_evidence_workspace."""
@@ -31,8 +55,20 @@ class SubmitMixin:
         emit_task_event: Any
 
     async def submit_task(self, project_id: str, task_id: str,
-                          evidence: dict) -> None:
+                          evidence: dict) -> dict:
         """Submit a task (running → submitted). Sets evidence (JSON) + submitted_at.
+
+        A4（D76 实测，批 2）幂等 + 防抖：
+        - ``submitted → submitted`` 重复提交 = **幂等成功**：返回
+          ``{"idempotent": True, ...}``，不改状态 / 不覆盖既有 evidence /
+          不重建义务 / 不重跑门禁（不产生新凭证要求）——不再抛
+          ``Illegal transition`` 逼 agent 把任务移回 running 绕路。
+        - 同任务并发提交由 per-task 锁串行化（in-flight 防抖）：后到者
+          拿到锁后重读状态，走幂等出口，不二次转移。
+        assignee-only 的权限语义在工具层强制；本层按状态判定（API / merge
+        auto-submit 等调用方同样受益）。返回
+        ``{"idempotent": bool, "task_id": ..., "status": "submitted"}``；
+        既有调用方均忽略返回值，dict 为新增信息面。
 
         BUG-P1b: 保留既有 evidence.merged_by —— VERIFY spawn 时写入的
         合并人标记是 review_task 独立审门排除合并人的唯一依据，submit
@@ -46,7 +82,28 @@ class SubmitMixin:
         against the assignee worktree (or project root) before transition.
         """
         task_id = await self.require_task_id(project_id, task_id)
+        async with _task_submit_lock(project_id, task_id):
+            return await self._submit_task_locked(project_id, task_id, evidence)
+
+    async def _submit_task_locked(self, project_id: str, task_id: str,
+                                  evidence: dict) -> dict:
         task = await self.get_task(project_id, task_id)
+
+        # A4-1（D76）：submitted → submitted 同 assignee 重复提交 = 幂等成功。
+        # 门禁判定整体跳过：首次提交已验过一次，重复提交不产生新凭证要求。
+        if (task or {}).get("status") == "submitted":
+            log.info(
+                "submit_task_idempotent",
+                project_id=project_id,
+                task_id=task_id,
+            )
+            return {
+                "idempotent": True,
+                "task_id": task_id,
+                "status": "submitted",
+                "submitted_at": task.get("submitted_at"),
+                "note": "already submitted (idempotent)",
+            }
 
         # E1 verdict gate：终验（VERIFY / milestoneVerify）任务 evidence 必须
         # 带强制判定字段，否则硬拒提交（transition 之前拦截）。
@@ -216,9 +273,19 @@ class SubmitMixin:
         from .gate_reject_guard import reset_gate_rejections
 
         reset_gate_rejections(project_id, task_id)
+        # T18 bug1/bug2：SYSTEM AUDIT 卡判别/reviewer 解析/溯源键保护
+        # （懒 import 防环，与本文件其余 services 间引用同风格）。
+        from .audit_dispatch import (
+            AUDIT_TASK_EVIDENCE_KEYS,
+            is_system_audit_card,
+            resolve_card_reviewer,
+        )
+
         if isinstance(evidence, dict) and "merged_by" not in evidence:
             rows0 = await _query(
-                project_id, "SELECT evidence FROM tasks WHERE id = ?", [task_id]
+                project_id,
+                "SELECT evidence, tags, title FROM tasks WHERE id = ?",
+                [task_id],
             )
             if rows0 and rows0[0]["evidence"]:
                 try:
@@ -229,12 +296,23 @@ class SubmitMixin:
                 if isinstance(prev, dict) and prev.get("merged_by"):
                     evidence = dict(evidence)
                     evidence["merged_by"] = prev["merged_by"]
+                # T18 bug2：SYSTEM AUDIT 卡的 mint 溯源键不得被提交 evidence
+                # 整体覆盖 —— approve 收口的凭证回写靠 source_task_id /
+                # submitter_id 找回源任务；丢了它回写就落空（S16 门纹丝不动
+                # 的成因之一）。新 evidence 的同名键仍以提交者为准。
+                if isinstance(prev, dict) and is_system_audit_card(
+                    {"tags": rows0[0]["tags"], "title": rows0[0]["title"]}
+                ):
+                    evidence = dict(evidence)
+                    for _pk in AUDIT_TASK_EVIDENCE_KEYS:
+                        if _pk in prev and _pk not in evidence:
+                            evidence[_pk] = prev[_pk]
         now_ms = int(time.time() * 1000)
         # Pin reviewer at submit: existing column wins; evidence.reviewer_id
         # only fills when column is empty (non-VERIFY). VERIFY always → creator.
         meta_rows = await _query(
             project_id,
-            "SELECT assignee_id, creator_id, reviewer_id, tags, title, kind "
+            "SELECT assignee_id, creator_id, reviewer_id, tags, title, kind, evidence "
             "FROM tasks WHERE id = ?",
             [task_id],
         )
@@ -253,6 +331,39 @@ class SubmitMixin:
             }
             if self._is_verify_task(draft):
                 reviewer_id = creator_id
+            elif is_system_audit_card(draft):
+                # T18 bug1：SYSTEM AUDIT 卡的 reviewer 不得用旧默认
+                # creator_id —— 卡的 creator 恰是被审 submitter（executor 无
+                # review_task ⇒ 卡死 submitted）。改走 review-权角色链：
+                # 源任务 reviewer/creator → qa_lead → 卡 assignee 的 parent；
+                # 全败才回退 creator（旧行为）并留日志。
+                _ev: dict = {}
+                try:
+                    _raw_ev = meta_rows[0]["evidence"]
+                    _ev = json.loads(_raw_ev) if isinstance(_raw_ev, str) else (_raw_ev or {})
+                except (json.JSONDecodeError, TypeError):
+                    _ev = {}
+                try:
+                    _card_rev, _card_chain = await resolve_card_reviewer(
+                        project_id,
+                        card_assignee_id=str(agent_id or ""),
+                        submitter_id=str((_ev or {}).get("submitter_id") or creator_id or ""),
+                        source_task_id=str((_ev or {}).get("source_task_id") or "") or None,
+                    )
+                except Exception as e:  # noqa: BLE001 — 解析失败退旧默认
+                    log.warning(
+                        "audit_card_reviewer_resolve_failed",
+                        task_id=task_id,
+                        error=str(e),
+                    )
+                    _card_rev = None
+                if _card_rev is None:
+                    log.warning(
+                        "audit_card_reviewer_fallback_creator",
+                        task_id=task_id,
+                        creator_id=str(creator_id or "")[:8],
+                    )
+                reviewer_id = str((_card_rev or {}).get("id") or "") or creator_id
             elif existing_reviewer:
                 reviewer_id = existing_reviewer
             elif isinstance(evidence, dict) and evidence.get("reviewer_id"):
@@ -305,6 +416,8 @@ class SubmitMixin:
                 task_id=task_id,
                 error=str(e),
             )
+
+        return {"idempotent": False, "task_id": task_id, "status": "submitted"}
 
     @staticmethod
     def _validate_verdict_evidence(evidence: dict) -> None:

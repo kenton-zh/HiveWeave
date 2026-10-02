@@ -22,6 +22,7 @@ import re
 import os
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,36 @@ _SOFT_FAIL_ATTEMPT_REASONS = frozenset({"llm_failed", "no_model", "no_callback"}
 
 _DIFF_CAP_BYTES = 50 * 1024
 _DIFF_CAP_MARKER = "\n... [diff truncated at 50KB] ...\n"
+
+# T2（2026-09-29）：50KB 截断的**非阻塞标注**（拒绝/派单化是 T1 的职责）。
+# 截断是常态而非边缘（实测 233KB 单文件；审计常撞 540s 上游帽）——「PASS
+# 只代表前 50KB 没问题」的假信心必须显式破掉。三处事实位同源（一个
+# ``truncated`` 标志），判定语义不变：截断不改 PASS/ISSUES、不阻断提交。
+#   ① 审计回执明示（PASS 与 ISSUES 都带，``tools/code_audit._format_verdict``）；
+#   ② 凭证 ``command_or_url`` 追加标注（下方 marker，``[verdict=...]`` 同一
+#      标记约定；``parse_audit_verdict`` 的 regex 不受影响），读凭证的
+#      人/模型直接可见覆盖不全；
+#   ③ ``run_steps.truncated`` **现成列**盖上（工具壳经 ``ToolResult`` extra
+#      透传，``agents/streaming.py`` 落库）——不新增列。
+AUDIT_PARTIAL_COVERAGE_MARKER = "[PARTIAL COVERAGE: diff truncated at 50KB]"
+AUDIT_TRUNCATED_RECEIPT_NOTE = (
+    "diff 超 50KB 已截断——本次审计仅覆盖前 50KB，后续改动未审计"
+    "（凭证已标注 PARTIAL COVERAGE）。"
+)
+
+
+@dataclass(frozen=True)
+class WorktreeDiff:
+    """``collect_worktree_diff`` 返回契约：diff 文本 + 截断标志。
+
+    ``truncated=True`` ⇒ 文本在 50KB 帽处截断（或 untracked 枚举因预算耗尽
+    提前收尾），**帽后内容未收集**——消费方必须如实标注「覆盖不全」，不得
+    把截断文本当成完整 diff 的审计结论。
+    """
+
+    text: str
+    truncated: bool = False
+
 _TOP_ISSUES_MAX = 5
 _TOP_ISSUE_MAX_CHARS = 120
 _ISSUE_PARSE_CAP = 100
@@ -297,6 +328,35 @@ def evidence_has_code_audit_soft_fail(evidence: dict | None) -> bool:
     if not isinstance(stamp, dict):
         return False
     return str(stamp.get("reason") or "") in _SOFT_FAIL_ATTEMPT_REASONS
+
+
+def strip_code_audit_kind_for_gate(
+    needed: frozenset[str] | None,
+) -> frozenset[str] | None:
+    """T42 单一事实源：``SUBMIT_AUDIT_GATE=off`` ⇒ 门必需清单里的 code_audit 一律剥离。
+
+    任务级 submitGate 政策（``code_audit`` / ``code_audit_unit`` /
+    ``code_audit_visual``）与 >20 行默认门共用本判据，覆盖两条评估路径：
+
+    1. submit preflight（``tools/tasks/submit.py``）——门在 submit 侧；
+    2. approve/HTTP 门（``tools/tasks/review.py`` / ``api/tasks.py`` /
+       ``attestation.check_task_attestations``）与契约前置展示
+       （``platform_state`` required_evidence / ``tasks.policy``
+       submit_expectations / ``policy_required_kinds_label``）——此前只认
+       soft-fail/impossible 事实行（``drop_code_audit_kind_if_soft``），而
+       flag off 下平台不再铸这些行 ⇒ 结构性不可满足门（S19 实测：
+       submit 凭 test_run 过了，approve 仍要 code_audit）。
+
+    剥离语义：code_audit 从 required kinds 移除 ⇒ 任务凭 test_run 等其余
+    凭证即可过门；剥离后为空 ⇒ 空集（既有软策略语义：HTTP 门直接放行，
+    submit 退 testsPassed ack，approve 走 tests_passed/任一凭证软门）。
+    ``flag=on`` 原样返回 —— 旧行为逐字节还原。
+    """
+    from hiveweave.config import submit_audit_gate_enabled
+
+    if needed and CODE_AUDIT_KIND in needed and not submit_audit_gate_enabled():
+        return frozenset(k for k in needed if k != CODE_AUDIT_KIND)
+    return needed
 
 
 async def drop_code_audit_kind_if_soft(
@@ -475,7 +535,7 @@ async def _resolve_base_branch_lazy(worktree_path: str) -> str | None:
         return None
 
 
-async def collect_worktree_diff(worktree_path: str) -> str:
+async def collect_worktree_diff(worktree_path: str) -> WorktreeDiff:
     """Collect the worktree diff: <base>...HEAD, HEAD (uncommitted), untracked.
 
     Base branch is resolved at runtime (main → master fallback) so repos
@@ -483,11 +543,15 @@ async def collect_worktree_diff(worktree_path: str) -> str:
     changes audited. Untracked files are listed via
     ``git ls-files --others --exclude-standard`` and their content read
     directly — otherwise brand-new files would render an empty diff and get
-    auto-PASSed. Total output capped at ~50KB with a truncation marker.
+    auto-PASSed. Total output capped at ~50KB with a truncation marker; the
+    returned :attr:`WorktreeDiff.truncated` flag reports whether the cap (or
+    an exhausted untracked budget) cut content, so callers can annotate
+    partial coverage instead of silently auditing only the first 50KB.
     Empty-safe; never raises.
     """
     parts: list[str] = []
     budget = _DIFF_CAP_BYTES
+    truncated = False
 
     base = await _resolve_base_branch_lazy(worktree_path)
     if base:
@@ -520,14 +584,18 @@ async def collect_worktree_diff(worktree_path: str) -> str:
             parts.append(content)
             budget -= len((header + "\n\n" + content).encode("utf-8", errors="replace"))
             if budget <= 0:
+                # 预算耗尽：后续 untracked 文件整段跳过 ⇒ 覆盖不全。即便
+                # 总字节恰好没超 50KB，也要如实标注（覆盖事实优先于字节数）。
+                truncated = True
                 break
 
     text = "\n\n".join(parts)
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) > _DIFF_CAP_BYTES:
+        truncated = True
         keep = _DIFF_CAP_BYTES - len(_DIFF_CAP_MARKER.encode("utf-8"))
         text = encoded[:keep].decode("utf-8", errors="replace") + _DIFF_CAP_MARKER
-    return text
+    return WorktreeDiff(text=text, truncated=truncated)
 
 
 # ── Audit prompt (platform English constants) ────────────────
@@ -790,6 +858,152 @@ def shadow_decision(verdict: str, issues: list[str]) -> dict[str, Any]:
         "shadow_blocking": shadow_blocking,
         "would_flip": shadow_blocking and not legacy_blocking,
     }
+
+
+# ── T17（2026-09-29）：审计器退化输出 sanity 校验 ─────────────────────
+# 病灶（S16 霜叶 88.8KB diff 实测）：审计 LLM 偶发把整段回复写成思维链/
+# 开场白（"Let me analyze this diff carefully."）。``_parse_verdict`` 对任何
+# 非 ``VERDICT: PASS`` 首行兜判 ISSUES（fail-closed 方向没错），``_parse_issues``
+# 再把其后每一行都收进 issue（帽 100）⇒ 「审计行数: 0 / 问题数: 100 / 第 1 条
+# finding = 开场白 / unparsed_ratio=1.0」的退化结论被照单全收成 ISSUES，还按
+# diff_hash 永久缓存（同 diff 重审 6 次原样回放）⇒ submit 门结构性无解。
+#
+# 治法：判定处（parse 之后）跑 :func:`detect_audit_output_degeneracy`，命中
+# ⇒ 判 llm_failed 走**既有软失败自动重试**（audit_retry 队列），结论不落地、
+# 不写缓存；缓存读点用同一判据「退化不信」⇒ 本次按缓存未命中强制重跑（重跑
+# 成功后 INSERT OR REPLACE 自然覆盖存量坏行——一次性失效路径，无迁移无代数列）。
+#
+# ⚠ 规则只对 verdict == ISSUES 生效：首行能对上 ``VERDICT: PASS`` 本身就是
+# 输出契约合规的强信号，且 PASS 路径 verdict 后的解释行（``_parse_issues``
+# 会收进 issue 槽位但不参与判定）是合法形态——对 PASS 跑规则只会误杀
+# （``test_truncated_pass_receipt_and_attestation_annotated`` 即此形态）。
+# 退化向量恰恰全在 ISSUES 一侧：所有不合规首行都被兜成 ISSUES。
+_AUDIT_COT_OPENING_RE = re.compile(
+    r"^(?:"
+    r"let me\b|i'?ll\b|i will\b|i'?m going to\b|i am going to\b|"
+    r"i notice\b|i see that\b|i found\b|"
+    r"analyz\w+|analysis\b|examin\w+|"
+    r"sure\b|okay\b|certainly\b|of course\b|got it\b|"
+    r"here (?:is|are)\b|below (?:is|are)\b|"
+    r"first(?:ly)?\s*[,:]|step \d+\b|as an ai\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _audit_sanity_enabled() -> bool:
+    """T17 总开关（env ``HIVEWEAVE_AUDIT_SANITY_ENABLED``，默认开）。
+
+    "0/false/no/off" 关闭 ⇒ 退回旧行为（退化输出照旧落地）。kill-switch：
+    真出现误拦风暴时先整体止血，再修规则。
+    """
+    raw = (os.environ.get("HIVEWEAVE_AUDIT_SANITY_ENABLED") or "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _degen_unparsed_ratio_threshold() -> float:
+    """规则③阈值（env ``HIVEWEAVE_AUDIT_DEGEN_UNPARSED_RATIO``，默认 0.9）。
+
+    依据：退化样本 unparsed_ratio = 1.0（S16：100/100 全是无档位叙述行）；
+    正常审计 unparsed 基线 3.6%（D-3，167 样本 281 行，且全是 B 类叙述行）。
+    0.9 = 「几乎没有任何行能解析出档位」⇒ 输出根本不在契约格式里。不取
+    1.0 是允许洪水里恰好混进一行带档位的行。
+    """
+    raw = (os.environ.get("HIVEWEAVE_AUDIT_DEGEN_UNPARSED_RATIO") or "").strip()
+    try:
+        return float(raw) if raw else 0.9
+    except ValueError:
+        return 0.9
+
+
+def _degen_min_findings() -> int:
+    """规则①/③共用的「最少 findings 数」门槛（env
+    ``HIVEWEAVE_AUDIT_DEGEN_MIN_FINDINGS``，默认 10）。
+
+    依据：①/③都是**洪水签名**规则，必须只对多行输出生效——单条/少数
+    findings 是正常审计的主体（基线 167 样本 ≈1.7 行/次），且「ISSUES +
+    个数少的 unparsed」已有 #12 fail-safe 兜（逐条视为 high 拦门），sanity
+    再拦就会把 severity-failsafe/T2 那批**合法单 finding 用例**误判成
+    llm_failed（台账为 0 的合法审计也存在：内存台账重启即清、diff 仍在）。
+    10 ≈ 基线均值的 6 倍，且远低于退化 parse 洪水撞的 100 行帽
+    （``_ISSUE_PARSE_CAP``，S16 实测 100/100）。
+    """
+    raw = (os.environ.get("HIVEWEAVE_AUDIT_DEGEN_MIN_FINDINGS") or "").strip()
+    try:
+        return int(raw) if raw else 10
+    except ValueError:
+        return 10
+
+
+def detect_audit_output_degeneracy(
+    verdict: str,
+    issues: list[str],
+    *,
+    lines_audited: int | None = None,
+) -> list[str]:
+    """T17：审计 LLM 输出退化检测。返回命中的规则名列表（空 = 正常）。
+
+    任一规则命中 ⇒ 调用方判 llm_failed（走软失败自动重试），结论不得作为
+    ISSUES 落地/入缓存。规则：
+
+      ① ``zero_lines_with_issues`` —— 审计行数（台账，与回执「审计行数」
+         同源）为 0 却报出 ≥ ``_degen_min_findings()`` 条问题：矛盾签名
+         （S16 回执「审计行数: 0 / 问题数: 100」）。``lines_audited=None``
+         （缓存读点：缓存行不带台账快照）时本规则不评估。
+      ② ``first_finding_cot_opening`` / ``cot_flood`` —— finding 行是审计员
+         的思维链/开场白（S16 第 1 条 finding = "Let me analyze this diff
+         carefully."）。**首条**命中即退化（finding 槽位不该出现开场白）；
+         ≥2 条命中按洪水判（合法输出偶混一行叙述不至于整份作废）。
+      ③ ``unparsed_ratio_high`` —— unparsed 占比 ≥
+         ``_degen_unparsed_ratio_threshold()`` 且条数 ≥ ``_degen_min_findings()``：
+         几乎整份解析不出档位 ⇒ 输出不在契约格式里。
+
+    纯函数、无副作用：缓存读点与新鲜判定处共用同一判据（单点定义，
+    防「同一事实两处判」漂移——见 :func:`shadow_decision` 上方的同门教训）。
+    """
+    if not _audit_sanity_enabled():
+        return []
+    if (verdict or "").strip().upper() != "ISSUES":
+        return []
+    rules: list[str] = []
+    total = len(issues)
+    min_findings = _degen_min_findings()
+    if lines_audited is not None and lines_audited <= 0 and total >= min_findings:
+        rules.append("zero_lines_with_issues")
+    if total:
+        cot_hits = sum(1 for i in issues if _AUDIT_COT_OPENING_RE.match(i))
+        if cot_hits and _AUDIT_COT_OPENING_RE.match(issues[0]):
+            rules.append("first_finding_cot_opening")
+        if cot_hits >= 2:
+            # 2 = 「开场白 + 展开」两行即坐实整份是思维链；合法 finding 列表
+            # 偶混 1 行叙述的容忍度由 first_finding 规则单独收紧。
+            rules.append("cot_flood")
+        if total >= min_findings:
+            counts = count_issue_severities(issues)
+            if counts["unparsed"] / total >= _degen_unparsed_ratio_threshold():
+                rules.append("unparsed_ratio_high")
+    return rules
+
+
+def _cached_hit_facts(cached_hit: dict) -> tuple[str, int, list[str]]:
+    """缓存行 → (verdict, 存储的 exit_code, issue 行列表)。
+
+    T17 抽取：读点退化探针与命中回放两处共用同一推导（此前内联在命中体里，
+    探针引入后两处各写一遍就是将来漂移源）。verdict 缺失时按 exit_code 推导
+    （0=PASS；缺失/非 0=拦）——与既有命中路径语义逐字一致。
+    ⚠ 历史坑（勿"简化"成 ``int(x or 1)``）：``exit_code=0`` 是**合法值**
+    （PASS / warnings-only 的 ISSUES+exit 0），``0 or 1 ⇒ 1`` 会把缓存里所有
+    PASS 行回放成"拦"（误拦方向）；只有 ``None``（列缺失/NULL）才兜 1。
+    """
+    raw_exit = cached_hit.get("exit_code")
+    exit_stored = int(raw_exit) if raw_exit is not None else 1
+    verdict = (
+        str(cached_hit.get("verdict") or "").strip()
+        or ("PASS" if exit_stored == 0 else "ISSUES")
+    )
+    return verdict, exit_stored, _parse_cached_issues(cached_hit.get("top_issues"))
 
 
 def _parse_cached_issues(raw: object) -> list[str]:
@@ -1169,7 +1383,10 @@ async def run_code_audit(
 
     Return contract (soft-fail dicts):
       - ``{"audited": False, "reason": "no_worktree" | "no_callback" | "no_model" | "llm_failed" | "error"}``
-        （llm_failed 且成功入队时附 ``retry_queued`` / ``retry_attempts``）
+        （llm_failed 且成功入队时附 ``retry_queued`` / ``retry_attempts``；
+        T17：LLM 输出退化（sanity 命中，见 ``detect_audit_output_degeneracy``）
+        同样归 llm_failed 走软失败自动重试，附 ``degenerate_rules``——
+        结论不落地、不写缓存）
       - ``{"audited": True, "verdict": "PASS" | "ISSUES", ...}``
 
     ⚠ **本层只返回数据，不构造工具结果**（模块 docstring 的既有拓扑）：返回的
@@ -1188,7 +1405,11 @@ async def run_code_audit(
         if not worktree:
             return {"audited": False, "reason": "no_worktree"}
 
-        diff = await collect_worktree_diff(worktree)
+        diff_result = await collect_worktree_diff(worktree)
+        diff = diff_result.text
+        # T2：截断标志随行——回执明示 / 凭证标注 / run_steps.truncated
+        # 三处同源事实（见 AUDIT_PARTIAL_COVERAGE_MARKER 上方注释）。
+        diff_truncated = bool(diff_result.truncated)
 
         from hiveweave.services.attestation import (
             attestation_service,
@@ -1285,24 +1506,47 @@ async def run_code_audit(
                 )
             except Exception:  # noqa: BLE001 — 缓存查询失败退化为正常审计
                 cached_hit = None
+        # T17 缓存读点「退化不信」：存量缓存行若来自退化输出（S16：同 diff
+        # 重审 6 次全部原样回放坏结论），按缓存未命中处理 ⇒ 本次强制重跑。
+        # 这是**一次性失效路径**的读半边；写半边 = 退化结论在更早的
+        # llm_failed 出口已返回，永远到不了下面的 ``audit_cache_store``。
+        # 坏行在重跑成功后被 INSERT OR REPLACE 覆盖——无迁移、无代数列。
+        # ⚠ 规则①在缓存行上不可评估（行里没有写入时刻的台账快照），探针
+        # 只跑 ②③（lines_audited=None 即关闭①）。
         if cached_hit is not None:
-            # ⚠ **不能用 `int(x or 1)`**（本批实测抓到的真 bug）：`exit_code=0`
-            # 是**合法值**（PASS，或 warnings-only 的 ISSUES+exit 0），而
-            # `0 or 1` ⇒ **1** ⇒ 缓存里所有 PASS 行都会被回放成"拦"，
-            # 把一份**通过过的 diff** 在重审时判成阻塞（误拦方向 —— 正是
-            # CEO 验收流程最怕的那一档）。`None`（列缺失/NULL）才该兜 1（拦）。
-            _raw_exit = cached_hit.get("exit_code")
-            cached_exit_stored = int(_raw_exit) if _raw_exit is not None else 1
-            # 用缓存行存的真实判定（可能是 warnings-only 的 ISSUES+exit 0）
-            verdict_cached = (
-                str(cached_hit.get("verdict") or "").strip()
-                or ("PASS" if cached_exit_stored == 0 else "ISSUES")
+            _probe_verdict, _probe_exit, _probe_issues = _cached_hit_facts(
+                cached_hit
             )
+            _cached_degen = detect_audit_output_degeneracy(
+                _probe_verdict, _probe_issues, lines_audited=None,
+            )
+            if _cached_degen:
+                log.warning(
+                    "audit_degenerate_detected",
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    source="audit_cache",
+                    diff_hash=diff_hash[:12],
+                    rules=_cached_degen,
+                    verdict=_probe_verdict,
+                    issues_total=len(_probe_issues),
+                    stored_exit=_probe_exit,
+                    action=(
+                        "退化缓存行不信 ⇒ 本次按缓存未命中强制重跑；"
+                        "重跑成功后覆盖坏行"
+                    ),
+                )
+                cached_hit = None
+        if cached_hit is not None:
+            # T17：三事实统一走 `_cached_hit_facts`（与上方读点退化探针同源
+            # ——两处各写一遍就是漂移源）。
             # 审计 epic P0-1（42 轮报告）：缓存命中要回放**原结论**——
             # 旧实现回执「ISSUES / 0 行 / 0 问题」自相矛盾，agent 误判审计
             # 空转后 12 次重审赌结果。issue 列表随缓存落库（P0-1 新列），
             # 行数用当前台账值（本次会话累计未审行）。
-            cached_issues = _parse_cached_issues(cached_hit.get("top_issues"))
+            verdict_cached, cached_exit_stored, cached_issues = _cached_hit_facts(
+                cached_hit
+            )
             # ⚠ **缓存只回放事实，不复述策略**（#12 切真拦，2026-09-16）。
             # 缓存行的 `exit_code` 是**写它那一刻的策略**算出来的：shadow 期写下的
             # 行里 `【high】` 那批 `exit_code=0`（那时真闸门按 legacy 不拦）
@@ -1361,7 +1605,12 @@ async def run_code_audit(
                 workspace=worktree,
                 commit_hash=commit_hash,
                 stdout_hash=hash_stdout(f"cached audit reuse {diff_hash}"),
-                command_or_url=f"[verdict={verdict_cached}] cached-reuse",
+                # T2：当前收集到的 diff 若被截断，缓存结论同样只覆盖前
+                # 50KB——凭证照标（覆盖事实与结论来源无关）。
+                command_or_url=(
+                    f"[verdict={verdict_cached}] cached-reuse"
+                    + (f" {AUDIT_PARTIAL_COVERAGE_MARKER}" if diff_truncated else "")
+                ),
             )
             lines_now = get_unaudited_lines(agent_id)
             reset_ledger(agent_id)
@@ -1380,6 +1629,7 @@ async def run_code_audit(
                 "top_issues": cached_issues[:_TOP_ISSUES_MAX],
                 "lines_audited": lines_now,
                 "attestation_id": attestation_id,
+                "diff_truncated": diff_truncated,
                 "cached_diff_hash": diff_hash[:12],
                 "cached_from_attestation_id": cached_source or None,
                 "message": (
@@ -1404,6 +1654,47 @@ async def run_code_audit(
             text, meta = await _invoke_audit_llm(
                 project_id, agent_id, system, user, call_llm, oneshot_llm,
             )
+        # T17：parse 后先过退化 sanity。命中 ⇒ 转 llm_failed 走下方**既有**
+        # 软失败自动重试出口（audit_retry 队列）——结论不落地（不发凭证）、
+        # 不写审计缓存（写半边失效路径）。规则与阈值依据见
+        # :func:`detect_audit_output_degeneracy`。
+        verdict = ""
+        issues: list[str] = []
+        if text is not None:
+            verdict = _parse_verdict(text)
+            issues = _parse_issues(text)
+            _degen_rules = detect_audit_output_degeneracy(
+                verdict,
+                issues,
+                lines_audited=get_unaudited_lines(agent_id),
+            )
+            if _degen_rules:
+                log.warning(
+                    "audit_degenerate_detected",
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    source="fresh",
+                    rules=_degen_rules,
+                    verdict=verdict,
+                    issues_total=len(issues),
+                    lines_audited=get_unaudited_lines(agent_id),
+                    audit_model_id=meta.get("audit_model_id"),
+                    action=(
+                        "退化输出判 llm_failed ⇒ 走软失败自动重试；"
+                        "结论不落地、不写审计缓存"
+                    ),
+                )
+                meta = dict(meta)
+                meta.update(
+                    {
+                        "audited": False,
+                        "reason": "llm_failed",
+                        # 复用「上游不可用」口径 ⇒ 下方既有分支自动入队重试
+                        "audit_upstream_unavailable": True,
+                        "degenerate_rules": list(_degen_rules),
+                    }
+                )
+                text = None
         if text is None:
             # No extra HTTP retry here: _oneshot_llm already retries once via
             # stream_oneshot_with_retry (connect-fail / immediate-reject only).
@@ -1437,9 +1728,8 @@ async def run_code_audit(
                     meta["retry_resequence"] = bool(queued.get("resequence"))
             return meta
 
-        verdict = _parse_verdict(text)
-        issues = _parse_issues(text)
-        # 41+08 双跑 P0-2（审计门 27.3%）：只有 high 级问题才锁门——
+        # 走到这里 = text 非空且未被判退化（verdict/issues 已在上方 sanity
+        # 块解析完毕）。41+08 双跑 P0-2（审计门 27.3%）：只有 high 级问题才锁门——
         # medium/low 记录为警告不阻塞（41 实测 24 次 ISSUES 中 4 次无 high
         # 仍被锁死）。ISSUES 判定保留诚实；门禁语义 = 「有 high 才拦」。
         #
@@ -1539,16 +1829,25 @@ async def run_code_audit(
             workspace=worktree,
             commit_hash=commit_hash,
             stdout_hash=hash_stdout(text),
+            # T2：截断时凭证追加 PARTIAL COVERAGE 标注（PASS 与 ISSUES 都
+            # 标——覆盖事实与结论方向无关；parse_audit_verdict 的 regex
+            # 只找 [verdict=...]，不受追加标记影响）。
             command_or_url=(
-                f"[verdict={verdict}] high={_dec['failsafe_high']}"
-                f"(legacy={_dec['legacy_high']})"
-                if verdict == "ISSUES"
-                else f"[verdict={verdict}]"
+                (
+                    f"[verdict={verdict}] high={_dec['failsafe_high']}"
+                    f"(legacy={_dec['legacy_high']})"
+                    if verdict == "ISSUES"
+                    else f"[verdict={verdict}]"
+                )
+                + (f" {AUDIT_PARTIAL_COVERAGE_MARKER}" if diff_truncated else "")
             ),
         )
 
         # 40 轮报告第 4 步：审计结论入缓存（同 agent + 同 diff 哈希复用）。
         # 审计 epic P0-1：同时落 issue 列表 + 原凭证 id，命中路径可回放。
+        # T17（2026-09-29）：**退化结论到不了这里**——sanity 命中在更早的
+        # llm_failed 出口已返回 ⇒ 坏结论永不入缓存（写半边）；读半边（读点
+        # 「退化不信」⇒ 强制重跑）在上方缓存查找处。
         try:
             await attestation_service.audit_cache_store(
                 project_id,
@@ -1573,6 +1872,7 @@ async def run_code_audit(
             "top_issues": issues[:_TOP_ISSUES_MAX],
             "report_path": report_path,
             "attestation_id": attestation_id,
+            "diff_truncated": diff_truncated,
             "lines_audited": lines_audited,
             "audit_model_id": meta.get("audit_model_id"),
             "audit_model_source": meta.get("audit_model_source"),
@@ -1585,7 +1885,17 @@ async def run_code_audit(
 # ── Shared notice helper ─────────────────────────────────────
 
 def append_code_audit_notice(description: str) -> str:
-    """Append CODE_AUDIT_POLICY to a description once (idempotent)."""
+    """Append CODE_AUDIT_POLICY to a description once (idempotent).
+
+    T16 增补（09-30）：submit 审计门退役（SUBMIT_AUDIT_GATE=off）后，任务
+    卡片不得再宣称「code_audit 必需」——否则 executor/协调者会为不再需要
+    的审计白费力气（D85 实测：技术负责人为 S0 计划 request_code_audit）。
+    门 off 时原样返回描述；flag=on 回切时恢复钉通知。
+    """
+    from hiveweave.config import submit_audit_gate_enabled
+
+    if not submit_audit_gate_enabled():
+        return description
     if not description:
         return CODE_AUDIT_POLICY
     if CODE_AUDIT_POLICY in description:

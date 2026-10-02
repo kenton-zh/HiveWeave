@@ -739,8 +739,16 @@ async def hire_agent_tool(
 
         # Do NOT auto-send inbox — that steals the agent's judgment.
         # Surface the unfinished chain so the model chooses to advance.
+        # T16 残尾尾巴：前置条件文案按模式分流（auto ⇒ 停止前完成）。
+        from hiveweave.config import turn_exit_mode as _tem
+
+        _before = (
+            "(required before stopping; the platform auto-closes the turn)"
+            if _tem() == "auto"
+            else "(required before commit_turn done_slice)"
+        )
         next_action = (
-            "\n\n⚠️ NEXT ACTION (required before commit_turn done_slice):\n"
+            f"\n\n⚠️ NEXT ACTION {_before}:\n"
             "  hire_agent only creates the person — the requester does NOT know yet.\n"
             "  Call send_message / ask_agent / notify_agent to the requester NOW with:\n"
             f"    name={name}, shortId={new_short}, role={role}, permission={perm_type}.\n"
@@ -758,7 +766,43 @@ async def hire_agent_tool(
             adding_coordinator=(perm_type == "coordinator"),
         ) or ""
         if span_note:
-            span_note = f"\n{span_note}\n"
+            # B3 修法①（2026-09-28）：hire 的执行者是 HR，改结构的决定权
+            # 在 CEO/上级 —— 提示必须经回报链上达，不能停在有权执行、
+            # 无权改结构的操作者手里（transfer 回执在操作者本人手里，无需转达）。
+            span_note = (
+                f"\n{span_note}\n"
+                "  请把本提示转达 CEO/上级，由其决定是否加层。\n"
+            )
+
+        # B3 修法④（2026-09-28）：charter 声明了 paradigm/faces 时，与现有
+        # 业务中层数做非阻塞一致性校验（「末次 hire 时告警」通道，与
+        # span_advisory 同点追加）。fail-open —— 读 charter 失败就跳过，
+        # 绝不阻断 hire。本次新招的人计入中层数（加中层那一刻恰是校验时刻）。
+        charter_note = ""
+        charter_svc = getattr(ctx, "charter", None)
+        if charter_svc is not None:
+            try:
+                from hiveweave.services.org_invariants import (
+                    charter_shape_advisory,
+                )
+
+                shape_agents = list(existing_agents)
+                if isinstance(new_agent, dict):
+                    shape_agents.append({**new_agent, "status": "active"})
+                shape_note = charter_shape_advisory(
+                    charter=await charter_svc.read_charter(project_id),
+                    agents=shape_agents,
+                )
+                if shape_note:
+                    charter_note = (
+                        f"\n{shape_note}\n"
+                        "  请把本提示转达 CEO/上级，由其决定是否调整编制。\n"
+                    )
+            except Exception as shape_err:
+                log.debug(
+                    "hire_agent.charter_shape_advisory_failed",
+                    error=str(shape_err),
+                )
 
         # Non-blocking staffing guidance (dsh42 实证：招 6 executor 只有
         # 4 个可做任务位，2 人 Reserve 待命 30min)：hire executor 时若
@@ -800,6 +844,7 @@ async def hire_agent_tool(
             f"{next_action}"
             f"{span_note}"
             f"{staffing_note}"
+            f"{charter_note}"
         )
     except Exception as e:
         return ToolResult.err(f"Failed to hire agent: {e}")
@@ -825,12 +870,19 @@ class DismissAgentParams(BaseModel):
     )
 
 
+# B6 契约单源化（缺口 19）：工具最终描述的唯一 owner 是本常量 —— @tool
+# 注册处与 executor.py 的 TOOL_PARAM_SCHEMAS 手写条目都引用它。
+DISMISS_AGENT_TOOL_DESCRIPTION = (
+    "Archive/fire an agent. Cannot be undone. Prefer transfer_agent "
+    "or bind_skill first. Hard-rejected by the per-project "
+    "per-game-day dismiss quota and the same-role rehire cooldown "
+    "(numbers in the rejection receipt)."
+)
+
+
 @tool(
     "dismiss_agent",
-    "Archive/remove an agent. PREFER transfer_agent over dismiss+rehire when "
-    "the person is fine but reporting line/role is wrong. Dismiss closes their "
-    "open tasks and inbox; cannot undo. DESIGN-3: per project per game day "
-    "quota applies; same-role rehire within cooldown is hard-rejected.",
+    DISMISS_AGENT_TOOL_DESCRIPTION,
     requires_workspace=False,
     security_level="standard",
 )
@@ -854,16 +906,27 @@ async def dismiss_agent_tool(
     if not target_agent:
         return ToolResult.err(f"Agent not found: {params.agent_id}")
 
+    reason = (params.reason or "").strip()
     result = await ctx.org.dismiss_agent(
         project_id,
         target_agent["id"],
         dismissed_by=agent_id,
     )
     if result.get("success"):
-        return ToolResult.ok(
+        message = (
             f"Agent {target_agent['name']} "
             f"({target_agent.get('short_id', '?')}) has been dismissed."
         )
+        if reason:
+            log.info(
+                "org.dismiss_agent",
+                project_id=project_id,
+                agent_id=target_agent["id"],
+                dismissed_by=agent_id,
+                reason=reason,
+            )
+            message += f" reason: {reason}"
+        return ToolResult.ok(message)
     return ToolResult.err(result.get("message", "Unknown error"))
 
 
@@ -1148,6 +1211,34 @@ async def check_agent_status_tool(
     for a in sorted_agents:
         unread = await _unread_wake_count(a["id"])
         lines.append(_format_agent_status_line(a, unread_wake=unread))
+
+    # B3 修法④⑤（2026-09-28）：项目级组织形态信号（1 业务中层 + ≥6 叶子）
+    # 与 charter faces×中层数校验挂在全员花名册视图尾部 —— 这是 CEO 里程碑
+    # 审查时的组织视野挂点（review_task 回执在 tools/review.py，未在此批
+    # 允许改动清单内）。全部 fail-open，绝不阻断查询。
+    advisories: list[str] = []
+    try:
+        from hiveweave.services.org_invariants import (
+            charter_shape_advisory,
+            org_shape_signals,
+        )
+
+        advisories.extend(org_shape_signals(agents=all_agents))
+        charter_svc = getattr(ctx, "charter", None)
+        if charter_svc is not None:
+            shape_note = charter_shape_advisory(
+                charter=await charter_svc.read_charter(project_id),
+                agents=all_agents,
+            )
+            if shape_note:
+                advisories.append(shape_note)
+    except Exception as adv_err:
+        log.debug("check_agent_status.shape_advisory_failed", error=str(adv_err))
+    if advisories:
+        lines.append("")
+        lines.append("## Org Shape Advisories（非阻塞提示，供组织设计参考）")
+        lines.extend(f"- {a}" for a in advisories)
+
     return ToolResult.ok(
         f"## Agent Status ({len(sorted_agents)} agents)\n" + "\n".join(lines)
     )

@@ -53,6 +53,30 @@ def _race_fact_bit(task: dict | None) -> str:
         "being written to the ledger."
     )
 
+
+def _running_race_receipt(task: dict | None, task_id: str) -> str:
+    """running 态拒绝回执（T40）：事实照旧 + 追加 wait_on 挂起处方。
+
+    D85 实测（review/submit 竞态）连续 8 次硬拒：旧回执只教「等几秒重试」，
+    模型重试间隔小于落库延迟 ⇒ 连撞。拒绝语义不变（仍 failed），只补出路：
+    用 wait_on 挂起本回合，任务转 submitted/reviewing 时平台唤醒再评审。
+    legacy 模式（默认）没有 wait_on 工具，同形条目走 commit_turn(phase=
+    'waiting')——两种写法都给出，模型按本机可用工具选一。
+    """
+    tid = str((task or {}).get("id") or task_id)
+    ref = '{"kind": "task", "ref": "%s"}' % tid
+    return (
+        "Task is 'running' — a submission is likely still landing "
+        "(review/submit race). WAIT a few seconds and retry the "
+        "same review_task call; do NOT rework or punish the "
+        "assignee based on this state.\n"
+        + _race_fact_bit(task)
+        + "\n处方: 任务 " + tid + " 当前 running——可用 wait_on(refs=["
+        + ref + "]) 挂起，任务转 submitted/reviewing 时平台会唤醒你再来 "
+        "review；无 wait_on 工具（legacy 模式）时等价写法 "
+        "commit_turn(phase='waiting', waiting_on=[" + ref + "])。"
+    )
+
 # ── review_task ─────────────────────────────────────────
 
 
@@ -296,9 +320,17 @@ async def review_task_tool(
             if not isinstance(evidence, dict):
                 evidence = {}
             policy_id = ledger_policy_id(task)
-            needed = required_attestation_kinds(policy_id)
-            from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+            # T42：flag off ⇒ 任务级 submitGate 政策里的 code_audit kind 结构性
+            # 剥离（与 submit preflight 同源同判据）——否则 submit 凭 test_run
+            # 过了、approve 仍要 code_audit = 结构性不可满足门（S19 实测）。
+            from hiveweave.services.code_audit import (
+                drop_code_audit_kind_if_soft,
+                strip_code_audit_kind_for_gate,
+            )
 
+            needed = strip_code_audit_kind_for_gate(
+                required_attestation_kinds(policy_id)
+            )
             needed, _ = await drop_code_audit_kind_if_soft(
                 needed,
                 project_id,
@@ -686,10 +718,7 @@ async def review_task_tool(
                 await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
             elif current_status == "running":
                 return ToolResult.err(
-                    "Task is 'running' — a submission is likely still landing "
-                    "(review/submit race). WAIT a few seconds and retry the "
-                    "same review_task call; do NOT rework or punish the "
-                    "assignee based on this state.\n" + _race_fact_bit(task)
+                    _running_race_receipt(task, params.task_id)
                 )
             elif current_status == "approved":
                 # TEST_DSH_62 P5/L8：重复 approve 旧文案与 blocked 混用同一
@@ -721,10 +750,7 @@ async def review_task_tool(
                 await ts.start_review(project_id, params.task_id, reviewer_id=agent_id)
             elif current_status == "running":
                 return ToolResult.err(
-                    "Task is 'running' — a submission is likely still landing "
-                    "(review/submit race). WAIT a few seconds and retry the "
-                    "same review_task call; do NOT rework or punish the "
-                    "assignee based on this state.\n" + _race_fact_bit(task)
+                    _running_race_receipt(task, params.task_id)
                 )
             elif current_status not in ("reviewing", "approved"):
                 return ToolResult.err(

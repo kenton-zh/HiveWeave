@@ -380,6 +380,14 @@ class OrgService:
             if (a.get("status") or "").lower() != "archived"
         ]
 
+        # 1b. short_id within project scope (router-independent — DB rows
+        # the router hasn't registered, e.g. fresh process / direct inserts)
+        if _SHORT_ID_RE.match(inp):
+            norm = "A" + inp[1:].upper()
+            for a in active:
+                if str(a.get("short_id") or "").upper() == norm:
+                    return a
+
         # 2. 花名 / name exact (case-insensitive)
         name_hits = [
             a for a in active

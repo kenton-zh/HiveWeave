@@ -11,6 +11,7 @@ from typing import Any
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from hiveweave.config import submit_audit_gate_enabled
 from hiveweave.services import task as _task_svc
 from hiveweave.services.param_shapes import coerce_list_param
 from hiveweave.services.tasks.verify import is_verify_task
@@ -37,7 +38,161 @@ def _fmt_issue_line(i: dict) -> str:
         line += f"\n  处方: {remedy}"
     return line
 
+# ── T37 契约墙：dc 拒收回执附「按本任务实例化」的可抄模板 ───────────
+# S19 屿洲实测：delivery contract 回执未填齐导致 44 次连续提交失败（43 分钟）
+# —— 旧回执只给字段名 + 格式示意，模型反复填错（evidence.delivery_contract
+# .summary 字样被当成参数键名）。修法：拒绝分支实例化一份完整可抄的
+# deliveryContract JSON，test 字段用本任务已 attest 的 test_run 凭证 id
+# 实时填充（照抄即过同一张门），并附一行抄写指令。凭证查询与 auto-attach
+# 同源（find_recent_for_agent：task 匹配优先 + exit=0 + stdout_hash + 未过期），
+# 保证填进去的 id 能过 verify_ids(expected_kinds=["test_run"], task_id=…)。
+
+# P0-4：summary 示例值必须是**可照抄**的真实示例——旧值 "<实现摘要：…>" 以
+# "<" 开头，正好落在 delivery_contract._PLACEHOLDER_LEADS 占位前缀上，照抄
+# 必被同一张门二次拒收（处方自相矛盾）。新值不落在任何占位前缀上，原样照
+# 抄即过 dc 门；summary 的合法性判定与门禁同源（delivery_contract_missing）。
+_DC_SUMMARY_EXAMPLE = "实现摘要：本次实际改动内容与预期的偏差"
+_DC_TEST_PLACEHOLDER = "test_run:<本任务的attestationId>"
+
+
+def _dc_copyable_json(evidence: dict[str, Any], test_value: str) -> str:
+    """实例化可抄 deliveryContract JSON（纯函数）。
+
+    summary 尽量复用本次提交里**已合法**的摘要（只缺/错 test 的场景照抄
+    整份 JSON 即过）；缺失/占位时换可照抄示例（:data:`_DC_SUMMARY_EXAMPLE`，
+    不落在 _PLACEHOLDER_LEADS 占位前缀上）——合法与否的判定与门禁同源
+    （delivery_contract_missing），不在此处另立判据。
+    """
+    from hiveweave.services.delivery_contract import delivery_contract_missing
+
+    rc = evidence.get("delivery_contract")
+    summary = ""
+    if isinstance(rc, dict):
+        s = rc.get("summary")
+        if isinstance(s, str):
+            summary = s.strip()
+    if not summary or delivery_contract_missing(
+        {"delivery_contract": {"summary": summary, "test": "test_run:x"}}
+    ):
+        summary = _DC_SUMMARY_EXAMPLE
+    return json.dumps(
+        {"summary": summary, "test": test_value}, ensure_ascii=False
+    )
+
+
+async def _dc_receipt_template_block(
+    project_id: str, agent_id: str, task_id: str, evidence: dict[str, Any]
+) -> str:
+    """T37 拒收回执的可抄模板块：一行抄写指令 + 实例化 JSON。
+
+    test 字段优先填本任务真实的 test_run 凭证 id；查不到退占位符并附跑测
+    指引（fail-open：查询失败不改变拒绝本身）。
+    """
+    test_value = _DC_TEST_PLACEHOLDER
+    try:
+        from hiveweave.services.attestation import attestation_service
+
+        ids = await attestation_service.find_recent_for_agent(
+            project_id, agent_id=agent_id, task_id=task_id, kinds=["test_run"]
+        )
+        if ids:
+            test_value = f"test_run:{ids[0]}"
+    except Exception as e:  # noqa: BLE001 — 模板尽力填充，失败退占位符
+        log.debug("submit_dc_template_test_run_lookup_failed", error=str(e))
+    template = _dc_copyable_json(evidence, test_value)
+    if test_value == _DC_TEST_PLACEHOLDER:
+        test_note = (
+            "（当前查不到本任务已 attest 的 test_run 凭证——先 bash 真跑"
+            "一次测试拿到凭证 id，再替换 test 字段）"
+        )
+    else:
+        test_note = "（test 已填本任务真实凭证 id，照抄即可）"
+    return (
+        "\nCOPY-PASTE: 把下面的 JSON 原样作为 submit_task 的 "
+        f"deliveryContract 参数重交{test_note}：\n{template}"
+    )
+
+
 # ── submit_task ─────────────────────────────────────────
+
+
+# B6 契约单源化（缺口 19）：工具最终描述的唯一 owner 是本模块 —— @tool
+# 注册处与 executor.py 的 TOOL_PARAM_SCHEMAS 手写条目都引用
+# ``SUBMIT_TASK_TOOL_DESCRIPTION``。
+# 批3 灰度：审计门条款按 ``SUBMIT_AUDIT_GATE`` flag 装配（导入期定稿，
+# 与全部 HIVEWEAVE_* 设置同口径：改 env 重启生效）。off（默认）时描述
+# 不得出现审计门契约 —— 模型可见面必须与门禁行为同 commit 一致（prompt
+# authoring skill §4：事实单源，运行时工具数组即能力）。
+_SUBMIT_DESCRIPTION_HEAD = (
+    "Submit for review (running → submitted). testsPassed must be true "
+    "after real tests. Pass attestationIds from bash/browse. dryRun=true "
+    "lists missing items without submitting. VERIFY tasks MUST pass "
+    "verdict=PASS|FAIL (blockingIssues when FAIL, E1 hard gate); "
+    "delivery-contract tasks MUST pass deliveryContract={summary, test}. "
+)
+
+_SUBMIT_DESCRIPTION_TAIL = (
+    "Branch conflicting with main is rejected (merge_conflict_with_main) "
+    "— call git_worktree_sync in your worktree (mode=materialize_conflict "
+    "to get the conflict left there for you to resolve by hand), then "
+    "resubmit. Only the assignee can submit."
+)
+
+# T16 残尾尾巴：gate=on 条款的挂起处方按模式分流（auto ⇒ wait_on，
+# legacy ⇒ commit_turn(waiting_on …) 旧形态）。函数形态：使用时求值，
+# 不在 import 钉死模式。
+def _audit_gate_park_rx() -> str:
+    from hiveweave.config import turn_exit_mode
+
+    if turn_exit_mode() == "auto":
+        return (
+            'wait_on(refs=[{"kind": "task", "ref": "<audit task id>"}]) '
+            "to park"
+        )
+    return "commit_turn(waiting_on kind=task, ref=<audit task id>) to park"
+
+
+def _submit_audit_gate_on_clause() -> str:
+    return (
+        "CODE AUDIT GATE: a cumulative code diff over 20 lines requires an "
+        "already-PASSING code_audit attestation to submit — you do NOT run the "
+        "audit synchronously in your own turn. When the gate triggers, the "
+        "platform auto-dispatches a SYSTEM AUDIT task to the reviewer pool and "
+        "the submit is rejected with the dispatch receipt; follow that receipt: "
+        + _audit_gate_park_rx()
+        + ", and "
+        "re-submit after the attestation lands (the platform wakes you). If the "
+        "receipt says no reviewer is available, have your coordinator/superior "
+        "fix the reviewer pool or run waive_attestation — do not waive on your "
+        "own, and do not blindly re-submit. "
+        "If a required credential is STRUCTURALLY impossible to issue "
+        "(e.g. code_audit when your branch has no diff vs MAIN — task "
+        "already merged), the gate records attestation_impossible"
+        "(reason=tool_limited) and consumes it itself: no waiver needed. "
+    )
+
+_SUBMIT_AUDIT_GATE_OFF_CLAUSE = (
+    "Per-commit code audit is retired (SUBMIT_AUDIT_GATE=off): submit "
+    "requires no code_audit attestation and never dispatches audit tasks; "
+    "audit duty belongs to milestone QA acceptance. "
+)
+
+
+def build_submit_task_description(*, audit_gate: bool) -> str:
+    """submit_task 描述单源组装（B6）：审计门条款按灰度 flag 拼装（纯函数）。
+
+    ``audit_gate=True`` 渲染旧门契约（CODE AUDIT GATE 全文）；
+    ``False``（默认 off）渲染拆门契约，不提审计要求。
+    """
+    return _SUBMIT_DESCRIPTION_HEAD + (
+        _submit_audit_gate_on_clause() if audit_gate
+        else _SUBMIT_AUDIT_GATE_OFF_CLAUSE
+    ) + _SUBMIT_DESCRIPTION_TAIL
+
+
+SUBMIT_TASK_TOOL_DESCRIPTION = build_submit_task_description(
+    audit_gate=submit_audit_gate_enabled()
+)
 
 
 class SubmitTaskParams(BaseModel):
@@ -50,14 +205,29 @@ class SubmitTaskParams(BaseModel):
         description="ID of the task to submit. If omitted, auto-detects your current running task.",
         json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
     )
-    summary: str = Field(
-        description="Summary of work done.",
-        json_schema_extra={"aliases": ["summary", "report"]},
+    summary: str | None = Field(
+        default=None,
+        description=(
+            "Summary of work done. OPTIONAL (P0-4 single authoritative "
+            "standard): when omitted, the platform backfills it from "
+            "deliveryContract.summary — the one required reply path. "
+            "Rejected only when BOTH are absent."
+        ),
+        # 别名 = 手写层（TOOL_PARAM_SCHEMAS）曾接受名字的并集——registered
+        # 管线的别名解析只认 pydantic 这张表，回填才不丢既有可达面（B6 红线）。
+        json_schema_extra={"aliases": ["summary", "report", "description"]},
     )
     commit: str | None = Field(
         default=None,
         description="Git commit hash (optional).",
-        json_schema_extra={"aliases": ["commit", "commitHash"]},
+        # llm_name 钉住 LLM 可见 property 正名为 commit（别名 commitSha 含
+        # 大写会被 base._llm_prop_name 选成键名）。别名不收 "commitHash"
+        # —— 那是 commit_hash 字段（VERIFY 证据）的正名，放这里会在别名
+        # 解析时把 VERIFY 证据错路由到 commit。
+        json_schema_extra={
+            "aliases": ["commit", "commitSha", "commit_sha"],
+            "llm_name": "commit",
+        },
     )
     files_changed: list[str] | None = Field(
         default=None,
@@ -237,9 +407,29 @@ def _build_evidence(
     从 _submit_preflight 原地抽出（TEST_DSH_63 接线修复）：只负责把参数
     逐键透传进 evidence；audit_soft 落章等需要任务上下文的步骤仍留在
     调用方。除新增 acceptance_coverage 透传外，行为与抽取前一致。
+
+    P0-4 单一口径回填：顶层 ``summary`` 缺失/空白时从
+    ``deliveryContract.summary`` 回执取（回执 summary 是存侧权威路径）。
+    占位/空白值不回填——dc 门会以同一判据（``_PLACEHOLDER_LEADS``）拒绝，
+    入口不把垃圾搬进 ``evidence.summary``；两者皆缺 ⇒ evidence.summary
+    为 None，由 _submit_preflight 的 summary_missing 检查统一拒（唯一口径）。
     """
+    # ⚠ `getattr` 容读：与下方 acceptance_coverage 同款纪律 —— 进程内其它
+    # 调用点 / 测试里的 SimpleNamespace 假参数可能没有 summary 属性。
+    _summary = getattr(params, "summary", None)
+    if not (isinstance(_summary, str) and _summary.strip()):
+        from hiveweave.services.delivery_contract import is_placeholder_text
+
+        _rc = getattr(params, "delivery_contract", None)
+        _rs = _rc.get("summary") if isinstance(_rc, dict) else None
+        if (
+            isinstance(_rs, str)
+            and _rs.strip()
+            and not is_placeholder_text(_rs)
+        ):
+            _summary = _rs
     evidence: dict[str, Any] = {
-        "summary": params.summary,
+        "summary": _summary,
         "tests_passed": True,
         "policy_id": policy_id,
         "attestation_ids": attest_ids,
@@ -309,7 +499,10 @@ async def _submit_preflight(
         required_attestation_kinds,
         resolve_task_policy,
     )
-    from hiveweave.services.code_audit import code_audit_soft_fail_pending
+    from hiveweave.services.code_audit import (
+        code_audit_soft_fail_pending,
+        strip_code_audit_kind_for_gate,
+    )
 
     ts = _task_svc.TaskService()
     issues: list[dict] = []
@@ -322,10 +515,30 @@ async def _submit_preflight(
             tags = []
     policy_id = ledger_policy_id(task)
     needed = required_attestation_kinds(policy_id)
+    # ── 批3 灰度：SUBMIT_AUDIT_GATE=off（默认）⇒ 拆除逐提交审计门 ──────
+    # T42：剥离判据抽为单一事实源 ``strip_code_audit_kind_for_gate``（本路径
+    # 与 review/api approve·HTTP 门共用）——覆盖 >20 行默认门 + 任务级
+    # submitGate 政策（code_audit_unit 等）。单点过滤 = 下游全自然收敛：
+    # verify_ids 不再要求 code_audit 凭证、audit_gate_pending 恒 False（不铸
+    # SYSTEM AUDIT）、impossible/soft 探测短路、回执处方不再提
+    # request_code_audit。test_run / browse_e2e 等任务级 kind 原样保留
+    # （unit/visual 门不动）；审计责任归 QA 里程碑终验，QA 自愿审计仍走
+    # request_code_audit（工具本体不动）。
+    _stripped = strip_code_audit_kind_for_gate(needed)
+    if _stripped != needed:
+        needed = _stripped
+        log.debug(
+            "submit_audit_gate_off_code_audit_dropped",
+            agent_id=agent_id,
+            task_id=str(task_id)[:8],
+            policy_id=policy_id,
+        )
     # P0-3 fail-loud (TEST_DSH_38): an llm_failed attempt no longer drops the
     # kind at submit. The kind stays required; a passing attestation satisfies
     # verify_ids, otherwise the submit is rejected with an explicit-waive hint.
     audit_soft = code_audit_soft_fail_pending(needed, agent_id, task_id)
+    # T1：审计门触发事实位（含义与判定见下方 verify_ids 之后），默认 False。
+    audit_gate_pending = False
     if audit_soft:
         log.info(
             "submit_code_audit_soft_fail_gate",
@@ -540,6 +753,27 @@ async def _submit_preflight(
                 task_id=task_id,
                 report=_gate_report,
             )
+            # ── T1 审查/审计派单化（单轨）：审计门触发事实位 ─────────────
+            # policy 要求 code_audit 凭证且**未满足**（verify 整体失败 且
+            # submitter 名下没有可自动附上的有效 code_audit 凭证——后者排除
+            # 「门因其它 kind 失败 / 凭证在手只是没传 id」的误铸）。真实
+            # submit 撞门时，submit_task_tool 据此铸造内部审计任务派审查池
+            # （submitter 不再同步跑审计）；dry-run 只回执不铸造。
+            audit_gate_pending = False
+            if not ok and CODE_AUDIT_KIND in gate_needed:
+                try:
+                    _audit_cands = await attestation_service.find_recent_for_agent(
+                        project_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        kinds=[CODE_AUDIT_KIND],
+                    )
+                except Exception as _ac_e:  # noqa: BLE001 — 查不动按无可附
+                    log.debug(
+                        "submit_audit_gate_pending_probe_failed", error=str(_ac_e)
+                    )
+                    _audit_cands = []
+                audit_gate_pending = not _audit_cands
             if not ok:
                 from hiveweave.services.attestation import (
                     format_umbrella_gate_hint,
@@ -603,6 +837,14 @@ async def _submit_preflight(
                             f"attestationIds=[...]).\n"
                         )
                     full_tid = task.get("id") or task_id
+                    # 批3 灰度：处方菜单按门内实际 kind 渲染 —— code_audit
+                    # 不在必需清单（off 拆门后恒如此；或本就非审计 policy）
+                    # 时不提 request_code_audit，回执只给剩余可达通道。
+                    _remedy_menu = (
+                        "request_code_audit / browse / attest_doc_review"
+                        if (needed and CODE_AUDIT_KIND in needed)
+                        else "browse / attest_doc_review / bash 跑测试(test_run)"
+                    )
                     issues.append({
                         "code": "attestation",
                         "message": (
@@ -622,8 +864,8 @@ async def _submit_preflight(
                         ),
                         "remedy": (
                             "按 Options 选一条执行（本任务 policy 对应 "
-                            "request_code_audit / browse / attest_doc_review），"
-                            "凭证到手后原样重交；确属平台侧无法签发时才走 "
+                            + _remedy_menu
+                            + "），凭证到手后原样重交；确属平台侧无法签发时才走 "
                             "waive_attestation。"
                         ),
                         "gate": "submit_attestation",
@@ -636,24 +878,21 @@ async def _submit_preflight(
                         "code": "audit_soft_fail_gate",
                         "message": (
                             "A previous request_code_audit attempt ended "
-                            "llm_failed — silent skip is no longer allowed "
-                            "(P0-3 fail-loud). This is NOT missing evidence "
-                            "on your side: the platform auto-enqueued a "
-                            "background retry and will notify you in your "
-                            "inbox when it succeeds — wait for that notice. "
-                            "Only if repeated auto-retries (5) still fail, "
-                            "have a coordinator run waive_attestation(taskId=\""
-                            f"{task_id}\", reason=\"audit unavailable\", "
-                            "reasonKind=\"tool_failure\") — a real human "
-                            "decision. (A structurally IMPOSSIBLE audit — "
-                            "e.g. the branch has no diff left because it is "
-                            "already merged — is NOT this case: the gate "
-                            "records attestation_impossible(reason="
-                            "tool_limited) itself and needs no waiver.)"
+                            "llm_failed (platform-recorded) — silent skip is "
+                            "not allowed (P0-3 fail-loud). This is NOT "
+                            "missing evidence on your side. Under the "
+                            "dispatched-audit flow you do NOT retry the audit "
+                            "yourself: the platform dispatches a SYSTEM AUDIT "
+                            "task with this receipt (see the AUDIT TASK "
+                            "DISPATCHED block) — wait on it. Your own failed "
+                            "attempt still gets background auto-retries; "
+                            "whichever lands first opens the gate."
                         ),
                         "remedy": (
-                            "等 inbox 里的自动重试成功通知（不要静默重交）；"
-                            "自动重试 5 次仍失败，才请协调者 waive_attestation"
+                            "按回执 AUDIT TASK DISPATCHED 区块收尾："
+                            f"{_audit_gate_park_rx()}；凭证落地唤醒你后重交。"
+                            "不要循环 request_code_audit；多次自动重试仍失败"
+                            "且无可用审查者时，才请协调者 waive_attestation"
                             f"(taskId=\"{task_id}\", reasonKind=\"tool_failure\")。"
                         ),
                     })
@@ -1017,28 +1256,57 @@ async def _submit_preflight(
     _dc_waived = bool(evidence.get("contract_waived")) or await has_valid_waiver(
         project_id, task_id
     )
+    # ── P0-4 单一权威口径：实现摘要必填性（两套互斥必填收敛为一条）──────
+    # 修前 pydantic 顶层 summary 必填 与 dc 门 REQUIRED_REPLY_FIELDS 并存，
+    # 同一 agent 78s 内拿到两种互斥处方（实测 116/272=42.6% 拒绝）。现口径：
+    # 回执 summary（deliveryContract.summary）是唯一权威路径，顶层 summary
+    # 是兼容入口（缺失时 _build_evidence 自动回填）；两者皆缺才拒。
+    # 带 dc 契约且未豁免的任务由 dc 门统一开火（其回执自带可照抄模板，
+    # 是唯一处方——此处不得重复报因，否则又是两种口径）。
+    if not str(evidence.get("summary") or "").strip() and not (
+        _dc_contract and not _dc_waived
+    ):
+        issues.append({
+            "code": "summary_missing",
+            "message": (
+                "submit_task rejected: missing implementation summary "
+                "（顶层 summary 与 deliveryContract.summary 均未提供——"
+                "唯一权威口径见处方）。"
+            ),
+            "remedy": (
+                "重新 submit_task 并带 summary=\"<真实实现摘要>\""
+                "（唯一必填路径）。"
+            ),
+        })
     if _dc_contract and not _dc_waived:
         missing = delivery_contract_missing(evidence)
         if missing:
+            # T37：可抄模板按本任务实例化（test 优先填真实凭证 id）。
+            _dc_block = await _dc_receipt_template_block(
+                project_id, agent_id, task_id, evidence
+            )
             issues.append({
                 "code": "delivery_contract_incomplete",
                 "message": (
                     "Delivery contract 回执未填齐：缺 "
                     + ", ".join(missing)
-                    + "。请补入 submit_task(..., deliveryContract={"
-                    "'summary': '<实现摘要>', 'test': 'test_run:<本任务凭证id>'})。"
-                    "test 必须引用**本任务**的 test_run 凭证 id（平台机器验证，"
-                    "不绑定本任务同样被拒）。确无法跑测试：改用 "
+                    + "。回执（deliveryContract.summary/test）是唯一权威"
+                    "必填口径——顶层 summary 缺失时平台自动从回执回填"
+                    "（P0-4）。"
+                    + _dc_block
+                    + " test 必须引用**本任务**的 test_run 凭证 id"
+                    "（平台机器验证）。确无法跑测试：改用 "
                     "deliveryContract={'evidence_kind': 'not_applicable', "
                     "'not_applicable_reason': '<为什么跑不了>'}，并由协调者 "
-                    "waive_attestation 正式豁免——未豁免的 not_applicable 不放行。"
-                    "非代码交付可显式 contractWaived=true 跳过（不静默缺失）。"
+                    "waive_attestation 正式豁免——未豁免的 not_applicable "
+                    "不放行。非代码交付可显式 contractWaived=true 跳过"
+                    "（不静默缺失）。"
                 ),
                 "remedy": (
-                    "submit_task(..., deliveryContract={'summary': '<摘要>', "
-                    "'test': 'test_run:<本任务凭证id>'}) 重交；跑不了测试走 "
-                    "not_applicable + waive_attestation；非代码交付用 "
-                    "contractWaived=true。"
+                    "照抄上面 COPY-PASTE 的 JSON 作为 deliveryContract 参数"
+                    "重交（示例值可原样照抄，不落占位前缀；建议把 summary "
+                    "换成你的真实实现摘要）；跑不了测试走 not_applicable + "
+                    "waive_attestation；非代码交付用 contractWaived=true。"
                 ),
             })
         else:
@@ -1103,16 +1371,24 @@ async def _submit_preflight(
                         report=_dc_report,
                     )
                     if not _tok:
+                        # T37：id 在但过不了门（过期/绑错任务/编造）——同样附
+                        # 可抄模板，库里有合格凭证时照抄真 id 即过。
+                        _dc_block = await _dc_receipt_template_block(
+                            project_id, agent_id, task_id, evidence
+                        )
                         issues.append({
                             "code": "delivery_contract_incomplete",
                             "message": (
                                 "Delivery contract 测试凭证不可验证："
                                 f"test_run:{aid} —— {_terr}。"
                                 "请用真实 test_run 凭证 id（bash 跑测试自动落库）。"
+                                + _dc_block
                             ),
                             "remedy": (
-                                "先 bash(..., taskId=本任务) 真跑一次测试拿到"
-                                "新凭证，再引用它的 id 重交。"
+                                "照抄上面 COPY-PASTE 的 JSON 重交（test 已填"
+                                "本任务合格凭证 id 时直接用；否则先 "
+                                "bash(..., taskId=本任务) 真跑一次测试拿到"
+                                "新凭证）。"
                             ),
                             "gate": "delivery_contract_test",
                             "expectedKinds": _dc_report.get("expectedKinds", []),
@@ -1131,30 +1407,17 @@ async def _submit_preflight(
         "impossible": impossible,
         # F1：平台判定的软失败（供提交时补落持久事实行；dry-run 不写库）。
         "audit_soft": audit_soft,
+        # T1：审计门触发（code_audit 必需且未满足）——submit_task_tool 据此
+        # 铸造内部审计任务派审查池（dry-run 不铸）。
+        "audit_gate_pending": audit_gate_pending,
     }
 
 
 @tool(
     "submit_task",
-    "Submit a task for review (running -> submitted). Requires server "
-    "attestationIds from browse (UI) or bash test runs (code). "
-    "VERIFY task: MUST pass verdict=PASS|FAIL (+blockingIssues when FAIL). "
-    "Tasks with a delivery contract (写树代码任务): MUST pass "
-    "deliveryContract={summary, test:'test_run:<id>' bound to THIS task}. "
-    "GATE CONTRACT (code_audit_unit policy): if your code edits exceed 20 "
-    "lines, a PASSING code_audit attestation (exit_code=0) is REQUIRED — "
-    "submit without one is rejected (dry-run lists the missing kinds). If "
-    "request_code_audit soft-fails (llm_failed/no_model/no_callback), the "
-    "gate stays CLOSED: retry once; if it keeps failing, ask your "
-    "coordinator/superior to run waive_attestation(taskId, reason) — a "
-    "silent re-submit just gets rejected again. If instead the audit is "
-    "STRUCTURALLY IMPOSSIBLE (your branch has no diff vs MAIN — e.g. the "
-    "task is already merged), the gate records a structured fact "
-    "attestation_impossible(reason=tool_limited) and consumes it itself: "
-    "no waiver needed. "
-    "docs/explore tasks may use tags docs/explore. "
-    "If taskId omitted, auto-detects your current running task. "
-    "See PLATFORM MECHANISMS (system prompt) for gate semantics.",
+    # B6 单源：唯一 owner 是上方 SUBMIT_TASK_TOOL_DESCRIPTION（executor
+    # 手写条目 import 同一常量）——此处不再维护第二份文本。
+    SUBMIT_TASK_TOOL_DESCRIPTION,
     requires_workspace=False,
     security_level="standard",
 )
@@ -1274,6 +1537,26 @@ async def submit_task_tool(
             msg += "\n\n[additional blockers]\n" + "\n".join(
                 _fmt_issue_line(i) for i in preflight["issues"][1:]
             )
+        # ── T1 审查/审计派单化（单轨）：审计门触发 ⇒ 平台自动铸造内部
+        # 「代码审计任务」派给审查池（qa_lead → parent coordinator 回退链）。
+        # submit 仍被既有门拒绝（门逻辑零改动）；拒绝回执自带 waiting_on
+        # 处方——submitter 不再同步跑审计 LLM 调用。幂等由铸造侧保证
+        # （同 (submitter, 源任务) 进行中的审计任务复用不重铸）。
+        audit_mint: dict[str, Any] = {}
+        # 批3 灰度：off 时不铸造（audit_gate_pending 在 preflight 已恒
+        # False，此 flag 守卫是第二道防御；铸造入口自身还有第三道短路）。
+        if preflight.get("audit_gate_pending") and submit_audit_gate_enabled():
+            from hiveweave.services.tasks.audit_dispatch import (
+                format_dispatch_receipt_block,
+                mint_audit_task,
+            )
+
+            audit_mint = await mint_audit_task(project_id, task, agent_id)
+            _mint_block = format_dispatch_receipt_block(
+                audit_mint, str(task.get("id") or task_id)
+            )
+            if _mint_block:
+                msg += f"\n\n{_mint_block}"
         # TEST_DSH_70 P1-2 活性出口：同一任务连续被门拒 N 次 ⇒ 自动
         # blocked(wait_kind=external) 升级，不再无限拉锯（37 连拒 110′ 实证）。
         try:
@@ -1286,6 +1569,13 @@ async def submit_task_tool(
             )
         except Exception as _esc_e:  # noqa: BLE001 — 出口护栏不改变拒绝本身
             log.debug("gate_reject_escalation_failed", error=str(_esc_e))
+        if audit_mint.get("dispatched"):
+            return ToolResult.err(
+                msg,
+                audit_task_id=audit_mint.get("task_id"),
+                audit_dispatched=True,
+                audit_reviewer_id=audit_mint.get("reviewer_id"),
+            )
         return ToolResult.err(msg)
 
     evidence: dict[str, Any] = preflight["evidence"]
@@ -1378,7 +1668,23 @@ async def submit_task_tool(
                 await ts.start_task(project_id, task_id)
             elif status == "claimed":
                 await ts.start_task(project_id, task_id)
-        await ts.submit_task(project_id, task_id, evidence)
+        _submit_result = await ts.submit_task(project_id, task_id, evidence)
+        # A4 让渡项（批 2）：消费服务层幂等出口 —— submitted 状态的重提在
+        # 此早退，跳过 preflight 之后的 audit 提醒 / handoff 汇报 / reviewer
+        # 唤醒（inbox wake + trigger_coordinator）。状态与证据均未变动，
+        # reviewer 不该多收一次 [TASK SUBMITTED]。isinstance 守卫兼容测试
+        # 里 submit_task 被 mock 成非 dict 返回的调用方。
+        if isinstance(_submit_result, dict) and _submit_result.get("idempotent"):
+            return ToolResult.ok(
+                f"Task {task_id} already submitted (idempotent). "
+                f"status={_submit_result.get('status')} "
+                f"submitted_at={_submit_result.get('submitted_at')} — "
+                "no new reviewer notification sent.",
+                idempotent=True,
+                task_id=_submit_result.get("task_id") or task_id,
+                status=_submit_result.get("status"),
+                submitted_at=_submit_result.get("submitted_at"),
+            )
 
         # ── code_audit：账本超阈且近期无审计凭证 → 软提醒（不阻断、不改
         #    状态流）；无论是否提醒，真实提交成功即重置账本 ──
@@ -1394,7 +1700,12 @@ async def submit_task_tool(
                 reset_ledger,
             )
 
-            if get_unaudited_lines(agent_id) > CODE_AUDIT_LINE_THRESHOLD:
+            # 批3 灰度：off 时不再提审计要求（软提醒一并静默）；账本重置
+            # 保留（提交成功即清账，与门禁去留无关）。
+            if (
+                submit_audit_gate_enabled()
+                and get_unaudited_lines(agent_id) > CODE_AUDIT_LINE_THRESHOLD
+            ):
                 latest = await find_latest_attestation_by_kind(
                     project_id, agent_id=agent_id, kind=CODE_AUDIT_KIND
                 )

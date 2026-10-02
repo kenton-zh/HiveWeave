@@ -20,6 +20,12 @@ WakeCategory = Literal["message"]
 # Includes Chinese UI marker 「用户」 used by phoenix/chat paths.
 _USER_IDS = frozenset({"user", "human", "operator", "用户"})
 
+#: P1-5（2026-10-02）：人类发件人 id 集合的**公开只读别名**——平台唯一权威
+#: 人类身份集合就是上面这个 frozenset；SQL 拼装调用点
+#: （``services/inbox.human_sender_sql`` / ``non_human_sender_sql``）从这里取，
+#: 禁止再写 ``NOT IN ('user','system')`` 这类字面量集合（漏排别名 = 旧病根）。
+HUMAN_SENDER_IDS = _USER_IDS
+
 HUMAN_MESSAGE_TYPES = frozenset({"user_message", "user"})
 
 OFFTURN_COMPLETION_MESSAGE_TYPE = "offturn_completion"

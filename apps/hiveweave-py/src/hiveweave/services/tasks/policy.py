@@ -59,6 +59,7 @@ def submit_expectations(task: dict[str, Any] | None) -> dict[str, Any]:
         ledger_policy_id,
         required_attestation_kinds,
     )
+    from hiveweave.services.code_audit import strip_code_audit_kind_for_gate
     from hiveweave.services.delivery_contract import (
         REQUIRED_REPLY_FIELDS,
         parse_delivery_contract,
@@ -72,7 +73,11 @@ def submit_expectations(task: dict[str, Any] | None) -> dict[str, Any]:
             "policy_unknown": False,
         }
     policy_id = ledger_policy_id(task)
-    needed = required_attestation_kinds(policy_id)
+    # T42：与门禁同源 —— flag off 时 code_audit kind 不是可达契约，
+    # [SUBMIT CONTRACT] 不得教 assignee 去 request_code_audit。
+    needed = strip_code_audit_kind_for_gate(
+        required_attestation_kinds(policy_id)
+    )
     kinds = (
         sorted(k for k in needed if k != _UNKNOWN_POLICY_SENTINEL)
         if needed
