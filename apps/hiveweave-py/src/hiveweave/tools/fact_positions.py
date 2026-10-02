@@ -457,6 +457,57 @@ def classify_denied_by(
     return "unknown_acl"
 
 
+# ── A3 事实位接线（批 3，2026-09-28）：非沙箱类拒绝的**成因签名表**──────
+#
+# 病灶：`denied_by` 的既有生产者只覆盖**沙箱/ACL**（`classify_denied_by`，
+# 构造点在 `services/acl_sandbox/service.py`）与**磁盘**（`disk_guard`）两类，
+# 而实测发生过的另外两类拒绝 —— **attestation 证据门**与**跨级指挥链** ——
+# 构造点从不盖 `denied_by` ⇒ 旧项目库 564 步里该位大量 NULL 的主要缺口。
+#
+# 为什么走**漏斗**而不是散点补 `denied_by=`：两类拒绝各有 2~4 个构造点
+# （跨级：dispatch_task / create_task / message_team / DispatchService；
+#  attestation：submit_task / approve_review），但**文案各只有一个唯一源**
+# （`services/org_span.py::_validate_span` 与 submit/review 的 gate 失败模板）
+# —— 在漏斗按平台自产文案归类 = 一份判据盖住全部构造点，新增第三种跨级
+# 拒绝路径时**零改动**自动带上。这与 `RUNNER_FAILURE_SIGNATURES` 的形态完全
+# 同构：文案判据只能当兜底，所以构造点**显式盖的位永远优先**（见
+# :func:`finalize_tool_result` 的盖戳顺序）。
+#
+# ⚠ 闭合枚举纪律：这里的每个成因都必须在 `tools/result.py::DENIED_BY_KINDS`
+# 里登记（import 期断言把关）；文案 needle 是平台自产模板的**专属子串**
+# （对齐 RUNNER_FAILURE_SIGNATURES 的 E19 教训：不收泛化词）。
+DENIED_BY_SIGNATURES: tuple[tuple[str, tuple[_Sig, ...]], ...] = (
+    # submit.py / review.py 的证据门失败模板（"…attestation gate failed ({policy_id}): …"）
+    ("attestation_mismatch", _substr("attestation gate failed")),
+    # org_span._validate_span 的唯一前缀（"拒绝跨级派活：…" / "拒绝跨级沟通：…"）
+    ("cross_level", _substr("拒绝跨级")),
+)
+
+
+def classify_denied_by_text(error: str) -> str | None:
+    """非沙箱类拒绝的**成因归类**（平台自产文案签名表）；未命中返回 None（不猜）。
+
+    与 :func:`classify_denied_by`（沙箱/ACL，吃 stderr + exit_code 的**状态
+    判据**）分工：本函数服务的是**没有状态位可读**的拒绝源（attestation 门 /
+    org_span 跨级，构造点只产出一段平台文案）—— 判据源与
+    :data:`RUNNER_FAILURE_SIGNATURES` 同级（文本兜底），消费点在
+    :func:`finalize_tool_result`，且**只在构造点没显式盖 `denied_by` 时**被
+    咨询（显式位永远优先）。
+    """
+    norm = _normalize(error)
+    if not norm:
+        return None
+    for denied_by, signatures in DENIED_BY_SIGNATURES:
+        for sig in signatures:
+            if sig.kind == "substr":
+                if _normalize(sig.value) in norm:
+                    return denied_by
+            else:  # pragma: no cover — 当前表只收 substr；regex 条目留扩展位
+                if re.search(sig.value, norm) is not None:
+                    return denied_by
+    return None
+
+
 def classify_error_text(error: str) -> FactKind | None:
     """**第二层判据**：按签名表归类错误的成因；**无签名命中时返回 None**（不猜）。
 
@@ -948,7 +999,47 @@ def finalize_tool_result(
                 bits=r,
             )
     # 裸字典路径可能带进陈旧的 runner_failed/command_failed —— 由 fact 统一
+    out = _stamp_denied_by(tool_name, r, out)
     return finalize_fact_dict(out)
+
+
+def _stamp_denied_by(tool_name: str, r: object, out: dict) -> dict:
+    """`denied_by` 的**唯一盖戳口**（A3 批3，2026-09-28，在漏斗尾、派生键展开前）。
+
+    两件事，顺序即优先级：
+      1. **显式位核对**：构造点（acl_sandbox / disk_guard）已盖的 `denied_by`
+         原样保留 —— 但必须是闭合枚举成员（`DENIED_BY_KINDS`），表外值记
+         WARNING 后**丢弃**（宁可 NULL 不可假事实；NULL = 未记录，与枚举的
+         每一格都不同形，`denied_by IS NULL` 回扫判据才成立）。
+      2. **签名表归类**：失败结果且位缺失时查 :func:`classify_denied_by_text`
+         （attestation 门 / 跨级指挥链 —— 两类各有多个构造点、文案各只有
+         一个唯一源，漏斗归类 = 一份判据盖住全部，见表处长注释）。
+
+    ⚠ 只对**失败**结果归类；成功结果带"拒绝"字样（如 message_team 的部分
+    成功回执 "Cross-level blocked: …"）**不算拒绝** —— 那次调用有成功交付。
+    """
+    from hiveweave.tools.result import DENIED_BY_KINDS
+
+    existing = out.get("denied_by")
+    if existing is not None:
+        if existing not in DENIED_BY_KINDS:
+            log.warning(
+                "fact_position_denied_by_unknown_kind",
+                tool=tool_name,
+                denied_by=str(existing)[:40],
+                action=(
+                    "denied_by 是闭合枚举（tools/result.py::DeniedBy），表外值"
+                    "已丢弃 —— 要么构造点写错值，要么该值应先登记进枚举"
+                ),
+            )
+            out.pop("denied_by", None)
+        return out
+    if getattr(r, "success", True):
+        return out
+    kind = classify_denied_by_text(str(getattr(r, "error") or ""))
+    if kind is not None:
+        out["denied_by"] = kind
+    return out
 
 
 # ── 批 2（I3+I4，fixplan 2026-09-27）：两处 dispatch 兜底的唯一实现 ──
@@ -998,11 +1089,26 @@ def dispatch_failure_result(tool_name: str, exc: BaseException) -> dict:
 
     message = f"Error: {type(exc).__name__}: {exc}"
     if isinstance(exc, SandboxUnavailableError):
-        stamped = ToolResult.blocked_err(
-            message,
-            fact="runner_failed" if is_platform_side(exc) else "outcome_unknown",
-            **_executed_stamp(exc),
-        )
+        if is_platform_side(exc):
+            stamped = ToolResult.blocked_err(
+                message,
+                fact="runner_failed",
+                **_executed_stamp(exc),
+            )
+        else:
+            # 缺口 7（prompt-authoring §3「失败处置步骤 → 报错文案自带处方」）：
+            # outcome_unknown 的模型可见文本必须自带处方——不声称平台故障正是
+            # outcome_unknown 区别于 runner_failed 的语义（见本函数 docstring
+            # 归因段），但此前文本只有异常堆栈头，模型读不到「该自查」这一步。
+            # runner_failed 分支（平台侧，命令从未执行）不动；函数签名与
+            # 既有字段（fact/blocked/executed/…）均不变，只追加文本。
+            stamped = ToolResult.blocked_err(
+                message
+                + " outcome_unknown：这次调用没有产生结果——先自查你的调用"
+                "与实现，不要当作平台故障",
+                fact="outcome_unknown",
+                **_executed_stamp(exc),
+            )
     else:
         stamped = ToolResult.err(message)
     return finalize_tool_result(tool_name, stamped)
@@ -1057,6 +1163,22 @@ def _assert_signature_table_wellformed() -> None:
     assert classify_error_text("Port 4000 is reserved for HiveWeave") == "bad_args", (
         "保留端口文案必须仍判 bad_args —— 词边界不能把真命中一起挡掉"
     )
+    # 5) A3：拒因签名表的每一条都必须是**闭合枚举**成员且 needle 非空已归一
+    from hiveweave.tools.result import DENIED_BY_KINDS
+
+    for _denied, _dsigs in DENIED_BY_SIGNATURES:
+        assert _denied in DENIED_BY_KINDS, (
+            f"denied_by {_denied!r} 未登记进 tools/result.py::DENIED_BY_KINDS —— "
+            f"表外成因会被 _stamp_denied_by 丢弃，签名表等于白写"
+        )
+        assert _dsigs, f"denied_by {_denied!r} 的签名表为空 —— 它永远不会被命中"
+        for _sig in _dsigs:
+            assert _sig.kind == "substr", _sig
+            assert _sig.value.strip() and _sig.value == _sig.value.strip(), (
+                f"拒因签名 {_sig.value!r} 为空或含首尾空白"
+            )
+    assert classify_denied_by_text("") is None
+    assert classify_denied_by_text("完全无关的一段报错") is None
 
 
 _assert_signature_table_wellformed()

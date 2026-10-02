@@ -246,7 +246,11 @@ async def _send_message_core(
         }
         if badge:
             user_payload["metadata"] = badge
-        await chat_service.save_message(user_payload)
+        # T16 三期（N1）：回执必须机器可验证 —— 占位符 "user-msg" 让出口
+        # 判据认不出「已向用户收尾」（D85 HR 95 连唤醒的机器侧根因之一）。
+        # save_message 缺 id 时生成 UUID 并回传，落账真实 chat_messages id。
+        saved = await chat_service.save_message(user_payload)
+        user_msg_id = str((saved or {}).get("id") or "")
         # Push via WebSocket so the frontend updates in real-time
         from hiveweave.realtime.event_bus import status_event_bus
 
@@ -260,7 +264,13 @@ async def _send_message_core(
             agent_id=agent_id,
             message=user_ws_message,
         )
-        results.append({"to": "user", "message_id": "user-msg"})
+        results.append(
+            {
+                "to": "user",
+                "message_id": user_msg_id or "user-msg",
+                "delivered": bool(user_msg_id),
+            }
+        )
 
     # ── Resolve remaining agent recipients ──────────────
     recipients = agent_recipients
@@ -477,11 +487,22 @@ async def _send_message_core(
     working_note = ""
     if working_names:
         who = ", ".join(working_names)
+        # T16 残尾尾巴：re-arm 处方按模式分流（auto ⇒ wait_on）。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            rearm = (
+                "re-arm wait_on(refs=[{\"kind\": \"task\", \"ref\": "
+                "\"that task id\"}]) instead of chasing submit/status"
+            )
+        else:
+            rearm = (
+                "re-arm commit_turn(waiting, kind=task, ref=that task id) "
+                "instead of chasing submit/status"
+            )
         working_note = (
             f" NOTE: {who} is 🔴 working (processing). This message steals "
-            "their next turn. If you already dispatched them a task, re-arm "
-            "commit_turn(waiting, kind=task, ref=that task id) instead of "
-            "chasing submit/status."
+            f"their next turn. If you already dispatched them a task, {rearm}."
         )
     return ToolResult.ok(
         f"Message sent to {len(resolved)} agent(s): "

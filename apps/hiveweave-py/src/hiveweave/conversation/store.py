@@ -20,6 +20,8 @@ import structlog
 from hiveweave.conversation.compaction import (
     SUMMARY_MARKER,
     Compaction,
+    fresh_window_has_tool_output,
+    fresh_window_start,
     resolve_compactor_callback,
 )
 from hiveweave.conversation.token_utils import (
@@ -52,6 +54,18 @@ CONTEXT_MARKER_KIND_PRUNE = "prune"
 # 压缩失败冷却（TEST18 巡检 P1）：LLM 摘要失败后 N 秒内不重新触发——
 # 否则超阈值 agent 每次 append 都空耗一次 ~20s 失败调用（16 次回退实证）。
 COMPACTION_COOLDOWN_S = 300
+
+# 可抄①（opencode message-v2.ts 先例；T33/T34 2026-09-29）：失败 turn 的
+# [ERROR] 标记 assistant 消息**不进下轮模型上下文** —— 它们只陈述「上次
+# 挂了」，却污染下轮请求与缓存前缀（缓存域内多一条尾部异形消息 = 整段
+# 前缀失效）。标记由平台写入（agents/recovery.py 的 FAILED_TURN_MARKER =
+# "[PLATFORM_TURN_FAILED]" 与历史遗留 "[ERROR]" 前缀），此处按内容前缀
+# 识别（平台自产数据的形式匹配，不是 agent 意图推断）。⚠ 仅 LLM 上下文
+# 读路径过滤（get_history 的 include_failed_turn_markers=False，由
+# agent._build_messages 传参）；recovery 的失败接续判定/幂等检查
+# （history_ends_with_failed_turn / _same_failed_turn_already_persisted）
+# 仍读全量（默认 True）—— 过滤面收窄到「喂给模型的」，不碰平台判据。
+FAILED_TURN_CONTENT_MARKERS = ("[PLATFORM_TURN_FAILED]", "[ERROR]")
 
 # 单条 turn 原子写入（C2 fix 保留）：INSERT...SELECT 原子计算 turn_index。
 _INSERT_TURN_SQL = (
@@ -133,9 +147,24 @@ class ConversationStore:
     # ── 公共 API ─────────────────────────────────────────────
 
     async def get_history(
-        self, agent_id: str, project_id: str, token_budget: int | None = None
+        self,
+        agent_id: str,
+        project_id: str,
+        token_budget: int | None = None,
+        *,
+        include_failed_turn_markers: bool = True,
     ) -> list[dict]:
-        """获取对话历史，裁剪到 token budget 内，不含 system 消息。"""
+        """获取对话历史，裁剪到 token budget 内，不含 system 消息。
+
+        T8（2026-09-29）：裁剪带新鲜性保护——最近几轮的工具输出不参与驱逐；
+        预算连保护窗都装不下时**不硬驱逐**，改为触发既有 compaction（LLM
+        摘要），本请求携带完整保护窗返回（上游 streamer 95% 硬裁兜底）。
+
+        ``include_failed_turn_markers=False``（可抄①，LLM 上下文读路径专用）：
+        过滤失败 turn 的 [ERROR] 标记 assistant 消息 —— 失败尝试不进下轮
+        模型上下文（opencode message-v2.ts 先例），不污染缓存前缀。默认
+        True 保持 recovery 判据/幂等检查读全量，行为不变。
+        """
         key = (project_id, agent_id)
         if key not in self._cache:
             loaded = await self._load_from_db(agent_id)
@@ -144,7 +173,29 @@ class ConversationStore:
             if key not in self._prefix_cache:
                 await self._load_compacted_prefix(agent_id, project_id)
         cleaned = self._clean_messages(self._cache[key])
-        return self._trim_to_budget(cleaned, token_budget)
+        if not include_failed_turn_markers:
+            cleaned = [
+                m
+                for m in cleaned
+                if not (
+                    isinstance(m, dict)
+                    and m.get("role") == "assistant"
+                    and str(m.get("content") or "")
+                    .lstrip()
+                    .startswith(FAILED_TURN_CONTENT_MARKERS)
+                )
+            ]
+        trimmed, fresh_overflow = self._trim_fresh_aware(cleaned, token_budget)
+        if fresh_overflow:
+            # T8：保护窗本身超预算 ⇒ 硬驱逐只会重演「读入即驱逐」死循环。
+            # 走既有 compaction（去重/冷却/写队列都在 _maybe_trigger_compaction
+            # 里）；budget_override 让它跳过 70% 窗口线检查（预算线的触发
+            # 量纲是本次传入的 token_budget，不是模型窗口）。
+            await self._maybe_trigger_compaction(
+                agent_id, project_id, key, cleaned,
+                budget_override=max(token_budget or 0, 1),
+            )
+        return trimmed
 
     async def append_turn(
         self, agent_id: str, project_id: str, messages: list[dict],
@@ -272,10 +323,26 @@ class ConversationStore:
     async def _maybe_trigger_compaction(
         self, agent_id, project_id, key, messages,
         *, prefix_messages=None, tools=None,
+        budget_override: int | None = None,
     ) -> None:
+        """超线触发 compaction（去重 + 失败冷却 + 写队列串行）。
+
+        ``budget_override``（T8，2026-09-29）：显式目标预算——提供时跳过
+        70% 模型窗口线检查，直接以该预算入队（新鲜性保护窗装不下时的
+        裁剪侧出口：触发 LLM 摘要而不是硬驱逐）。去重/冷却语义不变。
+        """
         total = estimate_tokens_for_messages(messages)
-        ctx = await self._get_agent_context_window(agent_id)
-        budget = self._compaction.check_overflow(total, ctx)
+        if budget_override is None:
+            ctx = await self._get_agent_context_window(agent_id)
+            budget = self._compaction.check_overflow(total, ctx)
+            if budget is not None:
+                # 压缩目标把历史压到约半个上下文：_build_messages 现在不设读预算、
+                # 读取全部压缩后历史，压缩负责把总量控制在此值以下，给系统提示/工具/
+                # 输出留出上半区，超限时再由 streamer 95% 硬裁兜底。
+                read_budget = max(ctx // 2, 16_000)
+                budget = min(budget, read_budget)
+        else:
+            budget = max(budget_override, 1)
         if budget is not None:
             # 去重：已入队待执行的压缩不再重复入队（连续两次 append 双入队实证）
             if key in self._compaction_pending:
@@ -297,11 +364,7 @@ class ConversationStore:
                 )
                 return
             self._compaction_pending.add(key)
-            # 压缩目标把历史压到约半个上下文：_build_messages 现在不设读预算、
-            # 读取全部压缩后历史，压缩负责把总量控制在此值以下，给系统提示/工具/
-            # 输出留出上半区，超限时再由 streamer 95% 硬裁兜底。
-            read_budget = max(ctx // 2, 16_000)
-            target_budget = min(budget, read_budget)
+            target_budget = budget
             logger.info(
                 "compaction_triggered",
                 agent_id=agent_id,
@@ -805,14 +868,59 @@ class ConversationStore:
         """裁剪到 token budget 内。
 
         持久化 prune 已在 append_turn 后执行，cache 中的旧工具输出已是占位符。
-        此方法仅做预算检查：如果仍超限，用 turn-level 裁剪丢弃最旧的轮次。
+        此方法仅做预算检查：如果仍超限，用 turn-level 裁剪丢弃最旧的轮次
+        （T8：带新鲜性保护——保护窗内的工具输出不参与驱逐）。
+        """
+        trimmed, _overflow = ConversationStore._trim_fresh_aware(messages, budget)
+        return trimmed
+
+    @classmethod
+    def _trim_fresh_aware(
+        cls, messages: list[dict], budget: int | None
+    ) -> tuple[list[dict], bool]:
+        """T8 新鲜性保护裁剪。返回 ``(裁剪结果, 保护窗是否连预算都装不下)``。
+
+        溢出标志为 True 的语义：最老历史已裁光、保护窗内新鲜工具输出一个
+        未动、仍然超预算 ⇒ 调用方（get_history）应触发既有 compaction
+        （LLM 摘要），**不得**对保护窗做硬驱逐——那是「读入即驱逐」死循环
+        的裁剪侧根因。此时返回值携带完整保护窗（超预算交上游 95% 硬裁兜底）。
+
+        保护窗 = 最近 min(FRESH_PROTECT_TURNS 轮, FRESH_PROTECT_MAX_TOOL_RESULTS
+        条工具结果)（取小值防爆量）。窗内没有工具输出时保护空转，维持既有
+        裁剪语义（`_trim_turns`）——保护只为工具输出而设，不为散文扩权。
         """
         if budget is None or budget <= 0:
-            return messages
+            return messages, False
         total = estimate_tokens_for_messages(messages)
         if total <= budget:
-            return messages
-        return ConversationStore._trim_turns(messages, budget, total)
+            return messages, False
+        prefix, rest = cls._split_leading_system(messages)
+        if not rest:
+            return prefix, False
+        if not fresh_window_has_tool_output(rest):
+            # 窗内无新鲜工具输出 ⇒ 没有要护的东西，维持既有裁剪语义
+            return cls._trim_turns(messages, budget, total), False
+        w = fresh_window_start(rest)
+        head, protected = rest[:w], rest[w:]
+        prefix_tokens = estimate_tokens_for_messages(prefix)
+        protected_tokens = estimate_tokens_for_messages(protected)
+        effective = budget - prefix_tokens - protected_tokens
+        # 最老历史（head）按 turn 从新到旧尽量保留——与既有 fitting 语义
+        # 一致：保住连续的最新可塞段，绝不进入保护窗。
+        head_turns = cls._split_into_turns(head)
+        fitting: list[list[dict]] = []
+        for turn in reversed(head_turns):
+            tt = estimate_tokens_for_messages(turn)
+            if tt <= effective:
+                fitting.insert(0, turn)
+                effective -= tt
+            else:
+                break
+        result = prefix + [m for t in fitting for m in t] + protected
+        if estimate_tokens_for_messages(result) <= budget:
+            return result, False
+        # 连保护窗都装不下 ⇒ 不硬驱逐，交 compaction（LLM 摘要）
+        return prefix + protected, True
 
     @staticmethod
     def _split_leading_system(messages: list[dict]) -> tuple[list[dict], list[dict]]:

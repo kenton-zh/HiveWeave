@@ -52,6 +52,13 @@ from .types import DeltaCallback, ToolCallCallback
 
 log = structlog.get_logger(__name__)
 
+#: T16 auto：轮帽宽限轮数。auto 模式回合墙钟预算退役（2026-09-30 钦定，
+#: 对齐上游三仓 pi/opencode/DSH —— 均无回合总预算，只有调用级超时），
+#: 600 轮帽（DEFAULT_MAX_TOOL_ROUNDS）成为唯一轮数级硬停：到点先走
+#: auto 出口门禁收口（自然停同款：结算 ⇒ 平台 commit / 未结算 ⇒ hint），
+#: 再给这么多轮宽限；宽限耗尽仍不停 ⇒ 强制收口（blocked + 通知 creator）。
+TURN_ROUND_CAP_GRACE_ROUNDS = 50
+
 
 def e14_steering_decision(
     *,
@@ -191,6 +198,7 @@ class ToolLoopMixin:
         _detect_doom_loop: Any
         _execute_tools: Any
         _make_max_rounds_summary: Any
+        _effective_provider: Any
 
     @staticmethod
     def _normalize_usage(
@@ -267,13 +275,29 @@ class ToolLoopMixin:
             if not base:
                 base = self._strip_placeholder(text_acc)
         if note is None:
-            note = (
-                "[TURN BUDGET] Hard turn budget exhausted — all progress so "
-                "far is kept. Call commit_turn(phase='in_progress') to "
-                "checkpoint, then continue next wake with smaller slices "
-                "(split large operations; prefer background + polling over "
-                "long blocking calls)."
-            )
+            # T16 增补（回合墙钟预算退役，09-30 钦定）：auto 分支已【不可达】
+            # —— auto 模式下 _run_tool_loop 不武装 hard_deadline，本函数的
+            # 全部调用点（轮间硬检查 / E14 force / 轮闸 / budget_cut /
+            # 工具批闸）在 auto 下均被跳过。保留文案仅为防旁路结果误入时
+            # 退化为 legacy 的 commit_turn 指引（auto 已下架 commit_turn）。
+            from hiveweave.config import turn_exit_mode as _turn_exit_mode
+
+            if _turn_exit_mode() == "auto":  # pragma: no cover — dead in auto
+                note = (
+                    "[TURN BUDGET] Hard turn budget exhausted — all progress "
+                    "so far is kept. This run is marked interrupted and the "
+                    "platform will wake you in ~10 minutes to continue. "
+                    "Next wake: work in smaller slices; when obligations are "
+                    "settled just stop outputting."
+                )
+            else:
+                note = (
+                    "[TURN BUDGET] Hard turn budget exhausted — all progress so "
+                    "far is kept. Call commit_turn(phase='in_progress') to "
+                    "checkpoint, then continue next wake with smaller slices "
+                    "(split large operations; prefer background + polling over "
+                    "long blocking calls)."
+                )
         final_text = f"{base}\n\n{note}" if base else note
         final_msg = {"role": "assistant", "content": final_text}
         # 仅补当前被切断轮的 thinking（调用方已按 provider.supports_thinking
@@ -394,9 +418,23 @@ class ToolLoopMixin:
         truncated_rounds = 0
 
         # Turn budget（写死启用，见 constants.py 顶部说明）: session wall clock。
+        # T16 增补（2026-09-30 钦定）：回合墙钟预算退役 —— auto 模式下
+        # hard/soft deadline 均不武装（None），回合时长由模型停止自然决定。
+        # 安全网 = 调用级超时（T3' 首块总帽 300s / idle 150s / 工具声明超时）
+        # + 600 轮帽（唯一轮数级硬停，见下方轮帽收口块）+ T9/T27 断路器
+        # + 用户停止按钮。deadline 为 None 时下游 SSE wait_s 的 min(...)
+        # 自然退化为无预算钳制（http_stream/context 全链路 None-safe）。
+        # legacy 分支逐字节不动。
+        from hiveweave.config import turn_exit_mode as _turn_exit_mode_fn
+
+        _turn_budget_armed = _turn_exit_mode_fn() != "auto"
         loop_start = time.monotonic()
-        hard_deadline = loop_start + HARD_TOTAL_TIMEOUT_S
-        soft_deadline = loop_start + TOTAL_TIMEOUT_S
+        hard_deadline: float | None = (
+            loop_start + HARD_TOTAL_TIMEOUT_S if _turn_budget_armed else None
+        )
+        soft_deadline: float | None = (
+            loop_start + TOTAL_TIMEOUT_S if _turn_budget_armed else None
+        )
         budget_hint_injected = False
         # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
         # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：
@@ -406,11 +444,26 @@ class ToolLoopMixin:
         pacing_hint_round = -1
         # E14: 轮次疏导线提示一次性（不重复塞系统消息浪费 token）
         force_commit_hint_injected = False
+        # T16 auto：轮帽收口状态位（600 到点 hint 一次性；宽限见常量）。
+        _round_cap_gate_ran = False
 
+        # T16 auto：轮帽宽限 —— auto 下循环可越过 rounds_cap 继续
+        # （600 hint → 650 强制收口）；legacy 维持原轮数硬出。
+        if _turn_budget_armed:
+            _loop_round_limit = rounds_cap
+        else:
+            _loop_round_limit = rounds_cap + TURN_ROUND_CAP_GRACE_ROUNDS + 1
 
-        for round_num in range(rounds_cap):
+        for round_num in range(_loop_round_limit):
+            # T34：每轮刷新生效 provider —— 故障转移切换后（http_stream 层
+            # 置位 _failover.active_config），本轮请求体构建 / 上下文裁剪 /
+            # 思考方言 / usage 归一全部按切换后模型走；未切换时原样返回
+            # （同一对象直通，零开销）。
+            provider, provider_name = self._effective_provider(
+                provider, provider_name
+            )
             now_mono = time.monotonic()
-            if now_mono >= hard_deadline:
+            if hard_deadline is not None and now_mono >= hard_deadline:
                 log.warning(
                     "stream_budget_hard_exhausted",
                     agent_id=agent_id,
@@ -452,12 +505,17 @@ class ToolLoopMixin:
             # （提示 → 宽限 → 优雅收口）全部死于墙钟闸口之前，turn 边界
             # 全由墙钟决定。双触发：轮数线抓快轮 churn，墙钟线（硬预算
             # FORCE_COMMIT_WALL_PCT，默认 85%）抓慢轮无界磨。
-            decision, trigger = e14_steering_decision(
-                round_num=round_num,
-                elapsed_s=now_mono - loop_start,
-                hard_budget_s=HARD_TOTAL_TIMEOUT_S,
-                hint_injected=force_commit_hint_injected,
-            )
+            # T16 增补：auto 无墙钟 ⇒ E14 整体退役（其 hint 文案指挥
+            # commit_turn(in_progress)，该工具在 auto 已下架）；auto 的
+            # 疏导职责由自然停出口门禁阶梯 + 轮帽收口承担。
+            decision, trigger = ("none", "-")
+            if _turn_budget_armed:
+                decision, trigger = e14_steering_decision(
+                    round_num=round_num,
+                    elapsed_s=now_mono - loop_start,
+                    hard_budget_s=HARD_TOTAL_TIMEOUT_S,
+                    hint_injected=force_commit_hint_injected,
+                )
             if tool_history and decision == "hint":
                 force_commit_hint_injected = True
                 line_desc = (
@@ -516,6 +574,7 @@ class ToolLoopMixin:
             # 首轮（无 tool_history）不受此闸门限制 —— 预算刚起始必充足。
             if (
                 tool_history
+                and hard_deadline is not None
                 and hard_deadline - now_mono < MIN_ROUND_BUDGET_S
             ):
                 log.warning(
@@ -547,6 +606,7 @@ class ToolLoopMixin:
             if (
                 not pacing_hint_injected
                 and tool_history
+                and hard_deadline is not None
                 and hard_deadline - now_mono < BUDGET_PACING_HINT_S
             ):
                 pacing_hint_injected = True
@@ -570,7 +630,9 @@ class ToolLoopMixin:
             # （附 soft 续命给 commit_turn 留窗），强度不同，缺了它 agent
             # 在半程温和提示之后直到撞闸再无警告（审计 2026-08-08 P1）。
             if (
-                now_mono >= soft_deadline
+                soft_deadline is not None
+                and hard_deadline is not None
+                and now_mono >= soft_deadline
                 and not budget_hint_injected
                 and pacing_hint_round != round_num
                 and tool_history
@@ -592,6 +654,91 @@ class ToolLoopMixin:
                 soft_deadline = min(
                     now_mono + ACTIVITY_EXTEND_S, hard_deadline
                 )
+
+            # ── T16 auto：600 轮帽收口（唯一轮数级硬停）────────────────
+            # auto 无墙钟预算 ⇒ 轮帽接管 turn 级硬停。到点语义 = 自然停
+            # 同款平台收口：跑一次 auto 出口门禁（exit_gate_check 接缝）
+            # —— 全部结算（或 5 连停强挂标记已置位）⇒ break，loop 走下方
+            # max_rounds 收口，handle_completion 权威落账（平台 commit /
+            # blocked）；未结算 ⇒ 注入 gate hint 再给
+            # TURN_ROUND_CAP_GRACE_ROUNDS 轮宽限（600 轮还没停已是病态，
+            # 但 hint 仍给模型一次自纠机会）。宽限耗尽仍不见自然停 ⇒ 强制
+            # 收口：置强挂标记后返回，handle_completion 收口 blocked 并
+            # 通知 creator（_escalate_gate_exhaustion）。legacy 不进此块。
+            if (
+                not _turn_budget_armed
+                and tool_history
+                and round_num >= rounds_cap
+            ):
+                if round_num >= rounds_cap + TURN_ROUND_CAP_GRACE_ROUNDS:
+                    from hiveweave.services.turn_session import (
+                        set_force_exit_block,
+                    )
+
+                    set_force_exit_block(
+                        agent_id,
+                        {
+                            "violations": ["TURN_ROUND_CAP_EXCEEDED"],
+                            "source": "turn_round_cap_force_close",
+                            "rounds": round_num,
+                        },
+                    )
+                    cap_note = (
+                        f"[TURN ROUND CAP] {round_num} tool rounds in one "
+                        "turn without a natural stop — the platform has "
+                        "force-closed this turn. All progress is kept; the "
+                        "turn is marked blocked and your superior has been "
+                        "notified. On next wake: settle obligations first, "
+                        "then stop outputting (wait_on(refs) is the only "
+                        "legal mid-turn suspend)."
+                    )
+                    _acc({"role": "assistant", "content": cap_note})
+                    log.warning(
+                        "turn_round_cap_force_closed",
+                        agent_id=agent_id,
+                        rounds=round_num,
+                    )
+                    return {
+                        "status": "ok",
+                        "content": cap_note,
+                        "thinking": thinking_acc,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num,
+                        "usage": last_usage,
+                        "round_cap_forced": True,
+                    }
+                if not _round_cap_gate_ran:
+                    _round_cap_gate_ran = True
+                    if exit_gate_check is None:
+                        # 无 auto 门禁接缝（子代理/会议等旁路）→ 原样走
+                        # 下方 max_rounds 收口，不扩轮。
+                        break
+                    try:
+                        cap_gate_hint = await exit_gate_check(tool_history)
+                    except Exception as exc:
+                        log.warning(
+                            "exit_gate_check_failed",
+                            agent_id=agent_id,
+                            round=round_num,
+                            error=str(exc),
+                        )
+                        cap_gate_hint = None
+                    if cap_gate_hint is None:
+                        # 结算（平台 commit 已合成）或 5 连停强挂 —— 交
+                        # handle_completion 权威收口。
+                        break
+                    messages.append({
+                        "role": "user",
+                        "content": cap_gate_hint,
+                    })
+                    _acc({"role": "user", "content": cap_gate_hint})
+                    log.info(
+                        "turn_round_cap_hint_injected",
+                        agent_id=agent_id,
+                        round=round_num,
+                    )
+                    continue
 
             # 通知回调：新一轮开始（用于重置流式文本累积器）
             # BUG-7: also fire on round 0 so LLM call counters stay accurate
@@ -664,6 +811,8 @@ class ToolLoopMixin:
             # 单轮流式请求（带空响应重试）。预算截止提前
             # TURN_STREAM_CUT_GRACE_S —— 给 merge/记账/返回留出时间，
             # 保证 streamer 总在 agent SAFETY_TIMEOUT 之前返回。
+            # T16 增补：auto 无墙钟 ⇒ budget_deadline=None（SSE wait_s
+            # 的 min(...) 退化为无预算钳制，idle/首块看门狗照常生效）。
             # TEST_DSH_32 O2（测量补齐）：实测本轮耗时，供 llm_usage.duration_ms。
             _round_t0 = time.monotonic()
             round_result = await self._stream_with_empty_retry(
@@ -674,7 +823,11 @@ class ToolLoopMixin:
                 tools=tools,
                 on_delta=on_delta,
                 round_num=round_num,
-                budget_deadline=hard_deadline - TURN_STREAM_CUT_GRACE_S,
+                budget_deadline=(
+                    hard_deadline - TURN_STREAM_CUT_GRACE_S
+                    if hard_deadline is not None
+                    else None
+                ),
             )
             round_result["round_duration_ms"] = int(
                 (time.monotonic() - _round_t0) * 1000
@@ -863,6 +1016,8 @@ class ToolLoopMixin:
             # 不完整 tool_calls 已在流内丢弃 —— 直接优雅收口，本轮产出
             # 全部保留，下轮 wake 续跑。先于 finish_reason 分支判断：
             # budget_cut 与 length/content_filter 语义不同，不走截断告警。
+            # T16 增补：auto 无墙钟 ⇒ budget_deadline 不武装 ⇒ 流内永不
+            # 置 budget_cut —— 本出口在 auto 下不可达（legacy 逐字节不动）。
             if round_result.get("budget_cut"):
                 log.warning(
                     "stream_budget_cut_return",
@@ -1058,10 +1213,14 @@ class ToolLoopMixin:
                 # assistant(tool_calls) 落账【之前】——否则持久化的
                 # assistant(tool_calls) 缺对应 tool 回执，下次请求 400。
                 # 丢弃无副作用：未执行的工具由下次唤醒重新发起。
+                # T16 增补：auto 无墙钟 ⇒ 本闸门不武装（工具批时长由
+                # 声明式工具超时 timeout_policy 管）。
                 tool_budget_s = (
                     hard_deadline - TOOL_BUDGET_GRACE_S - time.monotonic()
+                    if hard_deadline is not None
+                    else None
                 )
-                if tool_budget_s < MIN_TOOL_BUDGET_S:
+                if tool_budget_s is not None and tool_budget_s < MIN_TOOL_BUDGET_S:
                     log.warning(
                         "stream_budget_tool_gate",
                         agent_id=agent_id,
@@ -1225,9 +1384,11 @@ class ToolLoopMixin:
                     tool_fail_stall_count = 0
                     last_stall_reason = None
                     # TEST21 M4: activity renews soft budget within hard cap
-                    soft_deadline = min(
-                        time.monotonic() + ACTIVITY_EXTEND_S, hard_deadline
-                    )
+                    # T16 增补：auto 无墙钟 ⇒ 无预算可续命（deadline 恒 None）
+                    if soft_deadline is not None and hard_deadline is not None:
+                        soft_deadline = min(
+                            time.monotonic() + ACTIVITY_EXTEND_S, hard_deadline
+                        )
                 elif round_reason == STALL_REASON_READONLY:
                     readonly_stall_count += 1
                     stall_count = 0
@@ -1332,6 +1493,10 @@ class ToolLoopMixin:
                         )
                     except Exception:
                         pass
+                    # T16 二期（commit_turn 退役）：auto 下收口文案不得指挥
+                    # 调用已下架的 commit_turn —— 改为「停止工具调用，平台将
+                    # 结算义务并给予后续指示」。legacy 分支文案逐字节不动
+                    # （那边 commit_turn 仍是合法出口）。
                     if stall_reason in (
                         STALL_REASON_TOOL_FAILED, STALL_REASON_RUNNER_FAILED
                     ):
@@ -1343,23 +1508,57 @@ class ToolLoopMixin:
                             if stall_count > tool_fail_stall_count
                             else ""
                         )
-                        break_text = (
-                            f"[STALL BREAK] 连续 {tool_fail_stall_count} 轮工具"
-                            f"调用失败（非模型空转）{scope}—— 工具自身返回了执行"
-                            "失败，不是你没动作。先读失败回执的具体报错：检查工具"
-                            "名与参数用法是否正确、前置条件是否满足；换一种方式或"
-                            "换工具达成同一目标，或用 commit_turn 提交已完成的"
-                            "部分并说明卡点。不要原样重发同一个失败调用。"
-                        )
+                        if not _turn_budget_armed:  # auto：commit_turn 已下架
+                            break_text = (
+                                f"[STALL BREAK] 连续 {tool_fail_stall_count} 轮工具"
+                                f"调用失败（非模型空转）{scope}—— 工具自身返回了执行"
+                                "失败，不是你没动作。先读失败回执的具体报错：检查工具"
+                                "名与参数用法是否正确、前置条件是否满足；换一种方式或"
+                                "换工具达成同一目标。不要原样重发同一个失败调用；"
+                                "修不好或已到停点就停止输出工具调用——平台将结算"
+                                "义务并给予后续指示。"
+                            )
+                        else:
+                            break_text = (
+                                f"[STALL BREAK] 连续 {tool_fail_stall_count} 轮工具"
+                                f"调用失败（非模型空转）{scope}—— 工具自身返回了执行"
+                                "失败，不是你没动作。先读失败回执的具体报错：检查工具"
+                                "名与参数用法是否正确、前置条件是否满足；换一种方式或"
+                                "换工具达成同一目标，或用 commit_turn 提交已完成的"
+                                "部分并说明卡点。不要原样重发同一个失败调用。"
+                            )
                     elif stall_reason == STALL_REASON_BLOCKED:
+                        if not _turn_budget_armed:  # auto：commit_turn 已下架
+                            break_text = (
+                                f"[STALL BREAK] {blocked_stall_count} consecutive "
+                                "tool-loop rounds were refused by platform guards "
+                                "(permission / sandbox / security rules) — not "
+                                "model errors. Stop repeating blocked calls: "
+                                "change approach, or ask your superior for the "
+                                "missing permission. If it cannot be resolved, "
+                                "stop calling tools — the platform will settle "
+                                "obligations and give follow-up instructions."
+                            )
+                        else:
+                            break_text = (
+                                f"[STALL BREAK] {blocked_stall_count} consecutive "
+                                "tool-loop rounds were refused by platform guards "
+                                "(permission / sandbox / security rules) — not "
+                                "model errors. Stop repeating blocked calls: "
+                                "change approach, commit partial work with "
+                                "commit_turn, or ask your superior for the missing "
+                                "permission."
+                            )
+                    elif not _turn_budget_armed:  # auto：commit_turn 已下架
                         break_text = (
-                            f"[STALL BREAK] {blocked_stall_count} consecutive "
-                            "tool-loop rounds were refused by platform guards "
-                            "(permission / sandbox / security rules) — not "
-                            "model errors. Stop repeating blocked calls: "
-                            "change approach, commit partial work with "
-                            "commit_turn, or ask your superior for the missing "
-                            "permission."
+                            f"[STALL BREAK] {max(stall_count, readonly_stall_count)} "
+                            "consecutive tool-loop "
+                            "rounds repeated identical readonly calls (same tool + "
+                            "same args) with no mutating progress. Stop polling the "
+                            "same state: change approach, or stop calling tools — "
+                            "the platform will settle obligations and give "
+                            "follow-up instructions. Do not repeat the same "
+                            "readonly call."
                         )
                     else:
                         break_text = (

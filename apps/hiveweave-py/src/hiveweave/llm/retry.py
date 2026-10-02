@@ -1,11 +1,21 @@
-"""重试逻辑 — 指数退避 + jitter + Retry-After header 解析。
+"""重试逻辑 — 波次级骑乘（无界重试+节流）+ Retry-After header 解析。
 
 契约 01: LLM 流式调用 — 重试与熔断
-- 可重试状态码: 429, 503, 504, 529
-- 最多 2 次重试（MAX_RETRIES）
-- 指数退避: base=1s, factor=2, jitter=±25%（即 [0.75, 1.25]）
+- 可重试状态码: 429 + 全量 5xx（RETRYABLE_STATUSES）
+- 主链路（streamer）：**波次级无界骑乘**（T33，2026-09-29 设计更新，对照
+  DSH ``mode:'always'`` retryPolicy）—— 同 run 内上游级失败（5xx/零分块/
+  连接失败）按节流节奏无限重试，直到成功或终止信号（用户停止 / 会话取消 /
+  deadline 预算到点 / 故障转移闸中止）。实测病灶：上游 500 波次单波
+  1.5-3 分钟、波间隔 10-20 分钟，有限梯（6 连 ~90s）必杀 run。
+- 通用/辅助路径（vision 等）：有界，MAX_RETRIES=8（env 可调）。
+- 节流节奏: 短指数 ramp（1/2/4/8s，jitter ±25%）后进入稳态 10-15s；
+  Retry-After ≤60s 原样尊重，>60s 忽略（配额级窗口走 park/恢复定时器）；
+  计算值受 retry_max_delay_ms()（env，默认 45s）单次封顶。
+- T34 故障转移闸（``failover_gate``）：每次上游级失败咨询一次；闸返回
+  True ⇒ 抛 :class:`RetryAborted`，由调用方换模型重启链。
+- ``deadline``（monotonic 刻度）：下一次退避睡眠将越过截止 ⇒ 停止重试并
+  抛最后一次错误（交既有 error→durable recovery 路收口），骑乘不越预算。
 - 解析 Retry-After header（OpenAI retry-after-ms + 标准 retry-after 秒/HTTP-date）
-- 参考: Elixir retry.ex + TS retry-utils.ts
 
 注意:
 - 本模块仅处理「单次 HTTP 请求」级别的重试，由 streamer 在 tool loop 每轮调用。
@@ -16,8 +26,10 @@
 from __future__ import annotations
 
 import asyncio
+import os as _os
 import random
 import re
+import time as _time
 from email.utils import parsedate_to_datetime
 from typing import Awaitable, Callable, TypeVar
 
@@ -28,19 +40,122 @@ from hiveweave.llm.error_codes import ErrorCode, classify_error
 log = structlog.get_logger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────────
-MAX_RETRIES = 5
-"""最大重试次数（不含首次请求）。对标 DSH 的 5 次预算（2026-08-26）。
+MAX_RETRIES = 8
+"""有界路径的最大重试次数（不含首次请求）；主链路默认无界（见下）。
 
-原值 2。TEST_DSH_29 实测 10/57 重试链（18%）打光预算失败，且失败原因
-100% 是 SSL UNEXPECTED_EOF（上游连接被截断）—— 这类瞬态故障多退避一两次
-即可恢复，2 次过紧。退避指数 + jitter 且硬顶 30s，5 次最坏累计约
-1+2+4+8+16≈31s，仍远低于 turn 预算。
+原值 5。T33（2026-09-29）：任务口径「重试次数 6 → 8」按总尝试计
+（5+1=6 → 8 次重试）。通用 RetryHandler 默认走本值（vision 等辅路）；
+主链路（streamer）经 :func:`main_ride_budget` 默认传 None = 波次级无界骑乘，
+本 env 同时作主链路的紧急刹车（>0 = 有界）。
 """
 BASE_DELAY_MS = 1_000
 """基础退避延迟（1 秒）。用户指定 base=1s。"""
 
-MAX_DELAY_MS = 30_000
-"""单次退避上限（30 秒），防止 Retry-After 返回过大值。"""
+MAX_DELAY_MS = 45_000
+"""单次退避帽的**默认值**（45 秒）。运行时以 :func:`retry_max_delay_ms`
+（env ``HIVEWEAVE_LLM_RETRY_MAX_DELAY_S``）为准；保留常量供既有导入方
+（llm/streamer/oneshot.py）与测试引用。原值 30s。"""
+
+RETRY_AFTER_HONOR_CAP_MS = 60_000
+"""Retry-After 尊重上限（60 秒）。≤60s 原样尊重（上游显式指令优先于
+本地节奏）；>60s 视为配额级窗口信号，忽略（走 park / 恢复定时器治理，
+不进逐次重试）。"""
+
+RIDE_STEADY_AFTER_ATTEMPT = 4
+"""进入稳态骑乘节奏的 attempt 阈值（0 起算）。attempt < 4 走短指数 ramp
+（1/2/4/8s），≥4 走稳态 10-15s。"""
+
+RIDE_STEADY_MIN_MS = 10_000
+"""波次骑乘稳态节奏下限（10 秒）。"""
+
+RIDE_STEADY_MAX_MS = 15_000
+"""波次骑乘稳态节奏上限（15 秒）。"""
+
+
+def _env_float(name: str, default: float) -> float:
+    """env 读取浮点秒数——非法值回退默认，绝不在导入期/调用期抛异常。"""
+    raw = _os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("retry.bad_env", key=name, value=raw, default=default)
+        return default
+    return value if value > 0 else default
+
+
+def retry_max_delay_ms() -> int:
+    """单次退避帽（毫秒）——env ``HIVEWEAVE_LLM_RETRY_MAX_DELAY_S``（秒）。
+
+    默认 45s（T33，原 30s）。只封顶**本地计算**的退避（ramp/稳态节奏）；
+    Retry-After ≤60s 是上游显式指令，原样尊重不受本帽约束。
+    """
+    return int(_env_float("HIVEWEAVE_LLM_RETRY_MAX_DELAY_S", MAX_DELAY_MS / 1000.0) * 1000)
+
+
+def bounded_retry_budget() -> int:
+    """有界路径的重试预算：env ``HIVEWEAVE_LLM_RETRY_MAX_RETRIES``。
+
+    unset / 非法 / ≤0 ⇒ 默认 MAX_RETRIES（8）。vision 等辅助 RetryHandler
+    走本值；主链路用 :func:`main_ride_budget`（默认无界）。
+    """
+    raw = _os.environ.get("HIVEWEAVE_LLM_RETRY_MAX_RETRIES")
+    if raw is None or not str(raw).strip():
+        return MAX_RETRIES
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return MAX_RETRIES
+    return v if v > 0 else MAX_RETRIES
+
+
+def main_ride_budget() -> int | None:
+    """主链路（streamer）重试预算：**默认 None = 波次级无界骑乘**。
+
+    env ``HIVEWEAVE_LLM_RETRY_MAX_RETRIES``：>0 = 有界（紧急刹车，运维
+    钳制骑乘总次数）；unset / ≤0 / 非法 = None（无界，靠 deadline/取消/
+    故障转移闸终止）。T33 设计更新（2026-09-29）：无界骑乘是「骑过波次」
+    的根因修复，有限梯（6 连 ~90s）在持续波次下必杀 run。
+    """
+    raw = _os.environ.get("HIVEWEAVE_LLM_RETRY_MAX_RETRIES")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+RIDE_WALL_CAP_DEFAULT_S = 900.0
+"""单条重试链（一次 ``with_retry`` 调用）的兜底墙钟默认值（秒）。
+
+无界骑乘在 **auto 模式**（T16：turn 墙钟退役，budget_deadline=None）下
+没有外部墙 —— 本帽是最后一道防线：到点停止骑乘并抛最后一次错误，交既有
+error → durable recovery 路。legacy 模式下 turn 预算（~540s）先于本帽
+生效（min 取小）。900s ≈ 覆盖数个实测波次（1.5-3min/波）+ 恢复余量。
+"""
+
+
+def ride_wall_cap_s() -> float:
+    """骑乘兜底墙（秒）：env ``HIVEWEAVE_LLM_RIDE_WALL_CAP_S``，默认 900。"""
+    return _env_float("HIVEWEAVE_LLM_RIDE_WALL_CAP_S", RIDE_WALL_CAP_DEFAULT_S)
+
+
+class RetryAborted(Exception):
+    """重试链被外部策略主动中止（T34 故障转移闸）。
+
+    与 RetryableError（预算耗尽）/ PermanentError（不可重试）三分：
+    本异常 = 链**还有**重试预算，但故障转移闸判定「换模型比继续骑更优」，
+    调用方（http_stream）捕获后切换 provider 并重启链。
+
+    ``last_error``：触发中止的最后一次上游错误（防死循环兜底时可复抛）。
+    """
+
+    def __init__(self, message: str, *, last_error: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.last_error = last_error
 
 RETRYABLE_STATUSES: frozenset[int] = frozenset(range(500, 600)) | frozenset({429})
 """可重试的 HTTP 状态码：429 + 全量 5xx。
@@ -648,26 +763,44 @@ def _parse_retry_after_uncapped(headers: dict[str, str]) -> int | None:
 # ── 退避计算 ────────────────────────────────────────────────
 
 def compute_backoff(attempt: int, retry_after_ms: int | None = None) -> int:
-    """计算第 attempt 次重试的退避延迟（毫秒）。
+    """计算第 attempt 次重试的退避延迟（毫秒）——波次级骑乘节奏。
 
-    公式: BASE * 2^attempt * jitter, jitter ∈ [0.75, 1.25]（±25%）。
-    若提供 retry_after_ms，则优先使用（capped at MAX_DELAY_MS）。
+    调度规则（T33，2026-09-29 设计更新）：
+    - ``retry_after_ms`` ≤60s（``RETRY_AFTER_HONOR_CAP_MS``）：**原样尊重**
+      —— 上游显式指令优先于本地节奏（含 0）。
+    - ``retry_after_ms`` >60s：忽略（配额级窗口信号，恢复钥匙是 park /
+      恢复定时器，不是逐次重试），落回本地节奏。
+    - ``attempt < RIDE_STEADY_AFTER_ATTEMPT``：短指数 ramp —— BASE × 2^attempt
+      × jitter（jitter ∈ [0.75, 1.25]，即 1/2/4/8s 附近）。
+    - ``attempt ≥ RIDE_STEADY_AFTER_ATTEMPT``：稳态骑乘节奏 ——
+      ``[RIDE_STEADY_MIN_MS, RIDE_STEADY_MAX_MS]``（10-15s）均匀取值。
+      无界骑乘下不再让指数增长失控（对照 DSH ``mode:'always'``）。
+    - 本地计算值最终受 :func:`retry_max_delay_ms`（env，默认 45s）封顶
+      （单次退避帽）。
 
     Args:
         attempt: 当前重试序号（0-based，0 = 第一次重试）。
-        retry_after_ms: 来自 Retry-After header 的延迟（毫秒），优先级最高。
+        retry_after_ms: 来自 Retry-After header 的延迟（毫秒），优先级最高
+            （仅 ≤60s 时）。
 
     Returns:
         延迟毫秒数。
     """
-    if retry_after_ms is not None:
-        return min(retry_after_ms, MAX_DELAY_MS)
+    if (
+        retry_after_ms is not None
+        and retry_after_ms <= RETRY_AFTER_HONOR_CAP_MS
+    ):
+        return max(0, retry_after_ms)
 
-    # 指数退避: 1s, 2s, 4s, 8s, ...
-    base = BASE_DELAY_MS * (2 ** attempt)
-    # jitter ±25% → [0.75, 1.25]
-    jitter = 0.75 + random.random() * 0.5
-    return min(int(base * jitter), MAX_DELAY_MS)
+    if attempt < RIDE_STEADY_AFTER_ATTEMPT:
+        # 短指数 ramp: 1s, 2s, 4s, 8s（jitter ±25%）
+        base = BASE_DELAY_MS * (2 ** attempt)
+        jitter = 0.75 + random.random() * 0.5
+        delay = int(base * jitter)
+    else:
+        # 稳态骑乘节奏：10-15s（波次内匀速探活，不 hammer 也不失速）
+        delay = random.randint(RIDE_STEADY_MIN_MS, RIDE_STEADY_MAX_MS)
+    return min(delay, retry_max_delay_ms())
 
 
 # ── 错误分类 ────────────────────────────────────────────────
@@ -713,27 +846,54 @@ class PermanentError(Exception):
 # ── RetryHandler ────────────────────────────────────────────
 
 class RetryHandler:
-    """异步重试处理器。
+    """异步重试处理器（波次级骑乘）。
 
     用法::
 
-        handler = RetryHandler()
+        handler = RetryHandler()                # 有界（bounded_retry_budget）
         result = await handler.with_retry(lambda: do_request())
 
     回调应返回结果或抛出 RetryableError / PermanentError。
     网络异常（httpx.ConnectError 等）自动判定为可重试。
 
+    ``max_retries=None`` = **无界骑乘**（主链路默认，:func:`main_ride_budget`）
+    —— 重试不设次数上限，终止靠：成功 / 取消信号 / ``deadline`` 预算到点 /
+    ``failover_gate`` 中止（:class:`RetryAborted`）。
+
     每次「实际重试」会触发 on_retry 回调（用于日志/遥测）。
-    全部重试耗尽后抛出最后一次的 RetryableError。
+    有界路径全部重试耗尽后抛出最后一次的 RetryableError。
     """
 
     def __init__(
         self,
-        max_retries: int = MAX_RETRIES,
+        max_retries: int | None = MAX_RETRIES,
         on_retry: Callable[[int, int, BaseException], Awaitable[None] | None] | None = None,
     ) -> None:
         self.max_retries = max_retries
         self.on_retry = on_retry
+
+    @staticmethod
+    async def _consult_failover_gate(
+        gate: Callable[[], Awaitable[bool]] | None,
+        exc: BaseException,
+    ) -> None:
+        """T34：每次上游级失败咨询一次故障转移闸。
+
+        闸返回 True ⇒ 抛 :class:`RetryAborted`（携带触发错误），调用方
+        （http_stream）捕获后切换模型并重启链。闸自身故障一律 fail-open
+        （继续骑乘，不因观测/切换层故障放大主流程）。
+        """
+        if gate is None:
+            return
+        try:
+            abort = await gate()
+        except Exception as ge:  # noqa: BLE001 — 闸故障不得放大主流程
+            log.warning("failover_gate_failed", error=str(ge)[:200])
+            return
+        if abort:
+            raise RetryAborted(
+                "failover gate aborted retry chain", last_error=exc
+            )
 
     async def with_retry(
         self,
@@ -742,13 +902,23 @@ class RetryHandler:
         persist: (
             Callable[[int, int, BaseException, bool], Awaitable[None]] | None
         ) = None,
+        deadline: float | None = None,
+        failover_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> T:
-        """执行带重试的异步函数。
+        """执行带重试的异步函数（波次级骑乘）。
 
-        - 首次调用 + 最多 max_retries 次重试。
-        - 指数退避 + jitter，Retry-After header 优先。
+        - 首次调用 + 重试；``max_retries=None`` = 无界骑乘，否则最多
+          ``max_retries`` 次。
+        - 节流节奏见 :func:`compute_backoff`（短 ramp + 10-15s 稳态 +
+          Retry-After ≤60s 尊重 + 45s 单次帽）。
         - PermanentError 立即抛出，不重试。
         - 非可重试异常也不重试（直接抛出）。
+        - ``deadline``（time.monotonic 刻度，可选）：每次调度重试前检查
+          「now + delay 是否越过截止」，越过 ⇒ 停止骑乘（落 exhausted 账）
+          并抛最后一次错误 —— 骑乘不越 turn 预算（auto 模式无墙钟时由
+          http_stream 侧另武装 ``LLM_RIDE_WALL_CAP_S`` 兜底墙）。
+        - ``failover_gate``（T34，可选异步闸）：每次上游级失败咨询一次
+          （在调度重试之前）；返回 True ⇒ 抛 :class:`RetryAborted`。
         - 流空转（``is_stream_idle_error``，TEST_DSH_64 #3）：**专属**预算
           ``STREAM_IDLE_MAX_RETRIES``（1 次），不经通用 max_retries 退避表、
           不 sleep（idle 判定本身已等满 150s）；重试仍空转 ⇒ 升级为
@@ -757,8 +927,9 @@ class RetryHandler:
           **不占**通用 attempt 名额，两条预算完全独立。
         - ``persist``：可选持久化回调 ``(attempt, delay_ms, exc, exhausted)``
           —— 每次决定重试（exhausted=False）与重试耗尽（exhausted=True）时
-          调用，供调用方把重试事件落库（参考 DSH 把 retry 写入持久事件流，
-          重启后仍可查/可审计）。
+          调用，供调用方把重试事件落库（**先落账后等待**——持久化先于
+          退避睡眠，进程重启不丢；DSH 先例）。参考 DSH 把 retry 写入持久
+          事件流，重启后仍可查/可审计。
         """
         last_exc: BaseException | None = None
         idle_retries = 0
@@ -780,6 +951,9 @@ class RetryHandler:
                         error=str(e)[:200],
                     )
                     raise
+                # T34：上游级失败先问故障转移闸（≥阈值且有候选 → 中止本链，
+                # 调用方换模型重启；无候选 → 继续骑乘）。
+                await self._consult_failover_gate(failover_gate, e)
                 # 流空转（TEST_DSH_64 #3）：专属 1 次重试，不经通用退避表。
                 # 每次空转判定已烧满 idle 窗口（150s），再指数退避纯属加时；
                 # 耗尽即升级 PermanentError（重醒门认 stream_idle_exhausted）。
@@ -817,7 +991,7 @@ class RetryHandler:
                     # attempt 不推进 —— 通用预算不被 idle 侵占
                     continue
                 last_exc = e
-                if attempt >= self.max_retries:
+                if self.max_retries is not None and attempt >= self.max_retries:
                     log.warning(
                         "retry_exhausted",
                         attempt=attempt,
@@ -828,6 +1002,21 @@ class RetryHandler:
                         await self._safe_persist(persist, attempt + 1, 0, e, True)
                     raise
                 delay = compute_backoff(attempt, parse_retry_after_ms(e.headers))
+                # 骑乘不越预算：本次退避睡眠将越过 deadline ⇒ 停止（exhausted
+                # 落账）并抛最后一次错误，交既有 error→durable recovery 路。
+                if deadline is not None and (
+                    _time.monotonic() + delay / 1000.0 > deadline
+                ):
+                    log.warning(
+                        "ride_deadline_exhausted",
+                        attempt=attempt,
+                        delay_ms=delay,
+                        status=e.status,
+                        error=str(e)[:200],
+                    )
+                    if persist is not None:
+                        await self._safe_persist(persist, attempt + 1, 0, e, True)
+                    raise
                 log.info(
                     "retry_scheduled",
                     attempt=attempt + 1,
@@ -846,7 +1035,8 @@ class RetryHandler:
                 # 其他异常 — 检查是否为可重试的网络错误
                 if should_retry_exception(e):
                     last_exc = e
-                    if attempt >= self.max_retries:
+                    await self._consult_failover_gate(failover_gate, e)
+                    if self.max_retries is not None and attempt >= self.max_retries:
                         log.warning("retry_exhausted_network", attempt=attempt, error=str(e))
                         if persist is not None:
                             await self._safe_persist(
@@ -854,6 +1044,20 @@ class RetryHandler:
                             )
                         raise
                     delay = compute_backoff(attempt)
+                    if deadline is not None and (
+                        _time.monotonic() + delay / 1000.0 > deadline
+                    ):
+                        log.warning(
+                            "ride_deadline_exhausted_network",
+                            attempt=attempt,
+                            delay_ms=delay,
+                            error=str(e)[:200],
+                        )
+                        if persist is not None:
+                            await self._safe_persist(
+                                persist, attempt + 1, 0, e, True
+                            )
+                        raise
                     log.info(
                         "retry_scheduled_network",
                         attempt=attempt + 1,

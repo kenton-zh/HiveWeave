@@ -491,7 +491,15 @@ def test_spawn_subagent_allows_write_for_executor_parent():
                     result = await spawn_subagent_tool(
                         params, agent_id="exec-1", workspace=_WRITE_TREE)
         assert result.success is True
-        assert "waiting" in (result.output or "").lower()
+        # T16 三期：收尾话术按模式分流（auto+external bg job ⇒ 直接停止
+        # 等唤醒；auto+可表达 kind ⇒ wait_on；legacy ⇒ waiting）。
+        out = (result.output or "").lower()
+        assert (
+            "wait_on(" in out
+            or "waiting" in out
+            or "wakes you when the background job finishes" in out
+        )
+        assert "do not poll" in out
         job_id = result.extra["job_id"]
         assert job_id.startswith("bg-sub-")
         assert result.extra["waiting_on"][0]["ref"] == job_id

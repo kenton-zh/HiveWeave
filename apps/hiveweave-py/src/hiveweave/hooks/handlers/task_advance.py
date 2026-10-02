@@ -74,7 +74,8 @@ _ASSIGNEE_WORK_TOOLS = frozenset({
 })
 
 # Legal idle — do not nag. ``blocked`` intentionally omitted: use
-# defer_task_advance or commit_turn(waiting)+waiting_on, not silent blocked.
+# defer_task_advance or a declared wait (wait_on in auto mode /
+# commit_turn(waiting)+waiting_on in legacy), not silent blocked.
 _LEGAL_WAIT_DISPOSITIONS = frozenset({
     "waiting_human",
     "waiting_agent",
@@ -178,10 +179,25 @@ def _task_merge_already_recorded(task: dict | None) -> bool:
 
 
 def build_task_advance_hint(obligations: list[dict]) -> str:
+    from hiveweave.config import turn_exit_mode
+
+    # T16 三期：教学面跟工具面同步 —— auto 模式下 commit_turn 已下架，
+    # 合法挂起只有 wait_on；legacy 文案原样保留。
+    auto = turn_exit_mode() == "auto"
+    if auto:
+        suspend = (
+            "或 wait_on(refs=[{\"kind\": \"task|agent|fact|user\", "
+            "\"ref\": \"<id>\"}]) 登记合法等待"
+            "（commit_turn 本模式已下架，不要尝试）。"
+        )
+    else:
+        suspend = "或显式 commit_turn(phase=waiting|blocked)+waiting_on。"
     lines = [
         "[TASK ADVANCE]",
         "本轮结束时你仍有可行动任务，但没有推动它们。"
-        "请用工具推进账本，或显式 commit_turn(phase=waiting|blocked)+waiting_on。"
+        f"请用工具推进账本，{suspend}"
+        "若任务卡死无法推进：dispatch 拆分派活，或 send_message 向上级"
+        "说明阻塞点求助（写清卡在谁/什么、需要谁决策）——不要空转复读。"
         "若此刻确实无法推进：调用 defer_task_advance(reason=…)（不推进）——"
         "之后不会再循环提醒，直到你被再次唤醒。"
         "注意：同一理由连发会触发断路器，届时 defer 被拒，需上报上级。",
@@ -213,15 +229,26 @@ def build_task_advance_hint(obligations: list[dict]) -> str:
         elif status == "rework":
             next_step = "按反馈返工后重新 submit_task"
         elif status == "claimed":
-            next_step = (
-                "若已 dispatch 给下属：commit_turn(waiting, kind=task, "
-                "ref=子任务id)，不要 ask/notify 催交。"
-                "否则 update_task_status(running) 后自己执行 / submit_task"
-            )
+            if auto:
+                next_step = (
+                    "若已 dispatch 给下属：wait_on(refs=[{\"kind\": \"task\", "
+                    "\"ref\": \"<子任务id>\"}])，不要 ask/notify 催交。"
+                    "否则 update_task_status(running) 后自己执行 / submit_task"
+                )
+            else:
+                next_step = (
+                    "若已 dispatch 给下属：commit_turn(waiting, kind=task, "
+                    "ref=子任务id)，不要 ask/notify 催交。"
+                    "否则 update_task_status(running) 后自己执行 / submit_task"
+                )
         elif status == "verifying":
             next_step = "执行 VERIFY 后 submit_task / review"
         else:
-            next_step = "继续执行或 submit_task / 合法 waiting / defer_task_advance"
+            next_step = (
+                "继续执行或 submit_task / "
+                + ("wait_on 挂起" if auto else "合法 waiting")
+                + " / defer_task_advance"
+            )
         lines.append(
             f"- [{status}] {tid[:8]}… ({role}){prog} {title} → {next_step}"
         )

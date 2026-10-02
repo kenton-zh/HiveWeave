@@ -149,6 +149,136 @@ async def _clear_sibling_wait(project_id: str, agent_id: str, question_id: str) 
         )
 
 
+async def wake_question_waiters(
+    project_id: str,
+    question_id: str,
+    *,
+    answer: str | None = None,
+    resolved_by: str | None = None,
+    chosen: str | None = None,
+    trigger: bool = True,
+    skip_trigger_agent_ids: frozenset[str] = frozenset(),
+) -> list[str]:
+    """T39：question 收口（用户答复 / 自动裁决）⇒ 唤醒
+    ``wait_on(kind='user', ref=<question_id>)`` 的等待者。
+
+    与 :func:`_clear_sibling_wait`（只清提问者自己的同生 wait）互补：
+    wait_on 的挂起者可以是**另一个 agent** 或**提问者的后续回合**（典型
+    场景：提问 180s 轮内超时 → wait_on 挂起 → 用户晚到答复 —— 此时
+    future 已不在，提问者全靠本函数唤醒）。幂等：rowcount 守卫
+    （cleared_at IS NULL）—— 已清过的行不重复通知，二次调用 no-op。
+
+    ``skip_trigger_agent_ids``：不触发 trigger 的 agent（如正被 future
+    解阻塞的提问者；行照清、信照发）。
+
+    Returns 被唤醒（实际清到等待行）的 agent id 列表。
+    """
+    qid = (question_id or "").strip()
+    if not project_id or not qid:
+        return []
+    from hiveweave.services.wait_contract import wait_contract_service
+
+    try:
+        active = await wait_contract_service.list_all_active(project_id)
+    except Exception as exc:  # noqa: BLE001 — 扫描失败退化为 TTL 兜底
+        log.warning(
+            "question.waiter_scan_failed",
+            question_id=qid[:8],
+            error=str(exc),
+        )
+        return []
+    waiters: list[str] = []
+    for w in active:
+        if str(w.get("kind") or "").lower() != "user":
+            continue
+        if str(w.get("ref") or "").strip() != qid:
+            continue
+        aid = str(w.get("agentId") or w.get("agent_id") or "")
+        if aid and aid not in waiters:
+            waiters.append(aid)
+    if not waiters:
+        return []
+
+    cleared: list[str] = []
+    for aid in waiters:
+        try:
+            n = await wait_contract_service.clear_waits_matching_ref(
+                project_id, aid, qid
+            )
+        except Exception as exc:  # noqa: BLE001 — 单个失败不拖累其余
+            log.warning(
+                "question.waiter_clear_failed", agent_id=aid, error=str(exc)
+            )
+            continue
+        if n:
+            cleared.append(aid)
+    if not cleared:
+        return []
+
+    qshort = qid[:8]
+    if resolved_by:
+        reason_label = (
+            "无人值守超时"
+            if resolved_by == RESOLVED_BY_TIMEOUT
+            else "项目下班/停止"
+        )
+        body = (
+            f"[QUESTION AUTO-RESOLVED] 你 wait_on 等待的问题"
+            f"（question_id={qshort}…）已{reason_label}按推荐项自动裁决："
+            f"{str(chosen or '')[:200]}。不会再有用户答复。Resume work."
+        )
+    else:
+        body = (
+            f"[QUESTION ANSWERED] 你 wait_on 等待的用户答复已到"
+            f"（question_id={qshort}…）：{str(answer or '')[:400]}。"
+            "Resume work with the user's answer."
+        )
+    try:
+        from hiveweave.services.inbox import InboxService
+
+        inbox = InboxService()
+        for aid in cleared:
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=aid,
+                    message=body,
+                    message_type="system",
+                    priority="urgent",
+                    wake=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — 单发失败不拖累其余
+                log.warning(
+                    "question.waiter_notify_failed",
+                    agent_id=aid,
+                    error=str(exc),
+                )
+    except Exception as exc:  # noqa: BLE001 — inbox 不可用退化为仅清等待
+        log.warning("question.waiter_inbox_unavailable", error=str(exc))
+    if trigger:
+        from hiveweave.agents.trigger import trigger_subordinate
+
+        for aid in cleared:
+            if aid in skip_trigger_agent_ids:
+                continue
+            try:
+                await trigger_subordinate(aid)
+            except Exception as exc:  # noqa: BLE001 — 触发失败退化为看门狗
+                log.warning(
+                    "question.waiter_trigger_failed",
+                    agent_id=aid,
+                    error=str(exc),
+                )
+    log.info(
+        "question_waiters_woken",
+        project_id=project_id,
+        question_id=qshort,
+        woken=len(cleared),
+        resolved_by=resolved_by or "user_answer",
+    )
+    return cleared
+
+
 # ── 裁决唯一出口（触发 A / 触发 B 共用）───────────────────────────
 
 
@@ -220,6 +350,20 @@ async def adjudicate_question(
     _question_projects.pop(question_id, None)
     _cancel_adjudicator(question_id, include_current=False)
     await _clear_sibling_wait(project_id, agent_id, question_id)
+    # T39：wait_on(kind=user) 等待者随裁决一并解锁 —— 不会再有用户答复，
+    # 等待只能空等到 TTL（与任务终态短路同判据）。提问者的唤醒由本函数
+    # 既有出口（send_inbox / trigger_agent）负责，这里跳过。
+    try:
+        await wake_question_waiters(
+            project_id,
+            question_id,
+            resolved_by=reason,
+            chosen=chosen,
+            trigger=trigger_agent,
+            skip_trigger_agent_ids=frozenset({agent_id}),
+        )
+    except Exception as exc:  # noqa: BLE001 — 唤醒失败退化为 TTL 兜底
+        log.warning("question.adjudicate_waiter_wake_failed", error=str(exc))
 
     preview = str(rowd.get("question") or "")[:160]
     reason_label = (
@@ -437,7 +581,7 @@ async def _unattended_adjudicator(
 # ── 晚到答案的兜底清扫（future 已不在：turn 已在轮内钟处返回）───────
 
 
-def _schedule_orphan_cleanup(question_id: str) -> None:
+def _schedule_orphan_cleanup(question_id: str, *, answer: str | None = None) -> None:
     _cancel_adjudicator(question_id)
     if question_id not in _question_projects:
         return
@@ -445,16 +589,24 @@ def _schedule_orphan_cleanup(question_id: str) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    task = loop.create_task(_orphan_cleanup(question_id))
+    task = loop.create_task(_orphan_cleanup(question_id, answer=answer))
     _cleanup_tasks.add(task)
     task.add_done_callback(_cleanup_tasks.discard)
 
 
-async def _orphan_cleanup(question_id: str) -> None:
+async def _orphan_cleanup(question_id: str, *, answer: str | None = None) -> None:
     loc = _question_projects.pop(question_id, None)
     if loc is None:
         return
     project_id, agent_id = loc
+    # T39：先唤醒 wait_on(kind=user, ref=本question) 的等待者（**含提问者
+    # 本人** —— 轮内超时后 wait_on 挂起、晚到答案的唯一唤醒口），再兜底清
+    # 同生 wait。顺序不可反：sibling clear 会连提问者的 wait_on 行一起清，
+    # 先清会让唤醒扫描扑空。
+    try:
+        await wake_question_waiters(project_id, question_id, answer=answer)
+    except Exception as exc:  # noqa: BLE001 — 唤醒失败退化为 TTL 兜底
+        log.warning("question.orphan_waiter_wake_failed", error=str(exc))
     await _clear_sibling_wait(project_id, agent_id, question_id)
 
 
@@ -617,6 +769,18 @@ async def execute_question(
         _question_projects.pop(question_id, None)
         _cancel_adjudicator(question_id)
         await _clear_sibling_wait(project_id, agent_id, question_id)
+        # T39：wait_on(kind=user, ref=本question) 的其他等待者唤醒。
+        # 提问者此刻正被 future 解阻塞（在跑），跳过其 trigger ——
+        # 行照清（同生语义），信照发可作留痕。
+        try:
+            await wake_question_waiters(
+                project_id,
+                question_id,
+                answer=answer,
+                skip_trigger_agent_ids=frozenset({agent_id}),
+            )
+        except Exception as exc:  # noqa: BLE001 — 唤醒失败退化为 TTL 兜底
+            log.warning("question.waiter_wake_failed", error=str(exc))
 
         # BUG-036: Save answer as user message in chat so the conversation is visible
         try:
@@ -639,15 +803,21 @@ async def execute_question(
         # I9：轮内钟到点**如实失败**——不再 fake success、不再把 question
         # 标成终态。question 保持 pending：用户晚到答案仍可写；触发 A
         # （600s 无人应答按推荐项裁决）/触发 B（下班收尾）负责收口。
+        # T39：回执带 question_id + wait_on(user) 处方 —— 这是超时后
+        # 继续合法等答复的唯一入口（带 id 才挂得上）。
         return {
             "success": False,
             "output": "",
+            "question_id": question_id,
             "error": (
                 f"Error: no user answer within {QUESTION_TIMEOUT_S}s "
                 "(in-turn wait). The question STAYS PENDING — the user may "
-                "still answer it later. Do NOT treat it as answered. If you "
-                "cannot wait, proceed without the user's input and say so "
-                "explicitly; if it stays unanswered, it will be "
+                "still answer it later. Do NOT treat it as answered. To keep "
+                "legally waiting for this answer, call "
+                'wait_on(refs=[{"kind": "user", "ref": "' + question_id + '"}])'
+                " then stop outputting; you will be woken when the answer "
+                "lands. If you cannot wait, proceed without the user's input "
+                "and say so explicitly; if it stays unanswered, it will be "
                 f"auto-adjudicated to the recommended option after "
                 f"{unattended_s}s."
             ),
@@ -660,10 +830,12 @@ async def execute_question(
         return {
             "success": False,
             "output": "",
+            "question_id": question_id,
             "error": (
                 "Error: question wait was cancelled (tool/turn teardown). "
                 "The question STAYS PENDING — no user input was received. "
-                "Do NOT treat it as answered."
+                "Do NOT treat it as answered. wait_on(kind=user, ref="
+                f"\"{question_id}\") can keep the wait legal if you stop here."
             ),
         }
     finally:
@@ -679,8 +851,9 @@ def resolve_question(question_id: str, answer: str) -> bool:
     future = _pending.get(question_id)
     if future is None or future.done():
         # I9：晚到答案（轮内钟已到、future 已收）——DB 侧由 API 直接写，
-        # 这里负责门铃退场：撤销未决裁决 + 解除同生 wait（否则 600s 空鸣）。
-        _schedule_orphan_cleanup(question_id)
+        # 这里负责门铃退场：撤销未决裁决 + 解除同生 wait（否则 600s 空鸣）
+        # + T39 唤醒 wait_on(kind=user) 等待者。
+        _schedule_orphan_cleanup(question_id, answer=answer)
         return False
     future.set_result(answer)
     # I9：答案已到，撤销无人值守裁决钟（answered 分支再做同生 wait 解除）。
@@ -711,6 +884,24 @@ from .base import tool
 from .result import ToolResult
 
 
+# B6 契约单源化（缺口 19）：工具最终描述的唯一 owner 是本常量 —— @tool
+# 注册处与 executor.py 的 TOOL_PARAM_SCHEMAS 手写条目都引用它，不再各写一份。
+QUESTION_TOOL_DESCRIPTION = (
+    "Ask the human a question and block up to ~180s for their "
+    "answer; optional options (each a string or {label, text}). "
+    "On timeout/cancel the call FAILS and the question stays "
+    "PENDING (the receipt carries the question_id — to keep "
+    "legally waiting for the answer, call wait_on(kind=user, "
+    "ref=<question_id>) then stop; if unattended it "
+    "is auto-adjudicated to your first option after ~600s, or when "
+    "the project stops) — NEVER treat a failed question as "
+    "answered. If you already have one pending question "
+    "unanswered, a new call is skipped (30-min dedup) — wait for "
+    "the prior answer. This is the ONLY channel that delivers a "
+    "question to the user; assistant text is not delivered."
+)
+
+
 class QuestionParams(BaseModel):
     """Parameters for question tool."""
     model_config = ConfigDict(populate_by_name=True)
@@ -726,23 +917,26 @@ class QuestionParams(BaseModel):
             "recommended option after ~600s, or when the project stops). "
             "Never treat a failed question as answered."
         ),
-        json_schema_extra={"aliases": ["prompt", "text"]},
+        # 别名是手写层（TOOL_PARAM_SCHEMAS）曾接受的并集——registered 管线的
+        # 别名解析只认 pydantic 这张表，回填才不丢既有可达面（B6 红线）。
+        json_schema_extra={"aliases": ["message", "content", "query", "prompt", "text"]},
     )
     options: Optional[list[Any]] = Field(
         default=None,
         description=(
-            "Optional list of choices. Each item can be a string or an "
-            "object with 'label'/'text' keys. The FIRST item is the "
-            "recommended default and is auto-selected if the question times "
-            "out unattended or the project stops — put the recommendation "
-            "first and state its rationale."
+            "Optional list of choices (up to 6 shown). Each item can be a "
+            "string or an object with 'label'/'text' keys. The FIRST item is "
+            "the recommended default and is auto-selected if the question "
+            "times out unattended or the project stops — put the "
+            "recommendation first and state its rationale."
         ),
+        json_schema_extra={"aliases": ["choices"]},
     )
 
 
 @tool(
     "question",
-    "Ask the user a question and wait for their answer. Use when you need clarification or a decision from the user.",
+    QUESTION_TOOL_DESCRIPTION,
     requires_workspace=False,
     security_level="standard",
 )
@@ -755,4 +949,9 @@ async def question_tool(params: QuestionParams, agent_id: str, workspace: str) -
     )
     if result.get("success"):
         return ToolResult.ok(result["output"])
-    return ToolResult.err(result.get("error", "Unknown error"))
+    extra = (
+        {"question_id": result["question_id"]}
+        if result.get("question_id")
+        else {}
+    )
+    return ToolResult.err(result.get("error", "Unknown error"), **extra)

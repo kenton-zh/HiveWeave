@@ -691,8 +691,12 @@ PROJECT_DB_TABLES = [
     # 不是 0/否），新行由 INSERT 显式写值，写入方只在能确定时传。
     """ALTER TABLE run_steps ADD COLUMN executed INTEGER""",
     # P0-3（2026-09-21）：拒绝成因细分落库。`denied_by` 是**闭合枚举**
-    # （outside_boundary / sealed_git / no_write_sid / unknown_acl），由
-    # `tools/fact_positions.py::classify_denied_by` 判定；`blocked_by_environment`
+    # （outside_boundary / sealed_git / no_write_sid / unknown_acl /
+    # disk_pressure，2026-09-28 批3 A3 补 attestation_mismatch / cross_level，
+    # 取值域 = tools/result.py::DeniedBy），由
+    # `tools/fact_positions.py::classify_denied_by`（沙箱拒绝）与
+    # `finalize_tool_result` 的拒因签名表（attestation 门 / 跨级指挥链，
+    # 平台自产文案）判定；`blocked_by_environment`
     # 区分「环境拒绝」与「runner 没起来」；`sealed_by` 由封条函数赋值。
     # ⚠ 三列都**无 DEFAULT**（NULL = 老行未记录，与 False/0 不同形）。
     """ALTER TABLE run_steps ADD COLUMN denied_by TEXT""",
@@ -715,7 +719,7 @@ PROJECT_DB_TABLES = [
     """ALTER TABLE run_steps ADD COLUMN command_failed INTEGER DEFAULT 0""",
     """ALTER TABLE run_steps ADD COLUMN injection_applied INTEGER DEFAULT 0""",
     # F7（平台修复计划 2026-08-30）：超时统一分类 + timeout_ms，与 F4 事实位正交可组合。
-    # 取值域（2026-09-10 补 `turn`）：
+    # 取值域（2026-09-10 补 `turn`；2026-09-28 批3 A3 补 `swept`）：
     #   command — 工具**自身声明**的超时（tool_exec.py 的 `Command timed out
     #             after Ns`，帽来自 DECLARED_TIMEOUT_MS / MAX_TIMEOUT_S）
     #   runner  — runner 层超时（进程没起来即超时）〔**预留**：全仓无写入点，
@@ -726,6 +730,13 @@ PROJECT_DB_TABLES = [
     #   turn    — **整轮兜底**超时（core.py 的 asyncio.wait_for(HARD+30) 掐断），
     #             由 run_ledger 的孤儿步骤清扫补写（TEST_DSH_50/51 实测：该出口
     #             此前完全未接线，4 个 600s 硬杀 run 的 timeout_kind 全 NULL）
+    #   swept   — **被清扫判死**（A3 批3，2026-09-28）：步骤终态由清扫员写的
+    #             （create_activation 孤儿清扫 + startup_sweep 进程死亡/收尾
+    #             回收），非超时也非执行器收尾。语义是步骤级的「这行的终态
+    #             不是执行器写的」—— 与 'turn'（同样是清扫写的，但 run 死因
+    #             明确是整轮总超时）构成两级归属；NULL = 执行器自己收的尾
+    #             （真失败 status='failed' 或正常 completed）。修的病：被扫断
+    #             与真失败此前共用 status='error'，九个分类位上不可分。
     """ALTER TABLE run_steps ADD COLUMN timeout_kind TEXT""",
     """ALTER TABLE run_steps ADD COLUMN timeout_ms INTEGER""",
     # L5（2026-09-11）：第三种事实位 —— 悬挂步骤的「结果未知」。

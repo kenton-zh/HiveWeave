@@ -199,8 +199,17 @@ async def test_numeric_note_not_taken_as_past_target(task_env, monkeypatch):
 # ── 唤醒文案区分 ──────────────────────────────────────────
 
 
-async def test_ttl_cap_wake_message_says_target_not_reached(task_env, monkeypatch):
-    """ttl_cap 唤醒文案明说「TTL 上限唤醒，目标未到，续等或改 ScheduledAlarm」。"""
+@pytest.mark.parametrize("exit_mode", ["auto", "legacy"])
+async def test_ttl_cap_wake_message_says_target_not_reached(
+    task_env, monkeypatch, exit_mode
+):
+    """ttl_cap 唤醒文案明说「TTL 上限唤醒，目标未到，续等或改 ScheduledAlarm」。
+
+    T16 三期：续等话术按模式分流 —— 两种模式都钉死跑一遍，不随环境漂移。
+    """
+    from hiveweave.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "turn_exit_mode", exit_mode)
     pid = task_env["project_id"]
     svc = GameTimeService(pid)
     wc = WaitContractService()
@@ -231,7 +240,13 @@ async def test_ttl_cap_wake_message_says_target_not_reached(task_env, monkeypatc
     body = send.await_args.kwargs["message"]
     assert "wakeup_reason=ttl_cap" in body
     assert "2030-01-01T15:00:00" in body  # 目标时刻明示
-    assert "commit_turn(waiting_on)" in body
+    # T16 三期：续等话术按模式分流（模式已在生成 body 前钉死）：
+    # auto ⇒ wait_on 续等（禁 commit_turn）；legacy ⇒ commit_turn 旧文案。
+    if exit_mode == "auto":
+        assert "commit_turn(waiting_on)" not in body
+        assert "wait_on(refs=" in body
+    else:
+        assert "commit_turn(waiting_on)" in body
     assert "schedule_alarm" in body
 
 

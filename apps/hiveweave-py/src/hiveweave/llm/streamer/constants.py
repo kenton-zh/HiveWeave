@@ -15,6 +15,18 @@ import os as _os
 # retrigger 续跑（completion.py），长工作仍持续，只是每 ~9.5 分钟强制
 # 经过一次 turn 边界：inbox 被处理、上下文 checkpoint、token 有帽。
 # 下方 TOTAL/HARD/ACTIVITY/PACING 数值仍可 env 微调。
+#
+# ── T16 增补（2026-09-30 钦定）：回合墙钟预算仅在 TURN_EXIT_MODE=legacy
+# 生效 ──────────────────────────────────────────────────────────────
+# auto 模式（HIVEWEAVE_TURN_EXIT_MODE=auto）下 tool_loop 不武装
+# hard/soft deadline，回合时长由模型停止自然决定 —— 对齐上游三仓
+# （pi/opencode/DSH 均无回合总预算，只有调用级超时）。auto 的安全网 =
+# 调用级超时（T3' 首块总帽 FIRST_BYTE_TOTAL_CAP_S=300s / idle 150s /
+# 工具声明超时 timeout_policy）+ 600 轮帽（DEFAULT_MAX_TOOL_ROUNDS，
+# 唯一轮数级硬停：到点走 auto 出口门禁收口，宽限后强制 blocked）+
+# T9 同参拒绝 / T27 复读断路器 + 用户停止按钮。
+# 本文件全部常量值【一律不动】：legacy 分支与下方结构断言继续消费；
+# auto 分支的退役是 tool_loop 不武装（deadline=None），不是删常量。
 
 MAX_TOOL_ROUNDS = 1_000_000
 """最大 tool loop 轮次 — 仅作极端安全网，实际由 doom loop 按工具分级保护。峰值复现真实死循环(同参数反复调用) 。"""
@@ -128,13 +140,38 @@ WORKING_SET_CHECKPOINT_MARKER = "[Working-set checkpoint]"
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""
 
+def continue_sentinel_text() -> str:
+    """T16 三期：续跑哨兵的挂起话术按模式分流（auto 下 commit_turn 已下架）。
+
+    ⚠ 哨兵文本进入请求前缀（cache key）：http_stream 与 cache_warmer
+    重放**必须**同源调用本函数，勿各写一份文案（P1-3 教训）。
+    """
+    from hiveweave.config import turn_exit_mode
+
+    if turn_exit_mode() == "auto":
+        finish = (
+            "finish outstanding steps, or park with "
+            'wait_on(refs=[{"kind": "task|agent|fact|user", "ref": "<id>"}]) '
+            "then stop (commit_turn is delisted in this mode; the platform "
+            "auto-closes the turn when you stop)"
+        )
+    else:
+        finish = "finish outstanding steps or commit_turn"
+    return (
+        "[HiveWeave runtime] Re-invoking this turn: the request did not end with a "
+        "user message (usually after tool/assistant output). The platform treats "
+        "your work as still open, so you are woken again to continue — "
+        f"{finish}. This is not a new human instruction."
+    )
+
+
 CONTINUE_SENTINEL = (
     "[HiveWeave runtime] Re-invoking this turn: the request did not end with a "
     "user message (usually after tool/assistant output). The platform treats "
     "your work as still open, so you are woken again to continue — finish "
     "outstanding steps or commit_turn. This is not a new human instruction."
 )
-"""Appended as a trailing user message on the HTTP request copy only.
+"""legacy 文案（保留兼容旧导入）。live wire 请用 :func:`continue_sentinel_text`。
 
 Dual purpose:
 1. Gateway FIX(gateway-tool-id-400): trailing non-user history can 400; a
@@ -290,7 +327,64 @@ IDLE_TIMEOUT_S = float(
 （判死 → 既有重试/收口接管），只调阈值。两层机制勿混。"""
 
 # Socket read must outlive the idle watchdog so httpx does not kill first.
+# （read 同时覆盖「等响应头」阶段 —— httpx 把响应头接收也计入 read timeout。）
 STREAM_SOCKET_READ_TIMEOUT_S = IDLE_TIMEOUT_S + 30.0
+
+# ── T3'（TEST_DSH_78）：pre-first-chunk 悬挂逃逸看门狗 ────────────────
+# 事故形态：首轮 kickoff 请求已发、上游（longcat）一个 chunk 都不来、悬挂
+# 11 分钟（llm_start/llm_queue/流事件全零、interrupt note="request started
+# but zero chunks arrived"）。根因：FIRST_CHUNK/IDLE/PING 三层守卫全是
+# **单次尝试**语义 —— RetryableError 重试链的**总墙钟**无人负责，
+# 90s × MAX_RETRIES(5) + 退避可合法拉到 8-11 分钟。
+# 修法：单次请求（含其全部重试/退避/排队）武装一个绝对零输出 deadline，
+# 只认上游真实字节续命；到点 PermanentError(first_byte_total_timeout)，
+# 走 run 级收口，不再重试。实现见 http_stream._stream_single_round /
+# _do_streaming_request（budget_deadline 同款 min() 进 wait_s）。
+FIRST_BYTE_TOTAL_CAP_S = float(
+    _os.environ.get("HIVEWEAVE_LLM_FIRST_BYTE_TOTAL_CAP_S", "300") or "300"
+)
+"""零输出总帽（秒）：从单次请求武装点到首个真实上游 SSE 字节的墙钟上限
+（跨该请求的全部重试/退避/排队等待）。
+
+- 起算点：``_stream_single_round`` 进入 ``with_retry`` 之前（一次武装）。
+- 续命条件：**只认上游真实 SSE 字节** —— 首个解析事件到达即溶解（跨重试
+  永久生效，此后由既有 IDLE 层接管）；内部控制事件（llm_queue ping、
+  attempt 切换、退避 sleep）**不续命**（sleep 期间同样无字节，计入墙钟）。
+- 与 ``budget_deadline``（turn 硬预算，570s 级、有进展即续命）是两条独立
+  绝对线：SSE wait 取两者 min；budget 到点 = 优雅切断（保已收文本），
+  本帽到点 = PermanentError（明确「上游零输出总超时」）。
+- 默认 300 对齐 DSH/pi/opencode 三仓；env
+  ``HIVEWEAVE_LLM_FIRST_BYTE_TOTAL_CAP_S`` 可调。
+"""
+
+FIRST_BYTE_TOTAL_TIMEOUT_ERROR_CODE = "first_byte_total_timeout"
+"""零输出总帽到点的稳定错误码（PermanentError 随行，供观测/收口按码消费）。"""
+
+TURN_TOTAL_TIMEOUT_ERROR_CODE = "turn_total_timeout"
+"""整轮兜底总超时（外层 wait_for，``timeout_kind='turn'``）的稳定错误码。
+
+P0-2（qoder 双项目报告）：总超时此前被转成裸 error result，下游
+with_retry / 熔断器 / T34 failover 全都看不见 → 不进重试、不上报、
+不换模型（实测 13,125 次调用仅 5 次 failover）。归因修复 = 把总超时
+按「上游级失败」喂三处闸门（``http_stream._feed_turn_total_timeout_gates``），
+熔断器 ``last_error_code`` 与 error result 都带本码，供机检消费。
+与 T3' 的 ``first_byte_total_timeout``（单请求零输出帽，语义不动）、
+工具自身超时（``timeout_kind='command'``）三者互斥。"""
+
+STREAM_NO_TERMINATOR_ERROR_CODE = "stream_no_terminator"
+"""SSE 传输正常关闭但从未见到终止事件（message_stop/finish/[DONE]）的
+稳定错误码（RetryableError 随行，对齐 pi「ended without message_stop」
+先例 —— 截断流不许当成功返回）。"""
+
+# ── httpx 超时四元组（T3' #2）────────────────────────────────────────
+# 四项必须显式齐全（httpx.Timeout 单标量=四项同值，显式四元组防漂移）。
+# read 必须覆盖「等响应头」阶段（httpx 将响应头接收计入 read timeout），
+# 且 socket read 必须活得比 idle 看门狗久（否则 httpx 先杀，归因失真）。
+# write 原为 10s：大上下文请求体（MB 级 JSON）在弱网上行可被误杀 → 60s。
+# pool 原为 10s：语义是「等连接池借出」，60s 与 connect 同量级更稳。
+STREAM_SOCKET_CONNECT_TIMEOUT_S = 10.0
+STREAM_SOCKET_WRITE_TIMEOUT_S = 60.0
+STREAM_SOCKET_POOL_TIMEOUT_S = 60.0
 
 LLM_QUEUE_PING_S = 15.0
 """While waiting for the global LLM semaphore, fire ``llm_queue`` this often
@@ -302,6 +396,10 @@ Must stay well below ``STREAMING_ZOMBIE_TIMEOUT_MS`` (default 5 min).
 def stream_chunk_wait_s(*, got_event: bool) -> float:
     """Seconds to wait for the next SSE event (first chunk vs idle)."""
     return FIRST_CHUNK_TIMEOUT_S if not got_event else IDLE_TIMEOUT_S
+
+assert FIRST_BYTE_TOTAL_CAP_S > 0, (
+    "FIRST_BYTE_TOTAL_CAP_S 必须为正 —— <=0 会让零输出帽立即触发"
+)
 
 # ── Bug B fix: 全局 LLM 并发控制 ───────────────────────────
 # 防止多 agent 同时打 LLM API 超过 provider 并发限制（默认 8）。

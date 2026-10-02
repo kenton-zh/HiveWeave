@@ -596,7 +596,7 @@ class Agent:
     async def chat(self, message: str, opts: dict | None = None) -> dict:
         """发起 LLM 调用。返回 {ok, error}。
 
-        - 如果 processing → 返回 {error: "busy"}
+        - 如果 processing → 入 _message_queue 队列，返回 {ok: true, queued: true}
         - 如果系统暂停 → 返回 {error: "paused"}
         - 否则启动 LLM task，返回 {ok: true}
 
@@ -807,6 +807,8 @@ class Agent:
             self._turn_gate_count = 0
             self._cancel_productive_continue()
             self._cancel_interrupted_resume()
+            # T16 auto：新 run 开始 → 旧的预算延续唤醒作废（已有人续跑）
+            self._cancel_budget_continue()
             source = (opts or {}).get("source") or ""
             # External wakes refill slice budget; reminder/productive-continue/
             # slice-continue turns do not (ADR-002 + audit P1-3). 批 C 第1步②：
@@ -1195,6 +1197,29 @@ class Agent:
                 else:
                     raise
 
+        # 批 2 A7（2026-09-28）：取消面补账兜底 —— 状态脱钩（PROCESSING 但
+        # 无活 LLM task）时 CancelledError handler 不会跑，handle_cancel 的
+        # flush 没人执行；此后实例被 pop / 复位，内存 sink 随之丢弃 ⇒
+        # interrupted run 零账（R11 的进程内来源之一）。此处补一次幂等
+        # flush：handler 已 flush 过 ⇒ sink 空 = no-op（只留 debug 日志）。
+        # ⚠ 仅在无活 LLM task 时动手：等锁窗口里若有新 chat() 起了新流，
+        # 抢摘 sink 会孤儿化新流的 usage_sink（流中途丢账）—— 那条流的
+        # 账由它自己的恢复路径接管。
+        _flush_task = self._llm_task
+        if (
+            getattr(self, "_pending_usage", None)
+            and (_flush_task is None or _flush_task.done())
+        ):
+            try:
+                await _agent_recovery._flush_pending_usage(self, reason=reason)
+            except Exception as flush_err:  # noqa: BLE001
+                log.warning(
+                    "cancel_pending_usage_flush_failed",
+                    agent_id=self.id,
+                    reason=reason,
+                    error=str(flush_err),
+                )
+
         try:
             from hiveweave.services.offturn import (
                 cancel_should_reap_offturn,
@@ -1427,7 +1452,18 @@ class Agent:
                 # 同一 run 的同一上下文注入 user hint 续跑补齐 commit_turn，
                 # 替代旧的「run 关闭后重开整轮」。判定逻辑在
                 # completion.build_gate_supplement_hint。
+                # T16 一期：auto 模式分发到平台程序化收口判据
+                # （turn_exit_auto.build_auto_exit_gate_hint —— hint 1-2 常规 /
+                # 3 起升级 / 5 连停强制挂起），legacy 原样。
                 async def _gate_supplement_check(tool_calls: list) -> str | None:
+                    from hiveweave.config import turn_exit_mode
+
+                    if turn_exit_mode() == "auto":
+                        from hiveweave.services.turn_exit_auto import (
+                            build_auto_exit_gate_hint,
+                        )
+
+                        return await build_auto_exit_gate_hint(self, tool_calls)
                     from hiveweave.agents.completion import (
                         build_gate_supplement_hint,
                     )
@@ -1843,7 +1879,14 @@ class Agent:
         # compacted_prefix（上面第 2 步已加入），原文从缓存和 DB 中删除。因此
         # get_history 只返回压缩后的对话，与摘要相加即为完整上下文，不会把压缩前
         # 的原文重复计入。历史总量由压缩控制，超限时由 streamer 95% 硬裁兜底。
-        history = await self._conversation.get_history(self.id, self.project_id)
+        # 可抄①（T33/T34 2026-09-29，opencode message-v2.ts 先例）：失败 turn
+        # 的 [ERROR] 标记消息不进下轮模型上下文（本读路径过滤；recovery 的
+        # 失败接续判定/幂等检查走默认全量读，不受影响）——失败尝试不污染
+        # 下轮请求与缓存前缀；原始 user 指令保留（recovery 唤醒的
+        # 「任务与上下文不变」依赖它）。
+        history = await self._conversation.get_history(
+            self.id, self.project_id, include_failed_turn_markers=False
+        )
         messages.extend(history)
 
         # 4. Context prompt (System 2 — 动态)
@@ -2175,6 +2218,18 @@ class Agent:
         from hiveweave.services.host_env import filter_tools_for_host
 
         visible_names = filter_tools_for_host(tool_names)
+
+        # T16 一期（auto 回合出口模式）：commit_turn 从模型工具面下架，
+        # 唯一合法中途挂起 wait_on 上架。实现/schema 保留在代码里（legacy
+        # 用）；幻觉调用在 auto 下也仍有注册实现可回执。legacy 模式零变化。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            visible_names = [
+                n for n in visible_names if n != "commit_turn"
+            ]
+            if "wait_on" not in visible_names:
+                visible_names = [*visible_names, "wait_on"]
 
         # MCP 绑定即用（45 轮 #9）：绑定的 server 工具按公开名追加进
         # 工具表（schema 来自 tools/list 原样透传）。best-effort：supervisor
@@ -2518,11 +2573,23 @@ class Agent:
             self._productive_continue_timer = None
             if self.status != AgentState.IDLE:
                 return
-            hint = (
-                "[PRODUCTIVE CONTINUE] Previous slice ended in_progress after "
-                "tool activity. Resume work; commit_turn(waiting/done_slice) "
-                "when blocked on an external party or finished."
-            )
+            # T16 残尾尾巴：唤醒话术按模式分流（auto 下 commit_turn 已下架）。
+            from hiveweave.config import turn_exit_mode
+
+            if turn_exit_mode() == "auto":
+                hint = (
+                    "[PRODUCTIVE CONTINUE] Previous slice ended in_progress after "
+                    "tool activity. Resume work; when blocked on an external "
+                    "party park with wait_on(refs=[{\"kind\": \"task|agent|fact|user\","
+                    " \"ref\": \"<id>\"}]) first, then just stop (the platform "
+                    "auto-closes the turn)."
+                )
+            else:
+                hint = (
+                    "[PRODUCTIVE CONTINUE] Previous slice ended in_progress after "
+                    "tool activity. Resume work; commit_turn(waiting/done_slice) "
+                    "when blocked on an external party or finished."
+                )
             log.info(
                 "productive_continue_wake",
                 agent_id=self.id,
@@ -2590,14 +2657,28 @@ class Agent:
                        "waiting_timer", "complete"}
             if self.disposition in _parked:
                 return
-            hint = (
-                f"[TASK INTERRUPTED] Previous turn ended early (tool-loop "
-                f"stall). Tasks still open under you: {refs_blob}. "
-                f"Verify current state from disk/ledger first, then resume "
-                f"with smaller steps; commit_turn(in_progress) to keep "
-                f"working, or commit_turn(waiting/blocked) with a ref if "
-                f"external input is needed."
-            )
+            # T16 残尾尾巴：唤醒话术按模式分流（auto 下 commit_turn 已下架）。
+            from hiveweave.config import turn_exit_mode
+
+            if turn_exit_mode() == "auto":
+                hint = (
+                    f"[TASK INTERRUPTED] Previous turn ended early (tool-loop "
+                    f"stall). Tasks still open under you: {refs_blob}. "
+                    f"Verify current state from disk/ledger first, then resume "
+                    f"with smaller steps. If external input is needed, park "
+                    f"with wait_on(refs=[{{\"kind\": \"task|agent|fact|user\", "
+                    f"\"ref\": \"<id>\"}}]) first, then just stop (commit_turn "
+                    f"is delisted; the platform auto-closes the turn)."
+                )
+            else:
+                hint = (
+                    f"[TASK INTERRUPTED] Previous turn ended early (tool-loop "
+                    f"stall). Tasks still open under you: {refs_blob}. "
+                    f"Verify current state from disk/ledger first, then resume "
+                    f"with smaller steps; commit_turn(in_progress) to keep "
+                    f"working, or commit_turn(waiting/blocked) with a ref if "
+                    f"external input is needed."
+                )
             log.info(
                 "interrupted_resume_wake",
                 agent_id=self.id,
@@ -2621,6 +2702,89 @@ class Agent:
             "interrupted_resume_armed",
             agent_id=self.id,
             task_refs=task_refs[:8],
+            delay_s=delay,
+        )
+
+    # ── T16 auto：预算掐断延续唤醒（原 T16 唤醒兜底的落点）──────────
+
+    def _cancel_budget_continue(self) -> None:
+        t = getattr(self, "_budget_continue_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._budget_continue_timer: asyncio.TimerHandle | None = None
+        self._budget_continue_armed_run: str | None = None
+
+    def _arm_budget_continue(self, run_id: str | None = None) -> None:
+        """T16 auto 预算掐断兜底：+10min 延续唤醒，幂等键 per-run。
+
+        同一 run 只武装一次（重复收口/并发路径不会双排）；任一新 run 开始
+        （chat() 入口 ``_cancel_budget_continue``）即作废 —— 已有人在续跑。
+        唤醒走 ``source="budget_continue"``（外部语义，回填 slice budget）。
+
+        【dead — T16 增补（09-30）】auto 模式回合墙钟预算已退役：tool_loop
+        不再武装 budget_deadline ⇒ 预算停（interrupted）不可达 ⇒ 本武装点
+        当前无调用路径（completion 的 dead 分支是唯一调用者）。保留代码供
+        灰度回切 / 旁路结果防御；唯一仍活跃的关联动作是 chat() 入口的
+        ``_cancel_budget_continue``（对未武装 timer 是无害 no-op）。
+        """
+        armed_key: str = run_id or str(
+            getattr(self, "_current_run_id", None) or ""
+        )
+        if getattr(self, "_budget_continue_armed_run", None) == armed_key:
+            return  # 幂等：同 run 已排
+        if not hasattr(self, "_budget_continue_timer"):
+            self._budget_continue_timer = None
+        if not hasattr(self, "_BUDGET_CONTINUE_DELAY_S"):
+            self._BUDGET_CONTINUE_DELAY_S = 600.0
+        self._cancel_budget_continue()
+        if not armed_key:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        delay = float(self._BUDGET_CONTINUE_DELAY_S)
+        self._budget_continue_armed_run = armed_key
+
+        def _fire() -> None:
+            self._budget_continue_timer = None
+            armed_run = getattr(self, "_budget_continue_armed_run", None)
+            self._budget_continue_armed_run = None
+            if self.status != AgentState.IDLE:
+                return
+            hint = (
+                "[BUDGET CONTINUE] Your previous turn was cut by the turn "
+                "budget and marked interrupted. Work already done is kept. "
+                "Resume from where the ledger stands (smaller slices); stop "
+                "outputting when obligations are settled, or wait_on(refs) "
+                "to suspend legally."
+            )
+            log.info(
+                "budget_continue_wake",
+                agent_id=self.id,
+                run_id=armed_run,
+                delay_s=delay,
+            )
+            asyncio.create_task(
+                self.chat(
+                    hint,
+                    opts={
+                        "trigger": True,
+                        "is_background": True,
+                        "source": "budget_continue",
+                    },
+                ),
+                name=f"agent-{self.id}-budget-continue",
+            )
+
+        self._budget_continue_timer = loop.call_later(delay, _fire)
+        log.info(
+            "budget_continue_armed",
+            agent_id=self.id,
+            run_id=armed_key,
             delay_s=delay,
         )
 
@@ -2679,10 +2843,10 @@ class Agent:
         TEST_DSH_63 批3 组4：run 永久死亡后 agent 此前无任何自动恢复 ——
         6 个 run 死于同一 30 秒抖动窗、全员停摆到人工介入。现按 DSH 参照
         哲学：死亡可接受、恢复靠 durable 触发 —— 判定真时给**同一 agent**
-        排一次自动唤醒（60s/180s/600s 退避、封顶 3 次、次数持久化在
-        agent_waits 行上，机制与口径见
+        排一次自动唤醒（60s/180s/600s… 退避、封顶 6 次可续期——T33.3
+        2026-09-29，次数持久化在 agent_waits 行上，机制与口径见
         :func:`hiveweave.services.wait_contract.schedule_upstream_recovery_wait`）；
-        3 次耗尽仍死 → 停止重醒，交人工（ORG_ESCALATION，独立去重）。
+        6 次耗尽仍死 → 停止重醒，交人工（ORG_ESCALATION，独立去重）。
 
         TEST_DSH_64 #6：判定扩为 ``is_upstream_death(error) or
         is_stream_idle_exhausted(error)`` —— 后者是流空转（首 chunk 后
@@ -3127,6 +3291,17 @@ class Agent:
         """
         return await _agent_recovery.escalate_unreplied(self, unreplied_msgs)
 
+    async def _escalate_gate_exhaustion(
+        self, violations: list[str], detail: dict | None = None
+    ) -> None:
+        """T16 auto：出口门禁补步耗尽强制挂起（blocked）→ 通知 creator。
+
+        creator = 上级 agent；CEO（无 parent）落 work_log/门禁公告可见。
+        """
+        return await _agent_recovery.escalate_gate_exhaustion(
+            self, violations, detail
+        )
+
     async def _escalate_trigger_fuse(self, pending: list[dict]) -> None:
         """Fuse tripped: notify parent, keep actionable inbox unread."""
         return await _agent_recovery.escalate_trigger_fuse(self, pending)
@@ -3405,8 +3580,8 @@ class Agent:
                 return True
             if project_rate_limit_remaining(self.project_id) > 0:
                 return True
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — 余额探针 fail-open，按无余额处理
+            log.debug("balance_probe_failed", agent_id=self.id, error=str(e))
         return False
 
     def _arm_resume_cooldown(self, seconds: float) -> None:

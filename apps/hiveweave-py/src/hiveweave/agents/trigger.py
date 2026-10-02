@@ -496,6 +496,249 @@ def _guard_sibling_offturn_waits(agent_id: str, latch_opts: dict) -> None:
         latch_opts["clear_waits"] = False
 
 
+# ── TEST_DSH_77：中层休眠形态的带处方唤醒 ────────────────────
+
+def _dormant_lead_prescription() -> str:
+    """T16 三期：挂起教学面按模式分流（auto 下 commit_turn 已下架）。"""
+    from hiveweave.config import turn_exit_mode
+
+    park = (
+        "派完后 wait_on(refs=[{\"kind\": \"task\", \"ref\": \"<子任务id>\"}])"
+        " 等收货（commit_turn 已下架）。"
+        if turn_exit_mode() == "auto"
+        else "派完后 commit_turn(waiting, kind=task, ref=子任务) 等收货。"
+    )
+    return (
+        "[DORMANT TEAM] 你的全部下属 executor 都闲置，而你名下没有任何已派任务"
+        "——组织在你这一层停摆。按既定设计稿立即拆活派工："
+        "dispatch_task 给每个 executor（附 acceptanceCriteria=[{id, description}]"
+        "验收标准，一个下属至少一个任务；测试岗留一个里程碑 QA 任务）。"
+        f"{park}"
+    )
+
+
+def _dormant_stuck_suffix(stuck: dict | None) -> str:
+    """T28：自派任务零进展命中时的 notice/上下文追加文案（无卡死 → 空串）。
+
+    判定本体在 ``TaskService.dormant_stuck_own_task``（单一事实源），这里
+    只负责把代表行渲染成人话；两处消费（inbox notice / force 上下文块）
+    共用本函数，防两处文案漂移。
+    """
+    if not stuck:
+        return ""
+    return (
+        f"\n你名下任务「{stuck.get('title')}」已 {stuck.get('stall_min')}"
+        " 分钟无进展，而你的下属全部闲置——考虑拆分派活或求助。"
+    )
+
+
+async def maybe_notify_dormant_lead(project_id: str, agent_id: str) -> bool:
+    """中层休眠形态命中时投递带处方的 platform notice（幂等，一次一批）。
+
+    D77 事故：技术负责人完成设计稿合并 + 招齐 executor 后，自己零派活、
+    下属全员闲置 —— 台账无义务、inbox 无消息，延续唤醒链被掐断，中层
+    睡死。本函数是该形态的**主动通知通道**：
+
+    - 判定复用闭式源 ``TaskService().has_dormant_idle_team``（五条件窄口径；
+      T28 放宽后「自派任务零进展 + 下属全闲置」同样命中）；
+    - 投递走 ``InboxService.send_message(message_type='platform_notice',
+      wake=True)`` —— inbox 5s watcher 在 ≤5s 内把中层唤醒，处方随
+      trigger digest 的 Messages 块到达；
+    - T28：命中来自「自派任务零进展」形态时，notice 追加卡死任务的后缀
+      （``_dormant_stuck_suffix``），处方从「去派活」升级为「拆自己的活」；
+    - 幂等键 ``dormant-lead:{lead}:{下属批指纹}:{下属名下历史任务总数}``：
+      同一批下属 + 零派任务状态下只投一次；dispatch 后下属名下任务总数
+      必然增长 ⇒ 键换代 ⇒「派完又全员收口」的同批休眠复发会重新投递
+      （状态变化自然失效，符合一次一批契约）。
+
+    Returns True 表示本 agent 命中休眠形态（无论本次是否新投递）。
+    """
+    try:
+        from hiveweave.services.task import TaskService
+
+        _svc = TaskService()
+        if not await _svc.has_dormant_idle_team(project_id, agent_id):
+            return False
+        try:
+            stuck = await _svc.dormant_stuck_own_task(project_id, agent_id)
+        except Exception as e:
+            log.debug(
+                "dormant_lead_stuck_probe_failed",
+                project_id=project_id, agent_id=agent_id, error=str(e),
+            )
+            stuck = None
+    except Exception as e:
+        log.debug(
+            "dormant_lead_probe_failed",
+            project_id=project_id, agent_id=agent_id, error=str(e),
+        )
+        return False
+
+    try:
+        import hashlib
+
+        from hiveweave.db.project import get_project_db_by_project_id
+        from hiveweave.services.inbox import InboxService
+
+        conn = await get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "SELECT id, name FROM agents "
+            "WHERE parent_id = ? AND status = 'active'",
+            [agent_id],
+        )
+        kid_rows = await cur.fetchall()
+        await cur.close()
+        kid_ids = sorted(
+            str(r["id"]) for r in kid_rows
+            if (r["id"] or "") and r["id"] != agent_id
+        )
+        kids_fp = ""
+        gen = 0
+        if kid_ids:
+            kids_fp = hashlib.sha1(
+                ",".join(kid_ids).encode("utf-8")
+            ).hexdigest()[:12]
+            ph = ",".join("?" for _ in kid_ids)
+            cur = await conn.execute(
+                f"SELECT COUNT(*) AS c FROM tasks WHERE assignee_id IN ({ph})",
+                kid_ids,
+            )
+            gen_row = await cur.fetchone()
+            await cur.close()
+            try:
+                gen = int(gen_row["c"] or 0) if gen_row else 0
+            except (KeyError, IndexError, TypeError, ValueError):
+                gen = 0
+        key = f"dormant-lead:{agent_id}:{kids_fp}:{gen}"
+        await InboxService().send_message(
+            from_agent_id="system",
+            to_agent_id=agent_id,
+            message=_dormant_lead_prescription()
+            + _dormant_stuck_suffix(stuck),
+            message_type="platform_notice",
+            priority="urgent",
+            wake=True,
+            trusted_platform=True,
+            idempotency_key=key,
+        )
+        log.warning(
+            "dormant_lead_notice",
+            project_id=project_id,
+            agent_id=agent_id,
+            idle_children=len(kid_ids),
+            generation=gen,
+            dedup_key=key,
+            stuck_own_task=bool(stuck),
+        )
+        return True
+    except Exception as e:
+        log.warning(
+            "dormant_lead_notice_failed",
+            project_id=project_id, agent_id=agent_id, error=str(e),
+        )
+        return True  # 形态判定已成立；投递失败不影响返回值语义
+
+
+# ── T19（S16 铁蛋/Iris）：出生即 blocked 的轻量待命 wake ──────────
+
+_BORN_BLOCKED_NOTICE_TMPL = (
+    "[BORN BLOCKED] 你的任务「{title}」已登记，当前等待依赖 {deps}"
+    "——依赖解除时你会被唤醒；期间无需轮询。"
+)
+
+
+async def maybe_notify_born_blocked(project_id: str, task_id: str) -> bool:
+    """出生即 blocked（dependency 等待）的任务，给 assignee 一次性知情 wake。
+
+    T19（S16 实测「雇而未用 2h45m」零信号）：born-blocked 任务
+    ``claimed_at=NULL`` 不入义务表（obligations 闭式负空间），派单消息按
+    设计 wake=0，沉默看门狗按合法 idle 豁免 —— assignee 对「已被派活」
+    制度性失明。本函数在该时刻投**一条**轻量待命 notice（只做知情，不
+    做持续催办——等依赖是合法等待；依赖解除由 ``reconcile_blocked_tasks``
+    自动唤醒）：
+
+    - 形态自校验：status=blocked + wait_kind=dependency + 有 assignee +
+      ``claimed_at IS NULL`` + 未归档，任一不满足 ⇒ False（不发）——
+      已 claim 的 blocked 走正常义务/看门狗路径，无须知情 wake；
+    - 幂等键 ``born-blocked:{task_id}``：任务一生一条（一次性），重复
+      调用由 inbox 唯一索引去重；
+    - 失败只记日志返回 False，不打断派单主链路。
+    """
+    try:
+        import json
+
+        from hiveweave.services.inbox import InboxService
+        from hiveweave.services.task import TaskService
+
+        svc = TaskService()
+        task = await svc.get_task(project_id, task_id)
+        if not task or task.get("is_archived"):
+            return False
+        if (task.get("status") or "") != "blocked":
+            return False
+        if ((task.get("wait_kind") or "").lower()) != "dependency":
+            return False
+        assignee = str(task.get("assignee_id") or "").strip()
+        if not assignee or task.get("claimed_at"):
+            return False
+        deps = task.get("depends_on") or []
+        if not isinstance(deps, list):
+            # 行型漂移兜底（与 lifecycle.reconcile_blocked_tasks 同款）：
+            # 依赖列 JSON 解析失败时 _row 保留原始字符串，直接 list() 会
+            # 逐字符查询。解析不出就按无依赖展示，不让文案毁掉知情 wake。
+            try:
+                deps = json.loads(deps)  # type: ignore[arg-type]
+            except Exception:
+                deps = []
+        if not isinstance(deps, list):
+            deps = []
+        dep_bits: list[str] = []
+        for dep_id in list(deps)[:5]:
+            dep = await svc.get_task(project_id, str(dep_id))
+            if dep:
+                dep_bits.append(
+                    f"「{(dep.get('title') or '')[:60]}」"
+                    f"({dep.get('status')})"
+                )
+            else:
+                dep_bits.append(str(dep_id)[:8])
+        # ⚠ 不走 str.format：title 是 agent 自由文本，内含 {} 会当场炸掉
+        #知情 wake（KeyError → 静默吞掉）。replace 逐槽填充，括号安全。
+        message = (
+            _BORN_BLOCKED_NOTICE_TMPL
+            .replace("{title}", (task.get("title") or "")[:80])
+            .replace(
+                "{deps}",
+                "、".join(dep_bits) if dep_bits else "(unspecified)",
+            )
+        )
+        await InboxService().send_message(
+            from_agent_id="system",
+            to_agent_id=assignee,
+            message=message,
+            message_type="platform_notice",
+            priority="normal",
+            task_id=task_id,
+            wake=True,
+            trusted_platform=True,
+            idempotency_key=f"born-blocked:{task_id}",
+        )
+        log.info(
+            "born_blocked_notice",
+            project_id=project_id,
+            task_id=task_id,
+            assignee_id=assignee,
+            dep_count=len(deps),
+        )
+        return True
+    except Exception as e:
+        log.warning(
+            "born_blocked_notice_failed",
+            project_id=project_id, task_id=task_id, error=str(e),
+        )
+        return False
+
+
 async def trigger_subordinate(agent_id: str, *, force: bool = False) -> None:
     """触发下属 executor 处理待处理内容。
 
@@ -1249,12 +1492,55 @@ async def build_trigger_context(
                     "status": o.get("status"),
                     "you_are": o.get("role_hint"),
                 }, ensure_ascii=False))
+            # T16 三期：挂起话术按模式分流（auto 下 commit_turn 已下架）。
+            from hiveweave.config import turn_exit_mode as _tem
+
+            if _tem() == "auto":
+                _open_work_how = (
+                    "继续推进；确需挂起先 wait_on 登记等待"
+                    "（commit_turn 已下架，直接停止输出即由平台收口）；"
+                )
+            else:
+                _open_work_how = "继续推进或用 commit_turn 正确声明状态；"
             blocks.append(
                 "## Open Work — 你名下有未收口的开放工作"
                 "（沉默看门狗穿透唤醒；与 inbox 读态无关）\n"
-                "继续推进或用 commit_turn 正确声明状态；"
-                "完成后 submit_task / 解除阻塞清账。\n"
+                + _open_work_how
+                + "完成后 submit_task / 解除阻塞清账。\n"
                 + "\n".join(lines)
+            )
+
+    # ── 3.7 Dormant Team（TEST_DSH_77：中层休眠形态的处方指引）──
+    # force 唤醒时若命中「下属全员闲置 + 零派活」的中层休眠形态，必须给出
+    # 处方指引 —— 否则 force 唤醒在最后一米蒸发（3.6 的 Open Work 只给裸
+    # 义务清单，无行动出口）。与 inbox notice（maybe_notify_dormant_lead，
+    # 幂等一次一批）互补：notice 是持久通道（一批一次），本块是每次 force
+    # 唤醒的上下文指引 —— 与 3.6/4a 同 philosophy：醒了一定有事可做，
+    # 不受幂等键约束（否则重犯中层被唤醒后无事可做，链条再次冻结）。
+    # T28（D79 木棉）：不再被 `not blocks` 短路 —— 自派任务零进展形态下
+    # 3.6 必然已产出 Open Work 块，旧闸门把处方整个吞掉（中层反刍 36 次
+    # 唤醒拿不到解药）。形态判定本身是窄口径五条件，误报成本低；命中且
+    # 来自「自派卡死」形态时追加拆活后缀（_dormant_stuck_suffix）。
+    if force and trigger_type == "coordinator":
+        try:
+            from hiveweave.services.task import TaskService
+
+            _ts = TaskService()
+            _dormant = await _ts.has_dormant_idle_team(
+                project_id, agent_id)
+            _stuck = (
+                await _ts.dormant_stuck_own_task(project_id, agent_id)
+                if _dormant
+                else None
+            )
+        except Exception as e:
+            log.debug("trigger_dormant_lead_block_failed",
+                      agent_id=agent_id, error=str(e))
+            _dormant = False
+            _stuck = None
+        if _dormant:
+            blocks.append(
+                _dormant_lead_prescription() + _dormant_stuck_suffix(_stuck)
             )
 
     # ── 4. Coordinator 专属 blocks ──

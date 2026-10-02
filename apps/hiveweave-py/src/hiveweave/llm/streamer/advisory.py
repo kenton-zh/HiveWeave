@@ -93,13 +93,23 @@ class AdvisoryGuard:
         detail = (
             f" Failure attribution: {attribution}" if attribution else ""
         )
+        # T16 残尾尾巴：退出建议按模式分流（auto ⇒ wait_on + 停止）。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            exit_rx = (
+                "or park with wait_on(refs=[{\"kind\": \"task|agent|fact|user\","
+                " \"ref\": \"<id>\"}]) and stop (the platform auto-closes the turn)"
+            )
+        else:
+            exit_rx = "or conclude via commit_turn"
         return (
             f"[ADVISORY] `{tool_name}` has now failed {count} consecutive "
             f"times with the same arguments ({verb}). This is a reminder, "
             f"not a block — but repeating the identical call rarely changes "
             f"the outcome.{detail} Read the last error carefully, change the "
             f"approach (different args, different tool, or a different "
-            f"sub-goal), or conclude via commit_turn."
+            f"sub-goal), {exit_rx}."
         )
 
 

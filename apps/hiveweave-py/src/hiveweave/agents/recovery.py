@@ -1304,6 +1304,20 @@ async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> No
         # R3 P2-3：流零 chunk 即被掐（请求已发起、无 round 返回）时 flush 为空。
         # 该次调用已在请求层计费但不进 llm_usage —— 留痕供观测/审计归因
         # （R3 已实证此类缺口量小：仅 1 次调用）。
+        #
+        # 批 2 A7（2026-09-28）：sink 空 + 本 run 已 flush 过 ⇒ 降 debug ——
+        # 新增的 close_running_runs 预 flush（project_lifecycle）与既有
+        # cancel/timeout flush 会先后到达同一个已排空的 sink，info 级
+        # 「空 flush」日志会把冗余调用误读成新的断口信号。
+        _rid_seen = getattr(agent, "_current_run_id", None)
+        if getattr(agent, "_usage_flushed_run_id", None) == _rid_seen:
+            log.debug(
+                "interrupted_usage_flush_empty",
+                agent_id=agent.id,
+                reason=reason,
+                note="sink already drained for this run; no-op",
+            )
+            return
         log.info(
             "interrupted_usage_flush_empty",
             agent_id=agent.id,
@@ -1327,7 +1341,16 @@ async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> No
         _rid = getattr(agent, "_current_run_id", None)
         if _rid and not getattr(agent, "_run_saw_stream_chunk", False):
             await agent._run_ledger.set_run_fact(agent.id, _rid, empty_stream=1)
+        # 批 2 A7：空 flush 也算「本 run 已交接完毕」，供上面的 debug 去重。
+        agent._usage_flushed_run_id = _rid
         return
+    # 批 2 A7 防重入：**同步**摘走 sink 快照后再 await 落库。asyncio 无抢占，
+    # 同步段不可分割 ⇒ 不存在「两个 flush 各持同一批 rounds 各写一遍」的
+    # 双计窗口（新增的 close_running_runs 预 flush 与 cancel/timeout 恢复账
+    # 可能在同一事件循环里先后到达）。失败不回灌：record_rounds 内部自捕获
+    # 并落 agent_events 告警，回灌反而可能在半提交状态上双写。
+    agent._pending_usage = []
+    agent._usage_flushed_run_id = getattr(agent, "_current_run_id", None)
     try:
         from hiveweave.services.token_meter import token_meter
 
@@ -1354,8 +1377,6 @@ async def _flush_pending_usage(agent: Any, *, reason: str = "interrupted") -> No
         )
     except Exception as e:
         log.warning("interrupted_usage_flush_failed", agent_id=agent.id, error=str(e))
-    finally:
-        agent._pending_usage = []
 
 
 async def handle_cancel(agent: Any) -> None:
@@ -1466,5 +1487,61 @@ async def escalate_trigger_fuse(agent: Any, pending: list[dict]) -> None:
         log.warning(
             "trigger_fuse_escalate_failed",
             agent_id=agent.id,
+            error=str(e),
+        )
+
+
+async def escalate_gate_exhaustion(
+    agent: Any, violations: list[str], detail: dict | None = None
+) -> None:
+    """T16 auto：出口门禁补步耗尽 → 强制挂起 blocked + 通知 creator。
+
+    5 次自然停仍未结算（``turn_exit_auto.build_auto_exit_gate_hint`` 置位
+    强挂标记）后的升级出口：给上级（creator）发 urgent escalation 并唤醒；
+    CEO（无 parent）只落日志 —— 其 blocked 状态与门禁公告（
+    ``_persist_gate_notice``）在 UI 侧已可见。best-effort，不阻塞收口。
+    """
+    try:
+        me = await meta_db.get_agent_by_id(agent.id)
+        parent_id = (me or {}).get("parent_id")
+        my_name = (me or {}).get("name", agent.id[:8]) if me else agent.id[:8]
+        if not parent_id:
+            log.warning(
+                "t16_gate_exhaustion_no_parent",
+                agent_id=agent.id,
+                violations=list(violations)[:6],
+            )
+            return
+        vblob = ", ".join(list(violations)[:6]) or "(gate detail unavailable)"
+        msg = (
+            f"[GATE EXHAUSTED] 下属 {my_name} 连续多次自然停止仍无法收口，"
+            f"已按平台规则强制挂起为 blocked。未结算: {vblob}。"
+            "请介入处理（派单调整 / 直接回复 / 解除阻塞），"
+            "处理完成后其会在下次唤醒继续。"
+        )
+        from hiveweave.services.inbox import InboxService
+
+        await InboxService().send_message(
+            "system",
+            parent_id,
+            msg,
+            message_type="escalation",
+            priority="urgent",
+            wake=True,
+        )
+        from hiveweave.agents.trigger import trigger_subordinate
+
+        await trigger_subordinate(parent_id)
+        log.warning(
+            "t16_gate_exhaustion_escalated",
+            agent_id=agent.id,
+            parent_id=parent_id,
+            violations=list(violations)[:6],
+            detail=str(detail or {})[:200],
+        )
+    except Exception as e:
+        log.warning(
+            "t16_gate_exhaustion_escalate_failed",
+            agent_id=getattr(agent, "id", "?"),
             error=str(e),
         )

@@ -258,20 +258,104 @@ class Compaction:
 
     @staticmethod
     def _trim_to_budget(messages: list[dict], budget: int) -> list[dict]:
-        """硬截断回退：从最旧消息开始移除直到在预算内（不拆 tool 对）。"""
+        """硬截断回退：从最旧消息开始移除直到在预算内（不拆 tool 对）。
+
+        T8（2026-09-29）：新鲜性保护窗内的工具输出**不参与驱逐**——本回退
+        是 LLM 摘要失败时的兜底，此前窗口尾部超预算时会把新鲜工具结果也吃掉
+        （读入即驱逐死循环的裁剪侧根因之一）。现在截断停在保护窗起点：
+        宁可带着超预算的保护窗返回（上游 streamer 95% 硬裁兜底、且从最老
+        处裁），也不驱逐新鲜工具输出。
+        """
         if budget <= 0:
             return messages[-2:] if len(messages) > 2 else list(messages)
         result = list(messages)
+        # 窗内有工具输出才启用保护；纯散文窗维持旧语义（裁到最少）
+        if fresh_window_has_tool_output(result):
+            protected_start = fresh_window_start(result)
+        else:
+            protected_start = 0
         total = estimate_tokens_for_messages(result)
-        while result and total > budget:
+        while len(result) > protected_start and total > budget:
             # 尝试成对移除 tool_calls + tool_result
             drop_count = 1
             if len(result) > 1 and "tool_calls" in result[0] and "tool_call_id" in result[1]:
                 drop_count = 2
+            # 成对丢弃不得越过保护窗起点（窗内第一条是工具结果时 drop=2 会吃进窗）
+            drop_count = min(drop_count, len(result) - protected_start)
             dropped = estimate_tokens_for_messages(result[:drop_count])
             result = result[drop_count:]
             total -= dropped
         return result
+
+
+# ── T8（2026-09-29）：新鲜性保护窗 ─────────────────────────────
+# 病灶（S15 朝露，101 run 长项目实测）：会话被历史撑满后，token 预算裁剪
+# 不断驱逐**新鲜**工具输出 → 模型永远凑不齐信息 → 同参 read_file（同文件
+# 同 offset）重复 8+ 次死循环，每次读入又被驱逐。修法（裁剪侧保护）：
+# 最近 N 轮 / 最近 K 条工具结果（**取小值**防爆量）内的工具输出**不参与
+# 驱逐**——宁可多裁最老的对话历史；预算连保护窗都装不下 ⇒ 触发既有
+# compaction（LLM 摘要），不做硬驱逐。
+#
+# 选小值的原因：每轮并发出多条工具结果时，纯轮数窗口会膨胀（3 轮 × 多工具
+# 可能几十条大结果）；K 封住单窗总量。两界任一先到即停。
+FRESH_PROTECT_TURNS = 3
+FRESH_PROTECT_MAX_TOOL_RESULTS = 4
+
+
+def _is_tool_result_msg(m: object) -> bool:
+    """消息是否为工具结果（tool role / 带 tool_call_id）。"""
+    if not isinstance(m, dict):
+        return False
+    return bool(m.get("tool_call_id") or m.get("role") == "tool")
+
+
+def fresh_window_start(messages: list[dict]) -> int:
+    """新鲜性保护窗起点下标——``messages[start:]`` 受保护。
+
+    逆序扫描：assistant 消息计一轮（对齐 token_utils.select_prune_indices
+    的计轮口径），工具结果单独计数；**任一上限先到即停**（取小值防爆量）。
+    触界的那条消息本身属于保护窗（它是窗内最老的一条）。
+
+    边界对齐（不拆 pair）：起点若落在某批 tool results 中间，回退到批首并
+    连同其 owning assistant(tool_calls) 一起划入保护窗——否则 head 侧裁剪
+    会把 assistant 裁掉、让受保护的 tool result 变孤儿（_clean_messages
+    随手清掉，保护形同虚设）。起点落在 assistant 上时 head 以完整 pair
+    结尾，无需回退。
+    """
+    turns = 0
+    tool_results = 0
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, dict):
+            start = i
+            continue
+        if m.get("role") == "assistant":
+            turns += 1
+        if _is_tool_result_msg(m):
+            tool_results += 1
+        start = i
+        if (
+            turns >= FRESH_PROTECT_TURNS
+            or tool_results >= FRESH_PROTECT_MAX_TOOL_RESULTS
+        ):
+            break
+    if start > 0 and _is_tool_result_msg(messages[start]):
+        while start > 0 and _is_tool_result_msg(messages[start - 1]):
+            start -= 1
+        prev = messages[start - 1] if start > 0 else None
+        if isinstance(prev, dict) and prev.get("tool_calls"):
+            start -= 1
+    return start
+
+
+def fresh_window_has_tool_output(messages: list[dict]) -> bool:
+    """保护窗内是否存在新鲜工具输出。
+
+    窗内无工具输出 ⇒ 保护空转（没有要护的东西），调用方应维持既有裁剪
+    语义——保护机制只为工具输出而设，不为散文扩权。
+    """
+    return any(_is_tool_result_msg(m) for m in messages[fresh_window_start(messages):])
 
 
 def _safe_content(content) -> str:

@@ -16,7 +16,7 @@ from __future__ import annotations
 # 超时错误不可机检分类。三档语义：
 #   30s   —— 短查询 / 网络（websearch、webfetch）
 #   120s  —— 典型工具面（browse、question、生成类）
-#   600s  —— 重计算 / 严格上限（game 用例、超长 question）
+#   600s  —— 重计算 / 严格上限（game 用例、超长 question、code audit）
 DECLARED_TIMEOUT_S: dict[str, float] = {
     "webfetch": 30.0,
     "websearch": 30.0,
@@ -26,6 +26,10 @@ DECLARED_TIMEOUT_S: dict[str, float] = {
     "generate_image": 120.0,
     "game_run_case": 600.0,
     "game_run_case_main": 600.0,
+    # A2（2026-09-28）：重工具档。未登记时 audit 被僵尸扫
+    # STREAMING_ZOMBIE_TIMEOUT_MS=300s 按 300s 静默上限扫断（game_time
+    # _tool_quiet_cap_ms 只对 declared 工具放宽到 budget+60s）。
+    "request_code_audit": 600.0,
 }
 
 # Hang net while an undeclared tool is in-flight (zombie quiet cap).

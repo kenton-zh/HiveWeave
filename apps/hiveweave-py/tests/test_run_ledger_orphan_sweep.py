@@ -229,9 +229,13 @@ def test_swept_orphan_of_hard_timeout_run_gets_timeout_kind_turn():
 
 
 def test_swept_orphan_of_non_timeout_run_keeps_timeout_kind_null():
-    """反向：startup_sweep / cancel 造成的孤儿**不是**超时，不得误标。
+    """反向：非超时死亡的 run，其孤儿步骤盖 'swept'（A3 批3，2026-09-28）。
 
-    否则 timeout_kind 会变成「所有孤儿都算超时」的噪声位。
+    旧期望是 NULL（「startup_sweep / cancel 造成的孤儿不是超时，不得误标」
+    —— 该约束仍然成立：**不许标 'turn'/'command' 等超时值**）。A3 在此之上
+    补了「被扫断」的专属值 'swept'：修「被扫断步骤与 record_step_end 写下的
+    真失败（status='failed'）共用 error 系终态、九个分类位上不可分」的混同。
+    'swept' 不是超时值 —— 语义是步骤级的「这一行的终态是清扫员写的」。
     """
     fake = _FakeDb()
     fake.seed_run_step("r-restart", "s-restart", "interrupted",
@@ -242,7 +246,7 @@ def test_swept_orphan_of_non_timeout_run_keeps_timeout_kind_null():
         asyncio.run(ledger.create_activation("a1", "wake"))
 
     assert fake.step_status("s-restart")[0] == "error"
-    assert fake.step_timeout_kind("s-restart") is None
+    assert fake.step_timeout_kind("s-restart") == "swept"
 
 
 def test_record_step_end_retries_after_update_failure():

@@ -56,6 +56,17 @@ class RequestCodeAuditParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["appealNotes", "appeal_notes", "appeal"]},
     )
+    author_id: str | None = Field(
+        default=None,
+        alias="authorId",
+        description=(
+            "被审者 id（可选，仅审查池 qa/coordinator/ceo 可用）：审计"
+            "**被审者**的 worktree diff，凭证绑定被审者与其任务——用于平台"
+            "派发的 SYSTEM AUDIT 审计任务（审计者自己不需要 worktree）。"
+            "缺省 = 审计你自己的 worktree（普通成员忽略此参数）。"
+        ),
+        json_schema_extra={"aliases": ["authorId", "author_id", "author"]},
+    )
 
 
 async def _resolve_task_id(project_id: str, agent_id: str) -> str | None:
@@ -102,6 +113,12 @@ def _format_verdict(result: dict) -> ToolResult:
     commit_hash = str(result.get("commit_hash") or "").strip()
     if commit_hash:
         lines.append(f"基于版本: HEAD {commit_hash[:12]}")
+    # T2：截断明示——PASS 与 ISSUES 回执都带（判定与门禁语义不变，只是把
+    # 「审计仅覆盖前 50KB」从静默变成明示）。
+    if result.get("diff_truncated"):
+        from hiveweave.services.code_audit import AUDIT_TRUNCATED_RECEIPT_NOTE
+
+        lines.append(AUDIT_TRUNCATED_RECEIPT_NOTE)
     if result.get("verdict") == "ISSUES":
         top = result.get("top_issues") or []
         if top:
@@ -151,7 +168,17 @@ def _format_verdict(result: dict) -> ToolResult:
     # 既有拓扑（见模块 docstring）。
     from hiveweave.services.code_audit import AUDIT_STATE_READY
 
-    return ToolResult.ok("\n".join(lines), audit_state=AUDIT_STATE_READY)
+    # T2：run_steps 的 **truncated 现成列**覆盖——审计步骤该位 = 输入 diff
+    # 在 50KB 帽截断（非 1MB 输出帽：审计回执很短，不会触输出帽；列契约的
+    # 审计侧扩展，此处即注释真相源）。经 ToolResult extra →
+    # agents/streaming.py 的 result.get("truncated") 落库；未截断不传键
+    # ⇒ 列保持 NULL（「未判定」语义不变，不回填 0）。
+    truncated_extra: dict = (
+        {"truncated": True} if result.get("diff_truncated") else {}
+    )
+    return ToolResult.ok(
+        "\n".join(lines), audit_state=AUDIT_STATE_READY, **truncated_extra
+    )
 
 
 def _soft_fail_receipt(result: dict) -> str:
@@ -272,11 +299,15 @@ def _soft_fail_result(result: dict) -> ToolResult:
 # 默认入口。完整裁决见 agents/agent.py::_activation_trigger_fields 注释。
 @tool(
     "request_code_audit",
-    "One-shot second-pass LLM audit of your worktree git diff. "
-    "REQUIRED before submit_task when your cumulative code edits exceed 20 lines. "
-    "Returns VERDICT PASS/ISSUES + top issues; full report persisted to disk. "
-    "The audit runs as a one-shot sub-call. It uses a teammate's currently "
-    "used model when that model differs from yours; otherwise your own model.",
+    "One-shot second-pass LLM audit of a worktree git diff. Two uses: "
+    "(a) audit YOUR OWN worktree (omit authorId) — optional fast path before "
+    "submit_task when your cumulative edits exceed 20 lines (the platform "
+    "otherwise auto-dispatches a SYSTEM AUDIT task on submit); "
+    "(b) reviewers (qa/coordinator/ceo) working a SYSTEM AUDIT task pass "
+    "authorId=<submitter> to audit the submitter's worktree and bind the "
+    "attestation to them. Returns VERDICT PASS/ISSUES + top issues; full "
+    "report persisted to disk. Uses a teammate's currently used model when "
+    "that model differs from the author's; otherwise the author's own model.",
     requires_workspace=False,
     security_level="standard",
 )
@@ -296,18 +327,53 @@ async def request_code_audit_tool(
         )
 
     task_id = params.task_id
+    # T1 审查/审计派单化：authorId = 代审（审计任务的审计者审计**被审者**的
+    # worktree，凭证绑定被审者 + 被审者的任务——submit 门的既有判定原样消费
+    # 该凭证）。仅审查池（qa/coordinator/ceo）可代审；普通成员省略即审计
+    # 自己。id 变更/校验失败一律 runner_failed（审计从未执行）。
+    author_id = agent_id
+    on_behalf = bool(
+        params.author_id and str(params.author_id).strip() != str(agent_id)
+    )
+    if on_behalf:
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.policy import infer_role_family
+
+        try:
+            caller = await OrgService().get_agent(agent_id)
+        except Exception as e:  # noqa: BLE001
+            caller = None
+        if infer_role_family(caller or {}) not in ("qa", "coordinator", "ceo"):
+            return ToolResult.err(
+                "authorId（代审）只对审查池（qa/coordinator/ceo）开放："
+                "普通成员审计自己的 worktree 即可（省略 authorId）。",
+                fact="runner_failed",
+            )
+        author_id = str(params.author_id).strip()
+        try:
+            author_row = await OrgService().get_agent(author_id)
+        except Exception as e:  # noqa: BLE001
+            author_row = None
+        if not author_row:
+            return ToolResult.err(
+                f"authorId not found: {author_id}（copy the full id from the "
+                "SYSTEM AUDIT task payload）.",
+                fact="runner_failed",
+            )
     if not task_id:
         try:
-            task_id = await _resolve_task_id(project_id, agent_id)
+            # 代审且未显式传 taskId：解析**被审者**的当前活动任务（审计任务
+            # 描述要求显式传源任务 id，这里是兜底，防止凭证落空挂不到门上）。
+            task_id = await _resolve_task_id(project_id, author_id)
         except Exception as e:  # noqa: BLE001 — 解析失败降级为 worktree 级审计
-            log.info("request_code_audit.task_resolve_failed", agent_id=agent_id, error=str(e))
+            log.info("request_code_audit.task_resolve_failed", agent_id=author_id, error=str(e))
             task_id = None
     call_llm = getattr(ctx, "review_llm_callback", None) if ctx else None
     oneshot_llm = getattr(ctx, "oneshot_llm_callback", None) if ctx else None
 
     try:
         result = await _code_audit.run_code_audit(
-            project_id, agent_id, task_id,
+            project_id, author_id, task_id,
             call_llm=call_llm,
             oneshot_llm=oneshot_llm,
             appeal_notes=(params.appeal_notes or "").strip() or None,

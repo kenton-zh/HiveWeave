@@ -127,6 +127,60 @@ def _build_charter_dict(body: ProjectCreate) -> dict:
     }
 
 
+# T4（78 实验定论）：orgPattern 推荐启发式的关键词表（匹配前去空白 + 小写）。
+# solo 信号 = 规格文本明写单交付面形态；多面信号优先级更高 —— 推荐错 solo
+# 的组织税已由 D77 实证（六模块组织图做单文件），漏推荐只是少个提示，故保守。
+_SOLO_SIGNAL_KEYWORDS: tuple[str, ...] = (
+    "单个html",
+    "单文件",
+    "单一交付面",
+    "一个页面",
+    "singlefile",
+    "singlehtml",
+    "singlepage",
+)
+_MULTI_SURFACE_KEYWORDS: tuple[str, ...] = (
+    "多交付面",
+    "多服务",
+    "多个服务",
+    "多页面",
+    "微服务",
+    "microservice",
+)
+
+
+def _recommend_org_pattern(
+    charter_vision: str | None, charter_goals: str | None, explicit: str | None
+) -> tuple[str | None, str]:
+    """按 charter 规格文本启发式推荐组织范式（只进响应，不改创建行为）。
+
+    78 实验定论：单规格项目「solo 单兵 + 锚定自查」≈ 组织版 1/5 时间、
+    85-90% 保真。调用方显式传 orgPattern/orgParadigm 时完全尊重——返回
+    None 推荐 + 说明 reason，不覆盖调用方选择。
+
+    Returns:
+        (orgPatternRecommended, orgPatternRecommendReason) 二元组；
+        recommended 为 None 表示不推荐（reason 说明原因/提示）。
+    """
+    if (explicit or "").strip():
+        return None, "调用方已显式指定 orgPattern，完全尊重调用方选择，未做推荐"
+    text = re.sub(
+        r"\s+", "", f"{charter_vision or ''} {charter_goals or ''}"
+    ).lower()
+    if any(k in text for k in _MULTI_SURFACE_KEYWORDS):
+        return None, (
+            "规格文本命中多交付面/多服务关键词：不适合 solo 单兵范式"
+            "（仅提示，创建行为不变）"
+        )
+    if any(k in text for k in _SOLO_SIGNAL_KEYWORDS):
+        return "solo", (
+            "规格文本命中单文件/单一交付面关键词：按 78 实验定论推荐 "
+            "solo 单兵 + 锚定自查（约组织版 1/5 时间、85-90% 保真；"
+            "仅推荐，创建行为不变）"
+        )
+    return None, "规格文本无单文件/多交付面信号，未做推荐"
+
+
 def _probe_existing_project_id(ws: Path) -> str | None:
     """探测 workspace 是否已含可收养的 per-project 数据（跨机搬迁场景）。
 
@@ -1098,12 +1152,22 @@ async def create_project(body: ProjectCreate) -> dict:
             # P2: 请求体中的 description/charter/language 等字段在收养路径被保留旧值忽略
             ignored_fields=["charter", "description", "language", "orgParadigm"],
         )
+        # 收养路径沿用原项目组织数据，请求体的 charter 不生效，推荐无意义
+        org_pattern_recommended: str | None = None
+        org_pattern_reason = "收养路径沿用原项目组织数据，未做推荐"
     else:
         log.info("project_created", project_id=project_id, name=body.name, workspace=str(ws))
+        # T4：orgPattern 推荐显式化（78 实验定论）——只进响应供前端/用户参考，
+        # 不改创建行为本身（仍建 CEO+HR）；显式传 orgPattern 时完全尊重。
+        org_pattern_recommended, org_pattern_reason = _recommend_org_pattern(
+            body.charterVision, body.charterGoals, body.orgPattern or body.orgParadigm
+        )
     return {
         "project": _project_response(row_dict),
         "mainAgentId": agent_ids[0] if agent_ids else None,
         "adopted": adopted_project_id is not None,
+        "orgPatternRecommended": org_pattern_recommended,
+        "orgPatternRecommendReason": org_pattern_reason,
     }
 
 

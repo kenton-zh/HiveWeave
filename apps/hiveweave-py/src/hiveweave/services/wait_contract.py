@@ -447,6 +447,11 @@ async def _conn(project_id: str) -> aiosqlite.Connection:
 # task_transition 唤醒事件都不会再来（没有后继转换），等待即僵尸。
 _TASK_WAIT_SATISFIED_STATUSES = frozenset({"approved", "closed", "cancelled"})
 
+#: 公开别名（T22-②，S16）：「[等待解除]」类通知的**解除声明**必须以此集合
+#: 为事实判据 —— 只有任务真的到达终态，才允许对等待者说「已解除/不必再等」；
+#: 非终态转换只能说「状态变更」。单一事实源仍在本文件，跨模块引用用本别名。
+TASK_WAIT_SATISFIED_STATUSES = _TASK_WAIT_SATISFIED_STATUSES
+
 
 async def _short_circuit_satisfied_task_waits(
     project_id: str, task_waits: list[dict]
@@ -1398,14 +1403,27 @@ UPSTREAM_RECOVERY_KIND = "timer"
 UPSTREAM_RECOVERY_PHASE = "upstream_recovery"
 """重醒等待行的 phase 标记（agent_waits.phase），DB 级可机检。"""
 
-UPSTREAM_RECOVERY_ATTEMPTS = 3
-"""自动重醒封顶次数；耗尽后停止重醒，交人工（ORG_ESCALATION）。"""
+UPSTREAM_RECOVERY_ATTEMPTS = 6
+"""自动重醒封顶次数；耗尽后停止重醒，交人工（ORG_ESCALATION）。
 
-UPSTREAM_RECOVERY_DELAYS_MS = (60_000, 180_000, 600_000)
-"""退避阶梯（第 1/2/3 次死亡的重醒延迟）。"""
+T33.3（2026-09-29）：3 → 6 可续期——无界骑乘（T33）把单次骑乘窗拉长到
+turn 级（数百秒），实测波次天气（单波 1.5-3min、间隔 10-20min）下 3 次
+封顶经常骑不完一整段波次就交人工。每次续期幂等（pending_exists 不叠排
++ 窗口内计数去重），上限 6 次。
+"""
 
-UPSTREAM_RECOVERY_WINDOW_MS = 30 * 60 * 1000
-"""attempt 计数窗：窗口内的重醒行（含已清除）计入退避档位，窗外归零。"""
+UPSTREAM_RECOVERY_DELAYS_MS = (60_000, 180_000, 600_000, 600_000, 600_000, 600_000)
+"""退避阶梯（第 1-6 次死亡的重醒延迟；第 3 次起饱和 600s）。"""
+
+UPSTREAM_RECOVERY_WINDOW_MS = 120 * 60 * 1000
+"""attempt 计数窗：窗口内的重醒行（含已清除）计入退避档位，窗外归零。
+
+⚠ 必须覆盖封顶次数的全部跨度，否则会漏计数造成**无限唤醒循环**：
+6 次 × (600s 延迟 + 一次失败 run 的存活时长，T33 骑乘下可达数百秒)
+≈ 1-2h；旧值 30min 在第 5/6 次续期时早先的行已出窗，attempt 计数回落
+⇒ 永远到不了 exhausted。120min 按最坏节奏（每次失败 run 活 ~10min）
+验算留有余量；窗外归零的「新事故新预算」语义保持不变。
+"""
 
 UPSTREAM_RECOVERY_NOTE_TAG = "[wakeup_reason=upstream_recovery"
 """note 标记前缀 —— game_time._process_wait_contracts 解析出
@@ -1476,15 +1494,15 @@ async def schedule_upstream_recovery_wait(
     run_id: str = "",
     now_ms: int | None = None,
 ) -> dict:
-    """给死于上游错误的 agent 排一次 durable 自动唤醒（幂等、封顶 3 次）。
+    """给死于上游错误的 agent 排一次 durable 自动唤醒（幂等、封顶 6 次，可续期）。
 
     返回 dict：
     - ``{"scheduled": True, "attempt": n, "delay_ms": d, "wake_at": ts,
       "wait_id": id}`` —— 已插入等待行；
     - ``{"scheduled": False, "reason": "pending_exists"}`` —— 已有未触发
-      的重醒等待（不叠排，保留最早一次）；
+      的重醒等待（不叠排，保留最早一次；即每次续期的幂等保证）；
     - ``{"scheduled": False, "exhausted": True, "attempt": n}`` —— 窗口内
-      已耗尽 3 次，调用方应升级人工（不再排）。
+      已耗尽 6 次，调用方应升级人工（不再排）。
 
     只 INSERT 单行，**不清**该 agent 既有等待（与 replace_waits 的全清
     语义刻意不同——死亡不该抹掉它上一轮的合法停泊）。

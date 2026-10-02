@@ -114,6 +114,100 @@ SANDBOX_TEMP_GUIDE = (
     "the same reused temp directory."
 )
 
+# ── 工具描述常量（B6 契约单源化：缺口 19）───────────────────────
+# TOOL_PARAM_SCHEMAS（executor.py 手写层）与 @tool 注册处对同一工具的描述
+# 此前是两份各自漂移的文本（双 owner）。本批起：**最终描述文本以这里的
+# 常量为唯一 owner** —— @tool 注册处引用常量，executor 手写条目 import
+# 同一常量。改 bash 家族的工具契约只改这里。
+# （SANDBOX_TEMP_GUIDE 只挂在 pwsh 常量上：bash 的模型可见面此前就没带它，
+#  本批不扩写 bash 契约 —— 行为不变。）
+
+BASH_TOOL_DESCRIPTION = (
+    "Execute a shell command and return stdout/stderr. Each call runs "
+    "in a fresh shell: cwd, variables, and functions do not persist — "
+    "do not `cd` expecting the next call to stay there (cwd is your "
+    "workspace). Check `Exit code: N` on every result before moving "
+    "on. Long output is truncated to head+tail; the full text is "
+    "saved and the path is reported. Windows: without the sandbox "
+    "Git Bash (`bash -c`) runs it; under the ACL sandbox (the "
+    "default) the command is actually executed by **pwsh**, with a "
+    "**narrow auto-translation** applied first for two closed sets — "
+    "a trailing `| head/-n N` or `| tail/-n N` or `| wc -l` pipe tail, "
+    "and a whole-command `head -N f` / `tail -N f` / `wc -l f`. "
+    "Other unix-only commands (`grep`, `sed`, `awk`, `xargs`, `cut`, "
+    "`find`, `touch`, `which`, `sort -u`, `echo -e`, …) are "
+    "rejected up front with the pwsh equivalent — rewrite it as "
+    "suggested, or call the `pwsh` tool and write PowerShell directly "
+    "(same permissions as bash). Plain non-unix commands (git, "
+    "python, uv, node, npm, pip) run fine. Note: python3 does not "
+    "exist here — use python. "
+    "Prefer `uv run python` (bare `python` may be missing). Never "
+    "invent `/workspace` or strip backslashes (`D:PC_AI...` is "
+    "invalid). "
+    "Commands may be blocked outright (self-destructive `rm -rf /`, "
+    "sensitive files like `.env`/`*.pem`/`id_rsa`, or the "
+    "`.hiveweave` system dir) — treat `blocked=true` as a hard "
+    "denial, read the reason, and change approach rather than retry "
+    "variations. On sandboxed Windows hosts `.hiveweave/env.sh` is "
+    "NOT sourced (bash syntax is incompatible with the pwsh/cmd "
+    "shell) — set per-process env inside your command via PowerShell "
+    "(`$env:VAR='v'; <cmd>`) or use start_dev_server's `env` param. "
+    "Set `background=true` for long scripts/tests: the call returns "
+    "immediately with `waiting_on` (job id `bg-bash-…`). Then stop "
+    "issuing tool calls — the platform settles the turn when you stop "
+    "(park explicitly with `wait_on(refs)` using that list); do not "
+    "poll. "
+    "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
+    "until done, `job_kill`, or project stop. Do not use "
+    "`background=true` for `vite` / `npm run dev` / `uvicorn` / "
+    "`python -m app.server` / `http.server` / `npx serve` — "
+    "long-running servers never finish, so waiting_on would never "
+    "fire. They are auto-registered "
+    "(tracked, killable via `stop_dev_server`); prefer "
+    "`start_dev_server`. Do not append `&` on a foreground "
+    "command. Default false keeps stdout in this turn. "
+    "This tool stays in YOUR workspace. Project-root / MAIN QA: "
+    "bash_main. "
+    # 批7 提示词瘦身（2026-09-28）：pwsh 独有知识从 prompts/executor.py 的
+    # 方言段迁来工具描述（唯一 owner = 工具 schema 通道，与代码同 commit）。
+    "Under pwsh, judge an external command's success by "
+    "`$LASTEXITCODE`, never `if (<command>)`: a quiet `git ...` prints "
+    "nothing whether it succeeds or fails, so `if (git cat-file -e ...)` "
+    "is always false. Run the command, then test `$LASTEXITCODE -eq 0` "
+    "in the next statement (cmdlets like Test-Path return objects and "
+    "can go in `if` directly)."
+)
+
+BASH_MAIN_TOOL_DESCRIPTION = (
+    "Same as bash, but cwd is the PROJECT ROOT (shared MAIN), not your "
+    "worktree. Use for milestone VERIFY tests and anything that must see "
+    "merged HEAD. Slice unit tests stay on bash."
+)
+
+# pwsh 的 command 属性描述（方言入参契约）——bash 与 pwsh 共用 BashParams，
+# 唯一字段级差别就是这条 command 描述，故也在这里单源。
+PWSH_COMMAND_DESCRIPTION = (
+    "The PowerShell command to execute. A narrow auto-translation "
+    "handles two closed sets first (`| head/-n N` / `| tail/-n N` / "
+    "`| wc -l` pipe tail, and whole-command `head -N f` / "
+    "`tail -N f` / `wc -l f`); `python3` / `pip3` (with or without "
+    "`.exe`) are rewritten to `python` / `pip`; everything else "
+    "reaches pwsh verbatim. Use $env:NAME for environment "
+    "variables and the & call operator for quoted programs: "
+    "& \"python\" \"script.py\"."
+)
+
+PWSH_MAIN_TOOL_DESCRIPTION = (
+    "Same as pwsh, but cwd is the PROJECT ROOT (shared MAIN), not your "
+    "worktree. Use for milestone VERIFY tests and anything that must see "
+    "merged HEAD. Slice unit tests stay on pwsh. "
+    # P1-8a ③：本描述**整体覆盖**了 pwsh 的 description ⇒ 不继承方言契约
+    # （DB 实测 pwsh_main 上确有 1 次方言拒绝）—— 至少把这一句带上。
+    "Dialect: PowerShell 7 (not bash) — unix-only commands are rejected "
+    "up front; python3 / pip3 are normalized to python / pip for you "
+    "(there is no python3 here), but prefer `uv run python`."
+)
+
 # B-1 P1-1 ②：测试类命令 + 权限类失败 → 追加"可写锚点"hint（bash.py 失败输出增强）。
 _TEST_CMD_RE = re.compile(
     r"\b(?:pytest|py\.test|vitest|jest|mocha|node\s+test|node\s+--test|"
@@ -762,6 +856,36 @@ def _maybe_append_node_isolation_hint(command: str, error_msg: str) -> str:
     return error_msg + NODE_TEST_ISOLATION_NOTE
 
 
+# ── T35（D85 实测）：spawn 类 EPERM ⇒ 一次性交底 Windows 沙箱 spawn 边界 ──
+#
+# 实测（D85）：npm install / node --test 的子进程 spawn 被 Windows 受限令牌拦
+# （EPERM），回执只有 node 报错本体 ⇒ agent 烧 3+ 轮自行摸边界（cmd.exe shim
+# 被拦 / node 直跑放行 / 子进程 spawn 全拦）。命中即把边界与三条出路一次说掉。
+# 判据复用 _SPAWN_EPERM_RE（spawn 痕迹与 EPERM 的邻近双观测，避开文件锁型
+# EPERM 的误诊——见其注释）；只看回执 error（execute_bash 的 error_msg 已并入
+# stdout/stderr tail），与命令文本无关 ⇒ 不 gate command。
+_SPAWN_EPERM_PRESCRIPTION_MARK = "[Windows sandbox spawn boundary]"
+_SPAWN_EPERM_PRESCRIPTION = (
+    "\n\n" + _SPAWN_EPERM_PRESCRIPTION_MARK + " Windows 沙箱拦截子进程 spawn："
+    "cmd.exe/.cmd 脚本（npm/pnpm 等 shim）与沙箱内子进程均不可用；"
+    "直接调用目标 exe（node.exe/python.exe）不受影响；"
+    "依赖安装请用平台白名单通道或 vendor 本地文件。"
+)
+
+
+def _maybe_append_spawn_eperm_hint(command: str, error_msg: str) -> str:
+    """spawn 痕迹 + EPERM ⇒ 追加"Windows 沙箱 spawn 边界"处方（幂等）。
+
+    幂等：同回执已带处方（mark 在场）不重复追加——链上的其他提示（node
+    隔离 / 锚点）可能先改写过 error_msg，本函数可能被喂进已含处方的文本。
+    """
+    if not error_msg or _SPAWN_EPERM_PRESCRIPTION_MARK in error_msg:
+        return error_msg
+    if not _SPAWN_EPERM_RE.search(error_msg):
+        return error_msg
+    return error_msg + _SPAWN_EPERM_PRESCRIPTION
+
+
 # ── 内联多行脚本的转义失败 ⇒ 落盘后再跑（处方）────────────────────
 #
 # 失败签名（实测两类）：把**多行脚本**内联进 `node -e "<…>"`，shell 重新转义时
@@ -811,7 +935,8 @@ def _maybe_append_inline_eval_hint(command: str, error_msg: str) -> str:
 
 
 def _maybe_append_test_hints(command: str, error_msg: str) -> str:
-    """shell 失败后的处方**唯一链**（顺序：可写锚点 → node 管道边界 → 内联脚本）。
+    """shell 失败后的处方**唯一链**（顺序：可写锚点 → node 管道边界 → spawn
+    EPERM 边界 → 内联脚本）。
 
     ⚠ 链只能有一份：两个调用点（`execute_bash` / `run_command` 的错误出口）都走
     这里 —— 否则加第三条提示时又会长成"每处各列一份清单"（本仓在事实位白名单上
@@ -820,8 +945,11 @@ def _maybe_append_test_hints(command: str, error_msg: str) -> str:
     """
     return _maybe_append_inline_eval_hint(
         command,
-        _maybe_append_node_isolation_hint(
-            command, _maybe_append_test_anchor_hint(command, error_msg)
+        _maybe_append_spawn_eperm_hint(
+            command,
+            _maybe_append_node_isolation_hint(
+                command, _maybe_append_test_anchor_hint(command, error_msg)
+            ),
         ),
     )
 
@@ -3237,24 +3365,32 @@ class BashParams(BaseModel):
         ),
         json_schema_extra={"aliases": ["cmd", "run"]},
     )
+    # llm_name：钉住 LLM 可见 property 正名 —— 别名 timeoutMs 含大写，会被
+    # base._llm_prop_name 选成键名（与手写层历史键漂移）；executor 的
+    # _schema_fields_from_pydantic 认这个哨兵。
     timeout: int = Field(
         default=TOOL_DEFAULT_TIMEOUT_MS["bash"],
         ge=5000,
         le=600000,
         description=(
-            "Foreground only (5s–10min). Ignored when background=true. "
-            "Default: 600000 (10min). Max: 600000 (10 min). Values 1-600 "
-            "are treated as seconds (e.g. 30 = 30s). The executor kills "
-            "the command on expiry."
+            f"Foreground only (5s–10min). Ignored when background=true. "
+            f"Default: {TOOL_DEFAULT_TIMEOUT_MS['bash']} ms (10 min). "
+            "Max: 600000 (10 min). Values 1-600 are treated as seconds "
+            "(e.g. 30 = 30s). The executor kills the command on expiry."
         ),
-        json_schema_extra={"aliases": ["timeout_ms", "timeoutMs"]},
+        json_schema_extra={
+            "aliases": ["timeout_ms", "timeoutMs"],
+            "llm_name": "timeout",
+        },
     )
     background: bool = Field(
         default=False,
         description=(
             "Run off the org turn and return a job id immediately. "
-            "No timeout. Then commit_turn(waiting) with waiting_on; "
-            "do not poll. Woken with [BASH DONE]/[BASH FAILED]. "
+            "No timeout. Then stop issuing tool calls — the platform "
+            "settles the turn when you stop (or park explicitly with "
+            "wait_on(refs) on the returned waiting_on); do not poll. "
+            "Woken with [BASH DONE]/[BASH FAILED]. "
             "Stop with job_kill. Default false keeps stdout in this turn. "
             "Do not use for vite / npm run dev / uvicorn / http.server — "
             "servers never finish (waiting_on would never fire)."
@@ -4099,28 +4235,9 @@ async def _bash_background(
 
 @tool(
     "bash",
-    "Execute a shell command in YOUR workspace (worktree if you have one). "
-    "Fresh shell each call (cwd does not persist). Check Exit code: N. "
-    "Project-root tests / MAIN QA: use bash_main, not this tool. "
-    "Test runs matching test_/verify_/check_ patterns auto-issue a "
-    "test_run attestation; for custom validation scripts with other "
-    "names pass testEvidence=true to force the attestation (exit 0 = "
-    "green). Long scripts: background=true returns waiting_on — then "
-    "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]. "
-    "Stop with job_kill. Windows: under the sandbox your command is actually "
-    "run by pwsh, with a **narrow auto-translation** applied first for two "
-    "closed sets (a trailing `| head/-n N` or `| tail/-n N` or `| wc -l` pipe "
-    "tail, and a whole-command `head -N f` / `tail -N f` / `wc -l f`). "
-    "Everything else unix-only is **not** translated. "
-    "unix-only commands (head/tail/grep/wc/sed/awk/xargs/cut/find/touch/which/"
-    "sort -u/echo -e…) fast-fail with the pwsh equivalent; rewrite as "
-    "suggested or call the `pwsh` tool for PowerShell semantics. Plain "
-    "non-unix commands (git, python, uv, node, npm, pip) run fine. "
-    "Prefer uv run python. Do not background=true for vite / npm run dev / "
-    "uvicorn / http.server — servers never finish, so waiting_on never "
-    "fires; prefer start_dev_server. Do not append & on a foreground "
-    "command."
-    + SANDBOX_TEMP_GUIDE,
+    # B6 单源：唯一 owner 是上方 BASH_TOOL_DESCRIPTION（executor 手写条目
+    # import 同一常量）——此处不再维护第二份文本。
+    BASH_TOOL_DESCRIPTION,
     requires_workspace=True,
     security_level="shell",
 )
@@ -4411,9 +4528,11 @@ PWSH_TOOL_DESCRIPTION = (
     "retry variations.\n"
     "- Long output is truncated to head+tail; the full text is saved and the "
     "path is reported.\n"
-    "Long scripts: background=true returns waiting_on — then "
-    "commit_turn(waiting); woken with [BASH DONE] / [BASH FAILED]; stop with "
-    "job_kill. Do not use background=true for vite / npm run dev / uvicorn / "
+    "Long scripts: background=true returns waiting_on — then stop "
+    "issuing tool calls (the platform settles the turn when you stop, "
+    "or park explicitly with wait_on(refs)); woken with [BASH DONE] / "
+    "[BASH FAILED]; stop the job with job_kill. Do not use "
+    "background=true for vite / npm run dev / uvicorn / "
     "http.server (servers never finish, so waiting_on never fires) — prefer "
     "start_dev_server. Do not append & on a foreground command. "
     "Project-root tests / MAIN QA: use pwsh_main."
@@ -4448,10 +4567,8 @@ def _with_cwd_note(result: ToolResult, note: str) -> ToolResult:
 
 @tool(
     "bash_main",
-    "Execute a shell command at the PROJECT ROOT (shared MAIN), not your "
-    "worktree. Same params as bash. Use this for milestone VERIFY tests, "
-    "MAIN git/log, or anything that must see merged HEAD. Your own slice "
-    "unit tests stay on bash (worktree). Platform does not rewrite bash cwd.",
+    # B6 单源：与 executor 的 bash_main 派生条目共用同一常量。
+    BASH_MAIN_TOOL_DESCRIPTION,
     requires_workspace=True,
     security_level="shell",
 )
@@ -4472,11 +4589,8 @@ async def bash_main_tool(
 
 @tool(
     "pwsh_main",
-    "Execute a PowerShell command at the PROJECT ROOT (shared MAIN), not "
-    "your worktree. Same params as pwsh. Use this for milestone VERIFY "
-    "tests, MAIN git/log, or anything that must see merged HEAD. Your own "
-    "slice unit tests stay on pwsh (worktree). Platform does not rewrite "
-    "pwsh cwd.",
+    # B6 单源：与 executor 的 pwsh_main 派生条目共用同一常量。
+    PWSH_MAIN_TOOL_DESCRIPTION,
     requires_workspace=True,
     security_level="shell",
 )

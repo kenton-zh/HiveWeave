@@ -1,7 +1,7 @@
 """Chat endpoints (contract 19, group 6 + 7).
 
 契约 19: Chat — 发送 + 历史 + 未读 + 收件箱 + 暂停/恢复 + 重置 + 解析模型 + SSE 流式
-- POST   /api/chat                          触发 agent 聊天（含专家命令路由 + busy 重试）
+- POST   /api/chat                          触发 agent 聊天（含专家命令路由；busy 入队不拒收，T14）
 - GET    /api/chat/history/{agentId}        历史消息（UI：分栏窗口，非混合 100）
 - GET    /api/chat/unread/{agentId}         未读背景消息
 - POST   /api/chat/mark-read                批量标记已读
@@ -58,9 +58,6 @@ _EXPERT_ROLE_MAP = {
     "audit": "security_auditor",
     "perf": "web_perf_auditor",
 }
-
-#: busy 重试 sleep（契约 19 特别流程 2）
-_BUSY_RESET_SLEEP = 0.5
 
 
 # ── SSE 流式事件总线 ─────────────────────────────────────────
@@ -183,7 +180,8 @@ async def send_chat(body: ChatSendBody) -> dict:
     """触发 agent 聊天。
 
     契约 19 特别流程 1: 专家命令路由（/review /test /audit /perf）。
-    契约 19 特别流程 2: busy 重试（force_reset + sleep 500ms + 重试 1 次）。
+    T14 语义: busy 一律入队（返回 {ok, queued: true}，消息经 inbox 队列
+    在 agent 空闲后投递）；409 仅保留 paused（带 Retry-After 轮询建议）。
     """
     agent_id = body.agentId
     message = body.message
@@ -200,7 +198,6 @@ async def send_chat(body: ChatSendBody) -> dict:
     from hiveweave.services.off_duty import (
         is_agent_off_duty,
         send_off_duty_auto_reply,
-        OFF_DUTY_REPLY,
     )
 
     if await is_agent_off_duty(agent_id):
@@ -224,7 +221,7 @@ async def send_chat(body: ChatSendBody) -> dict:
             "ok": True,
             "userMessageId": user_msg["id"],
             "offDuty": True,
-            "reply": OFF_DUTY_REPLY,
+            "reply": asst["content"],  # 与落库/流式同源（T13 platform-notice 前缀）
             "assistantMessageId": asst["id"],
         }
 
@@ -234,23 +231,43 @@ async def send_chat(body: ChatSendBody) -> dict:
         raise HTTPException(status_code=404, detail="Agent not found")
     agent, config = started
 
-    # 3. BUG-036: 先检查 busy 再保存消息，避免 orphan 消息
+    # 3. 保存用户消息（busy 入队分支共用；先落库再触发，BUG-036 口径）
+    async def _save_web_user_msg() -> dict:
+        return await _chat_msg.save_message(
+            {
+                "agent_id": agent_id,
+                "role": "user",
+                "content": message,
+                "is_streaming": False,
+                "is_read": True,
+                "images": body.images,
+                "metadata": {"source": "web"},  # REST 面统一 web 口径（原 user，381dbe5 P1 备忘）
+            }
+        )
+
+    # 3a. T14 对齐：busy 一律入队，不再 409 拒收。与三端共用入口
+    #     deliver_user_message 的 busy 语义逐字一致：存 chat_messages +
+    #     InboxService 排队（from=用户, type=user_message, trusted_platform），
+    #     inbox watcher 在 agent 空闲后随 trigger digest 投递。
+    #     （S15 现场病灶：原实现此处 409，调用方轮询三次才成功。）
+    #     409 只保留不可恢复/需人工介入的 paused（见下）。
     agent_check = agent_manager.get_agent(agent_id)
     if agent_check is not None and agent_check.status.value == "processing":
-        raise HTTPException(status_code=409, detail="Agent is busy")
+        user_msg = await _save_web_user_msg()
+        await _inbox.send_message(
+            from_agent_id="用户",
+            to_agent_id=agent_id,
+            message=message,
+            message_type="user_message",
+            priority="normal",
+            trusted_platform=True,
+        )
+        log.info("chat_busy_enqueued", agent_id=agent_id,
+                 user_message_id=user_msg["id"])
+        return {"ok": True, "queued": True, "userMessageId": user_msg["id"]}
 
     # 4. 保存用户消息
-    user_msg = await _chat_msg.save_message(
-        {
-            "agent_id": agent_id,
-            "role": "user",
-            "content": message,
-            "is_streaming": False,
-            "is_read": True,
-            "images": body.images,
-            "metadata": {"source": "web"},  # REST 面统一 web 口径（原 user，381dbe5 P1 备忘）
-        }
-    )
+    user_msg = await _save_web_user_msg()
 
     # 5. 触发 chat
     # BUG-036: JSON-structured user message — unambiguous sender identification
@@ -268,16 +285,17 @@ async def send_chat(body: ChatSendBody) -> dict:
     if user_images:
         chat_extra["opts"]["images"] = user_images
     result = await agent.chat(user_msg_str, **chat_extra)
-    if result.get("error") == "busy":
-        # force_reset + sleep + 重试
-        await agent.cancel(reason="busy_reset")
-        await asyncio.sleep(_BUSY_RESET_SLEEP)
-        result = await agent.chat(user_msg_str, **chat_extra)
-        if result.get("error") == "busy":
-            raise HTTPException(status_code=409, detail="Agent is busy after reset")
-        return {"ok": True, "userMessageId": user_msg["id"], "reset": True}
+    # T14：chat() 在 PROCESSING 下入内存队并返回 {ok, queued}，不再返回
+    # busy（原 force_reset + 重试分支自单飞改造起即为死代码，已删——
+    # 它若被执行会强杀运行中回合）。唯一残余 409 = paused。
     if result.get("error") == "paused":
-        raise HTTPException(status_code=409, detail="System is paused")
+        # 可恢复但需人工（resume）；Retry-After 是轮询节奏建议
+        # （调用方可轮询 GET /api/chat/paused），非恢复时间承诺。
+        raise HTTPException(
+            status_code=409,
+            detail="System is paused",
+            headers={"Retry-After": "5"},
+        )
     if result.get("held"):
         # 会务 hold（docs/spec/team-meeting.md §前端）：chat() 卡口把消息
         # 原样入队保留（散会回岗随普通 trigger 消化），REST 返回结构化
@@ -293,7 +311,7 @@ async def send_chat(body: ChatSendBody) -> dict:
             "ok": True,
             "userMessageId": user_msg["id"],
             "offDuty": True,
-            "reply": OFF_DUTY_REPLY,
+            "reply": asst["content"],  # 与落库/流式同源（T13 platform-notice 前缀）
             "assistantMessageId": asst["id"],
         }
     if not result.get("ok"):

@@ -303,6 +303,29 @@ def build_waiting_on(
 
 
 def next_action_waiting(waiting_on: list[dict[str, str]]) -> str:
+    # T16 残尾尾巴：挂起话术按模式分流（单点修 = bash/subagent 两个消费
+    # 方双修）。auto 下合法挂起 = wait_on，且 kind 枚举只有
+    # task/agent/fact/user —— build_waiting_on 的 external 项（bg job）
+    # 在 wait_on 里无法表达，过滤后为空 ⇒ 改「直接停止等事件唤醒」话术
+    # （回执本身已承诺 [BASH DONE]/[SUBAGENT DONE] 唤醒，无需 wait_on）。
+    from hiveweave.config import turn_exit_mode
+
+    if turn_exit_mode() == "auto":
+        refs = ", ".join(
+            '{"kind": "%s", "ref": "%s"}' % (w.get("kind", "task"), w.get("ref", "<id>"))
+            for w in waiting_on
+            if w.get("kind") in ("task", "agent", "fact", "user")
+        )
+        if refs:
+            return (
+                f"NEXT ACTION: wait_on(refs=[{refs}]) to park, then stop. "
+                "Do not poll (commit_turn is delisted in this mode)."
+            )
+        return (
+            "NEXT ACTION: just stop when your current step ends — the "
+            "platform wakes you when the background job finishes "
+            "([BASH DONE] / [SUBAGENT DONE]). Do not poll."
+        )
     return (
         f"NEXT ACTION: commit_turn(phase=waiting, waiting_on={waiting_on}). "
         "Do not poll."

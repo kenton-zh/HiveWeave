@@ -76,12 +76,24 @@ async def _build_obligations_snapshot(agent_id: str) -> str:
             if str(o.get("id") or "") not in actionable_ids
         ]
         if not actionable_ids and non_actionable:
+            # T16 残尾尾巴：挂起处方按模式分流（auto ⇒ wait_on）。
+            from hiveweave.config import turn_exit_mode
+
+            if turn_exit_mode() == "auto":
+                park = (
+                    'wait_on(refs=[{"kind": "task|agent|fact|user", '
+                    '"ref": "<id>"}]) to park with an explicit reason'
+                )
+            else:
+                park = (
+                    "commit_turn(phase='blocked', waiting_on=[…]) to park "
+                    "with an explicit reason"
+                )
             return (
                 f"\nYou still hold open work ({len(non_actionable)} item(s), "
                 "e.g. blocked / awaiting arbitration) that is NOT currently "
                 "actionable. Do NOT claim done or 'no obligations'; "
-                "commit_turn(phase='blocked', waiting_on=[…]) to park with "
-                "an explicit reason, or escalate to the creator."
+                f"{park}, or escalate to the creator."
             )
         lines = ["\nCurrent obligations (act directly, do NOT re-poll):"]
         for ob in obligations[:8]:
@@ -141,6 +153,16 @@ async def _poll_waiting_gate_block_async(
         refs = ", ".join(
             f"{w.get('kind')}:{w.get('ref')}" for w in waits[:4]
         )
+        # T16 残尾尾巴：auto 的 waiting disposition 正来自 wait_on ——
+        # 回执不得再教 commit_turn。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            return (
+                f"[wait contract active] disposition={disp}; waits=[{refs}]. "
+                f"Do NOT poll {tool_name} again — just stop and wait for "
+                "event wake (ask_reply / task_transition / timeout)."
+            )
         return (
             f"[wait contract active] disposition={disp}; waits=[{refs}]. "
             f"Do NOT poll {tool_name} again — call commit_turn(phase='waiting') "

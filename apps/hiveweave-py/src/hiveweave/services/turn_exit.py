@@ -1655,6 +1655,22 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         and not wt_git_err
         and not ceo_pending
     ):
+        # T16 三期补漏（qoder 报告 P0-1）：本函数每回合注入（agent.py 5a
+        # 出口条件前置），auto 下不得再教 commit_turn —— 教学残留里暴露面
+        # 最大的一处（每回合必达）。
+        from hiveweave.config import turn_exit_mode
+
+        if turn_exit_mode() == "auto":
+            return (
+                "【本轮出口条件】无未回复 ask / 未完成义务 / 未提交 worktree："
+                "干完后直接停止输出即可（平台自动收口；commit_turn 本模式已下架，"
+                "不要尝试）。\n"
+                "若要挂起等待：wait_on(refs=[{\"kind\": \"task|agent|fact|user\", "
+                "\"ref\": \"<id>\"}]) 登记后停止。\n"
+                "⚠️ 等待某个 agent（kind=agent）必须先在本轮或近 30 分钟内向该 "
+                "agent 发过消息/ask，否则被 WAIT_WITHOUT_ASK 拒绝；等待任务完成"
+                "请用 wait_on(refs=[{\"kind\": \"task\", \"ref\": \"<任务id>\"}])"
+            )
         return (
             "【本轮出口条件】无未回复 ask / 未完成义务 / 未提交 worktree："
             "仅需提交 commit_turn 收尾。\n"
@@ -1664,7 +1680,12 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
             "必须先在本轮或近 30 分钟内向该 agent 发过消息/ask，否则被 "
             "WAIT_WITHOUT_ASK 拒绝；等待任务完成请用 commit_turn(waiting, waiting_on=[task 引用])"
         )
-    items: list[str] = ["必须提交 commit_turn"]
+    from hiveweave.config import turn_exit_mode
+
+    auto = turn_exit_mode() == "auto"
+    items: list[str] = [
+        "干完后直接停止输出（平台自动收口；commit_turn 已下架）" if auto else "必须提交 commit_turn"
+    ]
     if asks:
         bits: list[str] = []
         for a in asks[:4]:
@@ -1709,8 +1730,13 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
                 )
                 items.append(
                     f"⚠ blocked 义务 {len(stale_blocked)} 个（最长 ~{max_h:.0f}h）："
-                    "不得自称「无待办」收尾；用 commit_turn(phase='blocked', "
-                    "waiting_on=[…]) 显式挂账等裁决，或请 creator/上级裁决"
+                    + (
+                        "不得自称「无待办」收尾；用 wait_on 挂起该任务显式挂账"
+                        "等裁决，或请 creator/上级裁决"
+                        if auto
+                        else "不得自称「无待办」收尾；用 commit_turn(phase='blocked', "
+                        "waiting_on=[…]) 显式挂账等裁决，或请 creator/上级裁决"
+                    )
                 )
     if wt_git_err:
         loc = f" at {wt.get('path')}" if wt.get("path") else ""
@@ -1723,18 +1749,29 @@ async def build_exit_contract_hint(agent_id: str, project_id: str) -> str:
         if files:
             extra_bits.append(", ".join(str(f) for f in files[:4]))
         extra = f"（{'；'.join(extra_bits)}）" if extra_bits else ""
-        items.append(f"worktree 有未提交改动{extra}（done_slice 前需 checkpoint）")
+        items.append(
+            f"worktree 有未提交改动{extra}（"
+            + ("停止输出前需 checkpoint" if auto else "done_slice 前需 checkpoint")
+            + "）"
+        )
     if ceo_pending:
         items.append(
             f"项目级待办（done_slice 前须推进）: {len(ceo_pending)} 项"
             f"（{'；'.join(ceo_pending[:3])}）"
         )
     # 与空分支共用同一条 waiting 规则（审计 P2：此前有 ask/义务的 agent
-    # 拿不到 WAIT_WITHOUT_ASK 预告）
-    items.append(
-        "若用 phase='waiting' 等待 agent：须先在本轮或近 30 分钟向该 agent "
-        "发过消息/ask，否则 WAIT_WITHOUT_ASK 拒绝；等待任务用 "
-        "waiting_on=[task 引用]"
-    )
+    # 拿不到 WAIT_WITHOUT_ASK 预告）；话术按模式分流（T16 三期补漏）。
+    if auto:
+        items.append(
+            "若 wait_on 等待 agent：须先在本轮或近 30 分钟向该 agent "
+            "发过消息/ask，否则 WAIT_WITHOUT_ASK 拒绝；等待任务用 "
+            "wait_on(refs=[{\"kind\": \"task\", \"ref\": \"<任务id>\"}])"
+        )
+    else:
+        items.append(
+            "若用 phase='waiting' 等待 agent：须先在本轮或近 30 分钟向该 agent "
+            "发过消息/ask，否则 WAIT_WITHOUT_ASK 拒绝；等待任务用 "
+            "waiting_on=[task 引用]"
+        )
     body = "；".join(f"{i}) {it}" for i, it in enumerate(items, 1))
     return f"【本轮出口条件】{body}"

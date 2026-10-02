@@ -9,13 +9,15 @@ import httpx
 import structlog
 
 from hiveweave.llm.circuit_breaker import CircuitBreaker, circuit_breaker
-from hiveweave.llm.provider import ProviderFactory, provider_factory
-from hiveweave.llm.retry import UPSTREAM_BREAKER_MARKER, RetryHandler
+from hiveweave.llm.failover import RunFailover
+from hiveweave.llm.provider import ProviderConfig, ProviderFactory, provider_factory
+from hiveweave.llm.retry import UPSTREAM_BREAKER_MARKER, RetryHandler, main_ride_budget
 
 from .constants import (
     DEFAULT_PLACEHOLDER,
     HARD_TOTAL_TIMEOUT_S,
     MAX_TOOL_ROUNDS,
+    TURN_TOTAL_TIMEOUT_ERROR_CODE,
 )
 from .context import ContextMixin
 from .errors import CircuitBreakerOpenError
@@ -85,7 +87,17 @@ class Streamer(
     ) -> None:
         self._provider_factory = provider_factory_inst or provider_factory
         self._circuit_breaker = circuit_breaker_inst or circuit_breaker
-        self._retry_handler = retry_handler or RetryHandler()
+        # T33（2026-09-29 设计更新）：主链路默认**波次级无界骑乘**
+        # （main_ride_budget() → None）；env HIVEWEAVE_LLM_RETRY_MAX_RETRIES
+        # >0 = 有界紧急刹车。测试注入 retry_handler 时尊重注入值。
+        self._retry_handler = retry_handler or RetryHandler(
+            max_retries=main_ride_budget()
+        )
+        # T34：per-run（per-实例）故障转移状态机 —— 实例由 agent 每 turn
+        # 新建 ⇒ 状态随 run 结束丢弃，「run 结束/下回合恢复主模型」免清理。
+        # 状态机方法（_failover_state / _effective_provider）住在
+        # HttpStreamMixin 上（测试会裸构造 mixin 直调 _stream_single_round）。
+        self._failover = RunFailover()
         self.max_tool_rounds = max_tool_rounds
         # 初值；每次 stream() 入口重置（同一实例可能因 empty 重试/failover
         # 被连续调用，跨 attempt 不得携带脏标志）
@@ -131,6 +143,12 @@ class Streamer(
         # 每次 stream() 调用重置：empty 重试 / 同层 failover 会复用同一实例
         # 连续调用 stream()，上一 attempt 的改写标志不得泄漏到下一 attempt。
         self._context_rewrote = False
+        # T34：先登记主模型（幂等），再把生效配置换成已切换的备用模型 ——
+        # 同一 run 内 agent 主循环因 transport 错误重开 stream() 时，转移态
+        # 跨调用续用（不回跳主模型）；下回合新实例自然恢复主模型。
+        _fo = self._failover_state()
+        _fo.bind_primary(model_config)
+        model_config = _fo.effective_config(model_config)
         provider = self._provider_factory.create(model_config)
         provider_name = model_config.get("name") or "primary"
         # #22（2026-09-16）：**错误 result 必须带「这次用的哪个 provider/model」**。
@@ -245,6 +263,21 @@ class Streamer(
                 "type": "error",
                 "content": f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
             })
+            # P0-2（qoder 双项目报告）：总超时归因为**上游级失败** —— 喂
+            # 熔断器 / T34 连败计数 / T33 骑乘账（best-effort，不抛；详见
+            # http_stream._feed_turn_total_timeout_gates）。此前本分支只返回
+            # 裸 error result，下游 with_retry 看不见异常 ⇒ 不进重试、不上
+            # 报熔断器、不触发 failover（实测 13,125 次调用仅 5 次）。
+            # 防重复计数边界：轮级失败仍在 _run_round_chain 上报（C10），
+            # 此处只补「整轮兜底超时」这一次独立失败。
+            await self._feed_turn_total_timeout_gates(
+                agent_id=agent_id,
+                provider_name=provider_name,
+                from_model=str(
+                    getattr(provider, "model_name", "") or provider_name
+                ),
+                error_message=f"请求总超时（{HARD_TOTAL_TIMEOUT_S}s）",
+            )
             result = self._error_result("请求总超时", start_time)
             # F7 补出口（TEST_DSH_50/51：真超时+悬挂上 timeout_kind 实测
             # 50% / 0%）。这条是**整轮兜底**超时（外层 wait_for），与工具
@@ -261,6 +294,9 @@ class Streamer(
             # 这里置位是为了日志可分类 + 给上层留判断入口，不代表步骤级已覆盖。
             result["timeout_kind"] = "turn"
             result["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
+            # P0-2：稳定错误码随行（timeout_kind 之外的机检通道，与熔断器
+            # last_error_code 同源；timeout_kind='turn' 语义不动）。
+            result["error_code"] = TURN_TOTAL_TIMEOUT_ERROR_CODE
             return _stamp_error_identity(result)
         except Exception as e:
             await self._circuit_breaker.report_failure(

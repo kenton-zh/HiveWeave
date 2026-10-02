@@ -179,6 +179,24 @@ class Settings(BaseSettings):
     question_unattended_timeout_s: int = 600
     question_wait_cap_s: int = 3600
 
+    # 批3（2026-09-29）：submit 路径逐提交 code_audit 门灰度。
+    #   off（默认）= 拆门：>20 行 diff 不再要求 code_audit 凭证、不铸 SYSTEM
+    #   AUDIT 任务（五次实跑：逐提交 LLM 审计高成本近零信号，S16 退化审计
+    #   冻结全组织 3.5h；审计责任归 QA 里程碑终验）。submitGate 的
+    #   test_run / browse_e2e 等任务级门原样保留。
+    #   on = 回切旧门（T1 派单化路径原样：审计门 + SYSTEM AUDIT 铸造）。
+    # 非法值按 off 处理（见 submit_audit_gate_enabled()），fail-safe 方向
+    # = 新行为（拆门）；回切 = 改 env 重启即可。
+    submit_audit_gate: str = "off"
+
+    # T16 一期灰度（2026-09-29）：回合出口模式。
+    #   legacy（默认）= commit_turn 工具面原样，行为零变化；
+    #   auto = commit_turn 从模型工具面下架，模型自然停止 ⇒ 平台程序化收口
+    #   （exit_gate_check 接缝 hint 循环 / 平台生成 commit），唯一合法中途
+    #   挂起 = wait_on 工具；预算掐断 ⇒ run interrupted + 延续唤醒。
+    # 非法值一律按 legacy 处理（见 turn_exit_mode()）。
+    turn_exit_mode: str = "legacy"
+
     # Attestation max age (ms) — Phase 3
     attestation_max_age_ms: int = 24 * 60 * 60 * 1000
 
@@ -220,6 +238,30 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def turn_exit_mode() -> str:
+    """T16 灰度判据（每次调用现读，测试可 monkeypatch settings 属性）。
+
+    返回 ``"auto"`` 仅当 ``HIVEWEAVE_TURN_EXIT_MODE=auto``（大小写/空白
+    容忍）；其余任何值（含非法值）一律 ``"legacy"`` —— fail-safe 方向是
+    旧行为，灰度回切 = 改 env 重启即可。
+    """
+    raw = str(getattr(settings, "turn_exit_mode", "") or "").strip().lower()
+    return "auto" if raw == "auto" else "legacy"
+
+
+def submit_audit_gate_enabled() -> bool:
+    """submit code_audit 门灰度判据（每次调用现读，测试可 monkeypatch settings）。
+
+    仅 ``HIVEWEAVE_SUBMIT_AUDIT_GATE=on``（大小写/空白容忍）回切旧门
+    （审计要求 + SYSTEM AUDIT 铸造）；其余任何值（含非法值）一律 ``False``
+    = 拆门后的新行为（QA 终局负责审计）。注意 ``tools/tasks/submit.py`` 的
+    工具描述在**导入期**按本判据装配（进程生命周期内不变，与全部
+    ``HIVEWEAVE_*`` 设置同口径：改 env 重启生效）。
+    """
+    raw = str(getattr(settings, "submit_audit_gate", "") or "").strip().lower()
+    return raw == "on"
 
 
 def sqlite_busy_timeout_sql() -> str:

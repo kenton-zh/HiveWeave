@@ -81,7 +81,9 @@ def test_llm_tool_schemas_are_dsh_style_hive_wake() -> None:
     bash = _llm_tool_text("bash")
     assert "fresh shell" in bash.lower()
     assert "Exit code" in bash
-    assert "commit_turn" in bash
+    # T16 二/三期：挂起教学面 = wait_on(refs)（auto/legacy 同文，工具描述
+    # 已不再教 commit_turn 顶层用法——schema 文本 3392/4533 行可证）。
+    assert "wait_on(refs" in bash
     assert "waiting_on" in bash
     assert "[BASH DONE]" in bash
     assert "[BASH FAILED]" in bash
@@ -94,7 +96,7 @@ def test_llm_tool_schemas_are_dsh_style_hive_wake() -> None:
     spawn = _llm_tool_text("spawn_subagent")
     assert "does not see this conversation" in spawn
     assert "[SUBAGENT DONE]" in spawn
-    assert "commit_turn" in spawn
+    assert "wait_on(refs" in spawn
     assert "job_output" not in spawn
 
     edit = _llm_tool_text("edit_file")

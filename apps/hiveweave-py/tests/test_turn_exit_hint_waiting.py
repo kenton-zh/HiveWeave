@@ -15,8 +15,13 @@ from hiveweave.services.turn_exit import build_exit_contract_hint
 
 
 @pytest.mark.asyncio
-async def test_hint_empty_branch_documents_wait_rule(monkeypatch):
-    """无待办时 hint 必须包含 WAIT_WITHOUT_ASK 规则 + phase 用法。"""
+@pytest.mark.parametrize("exit_mode", ["auto", "legacy"])
+async def test_hint_empty_branch_documents_wait_rule(monkeypatch, exit_mode):
+    """无待办时 hint 必须包含 WAIT_WITHOUT_ASK 规则 + 挂起用法（双模式钉死）。"""
+    from hiveweave.config import settings
+
+    monkeypatch.setattr(settings, "turn_exit_mode", exit_mode)
+
     async def _no_asks(_agent_id):
         return []
 
@@ -44,13 +49,22 @@ async def test_hint_empty_branch_documents_wait_rule(monkeypatch):
     )
 
     hint = await build_exit_contract_hint("agent-1", "proj-1")
-    assert "commit_turn" in hint
-    # 修复点 1：不再只说「仅需提交 commit_turn」——必须带 waiting 规则
+    # T16 三期：干净账本分支的收尾话术按模式分流 —— auto ⇒ wait_on 处方
+    # +「commit_turn 已下架」；legacy ⇒ commit_turn 用法 + waiting_on。
+    if exit_mode == "auto":
+        assert "wait_on(refs=" in hint
+        assert "commit_turn" in hint  # 「本模式已下架，不要尝试」的点名
+        assert "waiting_on" not in hint
+        assert "assistant 纯文本不是返回值" not in hint
+    else:
+        assert "commit_turn" in hint
+        # 修复点 1：不再只说「仅需提交 commit_turn」——必须带 waiting 规则
+        assert "waiting_on" in hint
+        # 修复点 2：带 phase 用法示例
+        assert "done_slice" in hint
+        assert "assistant 纯文本不是返回值" in hint
+    # WAIT_WITHOUT_ASK 预告两种模式都要可达（审计 P2）
     assert "WAIT_WITHOUT_ASK" in hint
-    assert "waiting_on" in hint
-    # 修复点 2：带 phase 用法示例
-    assert "done_slice" in hint
-    assert "assistant 纯文本不是返回值" in hint
 
 
 @pytest.mark.asyncio

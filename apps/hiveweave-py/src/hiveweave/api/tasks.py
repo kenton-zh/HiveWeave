@@ -110,9 +110,15 @@ async def _gate_attestation_for_task(
     if await has_valid_waiver(project_id, task.get("id")):
         return
     policy_id = ledger_policy_id(task)
-    needed = required_attestation_kinds(policy_id)
-    from hiveweave.services.code_audit import drop_code_audit_kind_if_soft
+    # T42：flag off ⇒ 任务级 submitGate 政策里的 code_audit kind 结构性剥离
+    # （与 submit preflight 同源同判据）——S19 实测 approve/HTTP 侧仍要
+    # code_audit 的结构性不可满足门在此收口。
+    from hiveweave.services.code_audit import (
+        drop_code_audit_kind_if_soft,
+        strip_code_audit_kind_for_gate,
+    )
 
+    needed = strip_code_audit_kind_for_gate(required_attestation_kinds(policy_id))
     needed, _ = await drop_code_audit_kind_if_soft(
         needed,
         project_id,

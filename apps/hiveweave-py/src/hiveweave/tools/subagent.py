@@ -195,8 +195,9 @@ class SpawnSubagentParams(BaseModel):
     "spawn_subagent",
     "Delegate a self-contained task to a subagent in its own context "
     "(it does not see this conversation). Each spawn returns its own "
-    "waiting_on entry — batch ALL pending entries (spawns + background bash) "
-    "into ONE commit_turn(phase=waiting, waiting_on=[...]). Woken with "
+    "waiting_on entry — cover ALL pending entries (spawns + background bash) "
+    "with ONE wait_on(refs=[...]) and stop (the platform settles the turn "
+    "when you stop). Woken with "
     "[SUBAGENT DONE], [SUBAGENT FAILED], or [SUBAGENT DONE_TRUNCATED]. "
     "DONE_TRUNCATED means the child hit the turn budget before finishing — "
     "its output is UNVERIFIED (the work may not have landed): check the "

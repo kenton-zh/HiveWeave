@@ -23,10 +23,17 @@ extract_usage），并重排三道帽：
    调过 570 的语义见 ``oneshot_total_timeout_s``）。逐事件判定（结构
    属性，不依赖流出现空隙）。到点 = 判死，**不重试**。
    外层（code_audit 的 wait_for）与内层共享同一 env 来源 —— 单一真相。
-3. **重试窗**：语义重定义为「只对连接失败 / 立即拒绝生效」——
+3. **零输出总帽**（T3'，TEST_DSH_78 同款）：``FIRST_BYTE_TOTAL_CAP_S``
+   （env ``HIVEWEAVE_LLM_FIRST_BYTE_TOTAL_CAP_S``，默认 300）—— 从调用
+   开始到首个真实上游字节的墙钟上限（跨重试；排队/退避 sleep 计入）。
+   一个字节都没来的悬挂不许拖满总时长帽：到点 =
+   ``OneshotFirstByteTotalTimeout``（timeout_layer="first_byte_total"），
+   **不重试**；首字节到达即溶解，此后由 idle 帽接管。
+4. **重试窗**：语义重定义为「只对连接失败 / 立即拒绝生效」——
    connect 类异常（未收到任何事件）+ HTTP 429/5xx 立即拒绝可重试
-   ≤1 次；idle / 总时长 / 首 chunk 判死与收到事件后的传输死亡一律不重试
-   （慢而活着不再触发「读超时→整段重发」的 110s 恒死循环）。
+   ≤1 次；idle / 总时长 / 零输出总帽 / 首 chunk 判死与收到事件后的
+   传输死亡一律不重试（慢而活着不再触发「读超时→整段重发」的 110s
+   恒死循环）。
 
 失败归因：**等待超时（窗口内无事件到达）恒归 idle 族**——真沉默就是
 "慢而死了"，即使沉默窗口被剩余预算提前截断（剩余 < idle 帽时到点，
@@ -51,19 +58,23 @@ import httpx
 import structlog
 
 from hiveweave.llm.retry import (
-    MAX_DELAY_MS,
     PermanentError,
     RetryableError,
     classify_http_error,
     is_region_unavailable_error,
     parse_retry_after_ms,
+    retry_max_delay_ms,
     should_retry_exception,
 )
 
 from .constants import (
+    FIRST_BYTE_TOTAL_CAP_S,
     FIRST_CHUNK_TIMEOUT_S,
     HARD_TOTAL_TIMEOUT_S,
     IDLE_TIMEOUT_S,
+    STREAM_SOCKET_CONNECT_TIMEOUT_S,
+    STREAM_SOCKET_POOL_TIMEOUT_S,
+    STREAM_SOCKET_WRITE_TIMEOUT_S,
     _get_llm_semaphore,
 )
 from .sse import parse_sse
@@ -166,6 +177,18 @@ class OneshotTotalTimeout(OneshotTimeoutError):
         super().__init__(message, "total")
 
 
+class OneshotFirstByteTotalTimeout(OneshotTimeoutError):
+    """零输出总帽判死（T3'，TEST_DSH_78 同款，timeout_layer="first_byte_total"）。
+
+    与 OneshotTotalTimeout 的分界：total = 事件仍在流动时预算耗尽（慢而
+    活着）；first_byte_total = 从调用起一个上游字节都没来（含信号量排队/
+    重试/退避全程）—— 悬挂而非慢，多给预算无意义。
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, "first_byte_total")
+
+
 async def stream_oneshot(
     provider: Any,
     messages: list[dict],
@@ -174,9 +197,10 @@ async def stream_oneshot(
     total_timeout_s: float | None = None,
     idle_timeout_s: float | None = None,
     first_chunk_timeout_s: float | None = None,
+    first_byte_total_cap_s: float | None = None,
     temperature: float = 0.3,
 ) -> dict:
-    """单次流式补全：SSE 逐事件消费，idle 看门狗 + 总时长帽双闸。
+    """单次流式补全：SSE 逐事件消费，idle 看门狗 + 总时长帽 + 零输出总帽。
 
     传输形状复用主链路 ``_do_streaming_request``（同步 httpx 跑线程池 +
     queue 推回事件循环 —— Windows 上 asyncio CancelledError 无法中断
@@ -190,6 +214,7 @@ async def stream_oneshot(
     Raises:
         OneshotIdleTimeout: 首 chunk / 事件间隔判死（timeout_layer 随行）。
         OneshotTotalTimeout: 总时长帽判死。
+        OneshotFirstByteTotalTimeout: 零输出总帽判死（T3'）。
         RetryableError / PermanentError: HTTP 状态 / 流中错误 chunk /
             传输异常（经 classify_http_error / should_retry 判定）。
     """
@@ -202,6 +227,15 @@ async def stream_oneshot(
         if first_chunk_timeout_s is not None
         else FIRST_CHUNK_TIMEOUT_S
     )
+    # T3'：零输出总帽 —— 起算点 = 本次调用开始（stream_oneshot_with_retry
+    # 的每次尝试各自拿满帽；帽到点不可重试，故跨尝试零输出墙钟仍被钳住，
+    # 外层总时长帽继续兜底）。首个真实字节到达（got_event）即不再适用。
+    fb_cap = (
+        first_byte_total_cap_s
+        if first_byte_total_cap_s is not None
+        else FIRST_BYTE_TOTAL_CAP_S
+    )
+    fb_deadline = started + fb_cap
 
     body = provider.build_body(
         messages=messages,
@@ -214,9 +248,13 @@ async def stream_oneshot(
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     # Socket read 必须活得比 idle 看门狗久（否则 httpx 先杀，归因失真）；
-    # idle 被 env 调大时 socket 跟涨。
+    # idle 被 env 调大时 socket 跟涨。四元组显式齐全（T3' #2，与主链路
+    # 同一常量源 —— write/pool 60s：大上下文请求体弱网上行不误杀）。
     read_to = httpx.Timeout(
-        read=max(IDLE_TIMEOUT_S, idle_s) + 30.0, connect=10, write=10, pool=10
+        read=max(IDLE_TIMEOUT_S, idle_s) + 30.0,
+        connect=STREAM_SOCKET_CONNECT_TIMEOUT_S,
+        write=STREAM_SOCKET_WRITE_TIMEOUT_S,
+        pool=STREAM_SOCKET_POOL_TIMEOUT_S,
     )
 
     url = provider.build_url()
@@ -290,14 +328,23 @@ async def stream_oneshot(
         finally:
             http_client.close()
 
-    # 信号量在 HTTP 请求级占槽（与主链路同帽）；等待期受总时长帽约束，
-    # 不单独 ping —— oneshot 无 UI 流可喂，超时归因走 total。
+    # 信号量在 HTTP 请求级占槽（与主链路同帽）；等待期受总时长帽**与**
+    # 零输出总帽双重钳制（排队同属零输出墙钟，T3'），不单独 ping ——
+    # oneshot 无 UI 流可喂，超时归因走 total / first_byte_total。
     sem = _get_llm_semaphore()
     try:
         await asyncio.wait_for(
-            sem.acquire(), timeout=max(0.1, deadline - time.monotonic())
+            sem.acquire(),
+            timeout=max(
+                0.1, min(deadline, fb_deadline) - time.monotonic()
+            ),
         )
     except asyncio.TimeoutError:
+        if time.monotonic() >= fb_deadline - 0.1:
+            raise OneshotFirstByteTotalTimeout(
+                f"Oneshot zero-output cap ({fb_cap:g}s wall clock; no byte "
+                "arrived — stuck waiting for LLM semaphore)"
+            ) from None
         raise OneshotTotalTimeout(
             f"Oneshot total timeout ({total_s:.0f}s wall clock; "
             "stuck waiting for LLM semaphore)"
@@ -319,10 +366,15 @@ async def stream_oneshot(
     try:
         while True:
             # idle 看门狗：只等下一个 SSE 事件（首事件前 first_s，之后
-            # idle_s）；总时长帽钳住单次等待上限。
+            # idle_s）；总时长帽钳住单次等待上限；零输出期间再被 T3' 总帽
+            # 钳住（budget_deadline 同款 min()）。
             wait_s = first_s if not got_event else idle_s
             remain_s = deadline - time.monotonic()
             wait_s = min(wait_s, max(0.05, remain_s))
+            if not got_event:
+                wait_s = min(
+                    wait_s, max(0.05, fb_deadline - time.monotonic())
+                )
             try:
                 kind, payload = await asyncio.wait_for(event_q.get(), timeout=wait_s)
             except asyncio.TimeoutError:
@@ -336,6 +388,19 @@ async def stream_oneshot(
                 silent_s = time.monotonic() - last_event_ts
                 cap_s = first_s if not got_event else idle_s
                 if not got_event:
+                    if time.monotonic() >= fb_deadline - 0.05:
+                        # T3'：零输出总帽到点 —— 一个字节都没来的悬挂
+                        # 不许拖满 idle/总帽（跨重试墙钟已有主）。
+                        log.warning(
+                            "oneshot_first_byte_total_timeout",
+                            agent_id=agent_id,
+                            cap_s=fb_cap,
+                            silent_s=round(silent_s, 2),
+                        )
+                        raise OneshotFirstByteTotalTimeout(
+                            f"Oneshot zero-output cap ({fb_cap:g}s wall "
+                            "clock) — upstream never produced a byte"
+                        ) from None
                     log.warning(
                         "oneshot_first_chunk_timeout",
                         agent_id=agent_id,
@@ -503,11 +568,15 @@ async def stream_oneshot(
 
 
 def _retry_backoff_s(exc: BaseException) -> float:
-    """429/503 尊重 Retry-After（帽 MAX_DELAY_MS）；其余小退避 0.5-1s。"""
+    """429/503 尊重 Retry-After（帽随 retry_max_delay_ms，默认 45s）；其余小退避 0.5-1s。
+
+    T33 梯窗参数传导：oneshot 的 Retry-After 帽不再钉死常量，跟随
+    ``HIVEWEAVE_LLM_RETRY_MAX_DELAY_S``（主链路同一真相源）。
+    """
     if isinstance(exc, RetryableError) and getattr(exc, "status", None) in (429, 503):
         retry_after_ms = parse_retry_after_ms(getattr(exc, "headers", None))
         if retry_after_ms is not None:
-            return min(retry_after_ms, MAX_DELAY_MS) / 1000.0
+            return min(retry_after_ms, retry_max_delay_ms()) / 1000.0
     return random.uniform(*_RETRY_BACKOFF_RANGE_S)
 
 
@@ -518,12 +587,17 @@ def _retry_allowed(exc: BaseException) -> bool:
       重发 = 整段生成重来，慢而活着/中途断流都不是重试 trigger；
     - HTTP 429/5xx **立即拒绝**（非 200 分支，流未开口）→ 可重试；
     - connect 类传输异常且流未开口 → 可重试；
-    - idle / 首 chunk / 总时长判死、其他 4xx、内容层错误 → 不重试。
+    - idle / 首 chunk / 总时长 / 零输出总帽判死、其他 4xx、内容层错误
+      → 不重试。
 
     「是否收到事件」由 stream_oneshot 挂在异常上的 ``oneshot_got_event``
     读取（setattr 形式保 mypy 基线，同 partial_usage 惯例）。
     """
-    if isinstance(exc, (OneshotIdleTimeout, OneshotTotalTimeout, PermanentError)):
+    if isinstance(
+        exc,
+        (OneshotIdleTimeout, OneshotTotalTimeout, OneshotFirstByteTotalTimeout,
+         PermanentError),
+    ):
         return False
     if getattr(exc, "oneshot_got_event", False):
         return False
@@ -543,6 +617,7 @@ async def stream_oneshot_with_retry(
     total_timeout_s: float | None = None,
     idle_timeout_s: float | None = None,
     first_chunk_timeout_s: float | None = None,
+    first_byte_total_cap_s: float | None = None,
     temperature: float = 0.3,
     max_retries: int = 1,
 ) -> dict:
@@ -550,6 +625,8 @@ async def stream_oneshot_with_retry(
 
     总时长帽是**跨尝试**的：deadline 在本函数入口一次算定，每次尝试只拿
     剩余预算 —— 重试不可能把总墙钟顶破 ``HIVEWEAVE_CODE_AUDIT_TIMEOUT_S``。
+    零输出总帽（T3'）每次尝试各自武装，但帽到点不可重试（非连接失败类），
+    故零输出墙钟仍被钳住；慢退避重试的累计另由总时长帽兜底。
     """
     started = time.monotonic()
     total_s = total_timeout_s if total_timeout_s is not None else oneshot_total_timeout_s()
@@ -568,6 +645,7 @@ async def stream_oneshot_with_retry(
                 total_timeout_s=remaining,
                 idle_timeout_s=idle_timeout_s,
                 first_chunk_timeout_s=first_chunk_timeout_s,
+                first_byte_total_cap_s=first_byte_total_cap_s,
                 temperature=temperature,
             )
         except (OneshotTimeoutError, PermanentError):

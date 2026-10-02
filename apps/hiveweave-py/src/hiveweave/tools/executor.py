@@ -40,8 +40,31 @@ from hiveweave.services.permission import PermissionService
 from hiveweave.services.roster import RosterService
 from hiveweave.services.skill_registry import SkillRegistryService
 from hiveweave.services.template import TemplateService
-from hiveweave.tools.bash import TOOL_DEFAULT_TIMEOUT_MS
+# B6 契约单源化（缺口 19）：四个重灾工具的描述常量与 pydantic 参数模型
+# 直接 import —— 手写层条目只保留「优先级壳」，文本与字段全部单源。
+# ⚠ 这些模块不能反过来在模块级 import executor（tools/__init__ 先于本文件
+# 完成 bash→executor 的导入链，见仓库 AGENTS.md「File size / split discipline」
+# 同款循环导入纪律）；现状 question/org_tools/tasks.submit 均不反向依赖。
+from hiveweave.tools.bash import (
+    BASH_MAIN_TOOL_DESCRIPTION,
+    BASH_TOOL_DESCRIPTION,
+    PWSH_COMMAND_DESCRIPTION,
+    PWSH_MAIN_TOOL_DESCRIPTION,
+    PWSH_TOOL_DESCRIPTION,
+    TOOL_DEFAULT_TIMEOUT_MS,
+    BashParams,
+)
+from hiveweave.tools.base import ToolDef
+from hiveweave.tools.org_tools import (
+    DISMISS_AGENT_TOOL_DESCRIPTION,
+    DismissAgentParams,
+)
+from hiveweave.tools.question import QUESTION_TOOL_DESCRIPTION, QuestionParams
 from hiveweave.tools.review import execute_review, ReviewLLMCallback
+from hiveweave.tools.tasks.submit import (
+    SUBMIT_TASK_TOOL_DESCRIPTION,
+    SubmitTaskParams,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -61,6 +84,74 @@ APPROVAL_TIMEOUT_S = 120
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 
+def _schema_fields_from_pydantic(model: type[Any]) -> dict:
+    """B6 契约单源化（缺口 19）：从 @tool 的 pydantic 参数模型派生
+    ``TOOL_PARAM_SCHEMAS`` 条目的 ``{properties, required}``。
+
+    手写层不再手写任何字段 —— pydantic 模型是参数契约的唯一 owner。本
+    helper 复用 :meth:`ToolDef.to_llm_schema`（与「无手写条目」时的回退
+    路径同一套派生，property 键取 camelCase 正名），并把 to_llm_schema
+    丢掉的原始模型约束（``items`` / ``minimum`` / ``maximum``）从
+    ``model_json_schema`` 合并回来 —— 切 owner 不许丢信息（B6 红线）。
+    ``aliases`` 保留在条目里：``validate_tool_args`` 的别名解析消费它，
+    ``get_tool_schema_for_llm`` 发给 LLM 前才剥除。``description`` 不经
+    此 helper —— 一律由工具模块的 ``*_TOOL_DESCRIPTION`` 常量提供。
+    """
+    # ToolDef 只用 params_model 派生 schema；execute_fn 传 None 即可。
+    td = ToolDef(
+        name=model.__name__,
+        description="",
+        params_model=model,
+        execute_fn=None,  # type: ignore[arg-type]
+    )
+    llm = td.to_llm_schema()
+    raw_props = model.model_json_schema().get("properties", {})
+    props: dict = {}
+    # to_llm_schema 按 model_fields 顺序产出 property，一一对应；长度守卫
+    # 防 base 实现未来跳字段时 zip 静默错位（导入期 loud-fail 优于错位）。
+    if len(model.model_fields) != len(llm["properties"]):
+        raise ValueError(
+            f"_schema_fields_from_pydantic({model.__name__}): to_llm_schema "
+            f"产出 {len(llm['properties'])} 个 property ≠ "
+            f"{len(model.model_fields)} 个字段 —— base.ToolDef 派生面变了，"
+            "先修对齐再单源化"
+        )
+    for (field_name, info), (public_name, prop) in zip(
+        model.model_fields.items(), llm["properties"].items()
+    ):
+        # json_schema_extra["llm_name"] = 模型侧显式正名：当别名里有
+        # camelCase 拼写（timeoutMs/commitSha）时 base._llm_prop_name 会把
+        # 键选成它，与手写层历史键（timeout/commit）漂移 —— 由模型自己声明。
+        extra = info.json_schema_extra
+        key = extra["llm_name"] if isinstance(extra, dict) and isinstance(
+            extra.get("llm_name"), str
+        ) else public_name
+        # model_json_schema 默认按 Field.alias 键（camelCase），字段名兜底。
+        raw = raw_props.get(field_name) or raw_props.get(key) or {}
+        if "anyOf" in raw:  # Optional[X]：约束在非 null 分支里
+            raw = next((b for b in raw["anyOf"] if b.get("type") != "null"), {})
+        merged = dict(prop)
+        # raw pydantic schema 是类型权威：base._json_type_from_py 对 PEP-604
+        # 的 `X | None`（types.UnionType）有 unwrap 缺口，Optional 字段会错落
+        # "string" 兜底 —— 手写层历来的 boolean/array/object 类型以此恢复。
+        if raw.get("type"):
+            merged["type"] = raw["type"]
+        for constraint in ("items", "minimum", "maximum"):
+            if constraint in raw and constraint not in merged:
+                merged[constraint] = raw[constraint]
+        props[key] = merged
+    return {"properties": props, "required": list(llm.get("required") or [])}
+
+
+# 四个先行工具的字段派生结果（每模型只算一次；条目按需取键）。
+_BASH_FIELDS = _schema_fields_from_pydantic(BashParams)
+_QUESTION_FIELDS = _schema_fields_from_pydantic(QuestionParams)
+_DISMISS_FIELDS = _schema_fields_from_pydantic(DismissAgentParams)
+_SUBMIT_FIELDS = _schema_fields_from_pydantic(SubmitTaskParams)
+from hiveweave.tools.wait_tools import WAIT_ON_TOOL_DESCRIPTION, WaitOnParams
+_WAIT_ON_FIELDS = _schema_fields_from_pydantic(WaitOnParams)
+
+
 # ── Tool parameter schemas ──────────────────────────────────
 # Centralized JSON Schema definitions for every tool. Used for:
 # 1. Sending to LLM (so it knows correct parameter names — no more guessing)
@@ -75,93 +166,11 @@ _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
 TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     "bash": {
-        "description": (
-            "Execute a shell command and return stdout/stderr. Each call runs "
-            "in a fresh shell: cwd, variables, and functions do not persist — "
-            "do not `cd` expecting the next call to stay there (cwd is your "
-            "workspace). Check `Exit code: N` on every result before moving "
-            "on. Long output is truncated to head+tail; the full text is "
-            "saved and the path is reported. Windows: without the sandbox "
-            "Git Bash (`bash -c`) runs it; under the ACL sandbox (the "
-            "default) the command is actually executed by **pwsh**, with a "
-            "**narrow auto-translation** applied first for two closed sets — "
-            "a trailing `| head/-n N` or `| tail/-n N` or `| wc -l` pipe tail, "
-            "and a whole-command `head -N f` / `tail -N f` / `wc -l f`. "
-            "Other unix-only commands (`grep`, `sed`, `awk`, `xargs`, `cut`, "
-            "`find`, `touch`, `which`, `sort -u`, `echo -e`, …) are "
-            "rejected up front with the pwsh equivalent — rewrite it as "
-            "suggested, or call the `pwsh` tool and write PowerShell directly "
-            "(same permissions as bash). Plain non-unix commands (git, "
-            "python, uv, node, npm, pip) run fine. Note: python3 does not "
-            "exist here — use python. "
-            "Prefer `uv run python` (bare `python` may be missing). Never "
-            "invent `/workspace` or strip backslashes (`D:PC_AI...` is "
-            "invalid). "
-            "Commands may be blocked outright (self-destructive `rm -rf /`, "
-            "sensitive files like `.env`/`*.pem`/`id_rsa`, or the "
-            "`.hiveweave` system dir) — treat `blocked=true` as a hard "
-            "denial, read the reason, and change approach rather than retry "
-            "variations. On sandboxed Windows hosts `.hiveweave/env.sh` is "
-            "NOT sourced (bash syntax is incompatible with the pwsh/cmd "
-            "shell) — set per-process env inside your command via PowerShell "
-            "(`$env:VAR='v'; <cmd>`) or use start_dev_server's `env` param. "
-            "Set `background=true` for long scripts/tests: the call returns "
-            "immediately with `waiting_on` (job id `bg-bash-…`). Then "
-            "`commit_turn(phase=waiting)` using that list; do not poll. "
-            "Woken with `[BASH DONE]` / `[BASH FAILED]`. No command timeout "
-            "until done, `job_kill`, or project stop. Do not use "
-            "`background=true` for `vite` / `npm run dev` / `uvicorn` / "
-            "`python -m app.server` / `http.server` / `npx serve` — "
-            "long-running servers never finish, so waiting_on would never "
-            "fire. They are auto-registered "
-            "(tracked, killable via `stop_dev_server`); prefer "
-            "`start_dev_server`. Do not append `&` on a foreground "
-            "command. Default false keeps stdout in this turn. "
-            "This tool stays in YOUR workspace. Project-root / MAIN QA: "
-            "bash_main."
-        ),
-        "properties": {
-            "command": {
-                "type": "string",
-                "aliases": ["cmd", "run"],
-                "description": "The bash command to execute.",
-            },
-            "timeout": {"type": "integer", "aliases": ["timeout_ms", "timeoutMs"],
-                        "description": f"Foreground only (5s–10min). Ignored when background=true. Default: {TOOL_DEFAULT_TIMEOUT_MS['bash']} ms (8 min). Max: 600000 (10 min). Values 1-600 are treated as seconds (e.g. 30 = 30s). The executor kills the command on expiry."},
-            "background": {
-                "type": "boolean",
-                "aliases": ["bg"],
-                "description": (
-                    "Run off the org turn and return a job id immediately. "
-                    "No timeout. Then commit_turn(waiting) with waiting_on; "
-                    "woken with [BASH DONE]/[BASH FAILED]. Stop with "
-                    "job_kill. Default false. Do not use for vite / "
-                    "npm run dev / uvicorn / http.server — servers never "
-                    "finish (waiting_on would never fire)."
-                ),
-            },
-            "taskId": {
-                "type": "string",
-                "aliases": ["task_id"],
-                "description": (
-                    "Optional task id to bind test_run attestation "
-                    "(reviewers: pass the task under review)."
-                ),
-            },
-            "testEvidence": {
-                "type": "boolean",
-                "aliases": ["test_evidence"],
-                "description": (
-                    "Declare this command as test evidence: ALWAYS issue a "
-                    "test_run attestation (exit 0 = green) regardless of "
-                    "command text. Use when running custom validation "
-                    "scripts whose names don't match test_/verify_/check_ "
-                    "patterns (e.g. validate-suite.mjs). Command+output are "
-                    "recorded for reviewer inspection."
-                ),
-            },
-        },
-        "required": ["command"],
+        # B6 契约单源（缺口 19）：description = bash.py 常量，字段 = pydantic
+        # 派生。条目本身保留以维持「手写层优先」的 LLM 可见面机制。
+        "description": BASH_TOOL_DESCRIPTION,
+        "properties": _BASH_FIELDS["properties"],
+        "required": _BASH_FIELDS["required"],
     },
     "python_script": {
         "description": (
@@ -191,7 +200,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "timeout": {
                 "type": "integer",
                 "aliases": ["timeout_ms", "timeoutMs"],
-                "description": f"Timeout ms (5s–10min). Default {TOOL_DEFAULT_TIMEOUT_MS['python_script']} (5 min). Values 1-600 treated as seconds.",
+                "description": f"Timeout ms (5s–10min). Default {TOOL_DEFAULT_TIMEOUT_MS['python_script']} (2 min). Values 1-600 treated as seconds.",
             },
         },
         "required": [],
@@ -559,11 +568,20 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "rejected — use {a,b} alternation."
                 ),
             },
+            "exclude": {
+                "type": "string",
+                "aliases": ["ignore", "skip"],
+                "description": "Glob pattern to exclude (e.g. '*.test.py'). Empty means no exclusions.",
+            },
             "head_limit": {"type": "integer", "aliases": ["headLimit", "maxResults", "limit"],
                 "description": "Max results to return (default: 500)."},
             "context": {"type": "integer", "aliases": ["contextLines", "contextAround"],
                 "description": "Number of context lines around each match (default: 0)."},
             "multiline": {"type": "boolean", "aliases": ["multiLine", "dotAll"]},
+            "output_mode": {"type": "string", "aliases": ["mode", "format"],
+                "description": "Output mode: 'content' shows matching lines, 'files_with_matches' lists only file names. Default: 'content'."},
+            "case_insensitive": {"type": "boolean", "aliases": ["ignore_case", "i"],
+                "description": "If true, perform case-insensitive matching. Default: false."},
             "include_ignored": {"type": "boolean", "aliases": ["includeIgnored"],
                 "description": "Also search .hiveweave subdirectories (e.g. worktrees when reviewing executor code). Default: false."},
         },
@@ -680,22 +698,16 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["expression"],
     },
     "question": {
-        "description": (
-            "Ask the human a question and block until they answer or ~180s "
-            "elapse; optional options (each a string or {label, text}). "
-            "Returns 'User answered: …' on an answer, or a timeout/cancel "
-            "message and proceeds without user input (not an error). If you "
-            "already have one pending question unanswered, a new call is "
-            "skipped (30-min dedup) — wait for the prior answer. This is the "
-            "ONLY channel that delivers a question to the user; assistant "
-            "text is not delivered."
-        ),
-        "properties": {
-            "question": {"type": "string", "aliases": ["message", "content", "query", "text"]},
-            "options": {"type": "array", "aliases": ["choices"],
-                "description": "Each item: a string, or an object {label, text}. Up to 6 shown as choices."},
-        },
-        "required": ["question"],
+        # B6 契约单源（缺口 9/19）：question.py 的 QUESTION_TOOL_DESCRIPTION
+        # 是唯一 owner —— 旧手写层曾以旧语义压制新语义，现同源。
+        "description": QUESTION_TOOL_DESCRIPTION,
+        "properties": _QUESTION_FIELDS["properties"],
+        "required": _QUESTION_FIELDS["required"],
+    },
+    "wait_on": {
+        "description": WAIT_ON_TOOL_DESCRIPTION,
+        "properties": _WAIT_ON_FIELDS["properties"],
+        "required": _WAIT_ON_FIELDS["required"],
     },
     "todowrite": {
         "description": (
@@ -717,9 +729,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Delegate a self-contained task to a subagent in its own context "
             "(it does not see this conversation). It works in YOUR worktree "
             "with YOUR permissions and returns its result, not intermediate "
-            "steps. Each spawn returns its own waiting_on entry — batch ALL "
-            "pending entries (spawns + background bash) into ONE "
-            "commit_turn(phase=waiting, waiting_on=[...]); do not poll. "
+            "steps. Each spawn returns its own waiting_on entry — cover ALL "
+            "pending entries (spawns + background bash) with ONE "
+            "wait_on(refs=[...]) and stop (the platform settles the turn "
+            "when you stop); do not poll. "
             "Dispatch independent children in the same turn rather than "
             "serializing them. Woken with [SUBAGENT DONE] / [SUBAGENT "
             "FAILED] / [SUBAGENT DONE_TRUNCATED] (the last means it ran out "
@@ -807,7 +820,9 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "Send a tool-visible message to agents (or recipient 'user'). "
             "Assistant text is private. Prefer ask_agent (needs reply) or "
             "notify_agent (FYI). To close an ask, pass replyTo=the original "
-            "reply_contract_id. End the turn with commit_turn."
+            "reply_contract_id. Then end the turn: stop issuing tool calls "
+            "and let the platform settle it (park with wait_on(refs) first "
+            "if you are waiting on something)."
         ),
         "properties": {
             "recipients": {"type": "array", "aliases": ["recipient", "to", "targets"],
@@ -925,9 +940,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "task = their work (copy the entire task id from the "
                     "receipt; no status-ask). A notify from that person still "
                     "wakes/clears the agent wait (no replyTo required). "
+                    "fact = a fact-bus entry you named (e.g. merge_landed) "
+                    "— woken with [FACT_OBSERVED] once that fact is "
+                    "verified/published. "
                     "Do not scan language. Do not put this task or a person "
                     "in update_task_status dependsOnTaskIds. "
-                    "Items: {kind: agent|task|user|timer|external, ref: string, note?: string}"
+                    "Items: {kind: agent|task|user|timer|external|fact, ref: string, note?: string}"
                 ),
             },
             "result": {
@@ -945,9 +963,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "description": (
             "Declare this turn cannot advance actionable tasks. Stops "
             "[TASK ADVANCE] nudges until the next wake. Requires a concrete "
-            "reason. Does not replace commit_turn — after declaring, still "
-            "end the turn with commit_turn(phase=waiting/blocked, "
-            "waiting_on=[...])."
+            "reason. Does not replace the turn exit — after declaring, still "
+            "stop issuing tool calls (park with wait_on(refs) first if you "
+            "are waiting on something); the platform settles the turn when "
+            "you stop."
         ),
         "properties": {
             "reason": {
@@ -1234,11 +1253,10 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
     },
     # — Agent management —
     "dismiss_agent": {
-        "description": "Archive/fire an agent. Cannot be undone. Prefer transfer_agent or bind_skill first.",
-        "properties": {
-            "agentId": {"type": "string", "aliases": ["agent_id", "id", "target"]},
-        },
-        "required": ["agentId"],
+        # B6 契约单源（缺口 19）：org_tools.py 常量 + pydantic 派生。
+        "description": DISMISS_AGENT_TOOL_DESCRIPTION,
+        "properties": _DISMISS_FIELDS["properties"],
+        "required": _DISMISS_FIELDS["required"],
     },
     "transfer_agent": {
         "description": "Reassign an agent to a new parent/supervisor in the hierarchy.",
@@ -1342,7 +1360,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "(ledger policy stays). Unmet dependsOn → blocked, assignee recorded, "
             "NOT woken (also applied when reusing taskId). dependsOn = other "
             "task ids only (self-id rejected); waiting on a person is "
-            "commit_turn(waiting, kind=agent). create_task alone "
+            "wait_on(refs=[{kind:agent,…}]) — then stop and let the "
+            "platform settle. create_task alone "
             "does not wake. Milestone MAIN QA: milestoneVerify=true "
             "(coordinator/CEO). Same-assignee dups cannot be forced. "
             "milestoneVerify=true only applies when creating a NEW task "
@@ -1429,7 +1448,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "description": (
                     "Other task ids only (self-id rejected). Unmet → blocked "
                     "(assignee recorded, not woken). VERIFY titles skip "
-                    "auto-block. People-waiting is commit_turn, not this list."
+                    "auto-block. People-waiting is wait_on(refs=[{kind:agent,…}]), "
+                    "not this list."
                 ),
             },
             "acceptanceCriteria": {
@@ -1497,9 +1517,11 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "coordinators dispatch one QA task with milestoneVerify=true. "
             "Judge completion ONLY by the stable token in the receipt TEXT: "
             "outcome=merged | outcome=already_merged | "
-            "outcome=nothing_to_merge. already_merged / nothing_to_merge "
-            "mean the merge is COMPLETE — do NOT call this tool again; the "
-            "task auto-closes after the grace period. (Structured fields "
+            "outcome=nothing_to_merge. merged / already_merged mean the "
+            "merge actually landed. nothing_to_merge means the branch has "
+            "0 commits ahead — NO merge happened this call; verify the "
+            "branch and worktree (git_worktree_list / git_worktree_status) "
+            "before assuming the work landed. (Structured fields "
             "like already_up_to_date are stripped from what you see — "
             "never wait for them.)"
         ),
@@ -1633,7 +1655,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "REQUIRED (docs|unit|module_visual|code_audit|code_audit+*). "
             "Unassigned → created; with assigneeId → claimed unless dependsOn "
             "is unmet (blocked, not claimed). dependsOn = other task ids only "
-            "(self-id rejected); waiting on a person is commit_turn. "
+            "(self-id rejected); waiting on a person is "
+            "wait_on(refs=[{kind:agent,…}]). "
             "VERIFY titles stay created. "
             "Coordinator/CEO milestone MAIN QA: milestoneVerify=true. To wake, "
             "call dispatch_task (pass taskId to reuse)."
@@ -1651,7 +1674,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "parentTaskId": {"type": "string", "aliases": ["parent_task_id", "parent"]},
             "dependsOn": {"type": "array", "items": {"type": "string"},
                 "aliases": ["depends_on"],
-                "description": "Other task ids only (self-id rejected). Unmet → blocked (not claimed/woken). VERIFY titles skip auto-block. People-waiting is commit_turn, not this list."},
+                "description": "Other task ids only (self-id rejected). Unmet → blocked (not claimed/woken). VERIFY titles skip auto-block. People-waiting is wait_on(refs=[{kind:agent,…}]), not this list."},
             "expectedModules": {"type": "array", "items": {"type": "string"},
                 "aliases": ["expected_modules"]},
             "tags": {
@@ -1733,7 +1756,8 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
             "waitKind='user'/'external' = waiting on a person / the outside "
             "world: no auto-unblock path, the platform escalates to your org "
             "parent instead. Waiting for a person keeps the task "
-            "running and uses commit_turn(waiting, waiting_on kind=agent). "
+            "running — park with wait_on(refs=[{kind:agent,…}]) and stop; "
+            "the platform settles the turn. "
             "Status omitted defaults to running. "
             "blockedReason is a note only, never an unblock path. "
             "running/unblock is refused while depends_on are still unmet."
@@ -1750,7 +1774,7 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                 "items": {"type": "string"},
                 "aliases": ["depends_on_task_ids", "dependsOnTaskId",
                             "depends_on_task_id", "dependsOn"],
-                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is commit_turn, not this list. Passing dependsOnTaskIds, wakeAt, or waitKind='user'/'external' is REQUIRED when blocking."},
+                "description": "Other task ids only (auto-unblock when all approved/closed). Self-id is rejected. People-waiting is wait_on(refs=[{kind:agent,…}]), not this list. Passing dependsOnTaskIds, wakeAt, or waitKind='user'/'external' is REQUIRED when blocking."},
             "waitKind": {"type": "string",
                 "aliases": ["wait_kind"],
                 "enum": ["dependency", "timer", "user", "external"],
@@ -1771,116 +1795,15 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         "required": ["taskId", "progress"],
     },
     "submit_task": {
-        "description": (
-            "Submit for review (running → submitted). testsPassed must be true "
-            "after real tests. Pass attestationIds from bash/browse. dryRun=true "
-            "lists missing items without submitting. VERIFY tasks MUST pass "
-            "verdict=PASS|FAIL (blockingIssues when FAIL, E1 hard gate); "
-            "delivery-contract tasks MUST pass deliveryContract={summary, test}. "
-            "If a required credential is STRUCTURALLY impossible to issue "
-            "(e.g. code_audit when your branch has no diff vs MAIN — task "
-            "already merged), the gate records attestation_impossible"
-            "(reason=tool_limited) and consumes it itself: no waiver needed. "
-            "Branch conflicting with main is rejected (merge_conflict_with_main) "
-            "— call git_worktree_sync in your worktree (mode=materialize_conflict "
-            "to get the conflict left there for you to resolve by hand), then "
-            "resubmit. Only the assignee can submit."
-        ),
-        "properties": {
-            "taskId": {"type": "string", "aliases": ["task_id", "id"]},
-            "summary": {"type": "string", "aliases": ["report", "description"]},
-            "commit": {"type": "string",
-                "aliases": ["commitSha", "commit_sha"]},
-            "filesChanged": {"type": "array", "items": {"type": "string"},
-                "aliases": ["files_changed", "files"]},
-            "testsPassed": {"type": "boolean", "aliases": ["tests_passed"],
-                "description": "Must be true. Run tests first."},
-            "testOutput": {"type": "string", "aliases": ["test_output", "testLog"],
-                "description": "Brief test command output / proof."},
-            "attestationIds": {
-                "type": "array",
-                "items": {"type": "string"},
-                "aliases": ["attestation_ids"],
-                "description": (
-                    "Server-issued attestation ids from browse/bash. "
-                    "Required for UI/code tasks."
-                ),
-            },
-            "dryRun": {"type": "boolean", "aliases": ["dry_run", "preflight", "check"],
-                "description": "Preflight only: list missing items. No submit. Default false."},
-            "failuresAcknowledged": {
-                "type": "array",
-                "aliases": ["failures_acknowledged", "acknowledgedFailures"],
-                "description": "VERIFY only: when tests report failures, list {test, reason} per case. Free-text excuses are rejected.",
-            },
-            "coreInteractionExecuted": {
-                "type": "boolean",
-                "aliases": ["core_interaction_executed"],
-                "description": "UI VERIFY: true if core canvas/DOM interaction ran. Prefer unset — platform accepts a core_interaction browse_e2e attestation.",
-            },
-            "commitHash": {
-                "type": "string",
-                "aliases": ["commit_hash"],
-                "description": "Optional MAIN commit hash for VERIFY evidence.",
-            },
-            "envSnapshot": {
-                "type": "string",
-                "aliases": ["env_snapshot"],
-                "description": "Optional environment snapshot for VERIFY evidence.",
-            },
-            "verdict": {
-                "type": "string",
-                "aliases": ["verdict"],
-                "description": (
-                    "VERIFY tasks only (title starts with 'VERIFY:'): 'PASS' or "
-                    "'FAIL'. A missing verdict on a VERIFY task is hard-rejected "
-                    "(E1); FAIL additionally requires blockingIssues."
-                ),
-            },
-            "blockingIssues": {
-                "type": "array",
-                "items": {"type": "string"},
-                "aliases": ["blocking_issues"],
-                "description": (
-                    "VERIFY tasks only: non-empty list of defect identifiers/"
-                    "strings when verdict=FAIL — hard gate, routes to rework."
-                ),
-            },
-            "deliveryContract": {
-                "type": "object",
-                "aliases": ["delivery_contract", "contract"],
-                "description": (
-                    "Required for delivery-contract (写树代码) tasks: "
-                    "{summary, test}. `test` must reference a test_run "
-                    "attestation bound to THIS task (machine-verified). "
-                    "Missing is a hard rejection. If tests truly cannot run, "
-                    "use evidence_kind='not_applicable' + not_applicable_reason "
-                    "and get a waiver — the text 'N/A' no longer passes."
-                ),
-            },
-            "contractWaived": {
-                "type": "boolean",
-                "aliases": ["contract_waived"],
-                "description": (
-                    "Explicit skip of the delivery contract when honestly nothing "
-                    "to fill (non-code / emergency hotfix). Never omit silently."
-                ),
-            },
-            "acceptanceCoverage": {
-                "type": "object",
-                "aliases": ["acceptance_coverage"],
-                "description": (
-                    "VERIFY 验收清单覆盖声明。最小格式："
-                    '{"<条目id>": {"attestation_ids": ["<凭证id>"]}}；'
-                    "确不适条目改 "
-                    '{"<条目id>": {"not_applicable_reason": "<理由>"}}'
-                    "（还须平台 waiver）。条目 id 见平台拒绝回执清单"
-                    "（条目N: … 的 N 就是 id）；不要照搬 policy kind 名——"
-                    "凭证须属本任务要求的类型、未过期且成功（平台机器核验）。"
-                ),
-            },
-        },
-        "required": ["summary", "testsPassed"],
+        # B6 契约单源（缺口 19）：submit.py 的 SUBMIT_TASK_TOOL_DESCRIPTION
+        # 是唯一 owner（硬门 + 软失败处方在此常量里）；17 个字段全部由
+        # SubmitTaskParams 派生 —— required 也随 pydantic（P0-4 后顶层
+        # summary 亦可选：缺失时平台从 deliveryContract.summary 回填，
+        # 两者皆缺才由门禁拒；taskId/testsPassed 交给真实门禁回执，
+        # 不由参数层硬拦）。
+        "description": SUBMIT_TASK_TOOL_DESCRIPTION,
+        "properties": _SUBMIT_FIELDS["properties"],
+        "required": _SUBMIT_FIELDS["required"],
     },
     "review_task": {
         "description": (
@@ -2348,6 +2271,17 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
                     "verifies independently and never auto-passes on appeal."
                 ),
             },
+            "authorId": {
+                "type": "string",
+                "aliases": ["author_id", "author"],
+                "description": (
+                    "Optional. Audit the AUTHOR's worktree diff and bind the "
+                    "attestation to the author + their task (reviewer pool "
+                    "qa/coordinator/ceo only). Use for platform-dispatched "
+                    "SYSTEM AUDIT tasks — pass the submitter id from the task "
+                    "payload. Omit to audit your own worktree."
+                ),
+            },
         },
         "required": [],
     },
@@ -2356,17 +2290,12 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
 TOOL_PARAM_SCHEMAS["bash_main"] = {
     **TOOL_PARAM_SCHEMAS["bash"],
     "properties": dict(TOOL_PARAM_SCHEMAS["bash"].get("properties") or {}),
-    "description": (
-        "Same as bash, but cwd is the PROJECT ROOT (shared MAIN), not your "
-        "worktree. Use for milestone VERIFY tests and anything that must see "
-        "merged HEAD. Slice unit tests stay on bash."
-    ),
+    # B6 单源：描述常量住 bash.py，@tool 注册处引用同一份。
+    "description": BASH_MAIN_TOOL_DESCRIPTION,
 }
 # DSH_33 P0: pwsh 一等工具 —— 与 bash 同参数面（command/timeout/background/
 # taskId/testEvidence），描述换成 PowerShell 方言契约（单一真源在 bash.py 的
 # PWSH_TOOL_DESCRIPTION，避免「bash 描述双副本」那种改一处漏一处）。
-from hiveweave.tools.bash import PWSH_TOOL_DESCRIPTION as _PWSH_SCHEMA_DESCRIPTION
-
 TOOL_PARAM_SCHEMAS["pwsh"] = {
     **TOOL_PARAM_SCHEMAS["bash"],
     "properties": {
@@ -2374,19 +2303,11 @@ TOOL_PARAM_SCHEMAS["pwsh"] = {
         "command": {
             "type": "string",
             "aliases": ["cmd", "run"],
-            "description": (
-                "The PowerShell command to execute. A narrow auto-translation "
-                "handles two closed sets first (`| head/-n N` / `| tail/-n N` / "
-                "`| wc -l` pipe tail, and whole-command `head -N f` / "
-                "`tail -N f` / `wc -l f`); `python3` / `pip3` (with or without "
-                "`.exe`) are rewritten to `python` / `pip`; everything else "
-                "reaches pwsh verbatim. Use $env:NAME for environment "
-                "variables and the & call operator for quoted programs: "
-                "& \"python\" \"script.py\"."
-            ),
+            # B6 单源：方言入参契约住 bash.py 的 PWSH_COMMAND_DESCRIPTION。
+            "description": PWSH_COMMAND_DESCRIPTION,
         },
     },
-    "description": _PWSH_SCHEMA_DESCRIPTION,
+    "description": PWSH_TOOL_DESCRIPTION,
 }
 # T3.2: pwsh_main = MAIN 位（pwsh 宿主上顶替 bash_main 的第四格）。
 # Windows 下 bash/bash_main 被宿主过滤移除，MAIN 里程碑测试 / QA 凭证签发
@@ -2394,16 +2315,8 @@ TOOL_PARAM_SCHEMAS["pwsh"] = {
 TOOL_PARAM_SCHEMAS["pwsh_main"] = {
     **TOOL_PARAM_SCHEMAS["pwsh"],
     "properties": dict(TOOL_PARAM_SCHEMAS["pwsh"].get("properties") or {}),
-    "description": (
-        "Same as pwsh, but cwd is the PROJECT ROOT (shared MAIN), not your "
-        "worktree. Use for milestone VERIFY tests and anything that must see "
-        "merged HEAD. Slice unit tests stay on pwsh. "
-        # P1-8a ③：本描述**整体覆盖**了 pwsh 的 description ⇒ 不继承方言契约
-        # （DB 实测 pwsh_main 上确有 1 次方言拒绝）—— 至少把这一句带上。
-        "Dialect: PowerShell 7 (not bash) — unix-only commands are rejected "
-        "up front; python3 / pip3 are normalized to python / pip for you "
-        "(there is no python3 here), but prefer `uv run python`."
-    ),
+    # B6 单源：描述常量住 bash.py，@tool 注册处引用同一份。
+    "description": PWSH_MAIN_TOOL_DESCRIPTION,
 }
 TOOL_PARAM_SCHEMAS["browse_main"] = {
     **TOOL_PARAM_SCHEMAS["browse"],
@@ -2515,6 +2428,29 @@ TOOL_PARAM_SCHEMAS["conclude_topic"] = {
     },
     "required": ["result"],
 }
+
+
+# B6 导入顺序补偿：本文件顶部为契约单源化 import 了 question/org_tools/
+# tasks.submit，后者经 services.task shim 连带把 tools.tasks.query 提前
+# 导入 —— query.py 的模块级 schema 同步（_expose_task_id/updated_since_to_gate）
+# 在 executor 半初始化期 import 不到 TOOL_PARAM_SCHEMAS，会静默跳过且模块
+# 缓存后不会重跑。这里在 TOOL_PARAM_SCHEMAS 完整成型后补跑一次（两函数
+# 幂等：setdefault + if-not-in）。
+def _resync_tasks_query_gate_schemas() -> None:
+    try:
+        from hiveweave.tools.tasks.query import (
+            _expose_task_id_to_gate,
+            _expose_updated_since_to_gate,
+        )
+
+        _expose_task_id_to_gate()
+        _expose_updated_since_to_gate()
+    except Exception as exc:  # noqa: BLE001 — 同步失败由别名棘轮测试兜底报警
+        log.debug("tasks_query_gate_schema_resync_failed", error=str(exc))
+
+
+_resync_tasks_query_gate_schemas()
+
 
 def _resolve_alias_for_tool(arg_name: str, props: dict) -> str | None:
     """Check if arg_name is an alias for any known parameter in this tool.
@@ -2985,7 +2921,10 @@ _LAST_SEEN_SIG_WINDOW_S = 600
 _LAST_SEEN_SIG_MAX_KEYS = 2000
 
 
-def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str:
+def _note_self_repeat_hit(
+    agent_id: str, tool_name: str, sig: str | None,
+    *, repeat_count: int | None = None,
+) -> str:
     """登记一次失败签名；短窗内同 agent 同签名复撞返回去重提示，否则 ""。
 
     键 = (agent_id, sig)：签名含上下文（工具/路径），天然按"同一堵墙"
@@ -2995,6 +2934,10 @@ def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str
     尝试、不提示，去掉 run_id 不会把久远 run 误标成"刚撞过"，却能让**窗口
     内**的跨 run 复撞（每次调用一个 run 的常态）真正触发「X 分钟前已撞过」。
     纯内存 best-effort（复撞发生在分钟级窗口，重启丢失无碍），容量有界。
+
+    ``repeat_count``（T9，2026-09-29）：同参连击计数（execute 入口登记）。
+    ≥ SELF_REPEAT_ESCALATE_AT 时提醒文案升级为强处方——同参连击 3+ 次
+    说明 inbox 软提醒已被无视，该升级处置强度（见 T9 块注释）。
     """
     if not sig:
         return ""
@@ -3020,6 +2963,11 @@ def _note_self_repeat_hit(agent_id: str, tool_name: str, sig: str | None) -> str
         ago = f"{int(elapsed)} 秒前"
     else:
         ago = f"{elapsed / 60:.1f} 分钟前"
+    if repeat_count is not None and repeat_count >= SELF_REPEAT_ESCALATE_AT:
+        return (
+            f"[SELF REPEAT #{count} via {tool_name}] "
+            + self_repeat_prescription(repeat_count, tool_name)
+        )
     return (
         f"[SELF REPEAT #{count} via {tool_name}] 你 {ago}刚撞过同一失败"
         f"（{sig[:80]}）—— 同一写法原样重试无效，直接换路执行；共享池该签名"
@@ -3031,6 +2979,146 @@ def reset_self_repeat_hits_for_tests() -> None:
     """测试用：清空复撞记忆。"""
     with _LAST_SEEN_SIG_LOCK:
         _LAST_SEEN_SIG.clear()
+
+
+# ── T9（2026-09-29）：同参连续重复升级处置 ────────────────────
+# 病灶（S15 朝露，101 run 长项目实测）：`[SELF_REPEAT]` inbox 提醒发了多轮
+# 毫无效果——提醒与回执物理分离（health_notice 独立通道的设计取舍）在
+# 「上下文被裁剪线洗掉新鲜工具输出」的结构病面前失效：模型每轮看到的世界
+# 一样，于是每轮做一样的事。修法（重复侧升级，挂在同参重复检测点）：
+# ① 连续同参 ≥3 次 → 回执文本从提醒升级为**强处方**（回执 = 模型下一轮
+#   必读的东西，不再指望它去 inbox 翘课）；
+# ② 第 N 次起（默认 5，env 可调）→ **直接拒绝执行**该调用（回执 = 强处方，
+#   算一次平台拒绝、不消耗上游工具/LLM）。
+# 「连续」口径：进程内 per-agent 单槽——同 agent 换了调用身份立即清零，
+# 间隔超过 _SELF_REPEAT_STREAK_WINDOW_S 也清零（跨 wake 的合法重读不算连坐）。
+
+#: 连续同参达到该次数即升级为强处方（< 拒绝阈值时仍执行，回执附处方）。
+SELF_REPEAT_ESCALATE_AT = 3
+
+#: 拒绝阈值 env（HIVEWEAVE_SELF_REPEAT_REFUSE_THRESHOLD）——默认 5。
+_SELF_REPEAT_REFUSE_ENV = "HIVEWEAVE_SELF_REPEAT_REFUSE_THRESHOLD"
+_SELF_REPEAT_REFUSE_DEFAULT = 5
+
+#: 同参连击的记忆窗口：距上次同身份调用超过该秒数 ⇒ 视为新序列（清零）。
+#: 对齐 _LAST_SEEN_SIG_WINDOW_S 的分钟级口径——S15 的死循环是分钟级连发，
+#: 跨小时的合法重读不该被连坐。
+_SELF_REPEAT_STREAK_WINDOW_S = 600
+
+#: 豁免工具：commit_turn 是等待契约的合法连发（waiting → wake → 再 waiting），
+#: 且已有专属治理（duplicate 信号 + doom limit 8 + 门禁），不进本机制。
+_SELF_REPEAT_EXEMPT_TOOLS = frozenset({"commit_turn"})
+
+# per-agent 单槽：{"identity": str, "count": int, "ts": float, "tool": str}
+_SELF_REPEAT_STREAKS: dict[str, dict[str, Any]] = {}
+_SELF_REPEAT_STREAKS_LOCK = threading.Lock()
+_SELF_REPEAT_STREAKS_MAX_AGENTS = 2000
+
+
+def _self_repeat_refuse_threshold() -> int:
+    """拒绝阈值：env 覆盖，默认 5；clamp 到 ≥ ESCALATE_AT+1（保住处方带）。"""
+    raw = os.environ.get(_SELF_REPEAT_REFUSE_ENV)
+    if raw is None or not raw.strip():
+        return _SELF_REPEAT_REFUSE_DEFAULT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return _SELF_REPEAT_REFUSE_DEFAULT
+    return max(value, SELF_REPEAT_ESCALATE_AT + 1)
+
+
+def self_repeat_action(count: int) -> str:
+    """按连续同参次数定处置：``"allow"`` / ``"escalate"`` / ``"refuse"``。"""
+    if count >= _self_repeat_refuse_threshold():
+        return "refuse"
+    if count >= SELF_REPEAT_ESCALATE_AT:
+        return "escalate"
+    return "allow"
+
+
+def self_repeat_prescription(count: int, tool_name: str, *, refused: bool = False) -> str:
+    """强处方文案——事实 + 下一步（对齐提示词规范：失败现场处方）。"""
+    head = (
+        f"[SELF_REPEAT ESCALATED] 你已连续 {count} 次用完全相同的参数调用 "
+        f"'{tool_name}' —— 该路径无效，重复不会产生新信息。"
+    )
+    tail = (
+        "停下：换方法（换工具/换参数/换路径），或用 send_message 向上级"
+        "说明卡点求助。禁止再次发起完全相同的调用。"
+    )
+    if refused:
+        tail = (
+            "本次调用已被平台拒绝执行（未运行，无新副作用）。停下：换方法"
+            "（换工具/换参数/换路径），或用 send_message 向上级说明卡点求助。"
+            "禁止再次发起完全相同的调用。"
+        )
+    return head + tail
+
+
+def _note_same_identity_call(agent_id: str, tool_name: str, tool_args: Any) -> int:
+    """登记一次调用，返回该 agent 当前**连续**同身份调用次数（本次计入，1 起）。
+
+    身份 = ``call_identity(tool_name, tool_args)``（failure_signature 的同一份
+    规范化，键序归一、值不洗白）。换身份立即清零；同身份但间隔超过
+    _SELF_REPEAT_STREAK_WINDOW_S 也清零。豁免工具恒返 0（不计数）。
+    纯内存 best-effort，容量有界（LRU 式砍半，同 _LAST_SEEN_SIG）。
+    """
+    if tool_name in _SELF_REPEAT_EXEMPT_TOOLS:
+        return 0
+    from hiveweave.services.failure_signature import call_identity
+
+    identity = call_identity(tool_name, tool_args)
+    key = agent_id or ""
+    now = time.time()
+    with _SELF_REPEAT_STREAKS_LOCK:
+        if len(_SELF_REPEAT_STREAKS) >= _SELF_REPEAT_STREAKS_MAX_AGENTS:
+            stale = sorted(
+                _SELF_REPEAT_STREAKS.items(), key=lambda kv: kv[1].get("ts", 0)
+            )[: _SELF_REPEAT_STREAKS_MAX_AGENTS // 2]
+            for k, _ in stale:
+                _SELF_REPEAT_STREAKS.pop(k, None)
+        entry = _SELF_REPEAT_STREAKS.get(key)
+        if (
+            entry is not None
+            and entry.get("identity") == identity
+            and now - float(entry.get("ts", 0)) <= _SELF_REPEAT_STREAK_WINDOW_S
+        ):
+            entry["count"] = int(entry.get("count", 1)) + 1
+            entry["ts"] = now
+            entry["tool"] = tool_name
+            return int(entry["count"])
+        _SELF_REPEAT_STREAKS[key] = {
+            "identity": identity, "count": 1, "ts": now, "tool": tool_name,
+        }
+        return 1
+
+
+def reset_self_repeat_streaks_for_tests() -> None:
+    """测试用：清空同参连击记忆。"""
+    with _SELF_REPEAT_STREAKS_LOCK:
+        _SELF_REPEAT_STREAKS.clear()
+
+
+def _append_self_repeat_prescription(
+    result: dict[str, Any], tool_name: str, count: int
+) -> dict[str, Any]:
+    """把强处方追加进工具回执正文（升级带：3 ≤ count < 拒绝阈值）。
+
+    处方只走 ``output``（回执正文 = 模型下一轮必读）；**绝不碰 ``error``**
+    —— error 逐字等于真错误是批次 4 立下的回执纪律（AST 守卫
+    test_no_result_error_concatenation_left_for_notices 钉死），T9 不豁免。
+    output 为空（失败回执常态）时 content=output 直接呈现处方——真错误
+    此前已连 seen 两次，第 3 次起新信息是处方而非重复报错原文（原错误
+    仍在 inbox 提醒与 run ledger 的 error 字段里可考）。
+    只动正文、不动 success/blocked 等事实位——本轮调用照常生效。
+    """
+    prescription = self_repeat_prescription(count, tool_name)
+    out = dict(result)
+    existing = out.get("output")
+    out["output"] = (
+        f"{existing}\n\n{prescription}" if existing else prescription
+    )
+    return out
 
 
 async def _emit_unclassified_sample(
@@ -3067,6 +3155,8 @@ async def _f10_result_hooks(
     tool_name: str,
     tool_args: dict[str, Any],
     agent_id: str,
+    *,
+    repeat_count: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(result, dict):
         return result
@@ -3075,6 +3165,14 @@ async def _f10_result_hooks(
     _sample = result.pop("unclassified_sample", None)
     if _sample:
         await _emit_unclassified_sample(_sample, tool_name, agent_id)
+    # T9（2026-09-29）升级带：3 ≤ 连续同参次数 < 拒绝阈值 → 回执正文追加
+    # 强处方。成功路径也要追加——S15 死循环正是**成功**的 read_file 重复；
+    # 置于 success 早退之前才能覆盖它。
+    if (
+        repeat_count is not None
+        and SELF_REPEAT_ESCALATE_AT <= repeat_count < _self_repeat_refuse_threshold()
+    ):
+        result = _append_self_repeat_prescription(result, tool_name, repeat_count)
     if not result or result.get("success"):
         return result
     try:
@@ -3195,7 +3293,9 @@ async def _f10_result_hooks(
         # 会自我不一致。键不含 run_id（P7 断链2），跨 run 复撞同样命中。）
         # 节流（P2-1 ③）：正文嵌 "#N / X 分钟前" 逐条不同，正文哈希键必然
         # 失效 ⇒ 显式键 + 600s 时间桶：同桶至多落一条，跨桶允许新提醒。
-        _self_note = _note_self_repeat_hit(agent_id, tool_name, _rec_sig or None)
+        _self_note = _note_self_repeat_hit(
+            agent_id, tool_name, _rec_sig or None, repeat_count=repeat_count
+        )
         if _self_note:
             _bucket = int(time.time() // _LAST_SEEN_SIG_WINDOW_S)
             await deliver_notice(
@@ -3411,13 +3511,35 @@ class ToolExecutor:
         log.info("tool.execute", agent_id=agent_id, tool=name,
                  args_preview=str(tool_args)[:200])
 
+        # ── T9（2026-09-29）：同参连续重复升级处置 ─────────────
+        # 每个进入执行器的调用在此登记连击（单一漏斗，registered / legacy /
+        # MCP 三条路径全覆盖）。达到拒绝阈值 ⇒ 不执行、直接回强处方（算一次
+        # 平台拒绝：blocked=True + 从未派发 runner_failed，与护栏拒绝同形，
+        # 供 stall 归因分流；不走 _f10_result_hooks——拒绝不是工具失败，
+        # 不写共享签名池）。升级带（3 ≤ count < 拒绝阈值）照常执行，回执
+        # 追加强处方——由各路径汇聚点的 _f10_result_hooks(repeat_count=…) 完成。
+        _repeat_count = _note_same_identity_call(agent_id, name, tool_args)
+        if self_repeat_action(_repeat_count) == "refuse":
+            log.warning(
+                "self_repeat_refused",
+                agent_id=agent_id, tool=name, count=_repeat_count,
+            )
+            refusal = self._error(
+                self_repeat_prescription(_repeat_count, name, refused=True)
+            )
+            refusal["blocked"] = True
+            refusal["fact"] = "runner_failed"
+            return refusal
+
         # ── 1.1 MCP 工具分流（45 轮 #9）──────────────────────
         # mcp__<server>__<raw> 名不在 @tool 注册表——必须先于未知工具
         # fast-fail 分流。绑定即用 + 通用门禁（硬门/denied/ask glob 与
         # 绑定校验在 _execute_mcp_tool 内，无 MCP 特殊权限分支）。
         if name.startswith("mcp__"):
             result = await self._execute_mcp_tool(agent_id, name, tool_args)
-            result = await _f10_result_hooks(result, name, tool_args, agent_id)
+            result = await _f10_result_hooks(
+                result, name, tool_args, agent_id, repeat_count=_repeat_count
+            )
             if result.get("output"):
                 result["output"] = self._maybe_save_large_output(
                     result["output"], agent_id, name, workspace_path
@@ -3484,7 +3606,8 @@ class ToolExecutor:
                     registered_result["output"], agent_id, name, workspace_path
                 )
             registered_result = await _f10_result_hooks(
-                registered_result, name, tool_args, agent_id
+                registered_result, name, tool_args, agent_id,
+                repeat_count=_repeat_count,
             )
             # 件1：工具成功返回汇聚点（registered 路径）—— pending 兑现回填
             await _f10_pending_success_backfill(
@@ -3617,7 +3740,9 @@ class ToolExecutor:
             result = dispatch_failure_result(name, exc)
             # 样本/事件通道与正常路径对齐：unclassified_sample 由 hooks 落
             # agent_events（漏斗只放进 dict，不猜 agent_id）。
-            result = await _f10_result_hooks(result, name, tool_args, agent_id)
+            result = await _f10_result_hooks(
+                result, name, tool_args, agent_id, repeat_count=_repeat_count
+            )
             await _emit_tool_execute_after(agent_id, name, tool_args, result)
             return result
 
@@ -3642,7 +3767,9 @@ class ToolExecutor:
             )
             result["output"] = truncated
 
-        result = await _f10_result_hooks(result, name, tool_args, agent_id)
+        result = await _f10_result_hooks(
+            result, name, tool_args, agent_id, repeat_count=_repeat_count
+        )
 
         # 件1：工具成功返回汇聚点（legacy 路径）—— pending 兑现回填
         await _f10_pending_success_backfill(result, name, tool_args, agent_id)

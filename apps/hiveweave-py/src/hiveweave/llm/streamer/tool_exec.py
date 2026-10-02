@@ -336,12 +336,25 @@ class ToolExecMixin:
                 # 「exit-gate 催审查 + poll 防护禁查询」双重夹击时无可行动
                 # 信息。快照来自与 exit-gate 相同的 obligations 数据源。
                 snapshot = await _build_obligations_snapshot(agent_id)
+                # T16 三期：挂起话术按模式分流（auto 下 commit_turn 已下架）。
+                from hiveweave.config import turn_exit_mode as _tem
+
+                if _tem() == "auto":
+                    park_rx = (
+                        "act on the obligations below directly, or "
+                        "wait_on(refs=[{\"kind\": \"task|agent|fact|user\", "
+                        "\"ref\": \"<id>\"}]) to park and wait for "
+                    )
+                else:
+                    park_rx = (
+                        "act on the obligations below directly, or call "
+                        "commit_turn(phase='waiting') and wait for "
+                    )
                 return {
                     "content": (
                         f"[poll hard reject] {tool_name} called {n} times "
                         f"with the same arguments this turn. STOP polling — "
-                        f"act on the obligations below directly, or call "
-                        f"commit_turn(phase='waiting') and wait for "
+                        f"{park_rx}"
                         f"event wake (task_transition / ask_reply / timeout)."
                         + snapshot
                     ),

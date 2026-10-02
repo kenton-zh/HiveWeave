@@ -210,10 +210,13 @@ class CommitTurnParams(BaseModel):
         alias="waitingOn",
         description=(
             "Required for waiting/blocked. "
-            "Items: {kind: agent|task|user|timer|external, ref: str, note?: str}"
+            "Items: {kind: agent|task|user|timer|external|fact, ref: str, "
+            "note?: str}. fact = a fact-bus entry you named (e.g. "
+            "merge_landed) — woken with [FACT_OBSERVED] once that fact is "
+            "verified/published."
         ),
         json_schema_extra={"aliases": ["waitingOn", "waiting_on", "waitingon"]},
-    )
+    )  # kind 清单单源: services/turn_result.WaitingKind（防再漂移）
     result: dict[str, Any] | None = Field(
         default=None,
         description="Data plane payload (replies, tasks, artifacts, …). May be {}",
@@ -651,6 +654,30 @@ async def defer_task_advance_tool(
             "(why you cannot advance now)."
         )
 
+    # T16 三期：auto 下合法挂起 = wait_on（commit_turn 已下架），教学面
+    # 同步；legacy 文案原样。
+    from hiveweave.config import turn_exit_mode
+
+    if turn_exit_mode() == "auto":
+        wait_rx = (
+            "2) 若确在等人：wait_on(refs=[{\"kind\": \"agent|task\", "
+            "\"ref\": \"<id>\"}]) 挂起，让等待可被"
+            "超时唤醒与成环检测看见（commit_turn 已下架，不要尝试）。\n"
+        )
+        wait_next = (
+            "直到你被再次唤醒。接着可直接停止输出（平台自动收口）；"
+            "若在等人，先 wait_on 登记等待再停。"
+        )
+    else:
+        wait_rx = (
+            "2) 若确在等人：commit_turn(phase=waiting, "
+            "waiting_on={kind:'agent'|'task', ref:'<id>'})，让等待可被"
+            "超时唤醒与成环检测看见。\n"
+        )
+        wait_next = (
+            "直到你被再次唤醒。请接着 commit_turn"
+            "(通常 phase=waiting 或 blocked，并写清 waiting_on)。"
+        )
     streak = record_defer_reason(agent_id, reason)
     tripped = streak >= DEFER_REASON_STREAK_LIMIT
     # Tripped: also lift the standing suppression, otherwise a flag set by an
@@ -700,9 +727,7 @@ async def defer_task_advance_tool(
             f"1) 若任务其实已具备收口条件（已 approved 且 merge 已落库），"
             f"检查 get_platform_state 的 ledger，不必再 merge；approved 由"
             f"平台定时收口（约 2 分钟一轮，超 10 分钟宽限即关闭）。\n"
-            f"2) 若确在等人：commit_turn(phase=waiting, "
-            f"waiting_on={{kind:'agent'|'task', ref:'<id>'}})，让等待可被"
-            f"超时唤醒与成环检测看见。\n"
+            f"{wait_rx}"
             f"3) 若已无路可走：向上级/CEO 上报阻塞点（ask_agent 写清缺什么、"
             f"需要谁决策），不要再 defer。\n"
             f"换一个真实变化的理由重试才会被接受。 reason={reason[:200]}"
@@ -710,8 +735,7 @@ async def defer_task_advance_tool(
 
     return ToolResult.ok(
         "已声明不推进。平台不会再因「未推动任务」循环提醒你，"
-        "直到你被再次唤醒。请接着 commit_turn"
-        "(通常 phase=waiting 或 blocked，并写清 waiting_on)。"
+        f"{wait_next}"
         f" 同一理由已连续 {streak}/{DEFER_REASON_STREAK_LIMIT} 次——"
         f"到阈值将不再接受，届时请上报上级或复核任务是否已可收口。"
         f" reason={reason[:200]}"

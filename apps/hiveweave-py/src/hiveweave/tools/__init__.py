@@ -49,6 +49,7 @@ import hiveweave.tools.task_tools  # noqa: F401 — registers dispatch/submit/wa
 import hiveweave.tools.misc_tools  # noqa: F401 — registers git_worktree, legacy tasks, webfetch, etc.
 import hiveweave.tools.patch_delivery  # noqa: F401 — registers deliver_patch (F12 cross-repo channel)
 import hiveweave.tools.turn_tools  # noqa: F401 — commit_turn, defer_task_advance, ask/notify
+import hiveweave.tools.wait_tools  # noqa: F401 — T16 auto: wait_on（唯一合法中途挂起；legacy 执行面拒绝）
 import hiveweave.tools.dev_server_tools  # noqa: F401 — start/stop/lookup_dev_server
 import hiveweave.tools.browse_tools  # noqa: F401 — browse (agent-browser Chromium CLI)
 import hiveweave.tools.game_qa_tools  # noqa: F401 — game_run_case (H5 harness)

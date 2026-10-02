@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -48,6 +49,46 @@ log = structlog.get_logger()
 #: 聚合 SQL 共用的 provider 收集列 — 能力位在 Python 侧按单一判据现算，
 #: 不把 "anthropic" 之类的字面量复写进 SQL。
 _PROVIDERS_AGG = "GROUP_CONCAT(DISTINCT provider) AS providers"
+
+#: llm_usage 行 INSERT 列集 — 主写路径与补录回放共用同一常量，杜绝两处漂移。
+_USAGE_INSERT_ROUNDS = (
+    "INSERT INTO llm_usage "
+    "(id, agent_id, project_id, run_id, task_id, model_id, "
+    "request_type, provider, input_tokens, output_tokens, "
+    "cache_read_tokens, cache_creation_tokens, total_tokens, "
+    "duration_ms, cold_start, creation_unreported, "
+    "timeout_layer, created_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+_USAGE_INSERT_COMPACTION = (
+    "INSERT INTO llm_usage "
+    "(id, agent_id, project_id, run_id, task_id, model_id, "
+    "request_type, provider, input_tokens, output_tokens, "
+    "cache_read_tokens, cache_creation_tokens, total_tokens, "
+    "duration_ms, creation_unreported, created_at) "
+    "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+# ── P1-11: llm_usage 写失败补录（spill sidecar + 回放）────────────
+# 实测：usage_recorder_failed（disk I/O error / closed database）各 1 次
+# —— 写失败即永久丢，重试层（_execute_write_with_retry）只覆盖 lock/busy。
+# 修法 = 缓冲 + 补录：非 lock 类写失败 ⇒ 待写行落 JSONL sidecar（append
+# 语义天然幂等安全）；下次 record 入口先回放，成功后删除。行数上限防膨胀，
+# 超限丢最旧。回放失败不阻塞主写入；sidecar 写失败只 log（不再丢主流程）。
+USAGE_SPILL_FILENAME = "llm_usage_spill.jsonl"
+USAGE_SPILL_MAX_LINES = 10_000
+
+#: 补录回放用 OR IGNORE：按行 id（主键）幂等 —— 回放成功但 sidecar 删除
+#: 失败时，下次重放不会重复计账、也不会因主键冲突炸掉整批回放。
+#: 由 INSERT 常量派生（单一来源，杜绝列集两处漂移）。
+_USAGE_REPLAY_SQL = {
+    "rounds": _USAGE_INSERT_ROUNDS.replace(
+        "INSERT INTO ", "INSERT OR IGNORE INTO ", 1
+    ),
+    "compaction": _USAGE_INSERT_COMPACTION.replace(
+        "INSERT INTO ", "INSERT OR IGNORE INTO ", 1
+    ),
+}
 
 #: cache 写入量程：全部上报 / 全部不上报 / 混合。
 CACHE_SCOPE_REPORTED = "reported"
@@ -144,6 +185,167 @@ def _with_cache_scope(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# ── P1-11: spill sidecar 机制（写失败缓冲 + 下次补录）──────────────
+
+
+async def _workspace_for_agent(agent_id: str) -> str | None:
+    """解析 agent 所在 workspace（sidecar 落点 = ``<ws>/.hiveweave/``）。
+
+    best-effort：路由链任一环失败返回 None（此时无处落 sidecar，只能
+    靠既有 error 日志 + agent_events 告警留痕）。
+    """
+    try:
+        project_id = await meta_db.get_agent_project_id(agent_id)
+        if not project_id:
+            return None
+        return await meta_db.get_project_workspace(project_id)
+    except Exception:
+        return None
+
+
+def _usage_spill_path(workspace: str) -> Path:
+    return Path(workspace) / ".hiveweave" / USAGE_SPILL_FILENAME
+
+
+def _spill_usage_rows(workspace: str, kind: str, rows: list[list[Any]]) -> None:
+    """待写 usage 行落 JSONL sidecar（append；写失败只 log，绝不再丢主流程）。"""
+    if not workspace or not rows:
+        return
+    path = _usage_spill_path(workspace)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = _now_ms()
+        with open(path, "a", encoding="utf-8") as f:
+            for row in rows:
+                f.write(
+                    json.dumps(
+                        {"v": 1, "kind": kind, "params": row, "spilled_at": stamp},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+    except Exception as exc:
+        log.error(
+            "token_meter.usage_spill_write_failed",
+            workspace=workspace,
+            kind=kind,
+            n=len(rows),
+            error=str(exc),
+        )
+        return
+    _trim_usage_spill(path)
+
+
+def _trim_usage_spill(path: Path) -> None:
+    """sidecar 行数上限防膨胀：超限丢最旧并 log.error（账已断，膨胀会拖垮磁盘）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        log.warning(
+            "token_meter.usage_spill_trim_read_failed", path=str(path),
+            error=str(exc),
+        )
+        return
+    if len(lines) <= USAGE_SPILL_MAX_LINES:
+        return
+    dropped = len(lines) - USAGE_SPILL_MAX_LINES
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-USAGE_SPILL_MAX_LINES:])
+        log.error(
+            "token_meter.usage_spill_overflow_dropped",
+            path=str(path),
+            dropped=dropped,
+            cap=USAGE_SPILL_MAX_LINES,
+        )
+    except Exception as exc:
+        log.error(
+            "token_meter.usage_spill_trim_write_failed",
+            path=str(path),
+            error=str(exc),
+        )
+
+
+async def _replay_usage_spill(agent_id: str) -> None:
+    """回放 sidecar 里上次写失败的 usage 行（best-effort，失败不阻塞主写入）。
+
+    - 回放走 INSERT OR IGNORE（按行 id 幂等）：回放成功但 sidecar 删除失败
+      时，下次重放不重复计账。
+    - 坏 JSON 行跳过不炸（不可解析的行本就无账可补），随成功回放一并清除。
+    - 回放失败（DB 仍不可用 / 路由失败）保留 sidecar，下次 record 入口再试。
+    """
+    ws = await _workspace_for_agent(agent_id)
+    if not ws:
+        return
+    path = _usage_spill_path(ws)
+    if not path.exists():
+        return
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        log.warning(
+            "token_meter.usage_spill_read_failed", path=str(path), error=str(exc)
+        )
+        return
+    statements: list[tuple[str, list[Any]]] = []
+    bad = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            kind = rec["kind"]
+            params = rec["params"]
+            if kind not in _USAGE_REPLAY_SQL or not isinstance(params, list):
+                raise ValueError(f"bad spill record kind={kind!r}")
+            statements.append((_USAGE_REPLAY_SQL[kind], params))
+        except Exception:
+            bad += 1  # 坏行跳过，不炸
+    if not statements:
+        if bad:
+            # 全是坏行：不可补录，清掉防每次 record 都空转
+            try:
+                path.unlink()
+                log.error(
+                    "token_meter.usage_spill_dropped_corrupt",
+                    path=str(path), n=bad,
+                )
+            except Exception as exc:
+                log.warning(
+                    "token_meter.usage_spill_cleanup_failed",
+                    path=str(path), error=str(exc),
+                )
+        return
+    try:
+        await project_db.execute_transaction(agent_id, statements)
+    except Exception as exc:
+        log.warning(
+            "token_meter.usage_spill_replay_failed",
+            agent_id=agent_id,
+            n=len(statements),
+            error=str(exc),
+        )
+        return  # 保留 sidecar，下次再试
+    try:
+        path.unlink()
+    except Exception as exc:
+        # 删除失败只留痕：重放按行 id 幂等，不会重复计账
+        log.warning(
+            "token_meter.usage_spill_cleanup_failed",
+            path=str(path), error=str(exc),
+        )
+    log.info(
+        "token_meter.usage_spill_replayed",
+        agent_id=agent_id,
+        n=len(statements),
+        skipped_bad=bad,
+    )
+
+
 class TokenMeter:
     """Token 计量服务（per-project best-effort 写入 + 聚合查询）。"""
 
@@ -165,6 +367,16 @@ class TokenMeter:
         rounds 为 streamer 返回的 usage_rounds，每项含
         input/output/cache_read/cache_creation/total/duration_ms。
         """
+        # P1-11：入口先补录上次写失败遗留的 sidecar 行（best-effort，
+        # 失败不阻塞本次记账主流程）。
+        try:
+            await _replay_usage_spill(agent_id)
+        except Exception as exc:  # noqa: BLE001 — 回放失败绝不挡主写入
+            log.warning(
+                "token_meter.usage_spill_replay_error",
+                agent_id=agent_id,
+                error=str(exc),
+            )
         if not rounds:
             # TEST_DSH_50/51 R11（2026-09-10）：静默 return 会让「零账」在
             # 任何日志里都无迹可寻 —— 调用方刚经历 error / 整轮硬超时兜底
@@ -204,13 +416,7 @@ class TokenMeter:
             # SQL NULL），正常完成行恒 NULL —— 与事实位「未确定不落」同纪律。
             _timeout_layer = r.get("timeout_layer") or None
             statements.append((
-                "INSERT INTO llm_usage "
-                "(id, agent_id, project_id, run_id, task_id, model_id, "
-                "request_type, provider, input_tokens, output_tokens, "
-                "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, cold_start, creation_unreported, "
-                "timeout_layer, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _USAGE_INSERT_ROUNDS,
                 [
                     str(uuid.uuid4()),
                     agent_id,
@@ -251,6 +457,15 @@ class TokenMeter:
                 run_id=run_id,
                 error=str(e),
             )
+            # P1-11：非 lock 类写失败（disk I/O / closed db）⇒ 待写行落
+            # JSONL sidecar，下次 record 入口回放补录。lock 类已有
+            # busy_timeout + 重试层兜底，不 spill（避免锁风暴刷盘）。
+            if not project_db.is_sqlite_lock_error(e):
+                ws = await _workspace_for_agent(agent_id)
+                if ws is not None:
+                    _spill_usage_rows(
+                        ws, "rounds", [params for _, params in statements]
+                    )
             try:
                 await project_db.execute(
                     agent_id,
@@ -315,32 +530,24 @@ class TokenMeter:
         cache_read_tokens = int(cache_read_tokens or 0)
         cache_creation_tokens = int(cache_creation_tokens or 0)
         total = input_tokens + output_tokens + cache_creation_tokens
+        insert_params: list[Any] = [
+            str(uuid.uuid4()),
+            agent_id,
+            project_id,
+            model_id,
+            f"compaction_{kind}",
+            provider,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            total,
+            int(duration_ms or 0),
+            1 if creation_unreported else 0,
+            _now_ms(),
+        ]
         try:
-            await project_db.execute(
-                agent_id,
-                "INSERT INTO llm_usage "
-                "(id, agent_id, project_id, run_id, task_id, model_id, "
-                "request_type, provider, input_tokens, output_tokens, "
-                "cache_read_tokens, cache_creation_tokens, total_tokens, "
-                "duration_ms, creation_unreported, created_at) "
-                "VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    str(uuid.uuid4()),
-                    agent_id,
-                    project_id,
-                    model_id,
-                    f"compaction_{kind}",
-                    provider,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                    total,
-                    int(duration_ms or 0),
-                    1 if creation_unreported else 0,
-                    _now_ms(),
-                ],
-            )
+            await project_db.execute(agent_id, _USAGE_INSERT_COMPACTION, insert_params)
         except Exception as e:
             # 与 record_rounds 同口径（正交结果独立上报）：压缩记账失败也
             # 不得静默蒸发 —— error 日志 + agent_events 落告警事件。
@@ -350,6 +557,12 @@ class TokenMeter:
                 kind=kind,
                 error=str(e),
             )
+            # P1-11：非 lock 类写失败 ⇒ 行落 sidecar，下次 record_rounds
+            # 入口回放补录（与 record_rounds 失败行同一份 sidecar）。
+            if not project_db.is_sqlite_lock_error(e):
+                ws = await _workspace_for_agent(agent_id)
+                if ws is not None:
+                    _spill_usage_rows(ws, "compaction", [insert_params])
             try:
                 await project_db.execute(
                     agent_id,

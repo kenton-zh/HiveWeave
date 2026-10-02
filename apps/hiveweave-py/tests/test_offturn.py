@@ -163,7 +163,16 @@ async def test_spawn_returns_before_subagent_finishes(
         "/tmp/ws",
     )
     assert result.success
-    assert "waiting" in result.output.lower()
+    # T16 三期：回执收尾话术按模式分流 —— auto+external（bg job）⇒
+    # 「直接停止等 [SUBAGENT DONE] 唤醒」；auto+可表达 kind ⇒ wait_on；
+    # legacy ⇒ waiting。语义钉点 = 不许轮询 + 挂起/等唤醒。
+    out = result.output.lower()
+    assert (
+        "wait_on(" in out
+        or "waiting" in out
+        or "wakes you when the background job finishes" in out
+    )
+    assert "do not poll" in out
     job_id = result.extra["job_id"]
     assert job_id.startswith("bg-sub-")
     assert result.extra["waiting_on"][0] == {"kind": "external", "ref": job_id}
@@ -396,7 +405,15 @@ async def test_bash_background_returns_immediately(
     job_id = result.extra["job_id"]
     assert job_id.startswith("bg-bash-")
     assert result.extra["waiting_on"][0]["ref"] == job_id
-    assert "waiting" in result.output.lower()
+    # T16 三期：auto+external ⇒ 直接停止等 [BASH DONE] 唤醒；auto+可表达
+    # kind ⇒ wait_on；legacy ⇒ waiting。语义钉点 = 不许轮询。
+    out = result.output.lower()
+    assert (
+        "wait_on(" in out
+        or "waiting" in out
+        or "wakes you when the background job finishes" in out
+    )
+    assert "do not poll" in out
     assert is_live_job(job_id)
     for _ in range(50):
         if started.is_set():

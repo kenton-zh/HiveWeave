@@ -408,7 +408,9 @@ async def test_warm_body_replicates_continue_sentinel(fresh_warmer):
     """快照尾条非 user（tool 结果，tool loop 原地 append 的常态）⇒ 续暖体
     末条必须是 user 哨兵 —— 与 http_stream 发请求前的形状逐字一致；快照
     本身不得被改写。"""
-    from hiveweave.llm.streamer.constants import CONTINUE_SENTINEL
+    # T16 三期：哨兵文案按模式分流 —— 断言与 live wire 同源（同一函数），
+    # 而非 legacy 常量；同源一致才是 P1-3 要守的契约。
+    from hiveweave.llm.streamer.constants import continue_sentinel_text
 
     snapshot = [
         {"role": "system", "content": "identity"},
@@ -423,7 +425,7 @@ async def test_warm_body_replicates_continue_sentinel(fresh_warmer):
     body = fake.posts[0]["json"]
     sent = body["messages"]
     assert sent[-1]["role"] == "user"
-    assert sent[-1]["content"] == CONTINUE_SENTINEL, (
+    assert sent[-1]["content"] == continue_sentinel_text(), (
         "线上末断点条目键含哨兵块，重放不带 ⇒ 命中只到首请求条目、尾部全价"
     )
     assert sent[:-1] == snapshot

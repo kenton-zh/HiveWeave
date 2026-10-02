@@ -50,6 +50,27 @@ def clear_pending_turn_result(agent_id: str) -> None:
     with _lock:
         _pending.pop(agent_id, None)
         _soft_warn_counts.pop(agent_id, None)
+        # T16 auto：新 run 一并清掉上一 run 残留的强制挂起标记
+        _force_exit_block.pop(agent_id, None)
+
+
+# ── T16 auto：出口门禁 5 连停强制挂起标记 ────────────────────
+# build_auto_exit_gate_hint（tool_loop exit_gate_check 接缝的 auto 实现）
+# 在补步预算耗尽仍违规时置位；handle_completion 收口时消费并升级
+# creator/CEO。内存态，语义同 _pending —— run 间由 clear_pending_turn_result
+# 复位，不跨 run 生效。
+
+_force_exit_block: dict[str, dict[str, Any]] = {}
+
+
+def set_force_exit_block(agent_id: str, detail: dict[str, Any] | None = None) -> None:
+    with _lock:
+        _force_exit_block[agent_id] = dict(detail or {})
+
+
+def pop_force_exit_block(agent_id: str) -> dict[str, Any] | None:
+    with _lock:
+        return _force_exit_block.pop(agent_id, None) or None
 
 
 def classify_commit_gate_soft_warn(

@@ -68,6 +68,18 @@ _BLOCKED_FACT_KINDS: frozenset[str] = frozenset(
 #                      而不是"换落点"**。单列一档是因为：它由**命令启动前的预检**
 #                      产生（`services/disk_guard.py`），与上面三类的来源层不同，
 #                      混进 `unknown_acl` 会把「磁盘满了」诊断成「权限问题」。
+#   attestation_mismatch — **证据门拒绝**（A3 批3，2026-09-28，实测发生过的源）：
+#                      submit/approve 的 attestation 门槛失败（凭证缺失 / kind
+#                      不匹配 / 过期）。处方在回执 Options 里：补签对应凭证
+#                      （request_code_audit / browse / attest_doc_review）后重交，
+#                      或确属平台侧无法签发时走 waive_attestation。不是沙箱、
+#                      不是 ACL —— 单列一档才能把「证据没补齐」与「环境拒绝」
+#                      分开统计（旧库 564 步该位全 NULL 的主要缺口之一）。
+#   cross_level      — **跨级指挥链拒绝**（A3 批3，2026-09-28，实测发生过的源）：
+#                      org_span 硬门（只能联系直属下属/上级/同级）。处方：派给
+#                      直属下属转派、请直属上级转发，或走升级/transfer。与 ACL
+#                      类毫无关系，混进 `unknown_acl` 会把「组织树走错门」
+#                      诊断成「沙箱越界」。
 #
 # ⚠ 为什么单独一个枚举而不是塞进 `FactKind`：`FactKind` 四格是**归因归属**
 # （谁的锅），本枚举是同一格内的**成因细分**（同样是"平台的锅"，但处方不同）。
@@ -78,6 +90,8 @@ DeniedBy = Literal[
     "no_write_sid",
     "unknown_acl",
     "disk_pressure",
+    "attestation_mismatch",
+    "cross_level",
 ]
 DENIED_BY_KINDS: frozenset[str] = frozenset(
     (
@@ -86,6 +100,8 @@ DENIED_BY_KINDS: frozenset[str] = frozenset(
         "no_write_sid",
         "unknown_acl",
         "disk_pressure",
+        "attestation_mismatch",
+        "cross_level",
     )
 )
 #: `sealed_by` 列的值前缀（机制名 + 封条目标路径），如

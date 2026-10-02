@@ -5,6 +5,8 @@ fire alarms, detect stalls. Absolute time model. Cooldown in-memory (A5).
 """
 
 import asyncio
+import difflib
+import hashlib
 import json
 import os
 import shlex
@@ -71,6 +73,9 @@ OBLIGATION_SCAN_TICKS = 12   # 12 * 5s = 60s — TEST16 D2: scan overdue obligat
 # 13b71e0d 停 75min 到会话结束）。装定时器；门槛仍由 migrate_orphan_approved
 # 自持（VERIFY 另走 _close_verify_and_parent、10min 宽限、pending merge 义务跳过）。
 ORPHAN_APPROVED_SWEEP_TICKS = 24  # 24 * 5s = 120s
+# P0-3: 运行时 run 租约 sweep —— 进程内死亡 run 的 running 行（lease 已过期
+# 且不在进程内活跃注册表）收口为 interrupted，不再等重启才被 startup sweep。
+RUN_LEASE_SWEEP_TICKS = 6    # 6 * 5s = 30s
 STALL_IDLE_MS = 10 * 60 * 1000        # 10 min idle threshold
 # 2026-08-22 env 化：看门狗节奏可调（TEST_DSH_24 复盘）。默认不变。
 # 注意耦合：SILENCE 阈值若下调，应 ≥ STREAMING_ZOMBIE_TIMEOUT_MS 的 1/2
@@ -117,6 +122,23 @@ DISTRESS_SAME_SIG_REPEAT = int(
 DISTRESS_LOOKBACK_MS = int(
     os.environ.get("HIVEWEAVE_DISTRESS_LOOKBACK_MS", "1800000") or "1800000"
 )
+# T27（2026-09-29，S16 牧云 / D79 木棉复盘）：复读型卡死断路器。
+# 病灶：连续多个 run 零工具调用、回执逐字节相同、status=completed、
+# work_logs 全是 completion ⇒ 既有 distress 判据（_agent_distress 只认
+# work_logs.type='error' 同签名 ≥6 次）对 completed 型空转全盲 —— 上级
+# 不知情，token 烧数小时。判据（全部命中）：最新 run 在窗口内 + 最近
+# run 连续 ≥ N 个「completed + 零工具调用 + 摘要互似（同文本或高重合，
+# 且非平台尾注形状）」。防误报：写文档/汇报类纯文本产出的 run 间摘要
+# 互异，不命中；平台尾注摘要（[TURN BUDGET] 类 [TAG] 形状，收口机制
+# 自产）不作为复读证据 —— 两类都靠「连续多 run 且输出重复」挡在门外。
+RUMINATION_MIN_STREAK = int(
+    os.environ.get("HIVEWEAVE_RUMINATION_MIN_STREAK", "3") or "3"
+)
+RUMINATION_LOOKBACK_MS = int(
+    os.environ.get("HIVEWEAVE_RUMINATION_LOOKBACK_MS", "1800000") or "1800000"
+)   # 30min — 最新 run 必须在此窗口内（正在烧才断路，陈年旧账归沉默看门狗）
+RUMINATION_SIMILARITY_THRESHOLD = 0.85
+RUMINATION_SCAN_DEPTH = 10  # streak 回溯的最大 run 数（notice 的次数以此封顶）
 # 修 #4: 未激活 agent 检测 — created_at 超过阈值且 activated_at IS NULL
 DEAD_AGENT_THRESHOLD_MS = 5 * 60 * 1000   # 5 min 未激活 → 重试 start_agent
 DEAD_AGENT_MAX_RETRIES = 3                 # 连续失败 3 次后升级给 CEO
@@ -197,6 +219,40 @@ def upstream_nudge_relevant(task: dict, by_id: dict[str, dict]) -> bool:
         if status not in _UPSTREAM_DELIVERED_OR_DONE:
             return True
     return False
+
+
+# ── T27: 复读型卡死判定的纯函数（可单测，不触 DB）──────────────
+
+
+def _normalized_summary(summary: object) -> str:
+    """run 摘要归一化（压空白）——逐字节相同的判定基准。"""
+    return " ".join(str(summary or "").split())
+
+
+def _is_platform_note_summary(summary: str) -> bool:
+    """平台尾注形状的摘要（段首 ``[TAG]``，tag ≤40 字符）。
+
+    与 ``agents/completion.py::_is_platform_note`` 同形判据。刻意本地实现
+    不反向 import：该文件正被 T16 施工，私有符号不稳定；且本判定语义是
+    「平台自产文案不作为复读证据」，与 completion 的旁白分类用途不同。
+    """
+    text = summary.lstrip()
+    if not text.startswith("["):
+        return False
+    end = text.find("]")
+    return 0 < end <= 40
+
+
+def _summaries_similar(a: str, b: str) -> bool:
+    """T27 复读判据的「同文本或高重合」：归一化后全等，或重合度达标。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return (
+        difflib.SequenceMatcher(None, a, b).ratio()
+        >= RUMINATION_SIMILARITY_THRESHOLD
+    )
 
 
 def mark_project_tombstoned(project_id: str) -> None:
@@ -404,7 +460,8 @@ class GameTimeService:
         # Preserve in-memory trackers across restart of a finished task
         if existing:
             for key in ("stall_trackers", "task_stall_trackers", "stall_cooldowns",
-                        "silence_trackers", "ledger_nudge_cooldowns"):
+                        "silence_trackers", "ledger_nudge_cooldowns",
+                        "rumination_trackers"):
                 if key in existing and key not in state:
                     state[key] = existing[key]
         # Duty session baseline — overnight wall-clock must not stampede nudges
@@ -625,6 +682,18 @@ class GameTimeService:
                     project_id=project_id,
                     error=str(e),
                 )
+        # P0-3: 运行时 run 租约 sweep（30s 槽位）—— lease 已过期且不在进程内
+        # 活跃注册表的 running run 收口为 interrupted（与启动 sweep 同语义）。
+        # 独立 try/except，故障不拖累既有 tick 槽位。
+        if state["tick_count"] % RUN_LEASE_SWEEP_TICKS == 0:
+            try:
+                await self._sweep_expired_run_leases(project_id)
+            except Exception as e:
+                log.error(
+                    "run_lease_sweep_tick_failed",
+                    project_id=project_id,
+                    error=str(e),
+                )
         # Watchdog: 每 2 分钟检查停滞 agent，直接触发（不经过上级）
         if state["tick_count"] % STALL_CHECK_TICKS == 0:
             await self._check_stalled(project_id)
@@ -657,6 +726,39 @@ class GameTimeService:
                 await self._check_silent_agents(project_id)
             except Exception as e:
                 log.error("silence_watchdog_failed",
+                          project_id=project_id, error=str(e))
+            # T10: 用户行动诉求 SLA 监控（与休眠中层机制互补不重复——
+            # 那条管「有团队没派活」，这条管「用户诉求没转成任何任务」）
+            try:
+                from hiveweave.services.user_directive_sla import (
+                    check_user_directive_sla,
+                )
+
+                await check_user_directive_sla(project_id)
+            except Exception as e:
+                log.error("user_directive_sla_check_failed",
+                          project_id=project_id, error=str(e))
+            # T27: 复读型卡死断路器（completed 型空转——work_logs 全是
+            # completion 时既有 error 签名 distress 判据全盲）。独立
+            # try/except，故障不拖累既有看门狗。
+            try:
+                await self._check_rumination_agents(project_id)
+            except Exception as e:
+                log.error("rumination_breaker_failed",
+                          project_id=project_id, error=str(e))
+            # T21（S16）：ask(reply_required) 无回复升级 SLA —— 超过
+            # HIVEWEAVE_ASK_ESCALATION_MIN（默认 30 分钟）未获回复 ⇒ 向
+            # asker 的组织 parent 投升级 notice（wake=1），再超一倍再升
+            # 一级直到 CEO。幂等键防重。尾部追加增量（本文件有在途改动，
+            # 不动既有扫描）。
+            try:
+                from hiveweave.services.ask_escalation import (
+                    check_ask_escalation,
+                )
+
+                await check_ask_escalation(project_id)
+            except Exception as e:
+                log.error("ask_escalation_check_failed",
                           project_id=project_id, error=str(e))
         log.debug("game_time_tick", project_id=project_id, game_seconds=new_gs)
 
@@ -779,6 +881,48 @@ class GameTimeService:
                 **migrated,
             )
 
+    async def _sweep_expired_run_leases(self, project_id: str) -> None:
+        """P0-3：运行时 run 租约 sweep（30s 槽位）—— 收口进程内死亡 run 的悬挂行。
+
+        病灶：``agent_runs.lease_expires_at`` 此前只写不读 —— 进程内 run 死亡
+        （收口路径漏掉 / task 静默消失 / OOM kill）后 running 行悬挂到重启
+        才被 startup sweep 收口。本方法把启动 sweep 的收口语义搬到运行时，
+        判据 = lease 过期 **且** 该 run 不在进程内活跃注册表。
+
+        防误杀（注册表判据，取法照 ``_check_silent_agents`` 的 processing
+        豁免）：进程内仍在跑的 run 不能动 —— 豁免 = PROCESSING 中 agent 的
+        ``_current_run_id``。⚠ 健康长 run 的 lease 普遍已过期
+        （``check_budget`` 不按墙钟停），注册表是唯一豁免通道；同 agent
+        更早的遗留 running 行（真正的悬挂行）不在豁免内，照常收口。
+        """
+        from hiveweave.agents.supervisor import agent_manager
+        from hiveweave.agents.types import AgentState
+        from hiveweave.services.run_ledger import sweep_expired_run_leases
+
+        live_run_ids: set[str] = set()
+        for agent in agent_manager.list_all():
+            if agent.project_id != project_id:
+                continue
+            if agent.status != AgentState.PROCESSING:
+                continue
+            rid = getattr(agent, "_current_run_id", None)
+            if rid:
+                live_run_ids.add(rid)
+
+        workspace_path = await meta_db.get_project_workspace(project_id)
+        if not workspace_path:
+            return
+        swept = await sweep_expired_run_leases(
+            workspace_path, exempt_run_ids=live_run_ids,
+        )
+        if swept:
+            log.info(
+                "run_lease_sweep_tick",
+                project_id=project_id,
+                swept=swept,
+                exempt=len(live_run_ids),
+            )
+
     async def _process_wait_contracts(self, project_id: str) -> None:
         """Expire waits (WAIT_TIMEOUT) and break agent wait cycles."""
         from hiveweave.services.inbox import InboxService
@@ -884,11 +1028,22 @@ class GameTimeService:
                     if wakeup_reason == "ttl_cap":
                         struct["wait_target"] = ttl_cap_target
                 if wakeup_reason == "ttl_cap":
+                    # T16 三期：续等教学面按模式分流（auto 下合法续等 =
+                    # wait_on；commit_turn 已下架）。
+                    from hiveweave.config import turn_exit_mode
+
+                    if turn_exit_mode() == "auto":
+                        rewait = (
+                            "请重新 wait_on(refs=[{\"kind\": "
+                            f"\"{kind}\", \"ref\": \"{ref}\"}}]) 续等，"
+                        )
+                    else:
+                        rewait = "请重新 commit_turn(waiting_on) 续等，"
                     body = (
                         f"[WAIT_TIMEOUT] wakeup_reason=ttl_cap — "
                         f"这是等待 TTL 上限唤醒，不是目标时刻到点："
                         f"目标 <{ttl_cap_target}> 未到。"
-                        f"请重新 commit_turn(waiting_on) 续等，"
+                        f"{rewait}"
                         f"或改用 ScheduledAlarm（schedule_alarm）。 "
                         f"Your wait ({kind}:{ref}) hit the wait-TTL cap. "
                         f"details={struct}"
@@ -1991,6 +2146,12 @@ class GameTimeService:
         from hiveweave.services.tasks.constants import TERMINAL_STATUSES
 
         try:
+            # P1-5：ask 债只对 agent 记账 ⇒ 排除集合单源自
+            # inbox.non_human_sender_sql（wake_policy 权威人类别名集），
+            # 不再写字面量 NOT IN ('user','system')。
+            from hiveweave.services.inbox import non_human_sender_sql
+
+            _not_frag, _not_params = non_human_sender_sql()
             neg = ",".join("?" for _ in TERMINAL_STATUSES)
             rows = await _query(
                 project_id,
@@ -2000,9 +2161,9 @@ class GameTimeService:
                 "(SELECT COUNT(*) FROM agent_waits WHERE cleared_at IS NULL) "
                 "AS open_waits, "
                 "(SELECT COUNT(*) FROM inbox WHERE expect_report = 1 "
-                " AND read = 0 AND from_agent_id NOT IN ('user', 'system')) "
+                f" AND read = 0 AND {_not_frag}) "
                 "AS open_asks",
-                list(TERMINAL_STATUSES),
+                [*list(TERMINAL_STATUSES), *_not_params],
             )
         except Exception as e:
             log.debug("advancable_state_check_failed",
@@ -2286,11 +2447,41 @@ class GameTimeService:
                     inbound_ask = False
             if not obligations and not inbound_ask and not waits \
                     and not root_arbitration:
-                # P0-4 ①组织上下文：直属下级近期深陷（同签名 error 终止 ≥
-                # 阈值）时不判合法空闲 —— 中层「名下无开放工作」但其下级反复
-                # 失败时仍应被唤醒介入，否则看门狗叫错人（下级深陷却不升级）。
-                if not await self._has_distressed_subordinate(
+                # TEST_DSH_77：三空 ≠ 无活 —— obligations/ask/wait 全空时，
+                # 中层休眠形态（coordinator 且 CEO 直属 + active executor
+                # 下属全员零被派任务 + 自己零未结任务 + 无 active run）只在
+                # 闭式 has_open_work 可见；不复核会在「合法 idle」闸门二次
+                # 蒸发（延续唤醒链少接一层，中层睡死）。fail-closed（异常按
+                # 有活）与上方 complete 分支同向。
+                try:
+                    busy_recheck = await task_svc.has_open_work(
+                        project_id, aid)
+                except Exception as e:
+                    log.warning("silence_idle_recheck_failed",
+                                project_id=project_id, agent_id=aid,
+                                error=str(e))
+                    busy_recheck = True
+                if busy_recheck:
+                    # 此处命中必为休眠形态（obligations/ask 已空、wait 已
+                    # 排除）：投递带处方的唤醒 notice —— 幂等键去重，同一批
+                    # 下属 + 零派任务状态只投一次，dispatch 后形态自然失效。
+                    # 失败不阻断下方唤醒主链（还有 force 唤醒 + digest
+                    # 处方块兜底）。
+                    try:
+                        from hiveweave.agents.trigger import (
+                            maybe_notify_dormant_lead,
+                        )
+
+                        await maybe_notify_dormant_lead(project_id, aid)
+                    except Exception as e:
+                        log.debug("dormant_lead_notice_failed",
+                                  project_id=project_id, agent_id=aid,
+                                  error=str(e))
+                elif not await self._has_distressed_subordinate(
                         project_id, agents, aid, now_ms):
+                    # P0-4 ①组织上下文：直属下级近期深陷（同签名 error 终止 ≥
+                    # 阈值）时不判合法空闲 —— 中层「名下无开放工作」但其下级反复
+                    # 失败时仍应被唤醒介入，否则看门狗叫错人（下级深陷却不升级）。
                     if tracker["flagged"]:
                         tracker["flagged"] = False
                         try:
@@ -2546,6 +2737,215 @@ class GameTimeService:
             if int(r["c"] or 0) >= DISTRESS_SAME_SIG_REPEAT:
                 return True
         return False
+
+    # ── T27: 复读型卡死断路器（completed 型空转的升级通道）─────────
+
+    async def _detect_rumination_streak(
+        self, project_id: str, agent_id: str, now_ms: int,
+    ) -> dict | None:
+        """最近 run 的「复读型卡死」判定（只读 agent_runs，不改写入）。
+
+        判据（全部命中）：
+        - 最新 run 在 RUMINATION_LOOKBACK_MS 窗口内（正在烧才断路）；
+        - 自最新 run 起连续 ≥ RUMINATION_MIN_STREAK 个 run：
+          ``status='completed'`` + ``actual_tool_calls=0`` +
+          ``result_summary`` 非空、非平台尾注形状、与最新 run 摘要互似
+          （``_summaries_similar``：同文本或重合 ≥ 阈值）。
+
+        任一不满足即断 streak（有工具调用 / 摘要变化 / interrupted/error /
+        running / 平台尾注摘要）。摘要互异 = 行为在变（写文档/试错），
+        不是复读。查询异常 fail-open 返回 None（不误报）。
+
+        返回 ``{"streak", "summary", "sig"}`` 或 None。
+        """
+        try:
+            rows = await _query(
+                project_id,
+                "SELECT status, actual_tool_calls, result_summary, started_at "
+                "FROM agent_runs WHERE agent_id = ? AND started_at > ? "
+                "ORDER BY started_at DESC LIMIT ?",
+                [agent_id, now_ms - RUMINATION_LOOKBACK_MS,
+                 RUMINATION_SCAN_DEPTH],
+            )
+        except Exception as e:
+            log.debug("rumination_probe_failed",
+                      project_id=project_id, agent_id=agent_id, error=str(e))
+            return None
+        if not rows:
+            return None
+        base = _normalized_summary(rows[0]["result_summary"])
+        if (str(rows[0]["status"] or "") != "completed"
+                or int(rows[0]["actual_tool_calls"] or 0) != 0
+                or not base
+                or _is_platform_note_summary(base)):
+            return None
+        streak = 0
+        for r in rows:
+            if str(r["status"] or "") != "completed":
+                break
+            if int(r["actual_tool_calls"] or 0) != 0:
+                break
+            s = _normalized_summary(r["result_summary"])
+            if (not s or _is_platform_note_summary(s)
+                    or not _summaries_similar(base, s)):
+                break
+            streak += 1
+        if streak < RUMINATION_MIN_STREAK:
+            return None
+        return {
+            "streak": streak,
+            "summary": base,
+            "sig": hashlib.sha1(base.encode("utf-8")).hexdigest()[:12],
+        }
+
+    async def _check_rumination_agents(self, project_id: str) -> None:
+        """T27: 复读型卡死断路器 — 每 STALL_CHECK 槽位扫一遍 active agent。
+
+        病灶（S16 牧云 / D79 木棉）：连续多个 run 零工具调用、回执逐字节
+        相同、status=completed、work_logs 全是 completion ⇒ 既有 distress
+        判据（只认 work_logs.type='error' 同签名 ≥6 次）全盲，上级不知情，
+        token 烧数小时。
+
+        动作（幂等：同 streak 只投一轮，换行为后重置；挂 wait contract 的
+        合法停泊不投 —— 停泊者没有新 run 在烧）：
+        ① 给 agent 本体投强处方 notice（platform_notice + wake）；
+        ② 同时投其组织上级一份知情 notice（含 agent 名 + 卡死摘要）。
+        """
+        proj = await meta_db.query_one(
+            "SELECT is_started FROM projects WHERE id = ?", [project_id]
+        )
+        if not proj or not dict(proj).get("is_started"):
+            return
+        from hiveweave.services.system_state import system_state
+
+        if system_state.paused():
+            return
+
+        state = _states.get(project_id)
+        if state is None:
+            return
+        now_ms = int(time.time() * 1000)
+        agents = await _query(
+            project_id,
+            "SELECT id, name, parent_id FROM agents WHERE status = 'active'",
+            [],
+        )
+        if not agents:
+            return
+
+        # 合法停泊豁免：有未过期 wait contract 的 agent 不投（自纠停车的
+        # 不该被断路器再拽起来；真正持续烧 run 的没有 wait）。
+        from hiveweave.services.wait_contract import wait_contract_service
+
+        live_wait_agents: set[str] = set()
+        try:
+            for w in await wait_contract_service.list_all_active(project_id):
+                exp = w.get("expiresAt")
+                if exp is None or int(exp) > now_ms:
+                    aid = str(w.get("agentId") or "")
+                    if aid:
+                        live_wait_agents.add(aid)
+        except Exception as e:
+            log.debug("rumination_wait_probe_failed",
+                      project_id=project_id, error=str(e))
+
+        trackers: dict = state.setdefault("rumination_trackers", {})
+
+        for row in agents:
+            aid = row["id"]
+            if not aid or aid in live_wait_agents:
+                continue
+            try:
+                hit = await self._detect_rumination_streak(
+                    project_id, aid, now_ms
+                )
+            except Exception as e:
+                log.warning("rumination_probe_failed",
+                            project_id=project_id, agent_id=aid, error=str(e))
+                continue
+            tracker = trackers.get(aid)
+            if hit is None:
+                # 形态消失（换行为 / 停跑 / 窗口滑出）→ 重置：streak 断裂
+                # 代际 +1，同签名复发也能再投一轮（幂等键随代际换代）。
+                if tracker is not None:
+                    if tracker.get("notified"):
+                        tracker["notified"] = False
+                        tracker["gen"] = int(tracker.get("gen") or 0) + 1
+                    else:
+                        trackers.pop(aid, None)
+                continue
+            sig = hit["sig"]
+            if tracker is None or tracker.get("sig") != sig:
+                tracker = {
+                    "sig": sig,
+                    "notified": False,
+                    "gen": int((tracker or {}).get("gen") or 0),
+                }
+            if tracker.get("notified"):
+                continue  # 同 streak 已投过，不刷屏
+            tracker["notified"] = True
+            trackers[aid] = tracker
+            await self._send_rumination_notices(
+                project_id, aid, row["name"] or aid[:12], row["parent_id"],
+                hit, int(tracker.get("gen") or 0),
+            )
+
+    async def _send_rumination_notices(
+        self, project_id: str, agent_id: str, name: str,
+        parent_id: Any, hit: dict, gen: int,
+    ) -> None:
+        """投递双 notice：本人强处方 + 上级知情。失败只记日志不抛。"""
+        from hiveweave.services.inbox import InboxService
+
+        streak = int(hit["streak"])
+        summary = str(hit["summary"])[:120]
+        sig = str(hit["sig"])
+        log.warning(
+            "rumination_breaker_hit",
+            project_id=project_id, agent_id=agent_id, streak=streak,
+            sig=sig, parent_id=parent_id,
+        )
+        inbox = InboxService()
+        try:
+            await inbox.send_message(
+                from_agent_id="system",
+                to_agent_id=agent_id,
+                message=(
+                    f"[复读卡断路器] 你已连续 {streak} 个回合零工具调用且"
+                    "输出重复（各回合回执几乎逐字相同）——这条路径无效，"
+                    "继续重复只会继续空转。立即换方法执行；若确有阻塞，"
+                    "用 send_message 向你的上级说明具体阻塞点求助。"
+                ),
+                message_type="platform_notice",
+                priority="urgent",
+                wake=True,
+                trusted_platform=True,
+                idempotency_key=f"rumination:{agent_id}:{gen}:{sig}",
+            )
+        except Exception as e:
+            log.warning("rumination_self_notice_failed",
+                        agent_id=agent_id, error=str(e))
+        if parent_id and parent_id != agent_id:
+            try:
+                await inbox.send_message(
+                    from_agent_id="system",
+                    to_agent_id=parent_id,
+                    message=(
+                        f"[复读卡断路器] 下级 {name} 已连续 {streak} 个回合"
+                        f"零工具调用且回执逐字重复（摘要：{summary}），"
+                        "疑似复读型卡死空转。请介入：与其沟通阻塞点、"
+                        "调整任务或重新派活。"
+                    )[:400],
+                    message_type="platform_notice",
+                    priority="urgent",
+                    wake=True,
+                    trusted_platform=True,
+                    idempotency_key=f"rumination-esc:{agent_id}:{gen}:{sig}",
+                )
+            except Exception as e:
+                log.warning("rumination_superior_notice_failed",
+                            agent_id=agent_id, superior_id=parent_id,
+                            error=str(e))
 
     async def _escalate_to_superior(self, project_id: str, agent_id: str,
                                     parent_id: str, name: str,

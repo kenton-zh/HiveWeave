@@ -314,6 +314,9 @@ async def gather_exit_gate_facts(agent: Any, tool_calls: list) -> ExitGateFacts:
     sent_to: set[str] = set()
     replied_contracts: set[str] = set()
     turn_started_ms = int((agent.current_job or {}).get("started_at") or 0)
+    import time as _time
+
+    since_30min = int(_time.time() * 1000) - 30 * 60 * 1000
     if turn_started_ms:
         try:
             # TEST10 修复: 判定窗口从「本 turn 开始后」扩展到「最老待回复
@@ -334,21 +337,27 @@ async def gather_exit_gate_facts(agent: Any, tool_calls: list) -> ExitGateFacts:
                     reply_window_ms,
                     cast(int, min([cast(int, t) for t in expect_ts])),
                 )
-            sent_to = await agent._inbox.get_sent_recipients_since(
-                agent.id, reply_window_ms
+            sent_to = set(
+                await agent._inbox.get_sent_recipients_since(
+                    agent.id, reply_window_ms
+                )
             )
-            import time as _time
-
-            since_30min = int(_time.time() * 1000) - 30 * 60 * 1000
-            sent_30min = await agent._inbox.get_sent_recipients_since(
-                agent.id, since_30min
-            )
-            sent_to = set(sent_to) | set(sent_30min)
             replied_contracts = await agent._inbox.get_replied_contracts_since(
                 agent.id, reply_window_ms
             )
         except Exception as e:
             log.debug("reply_gate_sent_lookup_failed", error=str(e))
+    # T29-①（S16，WAIT_WITHOUT_ASK 送达确认仍被拒的根因之一）：30 分钟
+    # 送达证据查询此前嵌在 `if turn_started_ms:` 内 —— current_job 缺
+    # started_at 时整份送达证据被丢成空集。该窗口不依赖 job 元数据，
+    # 必须无条件查（独立 try，不拖垮 reply 窗口分支）。
+    try:
+        sent_30min = await agent._inbox.get_sent_recipients_since(
+            agent.id, since_30min
+        )
+        sent_to = set(sent_to) | set(sent_30min)
+    except Exception as e:
+        log.debug("reply_gate_sent_30min_lookup_failed", error=str(e))
 
     unreplied_asks = collect_unreplied_asks(
         pending_msgs,
@@ -367,21 +376,43 @@ async def gather_exit_gate_facts(agent: Any, tool_calls: list) -> ExitGateFacts:
         )
     except Exception as e:
         log.debug("outbound_ask_refs_failed", error=str(e))
-    # Enrich messaged_refs with display names for ref matching
+    # T29-①（S16 根因之二）：送达证据必须按 **id + 花名 + short_id** 三形态
+    # 富化，且覆盖**全部**送达收件人。此前只给「恰为 pending 发件人」的
+    # 少数 id 补了花名 —— 模型按回执可见形态（短号/花名，AGENTS 铁律
+    # 「copy public ids whole from tool receipts」）写 waiting_on ref 时，
+    # inbox 落库的 UUID 证据匹配不上 ⇒ 真送达被 WAIT_WITHOUT_ASK 误拒。
+    # 口径对齐 commit_turn 预检（turn_exit.enrich_id_set：id+花名+短号）。
+    short_by_id: dict[str, str] = {}
+
+    async def _display_aliases(aid: str) -> tuple[str, str]:
+        """(name, short_id) for an agent id; ("", "") on lookup failure."""
+        if aid in name_by_id and aid in short_by_id:
+            return name_by_id[aid], short_by_id[aid]
+        try:
+            ag = await meta_db.get_agent_by_id(aid)
+        except Exception:
+            return name_by_id.get(aid, ""), short_by_id.get(aid, "")
+        name = (ag or {}).get("name") or ""
+        short = str((ag or {}).get("short_id") or "")
+        if name:
+            name_by_id[aid] = name
+        if short:
+            short_by_id[aid] = short
+        return name, short
+
     messaged_refs = set(sent_to)
     for aid in list(sent_to):
-        if aid in name_by_id:
-            messaged_refs.add(name_by_id[aid])
+        name, short = await _display_aliases(aid)
+        if name:
+            messaged_refs.add(name)
+        if short:
+            messaged_refs.add(short)
     for aid in list(outbound_ask_refs):
-        if aid not in name_by_id:
-            try:
-                ag = await meta_db.get_agent_by_id(aid)
-                if ag and ag.get("name"):
-                    name_by_id[aid] = ag["name"]
-            except Exception:
-                pass
-        if aid in name_by_id:
-            outbound_ask_refs.add(name_by_id[aid])
+        name, short = await _display_aliases(aid)
+        if name:
+            outbound_ask_refs.add(name)
+        if short:
+            outbound_ask_refs.add(short)
 
     open_obligations: list[dict] = []
     delegated_in_flight: list[dict] = []
@@ -541,6 +572,17 @@ async def handle_completion(
     content = result.get("content", "")
     thinking = result.get("thinking")
     tool_calls = result.get("tool_calls", [])
+
+    # T16 一期（auto 回合出口模式）判定。legacy 下三个 _t16 分支全部短路，
+    # 函数其余部分逐行保持原行为。
+    # T16 增补（回合墙钟预算退役，09-30 钦定）：auto 模式下 tool_loop 不
+    # 再武装 budget_deadline ⇒ ``budget_exhausted`` 结果在 auto 不可达，
+    # _t16_budget_stop 分支 = 结构性死分支（保留：若旁路结果真携带该键，
+    # 仍按 T16 一期 interrupted 语义兜底，不静默冒充自然停收口）。
+    from hiveweave.config import turn_exit_mode
+
+    _auto_exit = turn_exit_mode() == "auto"
+    _t16_budget_stop = _auto_exit and bool(result.get("budget_exhausted"))
 
     # E5: 成功一轮（收到正常 LLM 完成结果）即清除断流降级标志 —— 与
     # _run_id/ledger 写库解耦（审计修正：挂在 complete_run 成功副作用后，
@@ -712,6 +754,28 @@ async def handle_completion(
     # 批 C 第1步②：门禁事实装配提取为 gather_exit_gate_facts —— 与
     # build_gate_supplement_hint（run 关闭前的同 run 补步评估，经 tool loop
     # 的 exit_gate_check 接缝进入）共用同一装配，两处判据同源。
+    # T16 auto：平台程序化 commit —— 模型自然停止未提交时按平台推断合成
+    # TurnResult（wait 契约=waiting；否则 done_slice；summary=末段
+    # assistant 文本/最后工具结果），再走既有门禁判定与收口结构。
+    # 预算掐断不合成（run 标 interrupted，不做门禁收口）。
+    if _auto_exit and not _t16_budget_stop:
+        try:
+            from hiveweave.services.turn_exit_auto import (
+                ensure_platform_turn_result,
+            )
+
+            await ensure_platform_turn_result(
+                agent,
+                content,
+                tool_turn_messages,
+                refine_summary=True,
+            )
+        except Exception as e:
+            log.warning(
+                "t16_platform_commit_failed",
+                agent_id=agent.id,
+                error=str(e),
+            )
     facts = await gather_exit_gate_facts(agent, tool_calls)
     unreplied_asks = facts.unreplied_asks
     open_obligations = facts.open_obligations
@@ -778,7 +842,11 @@ async def handle_completion(
                 footer=(
                     "这不是你成功回复了——是平台防止死锁的降级。"
                     "下次收到 ask/expect_report 请用 send_message/ask_agent "
-                    "正确指向发件人后再 commit_turn。"
+                    + (
+                        "正确指向发件人，然后停止输出（平台自动收口）。"
+                        if _auto_exit
+                        else "正确指向发件人后再 commit_turn。"
+                    )
                 ),
             )
             unreplied_asks = []
@@ -790,6 +858,14 @@ async def handle_completion(
     # 保证收口判定与补步评估（build_gate_supplement_hint）同一口径。
     facts.unreplied_asks = unreplied_asks
     exit_decision = evaluate_turn_exit(facts.to_context())
+
+    # T16 auto：消费 5 连停强挂标记（auto 门禁接缝置位）。pop 即清 ——
+    # 无论本次收口走哪条分支，标记都不跨 run 存活（chat() 入口另有兜底清）。
+    _t16_force_block = None
+    if _auto_exit:
+        from hiveweave.services.turn_session import pop_force_exit_block
+
+        _t16_force_block = pop_force_exit_block(agent.id)
 
     continue_slice = False
     budget_exhausted = bool(result.get("budget_exhausted"))
@@ -810,7 +886,36 @@ async def handle_completion(
         agent._no_progress_streak = 0
         agent._progress_fingerprint = fp
 
-    if not exit_decision.ok:
+    if _t16_budget_stop:
+        # T16 auto：预算墙 = interrupted（原 T16 兜底）。保留已累积文本与
+        # 工具产出（tool_loop 已落），run 标 interrupted，延续唤醒在下方
+        # 第 9 节武装（+10min，幂等 per-run）。不开门禁 blocked/park，
+        # 不 ACK pending inbox（延续唤醒回来仍可见同一批消息）。
+        # 【dead branch】T16 增补（09-30）：auto 回合无墙钟预算 ⇒ 上游
+        # tool_loop 不再产生 budget_exhausted —— 本分支不可达，仅作旁路
+        # 结果防御保留（连同第 9 节的延续唤醒武装）。
+        pop_pending_turn_result(agent.id)
+        agent._turn_gate_count = 0
+        agent.disposition = "runnable"
+        _run_id_b = getattr(agent, "_current_run_id", None)
+        if _run_id_b:
+            try:
+                await agent._run_ledger.interrupt_run(
+                    agent.id,
+                    _run_id_b,
+                    reason="t16_budget_deadline",
+                    result_summary=build_run_result_summary(content or ""),
+                )
+            except Exception as e:
+                log.debug(
+                    "t16_budget_interrupt_run_failed", error=str(e)
+                )
+        log.info(
+            "t16_budget_interrupt",
+            agent_id=agent.id,
+            run_id=_run_id_b,
+        )
+    elif not exit_decision.ok:
         unreplied_ids = {m["id"] for m in unreplied_asks}
         if agent.pending_inbox_msg_ids:
             no_reply_ids = [
@@ -904,7 +1009,11 @@ async def handle_completion(
                     f"{_gate_footer_head}"
                     "disposition=blocked。"
                     "上级可能已收到升级。下次唤醒时请先处理上述 GATE，"
-                    "再 commit_turn。"
+                    + (
+                        "处理完直接停止输出（平台自动收口）。"
+                        if _auto_exit
+                        else "再 commit_turn。"
+                    )
                 ),
             )
             log.warning(
@@ -924,6 +1033,12 @@ async def handle_completion(
                 )
             except Exception:
                 pass
+            if _t16_force_block:
+                # T16 auto：5 连停强挂 —— 通知 creator（上级 agent）。
+                # CEO（无 parent）的 blocked 状态与门禁公告在 UI 已可见。
+                await agent._escalate_gate_exhaustion(
+                    exit_decision.violations, _t16_force_block
+                )
             agent.pending_inbox_msg_ids = None
     else:
         # ACK only what this turn latched/showed — never mid-turn arrivals.
@@ -936,6 +1051,26 @@ async def handle_completion(
         # Do NOT reset _task_reminder_count here — that would defeat the
         # agent.turn.after nudge cap and allow infinite [TASK ADVANCE] loops.
         pop_pending_turn_result(agent.id)
+        # T16 auto：平台生成 commit 落 work_log —— 与 commit_turn 工具接受
+        # 时的 turn_result 记录同结构（UI Logs 契约不变），仅 phase 前缀带
+        # /AUTO 标记来源。
+        if _auto_exit and exit_decision.turn_result is not None:
+            _tr = exit_decision.turn_result
+            _tr_ext = getattr(_tr, "extensions", None)
+            if isinstance(_tr_ext, dict) and _tr_ext.get("platform_commit"):
+                try:
+                    await agent._work_log.write_work_log(
+                        agent.project_id,
+                        agent.id,
+                        None,
+                        "turn_result",
+                        f"[{_tr.phase}/AUTO] {_tr.summary}"[:140],
+                        details=_tr.to_persist_dict(),
+                    )
+                except Exception as e:
+                    log.debug(
+                        "t16_platform_commit_worklog_failed", error=str(e)
+                    )
         agent.disposition = exit_decision.disposition or "runnable"
 
         # Empty done_slice/waiting streak — consecutive hollow exits park hard (TEST4)
@@ -1394,6 +1529,31 @@ async def handle_completion(
         mark_degraded(agent.id)  # E5: stall 打断 → 置位降级标志
         agent._arm_interrupted_resume(_stall_resume_refs)
     elif budget_exhausted:
+        if _auto_exit:
+            # T16：延续唤醒兜底（+10min，幂等键 per-run）—— interrupted run
+            # 的续跑来源。legacy 的「预算墙权威收口、不再重触」语义保持原样。
+            # 【dead branch】T16 增补（09-30）：auto 回合无墙钟预算 ⇒
+            # 本子分支不可达（_arm_budget_continue 同 marked dead）。
+            agent._arm_budget_continue()
+            log.info(
+                "t16_budget_continue_scheduled",
+                agent_id=agent.id,
+                delay_s=getattr(agent, "_BUDGET_CONTINUE_DELAY_S", 600.0),
+            )
+            try:
+                from hiveweave.services.telemetry import telemetry
+
+                telemetry.turn_exit_gate(
+                    agent.id,
+                    [],
+                    "t16_budget_interrupted",
+                    gate_round=0,
+                )
+            except Exception:
+                pass
+            # 不 return：落到 I10 收口评估（auto 预算停 exit_decision 必
+            # not-ok，maybe_wake_sole_advancer 天然跳过；若 ok 则唤醒唯一
+            # 可推进者亦与延续唤醒同向）。
         # 预算墙是权威收口（DSH: budget stop）。模型在 run 内已收到
         # [TURN BUDGET] pacing/soft 提示 + soft 续命的 commit 窗口；仍未
         # commit_turn 就收口 ⇒ 上面门禁分支已显式记录，不再开新 run 补一句
@@ -1418,10 +1578,22 @@ async def handle_completion(
         # ADR-002 切片续跑：门禁已 ok、仍有义务且本轮有进展 → 下一片以
         # 新 run 续跑。这是设计内切片（source=turn_continue），不是门禁
         # 修复 —— 门禁修复不再产生任何新 run。
+        # T16 三期：收尾话术按模式分流（auto 下 commit_turn 已下架）。
+        if _auto_exit:
+            _slice_finish = (
+                "Continue once more, then stop when done (the platform "
+                "auto-closes the turn); if waiting on someone/a task, "
+                'wait_on(refs=[{"kind": "task|agent|fact|user", '
+                '"ref": "<id>"}]) first (commit_turn is delisted).'
+            )
+        else:
+            _slice_finish = (
+                "Continue once more, then commit_turn "
+                "(prefer waiting/done_slice when idle on the user)."
+            )
         await agent._retrigger_slice_continue(
             "[TURN CONTINUE] You still have actionable obligations and made "
-            "progress this slice. Continue once more, then commit_turn "
-            "(prefer waiting/done_slice when idle on the user).",
+            f"progress this slice. {_slice_finish}",
         )
     elif (
         phase == "in_progress"
