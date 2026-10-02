@@ -32,11 +32,17 @@ import { usePendingData } from "./usePendingData";
 
 type Filter = "all" | PendingGroupId;
 
+/** 办公室 HUD 下的默认浮层定位；工作台顶栏入口传入覆盖值改挂到 header 下方。 */
+const DEFAULT_OVERLAY_CLASS =
+  "absolute left-3 top-11 z-20 w-[380px] max-w-[calc(100%-1.5rem)] max-h-[calc(100%-3.5rem)]";
+
 interface Props {
   open: boolean;
   onClose: () => void;
   /** 徽标数据回传：OfficeWorkspace 用它显示 HUD 未处理总数 */
   onTotalChange?: (total: number) => void;
+  /** 浮层定位覆盖（工作台顶栏形态用，办公室默认值不变） */
+  overlayClassName?: string;
 }
 
 function actorLabel(actorId?: string): string | null {
@@ -165,7 +171,7 @@ function GroupSection({
   );
 }
 
-export default function PendingPanel({ open, onClose, onTotalChange }: Props) {
+export default function PendingPanel({ open, onClose, onTotalChange, overlayClassName = DEFAULT_OVERLAY_CLASS }: Props) {
   const { projectId, loading, errors, groups, countByGroup, total, now, refresh } = usePendingData();
   const [filter, setFilter] = useState<Filter>("all");
   const [approvalAgentId, setApprovalAgentId] = useState<string | null>(null);
@@ -199,7 +205,7 @@ export default function PendingPanel({ open, onClose, onTotalChange }: Props) {
       {approvalDialog}
       <aside
         data-testid="pending-panel"
-        className="absolute left-3 top-11 z-20 w-[380px] max-w-[calc(100%-1.5rem)] max-h-[calc(100%-3.5rem)] flex flex-col rounded-gmLg border border-g-win-border bg-g-win-body-solid shadow-gm-window animate-slide-up overflow-hidden"
+        className={`${overlayClassName} flex flex-col rounded-gmLg border border-g-win-border bg-g-win-body-solid shadow-gm-window animate-slide-up overflow-hidden`}
         aria-label="待我处理"
       >
         <header className="flex items-center gap-2 px-3 py-2.5 border-b border-g-win-border bg-g-win-header text-g-win-header-fg shrink-0">

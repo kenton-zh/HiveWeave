@@ -172,7 +172,9 @@
     @apply flex gap-0.5 bg-g-bg-muted/70 rounded-gm p-0.5 border border-g-border/60;
   }
   .hw-segment-item {
-    @apply px-3 py-1 text-xs rounded-gm text-g-fg-3 transition-all duration-150
+    /* relative：给 App.tsx 两处 segment 的 motion 滑动指示条（layoutId pill）
+       提供定位基准（2026-10-01 动效） */
+    @apply relative px-3 py-1 text-xs rounded-gm text-g-fg-3 transition-all duration-150
            hover:text-g-fg active:scale-[0.97] select-none;
   }
   /* hover 背景排除活动页签（审计 L-6：@apply 内 hover 会以 (0,2,0) 压过
@@ -192,14 +194,30 @@
     @apply px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider text-g-fg-3 border-b border-g-border bg-g-bg-soft;
   }
 
-  /* Org-tree node card hover elevation (state styles are inline in the component) */
+  /* Org-tree node card hover elevation (state styles are inline in the component)
+     动效（2026-10-01）：节点位移/进出场由 motion 走 transform/opacity（OrgTree），
+     ⛔ 这里不得 transition/transform —— CSS transform 会与 motion 的内联 transform
+     双驱动。hover 微抬改用独立的 translate 属性（individual transform properties）：
+     它与 motion 写的 transform 是两个属性、按规范先后叠加，互不干扰。 */
   .hw-org-node {
-    transition: box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease,
-      background-color 0.18s ease;
+    transition: box-shadow 0.18s ease, border-color 0.18s ease,
+      background-color 0.18s ease, translate 0.18s ease;
   }
   .hw-org-node:hover {
     box-shadow: 0 2px 4px -1px rgba(23, 25, 35, 0.08), 0 8px 20px -4px rgba(23, 25, 35, 0.14);
-    transform: translateY(-1px);
+    translate: 0 -1px;
+  }
+
+  /* 组织图连线层：节点弹簧落位 ~0.4s，连线几何却按目标位形瞬切 ——
+     重排瞬间线会脱开卡片。包层（.hw-org-lines，按布局签名 remount）在
+     重排时先隐后渐显，把脱开窗口藏掉；稳态不 remount、动画不重跑。
+     2026-10-01 动效。 */
+  .hw-org-lines {
+    animation: hw-org-lines-in 450ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  @keyframes hw-org-lines-in {
+    0%, 30% { opacity: 0; }
+    100% { opacity: 1; }
   }
 
   /* Shared motion tokens — fold-section opening, tab/view crossfade, toast exit */

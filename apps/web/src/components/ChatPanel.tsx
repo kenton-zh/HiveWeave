@@ -4,6 +4,7 @@ import { useAppStore, MEETING_ACTIVE_STATUSES } from "../store";
 import ApprovalDialog from "./ApprovalDialog";
 import TodoBar from "./TodoBar";
 import { getRoleStyle, getPositionLabel } from "../utils/role-styles";
+import { resolveAgentStatus } from "../utils/agentStatus";
 import { roleLabels, statusLabels, composerSendLabel, ENQUEUE_HINT, INSERT_HINT, STOP_LABEL } from "../chat/constants";
 import { getDirectedAgentId, nextBadgePopToken } from "../chat/messageUtils";
 import { livePhaseLabel } from "../utils/livePhase";
@@ -305,16 +306,27 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
     (s) => (agentId ? s.liveMap[agentId]?.phase : undefined),
   );
   const liveLabelText = livePhaseLabel(livePhase);
-  const runtimeStatusInfo =
-    disposition && statusLabels[disposition]
-      ? statusLabels[disposition]
-      : agentInfo?.status === "active"
-        ? isAgentProcessing
-          ? { text: "实现中", color: "text-g-green" }
-          : liveLabelText
-            ? { text: liveLabelText, color: "text-g-green" }
-            : { text: "空闲", color: "text-g-fg-3" }
-        : statusInfo;
+  // 统一优先级（2026-10-01 状态准确性修复，审计 M1）：与组织图圆点共用
+  // resolveAgentStatus —— processing 先于 disposition，stale 等待态
+  // （turn-exit 才更新）不得压过实时忙闲，两处文案不再同屏矛盾。
+  // 头部不传 healthError（健康红框由节点/顶栏负责），health 层走保底分支。
+  const resolved = resolveAgentStatus({
+    isProcessing: isAgentProcessing && agentInfo?.status === "active",
+    disposition,
+    lifecycle: agentInfo?.status || "idle",
+  });
+  let runtimeStatusInfo: { text: string; color: string };
+  if (resolved.layer === "processing") {
+    runtimeStatusInfo = { text: "实现中", color: "text-g-green" };
+  } else if (resolved.layer === "lifecycle" && resolved.key === "active") {
+    runtimeStatusInfo = liveLabelText
+      ? { text: liveLabelText, color: "text-g-green" }
+      : { text: "空闲", color: "text-g-fg-3" };
+  } else if (resolved.layer === "disposition" || resolved.layer === "lifecycle") {
+    runtimeStatusInfo = statusLabels[resolved.key] ?? statusInfo;
+  } else {
+    runtimeStatusInfo = statusInfo;
+  }
 
   const resolveAgentInfo = (id: string) => {
     if (!id) return { name: "系统", role: "" };

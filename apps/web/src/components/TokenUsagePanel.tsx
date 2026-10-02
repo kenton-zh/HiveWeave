@@ -2,6 +2,7 @@ import EmptyState from "./EmptyState";
 import { Coins } from "lucide-react";
 import ErrorState from "./ErrorState";
 import { Fragment, useState, useEffect, useMemo } from "react";
+import { CountingNumber } from "./animate-ui/primitives/texts/counting-number";
 import {
   getProjectTokenUsage,
   getProjectTokenDaily,
@@ -28,6 +29,15 @@ function fmtNum(n: number | undefined | null): string {
 function fmtCalls(n: number | undefined | null): string {
   if (n == null) return "-";
   return String(n);
+}
+
+/** fmtNum 的可动效版：拆成 {数值, 小数位, 后缀}，交给 CountingNumber 滚动。
+ * 分档（1M / 1k / 原值）与 fmtNum 严格一致，避免两处口径漂移。 */
+function splitNum(n: number | undefined | null): { value: number; decimals: number; suffix: string } | null {
+  if (n == null) return null;
+  if (n >= 1_000_000) return { value: n / 1_000_000, decimals: 2, suffix: "M" };
+  if (n >= 1_000) return { value: n / 1_000, decimals: 1, suffix: "k" };
+  return { value: n, decimals: 0, suffix: "" };
 }
 
 type AgentMeta = { name: string; role: string };
@@ -90,11 +100,15 @@ function NumCell({
 function StatCard({
   label,
   value,
+  num,
   accent,
   hint,
 }: {
   label: string;
-  value: string;
+  /** 无 num 时的回退文案（如命中率缺失时的 "—"）。 */
+  value?: string;
+  /** 数字滚动（CountingNumber）；null/缺省时渲染 value 字符串。 */
+  num?: { value: number; decimals: number; suffix: string } | null;
   accent: string;
   hint?: string;
 }) {
@@ -104,7 +118,16 @@ function StatCard({
       title={hint}
     >
       <div className="text-[10px] font-medium uppercase tracking-wider text-g-fg-3">{label}</div>
-      <div className={`text-xl font-semibold mt-1 font-mono num ${accent}`}>{value}</div>
+      <div className={`text-xl font-semibold mt-1 font-mono num ${accent}`}>
+        {num ? (
+          <>
+            <CountingNumber number={num.value} decimalPlaces={num.decimals} />
+            {num.suffix}
+          </>
+        ) : (
+          (value ?? "—")
+        )}
+      </div>
       {hint ? (
         <div className="text-[10px] text-g-fg-4 mt-1 leading-snug">{hint}</div>
       ) : null}
@@ -280,30 +303,35 @@ export default function TokenUsagePanel({ projectId }: { projectId: string }) {
           <div className="flex gap-3 flex-wrap">
             <StatCard
               label="总 Token"
-              value={fmtNum(totals.total)}
+              num={splitNum(totals.total)}
               accent="text-g-purple"
               hint="未命中 + 输出 + 缓存写，不含缓存读"
             />
-            <StatCard label="输出" value={fmtNum(totals.output)} accent="text-g-fg" hint="模型生成" />
+            <StatCard label="输出" num={splitNum(totals.output)} accent="text-g-fg" hint="模型生成" />
             <StatCard
               label="输入（命中）"
-              value={fmtNum(totals.cache_read)}
+              num={splitNum(totals.cache_read)}
               accent="text-g-fg"
               hint="前缀命中，不进记账合计"
             />
             <StatCard
               label="输入（未命中）"
-              value={fmtNum(totals.input)}
+              num={splitNum(totals.input)}
               accent="text-g-fg"
               hint="未走缓存的新输入"
             />
             <StatCard
               label="命中率"
+              num={totals.hitPct == null ? null : { value: totals.hitPct, decimals: 0, suffix: "%" }}
               value={formatHitPercent(totals.hitPct)}
               accent="text-g-blue"
               hint="缓存读 ÷（未命中 + 缓存读 + 缓存写）"
             />
-            <StatCard label="LLM 调用" value={fmtCalls(totals.llm_calls)} accent="text-g-blue" />
+            <StatCard
+              label="LLM 调用"
+              num={{ value: totals.llm_calls, decimals: 0, suffix: "" }}
+              accent="text-g-blue"
+            />
           </div>
 
           {/* 每日趋势 */}

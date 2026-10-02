@@ -50,12 +50,20 @@ function agentWindowTitle(
 // ── FE-01（UX-01）：成员聊天 ─────────────────────────────────────
 
 /**
- * 显式「打开/聚焦成员聊天窗」命令。
+ * 显式「打开/聚焦成员聊天」命令。
  * 调用点：OfficeView 场景点击（每次点击都发，含同 ID 重复点击）+
- * OfficeWorkspace 的选中 effect（承接 OrgTree / 项目初始化等其它选中来源）。
+ * OfficeWorkspace 的选中 effect / OrgTree.handleSelect / PendingPanel 点成员。
+ * 工作台形态（办公室关闭，对话与详情合并一栏切页签）⇒ 「点成员 = 看其聊天」：
+ * 选中该成员并把合并栏切到对话页签，不开游戏窗。
  */
 export function openAgentChat(agentId: string): void {
-  if (!agentId || !officeSurfaceActive) return;
+  if (!agentId) return;
+  if (!officeSurfaceActive) {
+    const app = useAppStore.getState();
+    if (app.selectedAgentId !== agentId) app.setSelectedAgent(agentId);
+    if (app.rightPanelTab !== "chat") app.setRightPanelTab("chat");
+    return;
+  }
   useGameWindowStore.getState().open("chat", { agentId }, agentWindowTitle("chat", agentId));
 }
 

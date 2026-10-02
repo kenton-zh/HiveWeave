@@ -16,7 +16,9 @@
   "dependencies": {
     "@xyflow/react": "^12.0.0",
     "agent-browser": "0.33.2",
+    "clsx": "^2.1.1",
     "lucide-react": "^1.47.0",
+    "motion": "^13.4.6",
     "phoenix": "^1.7.0",
     "pixi.js": "^8.19.0",
     "react": "^19.0.0",
@@ -25,6 +27,7 @@
     "react-resizable-panels": "2.1.9",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^2.6.1",
     "winbox": "^0.2.82",
     "zustand": "^5.0.0"
   },

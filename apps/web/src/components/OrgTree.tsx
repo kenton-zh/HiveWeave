@@ -1,5 +1,6 @@
 import EmptyState from "./EmptyState";
 import { Users } from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
 import {
   useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect,
 } from "react";
@@ -9,11 +10,13 @@ import { useAppStore, MEETING_ACTIVE_STATUSES, type AgentAlarmInfo } from "../st
 import { getPositionLabel } from "../utils/role-styles";
 import { LIVE_PHASE_LABEL, LIVE_PHASE_STYLE } from "../utils/livePhase";
 import { realMsToGameSeconds, gameSecondsToRealMs, decomposeGameSeconds } from "../utils/game-time";
+import { deriveAgentDot, deriveHealthError } from "../utils/agentStatus";
 import { openAgentChat } from "../navigation/commands";
 
 // ── Types ──────────────────────────────────────────────────────
 
-interface OrgNodeData {
+/** export：OrgRail（折叠窄条）复用同一数据形状与清洗逻辑 */
+export interface OrgNodeData {
   id: string;
   name: string;
   role: string;
@@ -44,8 +47,9 @@ function countNodes(node: OrgNodeData): number {
 
 /** BUG-018 fix: Recursively sanitize org-tree data, removing nodes with
  *  missing/empty ids and ensuring all required fields have defaults.
- *  Prevents blank node cards caused by malformed agent records. */
-function sanitizeTree(nodes: OrgNodeData[]): OrgNodeData[] {
+ *  Prevents blank node cards caused by malformed agent records.
+ *  export：OrgRail 共用（单一清洗口径，不各写一份） */
+export function sanitizeTree(nodes: OrgNodeData[]): OrgNodeData[] {
   const out: OrgNodeData[] = [];
   for (const n of nodes) {
     if (!n || !n.id) continue; // skip malformed entries
@@ -321,7 +325,8 @@ function Connectors({
 
 // ── Node card ──────────────────────────────────────────────────
 
-const ROLE_COLORS: Record<string, string> = {
+/** export：OrgRail 头像同色（角色色单一真值源） */
+export const ROLE_COLORS: Record<string, string> = {
   ceo: "#d97706", hr: "#e11d48", architect: "#9333ea",
   manager: "#4f46e5", developer: "#189a52", module_dev: "#189a52",
   test_engineer: "#c77400", qa: "#c77400", code_reviewer: "#7c3aed",
@@ -349,7 +354,7 @@ function formatAlarmCountdown(realMs: number): string {
 function TreeNodeCard({
   node, isSelected, onSelect, onApproval, onToggle,
   expanded, pendingCount, hasUserPing, isProcessing, nodeH, alarm,
-  healthError, live,
+  healthError, live, disposition,
 }: {
   node: LayoutNode;
   isSelected: boolean;
@@ -366,9 +371,19 @@ function TreeNodeCard({
   healthError?: string | null;
   /** 实时活动相位（tool/llm/subagent/working/waiting），idle 不传。 */
   live?: AgentLiveStatus;
+  /** turn-exit disposition（等待你/等他人/阻塞…，WS status_change 广播） */
+  disposition?: string;
 }) {
   const compact = nodeH < 50;
   const hasError = !!healthError;
+  // 合成状态圆点（2026-10-01 状态准确性修复）：健康错误 > 运行中 >
+  // 等待/阻塞(disposition) > 生命周期 —— 详见 utils/agentStatus.ts
+  const dot = deriveAgentDot({
+    healthError,
+    isProcessing,
+    disposition,
+    lifecycle: node.status,
+  });
   const hasChildren = !!node.children?.length;
   const positionLabel = getPositionLabel(node.position, node.role);
   const accentColor = ROLE_COLORS[node.role] || "#6b7280";
@@ -397,13 +412,28 @@ function TreeNodeCard({
   }
 
   return (
-    <div
+    <motion.div
       onClick={(e) => { e.stopPropagation(); onSelect(node.id); }}
       data-interactive="true"
       className="absolute cursor-pointer rounded-[10px] overflow-hidden hw-org-node group"
+      // 动效（2026-10-01）：位置由 motion 走 transform（x/y 弹簧）插值 ——
+      // 重排/新增不再瞬移，且符合设计规格 §4.9「新增动效只允许 transform/opacity」。
+      // ⚠ x/y 只写在 initial/animate；style 里 left/top 恒为 0（不随重排变化，
+      // React 不会重写），避免同一属性被 React style 与 motion 双驱动打断动画。
+      // ⚠ 不用 motion 的 layout prop：画布祖先有 CSS scale（pan/zoom），
+      // layout projection 会把祖先缩放误判为布局变化而打架。
+      // hover 微抬走 CSS translate 独立属性（与 motion 的 transform 叠加，见 index.css）。
+      initial={{ x: node.x, y: node.y, opacity: 0 }}
+      animate={{ x: node.x, y: node.y, opacity: 1 }}
+      exit={{ opacity: 0, pointerEvents: "none" }}
+      transition={{
+        x: { type: "spring", stiffness: 340, damping: 34 },
+        y: { type: "spring", stiffness: 340, damping: 34 },
+        opacity: { duration: 0.18 },
+      }}
       style={{
-        left: node.x,
-        top: node.y,
+        left: 0,
+        top: 0,
         width: node.w,
         minHeight: nodeH,
         border: `1px solid ${
@@ -468,16 +498,8 @@ function TreeNodeCard({
           <span className={`${compact ? "w-1 h-1" : "w-1.5 h-1.5"} bg-g-red rounded-full animate-pulse shrink-0`} />
         )}
         <span
-          className={`rounded-full shrink-0 ${compact ? "w-1.5 h-1.5" : "w-2 h-2"} ${
-            node.status === "active"
-              ? isProcessing ? "bg-g-green-vivid animate-pulse" : "bg-g-fg-4/70"
-              : node.status === "idle" || node.status === "inactive" ? "bg-g-fg-4/70"
-              : node.status === "promoted" ? "bg-g-blue"
-              : node.status === "receiving" ? "bg-g-yellow-vivid animate-pulse"
-              : node.status === "merging" ? "bg-g-purple-vivid animate-pulse"
-              : node.status === "dissolving" || node.status === "archived" ? "bg-g-red"
-              : "bg-g-fg-3"
-          }`}
+          title={dot.title}
+          className={`rounded-full shrink-0 ${compact ? "w-1.5 h-1.5" : "w-2 h-2"} ${dot.dotClass}`}
         />
       </div>
 
@@ -530,7 +552,7 @@ function TreeNodeCard({
           </span>
         )}
       </div>
-    </div>
+    </motion.div>
   );
 }
 
@@ -594,12 +616,13 @@ function OrgTree() {
   const setAgentAlarms = useAppStore((s) => s.setAgentAlarms);
   const selectedAgentId = useAppStore((s) => s.selectedAgentId);
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
-  const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const pendingApprovals = useAppStore((s) => s.pendingApprovals);
   const userPingAgentIds = useAppStore((s) => s.userPingAgentIds);
   const processingAgents = useAppStore((s) => s.processingAgents);
   const agentAlarms = useAppStore((s) => s.agentAlarms);
   const agentHealth = useAppStore((s) => s.agentHealth);
+  // turn-exit 等待态（WS status_change 广播）—— 圆点合成状态的实时层
+  const agentDispositions = useAppStore((s) => s.agentDispositions);
   // 团队开会状态（meeting_updated 事件 / REST 水合 → store）
   const activeMeeting = useAppStore((s) => s.activeMeeting);
   const meetingBadge =
@@ -761,15 +784,11 @@ function OrgTree() {
 
   const handleSelect = useCallback((id: string) => {
     setSelectedAgent(id);
-    // 同 ID 重复点击也要聚焦/恢复聊天窗（UX-01）：选中 effect 只认变化，
-    // 这里补发显式命令；办公室窗口层未挂载时命令内部直接 no-op。
+    // 同 ID 重复点击也要聚焦聊天（UX-01）：选中 effect 只认变化，这里补发显式
+    // 命令。办公室形态 ⇒ 聚焦/重开聊天窗；工作台形态 ⇒ 选中 + 目标页签切回对话
+    // （补偿规则收敛在 openAgentChat 命令内，此处不再重复）。
     openAgentChat(id);
-    // Auto-switch from Goals tab to Chat tab when an agent is selected
-    const currentTab = useAppStore.getState().rightPanelTab;
-    if (currentTab === "goals") {
-      setRightPanelTab("chat");
-    }
-  }, [setSelectedAgent, setRightPanelTab]);
+  }, [setSelectedAgent, openAgentChat]);
 
   // ── Layout computation ──
 
@@ -1037,7 +1056,14 @@ function OrgTree() {
                 className="relative"
                 style={{ width: layoutData.maxW, height: layoutData.maxH }}
               >
-                {/* Connectors */}
+                {/* Connectors —— 连线几何按目标位形瞬切，而节点走弹簧落位；
+                    重排瞬间两者会脱开。包层按布局签名 remount + CSS 动画
+                    「先隐后渐显」，把脱开窗口藏掉（见 index.css .hw-org-lines）。
+                    包层不带 position，svg 的 absolute inset-0 仍锚到外层 relative。 */}
+                <div
+                  key={`${params.nodeH}|${visible.map((n) => `${n.id}:${n.x}:${n.y}`).join(",")}`}
+                  className="hw-org-lines"
+                >
                 {connectors.map(({ parent, children }) => (
                   <Connectors
                     key={parent.id}
@@ -1047,15 +1073,16 @@ function OrgTree() {
                     strokeWidth={params.strokeWidth}
                   />
                 ))}
+                </div>
 
-                {/* Node cards */}
+                {/* Node cards —— AnimatePresence 收进出场（淡入/淡出），
+                    节点内部 motion.div 负责位置弹簧与 hover 微抬 */}
+                <AnimatePresence initial={false}>
                 {visible.map((n) => {
-                  const h = agentHealth[n.id];
-                  const healthError =
-                    h && h.health === "error" &&
-                    (!h.projectId || h.projectId === selectedProjectId)
-                      ? h.message || "未知错误"
-                      : null;
+                  const healthError = deriveHealthError(
+                    agentHealth[n.id],
+                    selectedProjectId,
+                  );
                   return (
                   <TreeNodeCard
                     key={n.id}
@@ -1081,9 +1108,11 @@ function OrgTree() {
                     nodeH={params.nodeH}
                     alarm={agentAlarms[n.id]}
                     healthError={healthError}
+                    disposition={agentDispositions[n.id]}
                   />
                   );
                 })}
+                </AnimatePresence>
               </div>
             </div>
           </div>

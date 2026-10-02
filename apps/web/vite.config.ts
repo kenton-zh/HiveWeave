@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * 从构建产物中剔除 office-assets 的美术中间产物。
@@ -149,6 +150,12 @@ function pruneArtifactPlugin(): Plugin {
 export default defineConfig({
   base: "./",
   plugins: [react(), pruneArtifactPlugin()],
+  // shadcn / Animate UI 组件用 `@/` 相对别名（tsconfig paths 同名），两侧须一致
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
   server: {
     port: 5173,
     strictPort: true,

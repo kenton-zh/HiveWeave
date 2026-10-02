@@ -1,7 +1,8 @@
 import { SkeletonList, OfficeSkeleton } from "./components/Skeleton";
 import { useState, useRef, useEffect, Suspense } from "react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from "react-resizable-panels";
 import OrgTree from "./components/OrgTree";
+import OrgRail from "./components/OrgRail";
 import ChatPanel from "./components/ChatPanel";
 import ProjectTimeBadge from "./components/ProjectTimeBadge";
 import ToastContainer from "./components/Toast";
@@ -9,8 +10,12 @@ import TokenUsagePanel from "./components/TokenUsagePanel";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { useLiveStatusPoll } from "./hooks/useLiveStatusPoll";
 import AssistantBall from "./components/AssistantBall";
-import OfficeWorkspace from "./components/OfficeWorkspace";
-import { lazyRetry, resolveLeftPanel } from "./mainPanel";
+import PendingPanel from "./components/pending/PendingPanel";
+import { lazyRetry, resolveLeftPanel, OFFICE_UI_ENABLED } from "./mainPanel";
+
+// 办公室关闭时 OfficeWorkspace 永不渲染 ⇒ 其 chunk（gamewindow/OfficeView/pixi.js
+// ~1MB）不进主流程；开启时才按需拉取。PendingPanel 静态引入（顶栏徽标常驻所需）。
+const OfficeWorkspace = lazyRetry(() => import("./components/OfficeWorkspace"));
 
 // Lazy-loaded: only fetched when the user navigates to them.
 // OfficeView alone pulls in pixi.js (~1MB); dialogs are interaction-only.
@@ -34,6 +39,9 @@ const TaskTimelinePanel = lazyRetry(() => import("./components/timeline/TaskTime
 import { useAppStore } from "./store";
 import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribeAgentStatus, getProjectGameTime, getSettings, updateSettings, initApiKeyFromStorage, restartBackend, restartFrontend, updateProject, getSocket } from "./api";
 import ProjectRunControls from "./components/ProjectRunControls";
+import EmptyState from "./components/EmptyState";
+import { SegmentItem } from "./components/SegmentTabs";
+import { PanelLeftClose } from "lucide-react";
 import type { DeleteProjectResponse, Project } from "./api";
 
 function App() {
@@ -53,22 +61,16 @@ function App() {
   const activeView = useAppStore((s) => s.activeView);
   const setActiveView = useAppStore((s) => s.setActiveView);
   const rightPanelTab = useAppStore((s) => s.rightPanelTab);
-  // 主界面形态：office = 办公室主界面（默认，ADR-011 §D2）｜ workbench = 旧三栏工作台
-  // （过渡期回退形态；验证稳定后按 ADR-011 迁移第 2 步退役三栏）
-  const [workspaceMode, setWorkspaceMode] = useState<"office" | "workbench">("office");
+  // 主界面形态：office = 办公室主界面（ADR-011 §D2）｜ workbench = 三栏工作台（组织图 + Chat）。
+  // OFFICE_UI_ENABLED=false（办公室暂时关闭）⇒ 强制 workbench，右下角无切换入口。
+  const [workspaceMode, setWorkspaceMode] = useState<"office" | "workbench">(
+    OFFICE_UI_ENABLED ? "office" : "workbench"
+  );
+  // 顶栏「待我处理」抽屉（办公室关闭后由工作台承接，计数徽标 + 面板开合）
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [pendingTotal, setPendingTotal] = useState(0);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const selectedTaskId = useAppStore((s) => s.selectedTaskId);
-  // P3-3 窄屏降级（<1280px）：三栏折回两栏 + tab（Chat 回到右栏）。
-  // EXE 出厂窗 1600×1000 走三栏；1024×700 min_size 触发降级。
-  const [narrowViewport, setNarrowViewport] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 1279px)").matches
-  );
-  useEffect(() => {
-    const mq = window.matchMedia("(max-width: 1279px)");
-    const onChange = () => setNarrowViewport(mq.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
 
   const setProcessingAgents = useAppStore((s) => s.setProcessingAgents);
   const updateProcessingAgent = useAppStore((s) => s.updateProcessingAgent);
@@ -465,37 +467,46 @@ function App() {
 
   const leftPanel = resolveLeftPanel(activeView, selectedProjectId);
 
-  // P3：右栏详情面板块（窄屏与宽屏共用同一份 JSX —— 两份清单各列一份 =
-  // 必然漂移）。key=tab：错误不跨 tab sticky（boundary 随 tab 重挂载清 state）。
+  // ── 左栏折叠（2026-10-01「组织图太占地方」修复）────────────────
+  // 收起后左 Panel 缩到 collapsedSize≈3.5%（窄条 OrgRail：头像+状态点），
+  // 页头与视图用 display:none 保持挂载 —— OrgTree 的 approvals/闹钟轮询、
+  // 缩放与折叠状态都不中断，展开即恢复原样。
+  // 布局经 autoSaveId 持久化（恢复是 layout-effect 内同步读，且库在首帧
+  // 必回调 onResize）；挂载 effect 再兜一次 isCollapsed()，之后变化全走
+  // onResize —— 三条路径互为保险。
+  const leftPanelRef = useRef<ImperativePanelHandle>(null);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  useEffect(() => {
+    const p = leftPanelRef.current;
+    if (p) setLeftCollapsed(p.isCollapsed());
+  }, []);
+
+  // 合并栏的 "chat" 页签只在选中成员时存在：无成员时残留的 chat tab 归一为
+  // "目标"（避免未高亮的空页签）。
+  const effectiveRightTab =
+    rightPanelTab === "chat" && !selectedAgentId ? "goals" : rightPanelTab;
+
+  // 合并栏详情面板块（agent/logs/monitor/debug；goals 与 task 在外层链处理）。
+  // key=tab：错误不跨 tab sticky（boundary 随 tab 重挂载清 state）。
   const detailPanels = (
-    <ErrorBoundary key={rightPanelTab} label="右栏面板">
+    <ErrorBoundary key={effectiveRightTab} label="右栏面板">
       <Suspense fallback={<SkeletonList rows={5} />}>
-        {rightPanelTab === "goals" && selectedProjectId && (
-          <div key="panel-goals" className="hw-tab-in h-full">
-            <GoalsPanel projectId={selectedProjectId} />
-          </div>
-        )}
-        {rightPanelTab === "goals" && !selectedProjectId && (
-          <div key="panel-goals-empty" className="hw-tab-in h-full flex items-center justify-center text-g-fg-3 text-sm">
-            请先选择一个项目
-          </div>
-        )}
-        {rightPanelTab === "agent" && selectedAgentId && (
+        {effectiveRightTab === "agent" && selectedAgentId && (
           <div key="panel-agent" className="hw-tab-in h-full">
             <AgentDetailPanel agentId={selectedAgentId} />
           </div>
         )}
-        {rightPanelTab === "monitor" && selectedAgentId && (
+        {effectiveRightTab === "monitor" && selectedAgentId && (
           <div key="panel-monitor" className="hw-tab-in h-full">
             <MonitorPanel agentId={selectedAgentId} />
           </div>
         )}
-        {rightPanelTab === "debug" && (
+        {effectiveRightTab === "debug" && (
           <div key="panel-debug" className="hw-tab-in h-full">
             <DebugPanel />
           </div>
         )}
-        {rightPanelTab === "logs" && selectedAgentId && (
+        {effectiveRightTab === "logs" && selectedAgentId && (
           <div key="panel-logs" className="hw-tab-in h-full">
             <WorkLogPanel agentId={selectedAgentId} />
           </div>
@@ -605,6 +616,43 @@ function App() {
         </div>
 
         <div className="ml-auto flex items-center gap-1.5">
+          {/* 待我处理：工作台形态由顶栏承接（办公室形态走 OfficeWorkspace 自带
+              HUD 入口，两处同时挂 = 双份轮询）。徽标 = 未处理总数 */}
+          {workspaceMode === "workbench" && (
+          <div className="relative">
+            <button
+              data-testid="pending-trigger"
+              aria-expanded={pendingOpen}
+              aria-haspopup="dialog"
+              onClick={() => setPendingOpen((v) => !v)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium rounded-gm border transition-all duration-200 active:scale-[0.97] ${
+                pendingOpen
+                  ? "text-g-blue border-g-blue/40 bg-g-blue-bg shadow-gm-sm"
+                  : "text-g-fg-2 bg-white border-g-border shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm"
+              }`}
+              title="查看所有等待你处理的事项（提问 / 授权 / 验收 / 提醒）"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+              </svg>
+              <span className="hidden xl:inline">待我处理</span>
+              {pendingTotal > 0 && (
+                <span
+                  data-testid="pending-hud-badge"
+                  className="min-w-[1.1rem] px-1 py-px text-center text-[10px] leading-4 font-semibold rounded-full bg-g-red text-white"
+                >
+                  {pendingTotal > 99 ? "99+" : pendingTotal}
+                </span>
+              )}
+            </button>
+            <PendingPanel
+              open={pendingOpen}
+              onClose={() => setPendingOpen(false)}
+              onTotalChange={setPendingTotal}
+              overlayClassName="fixed right-3 top-[3.75rem] z-40 w-[380px] max-w-[calc(100vw-1.5rem)] max-h-[calc(100vh-4.75rem)]"
+            />
+          </div>
+          )}
           {/* 项目运行开关（FE-05/UX-06）：office / workbench 两种工作区共用的顶栏入口，
               与旧工作台左栏渲染同一个 ProjectRunControls 实例逻辑 */}
           <ProjectRunControls className="mr-1" />
@@ -701,61 +749,91 @@ function App() {
         </div>
       </header>
 
-      {/* 主界面形态：办公室（默认）/ 工作台（旧三栏，过渡期回退）。
+      {/* 主界面形态：办公室（OFFICE_UI_ENABLED=true 时默认）/ 工作台（组织图 + Chat 三栏）。
+          办公室暂时关闭（OFFICE_UI_ENABLED=false）⇒ 恒为工作台，OfficeWorkspace chunk
+          不渲染、不加载（pixi.js ~1MB 不进主流程）。
           ⚠ 三栏分支的内部缩进刻意保持原样未动 —— 1000+ 行文件重排缩进的出错
           风险大于收益，等三栏按 ADR-011 正式退役时一并清理。 */}
-      {workspaceMode === "office" ? (
-        <OfficeWorkspace onExitToWorkbench={() => setWorkspaceMode("workbench")} />
+      {OFFICE_UI_ENABLED && workspaceMode === "office" ? (
+        <Suspense fallback={<OfficeSkeleton />}>
+          <OfficeWorkspace onExitToWorkbench={() => setWorkspaceMode("workbench")} />
+        </Suspense>
       ) : (
       <>
       {/* Main Content — floating panels on a gray workbench.
-          P3：宽屏 = 三栏（Org/Office ｜ Chat 独立中栏 ｜ 详情），可拖拽分栏
-          （autoSaveId 持久化栏宽到 localStorage）；窄屏(<1280px) = 两栏 +
-          tab（Chat 回右栏，与旧行为一致）。 */}
+          10-01 改版：两栏（组织图 ｜ 对话+详情合并栏）。原三栏的中栏 Chat 与
+          右栏详情合并成一栏、对话成为页签之一 —— 三栏时 Chat 只有 ~31% 宽，
+          消息流太挤。可拖拽分栏（autoSaveId 持久化栏宽到 localStorage）。 */}
       <PanelGroup
         direction="horizontal"
-        autoSaveId="hw-main-columns"
+        autoSaveId="hw-main-columns-v2"
         className="flex-1 overflow-hidden"
       >
-        {/* Left Panel - Org Tree / Office */}
-        <Panel id="left" defaultSize={narrowViewport ? 60 : 38} minSize={22} className="min-w-0 pt-3 pl-3 pb-3">
+        {/* Left Panel - Org Tree / Office；collapsible：一键收成 OrgRail 窄条 */}
+        <Panel
+          id="left"
+          ref={leftPanelRef}
+          defaultSize={32}
+          minSize={18}
+          collapsible
+          collapsedSize={3.5}
+          onResize={(size) => setLeftCollapsed(size < 4)}
+          // 折叠态去掉 pl-3：窄条只有 ~40–56px，12px 内边距会让深层头像溢出（审计 L3）
+          className={`min-w-0 pt-3 pb-3 ${leftCollapsed ? "" : "pl-3"}`}
+        >
         <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
-          <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-3">
-            {/* View tabs */}
+          <div className={`px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-3 ${leftCollapsed ? "hidden" : ""}`}>
+            {/* View tabs（办公室关闭时不渲染 Office 页签）。
+                pillId 统一 "hw-seg-left"：切换时白底指示条滑动（SegmentItem） */}
             <div className="hw-segment">
-              <button
+              <SegmentItem
+                active={leftPanel === "tree"}
+                pillId="hw-seg-left"
                 onClick={() => setActiveView("tree")}
-                className={`hw-segment-item ${activeView === "tree" ? "hw-segment-item-active" : ""}`}
               >
-                Org Tree
-              </button>
-              <button
-                onClick={() => setActiveView("office")}
-                className={`hw-segment-item ${activeView === "office" ? "hw-segment-item-active" : ""}`}
-              >
-                Office
-              </button>
-              <button
+                组织图
+              </SegmentItem>
+              {OFFICE_UI_ENABLED && (
+                <SegmentItem
+                  active={activeView === "office"}
+                  pillId="hw-seg-left"
+                  onClick={() => setActiveView("office")}
+                >
+                  办公室
+                </SegmentItem>
+              )}
+              <SegmentItem
+                active={activeView === "timeline"}
+                pillId="hw-seg-left"
                 onClick={() => setActiveView("timeline")}
-                className={`hw-segment-item ${activeView === "timeline" ? "hw-segment-item-active" : ""}`}
               >
-                Timeline
-              </button>
+                时间线
+              </SegmentItem>
               {selectedProjectId && (
-                <button
+                <SegmentItem
+                  active={activeView === "token"}
+                  pillId="hw-seg-left"
                   onClick={() => setActiveView("token")}
-                  className={`hw-segment-item ${activeView === "token" ? "hw-segment-item-active" : ""}`}
                 >
                   Token
-                </button>
+                </SegmentItem>
               )}
             </div>
 
             {/* Project-level start/stop button —— FE-05：与顶栏共用 ProjectRunControls，
                 业务实现只有一份（不再在 App 内维护第二套开关逻辑） */}
             <ProjectRunControls className="ml-auto shrink-0" />
+            {/* 收起侧栏（2026-10-01）：组织图常驻占宽 → 一键变窄条 */}
+            <button
+              onClick={() => leftPanelRef.current?.collapse()}
+              title="收起侧栏（组织图变为窄条，可随时展开）"
+              aria-label="收起侧栏"
+              className="shrink-0 p-1 rounded-gm text-g-fg-4 hover:text-g-fg hover:bg-g-bg-muted transition-colors"
+            >
+              <PanelLeftClose className="w-4 h-4" />
+            </button>
           </div>
-          <div className="flex-1 overflow-hidden bg-app-tint">
+          <div className={`flex-1 overflow-hidden bg-app-tint ${leftCollapsed ? "hidden" : ""}`}>
             <div key={activeView} className="hw-tab-in h-full">
               {leftPanel === "tree" ? (
                 <OrgTree />
@@ -780,133 +858,130 @@ function App() {
               )}
             </div>
           </div>
+          {/* 折叠态：窄条头像列表（页头/视图此时 display:none 保持挂载） */}
+          {leftCollapsed && <OrgRail onExpand={() => leftPanelRef.current?.expand()} />}
         </div>
         </Panel>
 
-        {!narrowViewport && (
-          <>
-            <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
-            {/* 中栏：Chat 独立常驻（P3-1/P3-4）—— 与右侧详情同屏 */}
-            <Panel id="chat-middle" defaultSize={31} minSize={24} className="min-w-0 py-3">
-              <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
-                {selectedAgentId ? (
-                  <ChatPanel key="panel-chat-middle" agentId={selectedAgentId} hidden={false} />
-                ) : (
-                  <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
-                    从左侧 Org Tree 选择一个 Agent 开始对话
-                  </div>
-                )}
-              </div>
-            </Panel>
-            <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
-          </>
-        )}
-        {narrowViewport && (
-          <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
-        )}
+        <PanelResizeHandle className="w-2 self-stretch my-3 rounded-gm transition-colors hover:bg-g-blue-bg/70 data-[resize-handle-state=drag]:bg-g-blue/30" />
 
-        {/* Right Panel - 详情面板（宽屏）/ Chat+详情（窄屏） */}
-        <Panel
-          id="details"
-          defaultSize={narrowViewport ? 40 : 31}
-          minSize={22}
-          className="min-w-0 pt-3 pr-3 pb-3"
-        >
+        {/* 合并栏：对话 + 详情同栏切页签（原中栏 Chat 与右栏详情合并）。
+            ChatPanel 跨页签常驻挂载 —— hidden 只切可见性，不打断通道生命周期，
+            切到详情再切回来不会丢流式进度。 */}
+        {/* defaultSize 与左栏合计须 =100（32+68）：两栏都设 defaultSize 时
+            库不会补差额，合计≠100 会触发归一化 warning 并持久化偏离值（审计 M2） */}
+        <Panel id="work" defaultSize={68} minSize={40} className="min-w-0 pt-3 pr-3 pb-3">
         <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
           {/* Tab bar */}
           <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-1">
-            <div className="hw-segment mr-2">
-            <button
+            {/* pillId 统一 "hw-seg-right"：与左栏隔离，避免跨栏串联动画 */}
+            <div className="hw-segment mr-2 overflow-x-auto">
+            {selectedAgentId && (
+              <SegmentItem
+                active={rightPanelTab === "chat"}
+                pillId="hw-seg-right"
+                onClick={() => setRightPanelTab("chat")}
+              >
+                对话
+              </SegmentItem>
+            )}
+            <SegmentItem
+              active={effectiveRightTab === "goals"}
+              pillId="hw-seg-right"
               onClick={() => setRightPanelTab("goals")}
-              className={`hw-segment-item ${rightPanelTab === "goals" ? "hw-segment-item-active" : ""}`}
             >
-              Goals
-            </button>
-            {narrowViewport && selectedAgentId && (
+              目标
+            </SegmentItem>
+            {selectedAgentId && (
               <>
-                <button
-                  onClick={() => setRightPanelTab("chat")}
-                  className={`hw-segment-item ${rightPanelTab === "chat" ? "hw-segment-item-active" : ""}`}
-                >
-                  Chat
-                </button>
-                <button
+                <SegmentItem
+                  active={effectiveRightTab === "agent"}
+                  pillId="hw-seg-right"
                   onClick={() => setRightPanelTab("agent")}
-                  className={`hw-segment-item ${rightPanelTab === "agent" ? "hw-segment-item-active" : ""}`}
                 >
-                  Agent
-                </button>
-                <button
+                  详情
+                </SegmentItem>
+                <SegmentItem
+                  active={effectiveRightTab === "logs"}
+                  pillId="hw-seg-right"
                   onClick={() => setRightPanelTab("logs")}
-                  className={`hw-segment-item ${rightPanelTab === "logs" ? "hw-segment-item-active" : ""}`}
                 >
-                  Logs
-                </button>
-                <button
+                  日志
+                </SegmentItem>
+                <SegmentItem
+                  active={effectiveRightTab === "monitor"}
+                  pillId="hw-seg-right"
                   onClick={() => setRightPanelTab("monitor")}
-                  className={`hw-segment-item ${rightPanelTab === "monitor" ? "hw-segment-item-active" : ""}`}
                 >
                   监控
-                </button>
-                {selectedAgentId && (
-                  <button
-                    onClick={() => setRightPanelTab("debug")}
-                    className={`hw-segment-item ${rightPanelTab === "debug" ? "hw-segment-item-active" : ""}`}
-                  >
-                    调试
-                  </button>
-                )}
+                </SegmentItem>
               </>
             )}
             {selectedTaskId && (
-              <button
+              <SegmentItem
+                active={effectiveRightTab === "task"}
+                pillId="hw-seg-right"
                 onClick={() => setRightPanelTab("task")}
-                className={`hw-segment-item ${rightPanelTab === "task" ? "hw-segment-item-active" : ""}`}
               >
                 任务
-              </button>
+              </SegmentItem>
             )}
+            <SegmentItem
+              active={effectiveRightTab === "debug"}
+              pillId="hw-seg-right"
+              onClick={() => setRightPanelTab("debug")}
+            >
+              调试
+            </SegmentItem>
             </div>
           </div>
 
-          {/* Tab content */}
+          {/* Tab content —— ChatPanel 跨页签常驻（hidden 只切可见性，不打断
+              通道生命周期）。详情区用 effectiveRightTab 判定：无成员时残留的
+              chat tab 归一为 goals，避免整栏空白。 */}
           <div className="flex-1 overflow-hidden">
-            {rightPanelTab === "task" && selectedTaskId ? (
-              <ErrorBoundary label="任务">
-                <Suspense fallback={<SkeletonList rows={6} />}>
-                  <div key="panel-task" className="hw-tab-in h-full">
-                    <TaskTimelinePanel />
+            {selectedAgentId && (
+              <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
+            )}
+            {effectiveRightTab !== "chat" && (
+              effectiveRightTab === "task" && selectedTaskId ? (
+                <ErrorBoundary label="任务">
+                  <Suspense fallback={<SkeletonList rows={6} />}>
+                    <div key="panel-task" className="hw-tab-in h-full">
+                      <TaskTimelinePanel />
+                    </div>
+                  </Suspense>
+                </ErrorBoundary>
+              ) : effectiveRightTab === "goals" ? (
+                <ErrorBoundary key="panel-goals" label="右栏面板">
+                  <div className="hw-tab-in h-full">
+                    {selectedProjectId ? (
+                      <Suspense fallback={<SkeletonList rows={5} />}>
+                        <GoalsPanel projectId={selectedProjectId} />
+                      </Suspense>
+                    ) : (
+                      <div className="h-full flex items-center justify-center text-g-fg-3 text-sm">
+                        请先选择一个项目
+                      </div>
+                    )}
                   </div>
-                </Suspense>
-              </ErrorBoundary>
-            ) : !selectedAgentId ? (
-              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in">
-                <div className="text-center">
-                  <div className="w-16 h-16 rounded-full bg-gradient-to-br from-g-bg-soft to-g-bg-muted border border-g-border flex items-center justify-center mx-auto mb-4 shadow-gm-sm ring-4 ring-g-bg-muted/50">
-                    <svg className="w-8 h-8 text-g-fg-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+                </ErrorBoundary>
+              ) : effectiveRightTab === "debug" ? (
+                // 调试面板不依赖成员，无选中成员时也应可看（否则高亮「调试」却显示空态）。
+                detailPanels
+              ) : !selectedAgentId ? (
+                <EmptyState
+                  icon={
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                     </svg>
-                  </div>
-                  <p className="text-g-fg-3 font-medium">从左侧 Org Tree 选择一个 Agent</p>
-                  <p className="text-g-fg-4 text-xs mt-1.5">选择后即可查看对话、目标与日志</p>
-                </div>
-              </div>
-            ) : narrowViewport ? (
-              <>
-                <ChatPanel key="panel-chat" agentId={selectedAgentId} hidden={rightPanelTab !== "chat"} />
-                {detailPanels}
-              </>
-            ) : rightPanelTab === "chat" ? (
-              <div className="h-full flex items-center justify-center text-g-fg-3 text-sm animate-fade-in text-center px-6">
-                <div>
-                  <p className="font-medium">Chat 在中间栏</p>
-                  <p className="text-g-fg-4 text-xs mt-1.5">
-                    这里放 Goals / Agent / 日志 / 监控等详情面板，可与对话同屏
-                  </p>
-                </div>
-              </div>
-            ) : (
-              detailPanels
+                  }
+                  title="未选中成员"
+                  description="在左侧组织图中点击成员节点，即可查看其对话、详情、日志与监控"
+                />
+              ) : (
+                detailPanels
+              )
             )}
           </div>
         </div>
@@ -915,8 +990,8 @@ function App() {
       </>
       )}
 
-      {/* 工作台模式下的回办公室入口（办公室模式内已有 HUD 入口） */}
-      {workspaceMode === "workbench" && (
+      {/* 工作台模式下的回办公室入口（办公室模式内已有 HUD 入口；办公室关闭时隐藏） */}
+      {OFFICE_UI_ENABLED && workspaceMode === "workbench" && (
         <button
           onClick={() => setWorkspaceMode("office")}
           className="fixed bottom-5 right-5 z-40 px-3.5 py-2 rounded-full bg-[#394d6a] text-white text-xs font-medium shadow-gm-md hover:bg-[#2f405a] transition-colors"

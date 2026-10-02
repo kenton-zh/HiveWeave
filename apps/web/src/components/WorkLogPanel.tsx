@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import EmptyState from "./EmptyState";
+import { Slide } from "./animate-ui/primitives/effects/slide";
 import { FileText } from "lucide-react";
 import { getWorkLogs } from "../api";
 import { useAppStore } from "../store";
@@ -399,10 +400,16 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
         <button onClick={clearActivity} className="text-xs px-2 py-0.5 rounded-gm text-g-fg-4 hover:text-g-red hover:bg-g-red-bg transition-colors">清空</button>
       </div>
 
-      {/* Agent rows — click to expand */}
+      {/* Agent rows — click to expand；新行挂载时滑入（Animate UI Slide） */}
       <div className="px-4 pb-3 space-y-1">
         {agentRows.map(({ latest: conv, olderCount }) => (
-          <ActivityRow key={conv.agentId} conv={conv} olderCount={olderCount} />
+          <Slide
+            key={conv.agentId}
+            variants={{ hidden: { opacity: 0, y: 10 }, visible: { opacity: 1, y: 0 } }}
+            transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+          >
+            <ActivityRow conv={conv} olderCount={olderCount} />
+          </Slide>
         ))}
       </div>
     </div>

@@ -9,9 +9,16 @@ describe("resolveLeftPanel", () => {
   });
 
   it("does not send Token to Office", () => {
-    expect(resolveLeftPanel("office", "proj-1")).toBe("office");
     expect(resolveLeftPanel("tree", "proj-1")).toBe("tree");
     expect(resolveLeftPanel("timeline", "proj-1")).toBe("timeline");
+  });
+
+  it("办公室关闭时 office 视图回落组织图（OFFICE_UI_ENABLED=false）", () => {
+    expect(resolveLeftPanel("office", "proj-1")).toBe("tree");
+  });
+
+  it("未知视图兜底为组织图（不再兜底办公室）", () => {
+    expect(resolveLeftPanel("bogus", "proj-1")).toBe("tree");
   });
 });
 

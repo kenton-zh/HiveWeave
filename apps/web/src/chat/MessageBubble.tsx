@@ -1,7 +1,15 @@
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type { AttachmentRef, ChatMessage } from "./types";
 import { CHAT_MOTION_CSS } from "./constants";
 import { collectFileAttachments, collectMessageImages } from "./messageUtils";
+import {
+  digestPreview,
+  digestRoleLabel,
+  digestStatusLabel,
+  parseSystemDigest,
+  type DigestEntry,
+  type SystemDigest,
+} from "./systemDigest";
 import { estimateMessageTokens } from "./tokenEstimate";
 import { MarkdownText } from "./MarkdownText";
 import { ImageGallery } from "./ImageGallery";
@@ -99,10 +107,88 @@ const SOURCE_STYLES: Record<"agent" | "system" | "watchdog", { bar: string }> = 
   system: { bar: "border-r-slate-400" },
 };
 
+/** digest 条目渲染卡：来源 + 义务标记一行头，正文真换行。 */
+function DigestEntryCard({ entry }: { entry: DigestEntry }) {
+  return (
+    <div className="rounded-gm border border-g-yellow/50 bg-white/70 px-2.5 py-2">
+      <div className="flex flex-wrap items-center gap-1.5 mb-1">
+        {entry.from && (
+          <span className="text-[11px] font-semibold text-g-fg-2">{entry.from}</span>
+        )}
+        {entry.urgent && (
+          <span className="text-[10px] font-semibold px-1.5 py-px rounded-full bg-g-red-bg text-g-red border border-g-red/40">
+            紧急
+          </span>
+        )}
+        {entry.replyRequired && (
+          <span className="text-[10px] px-1.5 py-px rounded-full bg-g-blue-bg text-g-blue border border-g-blue/40">
+            需回复
+          </span>
+        )}
+        {entry.reportRequired && (
+          <span className="text-[10px] px-1.5 py-px rounded-full bg-g-blue-bg text-g-blue border border-g-blue/40">
+            需汇报
+          </span>
+        )}
+        {entry.status && (
+          <span className="text-[10px] px-1.5 py-px rounded-full bg-g-bg-muted text-g-fg-3 border border-g-border">
+            {digestStatusLabel(entry.status)}
+          </span>
+        )}
+        {entry.youAre && (
+          <span className="text-[10px] px-1.5 py-px rounded-full bg-g-purple-bg text-g-purple border border-g-purple/40">
+            {digestRoleLabel(entry.youAre)}
+          </span>
+        )}
+        {entry.taskId && (
+          <span className="text-[10px] font-mono text-g-fg-4 ml-auto" title={`任务 ${entry.taskId}`}>
+            #{entry.taskId}
+          </span>
+        )}
+      </div>
+      {entry.content ? (
+        <div className="text-[12px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words select-text">
+          {entry.content}
+        </div>
+      ) : (
+        <div className="text-[11px] text-g-fg-4">（无正文）</div>
+      )}
+    </div>
+  );
+}
+
+/** 展开态的 digest 结构化渲染；解析失败时调用方回退原文。 */
+function DigestBody({ digest }: { digest: SystemDigest }) {
+  return (
+    <div className="space-y-3 max-h-[40vh] overflow-y-auto">
+      {digest.sections.map((section, i) => (
+        <section key={i}>
+          <h4 className="text-[11px] font-semibold text-g-fg-2 mb-1.5 flex items-center gap-1.5" title={section.title}>
+            <span className="w-1 h-3 rounded-full bg-g-yellow inline-block shrink-0" aria-hidden="true" />
+            {section.title}
+            {section.entries.length > 0 && (
+              <span className="text-[10px] font-normal text-g-fg-4">{section.entries.length} 条</span>
+            )}
+          </h4>
+          {section.entries.length > 0 && (
+            <div className="space-y-1.5">{section.entries.map((e, j) => <DigestEntryCard key={j} entry={e} />)}</div>
+          )}
+          {section.notes.length > 0 && (
+            <p className={`text-[10px] text-g-fg-4 leading-relaxed ${section.entries.length > 0 ? "mt-1" : ""}`}>
+              {section.notes.join(" ")}
+            </p>
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
+
 /** 非真人入站消息（agent 来信 / 系统注入 / 看门狗唤醒 digest）。
  *
  * 微信式靠右（与用户气泡同侧）+ 琥珀底 + 右缘来源色条；
- * 默认折叠单行摘要，点击展开全文。
+ * 默认折叠单行摘要，点击展开全文。系统注入的「## 标题 + JSON lines」
+ * digest 解析成结构化卡片（每条一卡、正文真换行），解析失败回退原文。
  */
 function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: string }) {
   const [open, setOpen] = useState(false);
@@ -113,12 +199,15 @@ function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: str
     hour: "2-digit",
     minute: "2-digit",
   });
-  // 摘要：压空白 + 剥 markdown 标题/列表记号（digest 常为 "## 标题\n{json}" 格式）
-  const preview = (msg.content || "（无正文）")
-    .replace(/\s+/g, " ")
-    .replace(/(^|\s)#+\s*/g, "$1")
-    .replace(/(^|\s)[-•]\s+/g, "$1")
-    .trim();
+  const digest = useMemo(() => parseSystemDigest(msg.content), [msg.content]);
+  // 摘要：digest 用块计数行；其余压空白 + 剥 markdown 标题/列表记号
+  const preview = digest
+    ? digestPreview(digest)
+    : (msg.content || "（无正文）")
+        .replace(/\s+/g, " ")
+        .replace(/(^|\s)#+\s*/g, "$1")
+        .replace(/(^|\s)[-•]\s+/g, "$1")
+        .trim();
   return (
     <div className="flex justify-end my-1.5 hw-msg-in">
       <div
@@ -163,10 +252,19 @@ function InboundLetter({ msg, sourceName }: { msg: ChatMessage; sourceName?: str
           </span>
         </div>
         {open && (
-          <div className="px-3.5 pb-2.5 pt-1 border-t border-g-yellow/70 select-text">
-            <div className="text-[12px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
-              {msg.content || "（无正文）"}
-            </div>
+          <div
+            className="px-3.5 pb-2.5 pt-1.5 border-t border-g-yellow/70 select-text"
+            // 展开区内的点击/选字不冒泡到外层 role=button（否则选中复制
+            // 一松手整封信就折叠了）；收起走标题栏箭头/再点标题。
+            onClick={(e) => e.stopPropagation()}
+          >
+            {digest ? (
+              <DigestBody digest={digest} />
+            ) : (
+              <div className="text-[12px] text-g-fg-2 leading-relaxed whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto">
+                {msg.content || "（无正文）"}
+              </div>
+            )}
           </div>
         )}
       </div>

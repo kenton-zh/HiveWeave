@@ -109,6 +109,7 @@ export const statusLabels: Record<string, { text: string; color: string }> = {
   idle: { text: "Idle", color: "text-g-fg-3" },
   waiting_human: { text: "等待你验收", color: "text-g-yellow" },
   waiting_agent: { text: "等待同事", color: "text-g-yellow" },
+  waiting_timer: { text: "等待定时唤醒", color: "text-g-blue" },
   blocked: { text: "阻塞", color: "text-g-red" },
   complete: { text: "已交付", color: "text-g-blue" },
   runnable: { text: "Idle", color: "text-g-fg-3" },
