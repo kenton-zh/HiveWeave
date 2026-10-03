@@ -14,8 +14,9 @@ _ensure_user_pings_table``（**读接口自己 CREATE TABLE**），全仓零 INS
 2. ``api/communications.py`` 不再含任何建表路径；
 3. 反向断言能被打红（阳性对照：塞清单外表 → 红 → 移除 → 恢复）。
 
-另钉「正典路径建出的表形状 = 旧自建路径形状」（存量库由旧路径建表，
-形状分叉 = 旧库读接口静默 500）与「读端点 SQL 在纯正典库上可用」。
+另钉「正典路径建出的表形状 = 旧自建路径形状 + 批22 显式增列」（存量库由旧
+路径建表，正典增列必须走 ALTER 补齐存量库，形状分叉 = 旧库读接口静默 500）
+与「读端点 SQL 在纯正典库上可用」。
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ _COMMUNICATIONS = (
 )
 
 # 旧自建路径（api/communications.py::_ensure_user_pings_table，已删）的列形状。
-# 正典 DDL 必须与它逐列一致 —— 存量库的 user_pings 是旧路径建的。
+# 正典 DDL 必须包含它逐列一致的全部列 —— 存量库的 user_pings 是旧路径建的。
 _LEGACY_SHAPE: dict[str, str] = {
     "id": "TEXT",
     "project_id": "TEXT",
@@ -46,6 +47,14 @@ _LEGACY_SHAPE: dict[str, str] = {
     "is_read": "INTEGER",
     "created_at": "INTEGER",
     "read_at": "INTEGER",
+}
+
+# 批22（P1-12，2026-10-03）写方立项增列：正典 CREATE 直接带列，存量库（旧
+# 7 列形状）由 ALTER TABLE 补齐 —— 本测试走完整 ensure_project_db 流程，
+# ALTER 断裂会被 PROJECT_DB_COLUMN_CHECKS（user_pings 条目）fail-loud 打红。
+_BATCH22_COLUMNS: dict[str, str] = {
+    "question_id": "TEXT",
+    "status": "TEXT",
 }
 
 
@@ -194,10 +203,13 @@ def test_communications_module_has_no_table_creation():
 
 
 async def test_canonical_path_creates_user_pings_with_legacy_shape(tmp_path):
-    """ensure_project_db 建出的 user_pings 必须与旧自建路径逐列一致。
+    """ensure_project_db 建出的 user_pings = 旧自建 7 列 + 批22 增列。
 
-    顺带核实 PROJECT_DB_COLUMN_CHECKS fail-loud 机制：本测试走完整
-    ensure_project_db 流程（DDL → 列自检 → 索引），自检炸 = 这里先炸。
+    批22 前判据是「逐列 == 旧形状」；写方立项增列后判据改为
+    「旧 7 列全保留（存量库兼容）+ 增列恰为 _BATCH22_COLUMNS」—— 多列/少列/
+    改类型都打红。顺带核实 PROJECT_DB_COLUMN_CHECKS fail-loud 机制：本测试
+    走完整 ensure_project_db 流程（DDL → ALTER → 列自检 → 索引），自检炸 =
+    这里先炸。
     """
     from hiveweave.db.project import ensure_project_db
 
@@ -207,9 +219,11 @@ async def test_canonical_path_creates_user_pings_with_legacy_shape(tmp_path):
     await cur.close()
     assert rows, "正典路径没建出 user_pings 表"
     actual = {r[1]: (r[2] or "").upper() for r in rows}
-    assert actual == _LEGACY_SHAPE, (
-        f"列形状分叉：正典 {actual} ≠ 旧自建形状 {_LEGACY_SHAPE}"
-        "（存量库的 user_pings 由旧路径建，形状不一致 = 旧库读接口静默 500）"
+    assert actual == {**_LEGACY_SHAPE, **_BATCH22_COLUMNS}, (
+        f"列形状分叉：正典 {actual} ≠ 旧自建形状 {_LEGACY_SHAPE} "
+        f"+ 批22 增列 {_BATCH22_COLUMNS}"
+        "（存量库的 user_pings 由旧路径建，靠 ALTER 补列 —— 形状不一致 = "
+        "迁移断裂或旧库读接口静默 500）"
     )
 
 

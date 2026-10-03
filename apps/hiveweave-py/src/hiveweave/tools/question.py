@@ -149,6 +149,182 @@ async def _clear_sibling_wait(project_id: str, agent_id: str, question_id: str) 
         )
 
 
+# ── P1-12（批22，2026-10-03）：user_pings 人类侧 ping 台账 ─────────────
+# 病灶：user_pings 全仓零 INSERT（读方 GET /api/user-pings 消费一张永远为空
+# 的表）——无人值守 question 超时自动裁决后，用户在 ping 台账上看不到任何
+# 痕迹。注意：批8 的 agent_waits(kind='user') 门铃是**活的**（等待机制），
+# 本台账是**人类侧可见性**，两者不重复。
+#: ping 台账状态值（user_pings.status 列）。
+PING_STATUS_PENDING = "pending"
+PING_STATUS_ANSWERED = "answered"
+PING_STATUS_TIMED_OUT = "timed_out"
+PING_STATUS_READJUDICATED = "readjudicated"
+
+
+async def _update_user_ping_status(
+    project_id: str | None, question_id: str, status: str
+) -> None:
+    """question 收口 ⇒ 同步 user_pings 台账状态（best-effort，绝不影响收口）。"""
+    if not project_id or not question_id:
+        return
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "UPDATE user_pings SET status = ? WHERE question_id = ?",
+            [status, question_id],
+        )
+        await conn.commit()
+        await cur.close()
+    except Exception as exc:  # noqa: BLE001 — 台账同步是旁支
+        log.warning(
+            "question.user_ping_update_failed",
+            question_id=question_id[:8],
+            status=status,
+            error=str(exc),
+        )
+
+
+async def _insert_user_ping(
+    project_id: str,
+    agent_id: str,
+    question_id: str,
+    *,
+    question: str,
+    options: list | None,
+    now_ms: int,
+) -> None:
+    """question 创建（无人值守场景）⇒ INSERT user_pings 一行（P1-12 写方）。
+
+    message = 问题文本 + 选项摘要（label 优先）；status=pending。best-effort。
+    """
+    if not project_id:
+        return
+    labels: list[str] = []
+    for o in (options or [])[:6]:
+        if isinstance(o, dict):
+            labels.append(str(o.get("label") or o.get("text") or o))
+        else:
+            labels.append(str(o))
+    opts_summary = f" 选项: {' / '.join(labels)}" if labels else ""
+    try:
+        await project_db.execute(
+            agent_id,
+            """INSERT INTO user_pings
+               (id, project_id, from_agent_id, message, is_read, created_at,
+                question_id, status)
+               VALUES (?, ?, ?, ?, 0, ?, ?, 'pending')""",
+            [
+                str(uuid.uuid4()),
+                project_id,
+                agent_id,
+                f"{(question or '').strip()[:400]}{opts_summary[:300]}",
+                now_ms,
+                question_id,
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 — 台账写入是旁支
+        log.warning(
+            "question.user_ping_insert_failed",
+            question_id=question_id[:8],
+            error=str(exc),
+        )
+
+
+async def deliver_question_readjudication(
+    project_id: str,
+    agent_id: str,
+    question_id: str,
+    *,
+    question_text: str,
+    previous_choice: str,
+    new_answer: str,
+    changed: bool,
+) -> None:
+    """迟到人类裁决的投递 + 台账（P1-12 b，由 API answer 端点调用）。
+
+    user_pings 置 ``readjudicated``；答案与原自动裁决**不同**时再投递
+    ``[QUESTION RE-ADJUDICATED]`` 平台通知（inbox wake=1 + trigger 唤醒 +
+    chat 面板留痕）——同答案重复提交不重投（幂等，由调用方以 ``changed``
+    判定传入）。各出口独立 best-effort。
+    """
+    await _update_user_ping_status(project_id, question_id, PING_STATUS_READJUDICATED)
+    preview = (question_text or "").strip()[:160]
+    new_text = (new_answer or "").strip()[:200]
+    prev_text = (previous_choice or "").strip()[:200]
+    if changed:
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=agent_id,
+                message=(
+                    f"[QUESTION RE-ADJUDICATED] 你此前的提问「{preview}」原被"
+                    f"无人值守自动裁决为「{prev_text}」；用户现已迟到改判为："
+                    f"{new_text}。原自动裁决被推翻 —— 请按新答案继续；若此前"
+                    "按默认项执行的步骤与新答案冲突，先说明影响再返工。"
+                ),
+                message_type="question_readjudicated",
+                priority="urgent",
+                wake=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — 单出口失败不拖累其余
+            log.warning(
+                "question.readjudicate_inbox_failed",
+                question_id=question_id[:8],
+                error=str(exc),
+            )
+        try:
+            from hiveweave.agents.trigger import trigger_subordinate
+
+            await trigger_subordinate(agent_id)
+        except Exception as exc:  # noqa: BLE001 — 唤醒失败退化为看门狗
+            log.warning(
+                "question.readjudicate_trigger_failed",
+                question_id=question_id[:8],
+                error=str(exc),
+            )
+    # chat 面板留痕（含幂等同答案路径 —— 用户改判动作本身值得可见）。
+    try:
+        from hiveweave.services.chat_message import ChatMessageService
+
+        await ChatMessageService().save_message({
+            "agent_id": agent_id,
+            "role": "assistant",
+            "content": (
+                f"[QUESTION RE-ADJUDICATED] 提问「{preview}」用户迟到改判："
+                f"{new_text}（原自动裁决：{prev_text}，已推翻，按新答案继续）。"
+                if changed
+                else (
+                    f"[QUESTION RE-ADJUDICATED] 提问「{preview}」用户确认了"
+                    f"原自动裁决：{prev_text}（迟到裁决落账，无需改道）。"
+                )
+            ),
+            "is_streaming": False,
+            "is_background": False,
+            "is_read": True,
+            "metadata": {
+                "source": "platform",
+                "kind": "question_readjudicated",
+                "question_id": question_id,
+                "changed": changed,
+            },
+        })
+    except Exception as exc:  # noqa: BLE001 — 留痕失败不影响改判
+        log.warning(
+            "question.readjudicate_chat_failed",
+            question_id=question_id[:8],
+            error=str(exc),
+        )
+    log.info(
+        "question.readjudicated",
+        project_id=project_id,
+        agent_id=agent_id,
+        question_id=question_id[:8],
+        changed=changed,
+    )
+
+
 async def wake_question_waiters(
     project_id: str,
     question_id: str,
@@ -349,6 +525,8 @@ async def adjudicate_question(
 
     _question_projects.pop(question_id, None)
     _cancel_adjudicator(question_id, include_current=False)
+    # P1-12：ping 台账同步 —— 自动裁决（超时/下班）对人类侧可见。
+    await _update_user_ping_status(project_id, question_id, PING_STATUS_TIMED_OUT)
     await _clear_sibling_wait(project_id, agent_id, question_id)
     # T39：wait_on(kind=user) 等待者随裁决一并解锁 —— 不会再有用户答复，
     # 等待只能空等到 TTL（与任务终态短路同判据）。提问者的唤醒由本函数
@@ -674,6 +852,18 @@ async def execute_question(
     except Exception as exc:  # noqa: BLE001
         log.warning("question.persist_failed", error=str(exc))
 
+    # P1-12（批22）：user_pings 写方立项 —— 人类侧 ping 台账一行（pending）。
+    # 此前该表读方在、写方全仓为零；无人值守场景的可见性由此补齐（轮内钟
+    # 到点/被掐都不撤行 —— 台账本就该记录「这道题还没人管」）。
+    await _insert_user_ping(
+        project_id,
+        agent_id,
+        question_id,
+        question=question,
+        options=options,
+        now_ms=now_ms,
+    )
+
     # I9 ①：门铃两套并一套 —— 落库同时落一条 agent_waits(kind='user')。
     # 此前这条路存在（TTL=3600s）却只被用过 1 次；question 的等待从此
     # 是「有界的等待」（ref=question_id，解除与 question 同生共死）。
@@ -768,6 +958,10 @@ async def execute_question(
         # 撤销未决裁决（resolve_question 侧已撤，这里幂等兜底）。
         _question_projects.pop(question_id, None)
         _cancel_adjudicator(question_id)
+        # P1-12：ping 台账同步收口（answer 端点路径已写，此处幂等兜底）。
+        await _update_user_ping_status(
+            project_id, question_id, PING_STATUS_ANSWERED
+        )
         await _clear_sibling_wait(project_id, agent_id, question_id)
         # T39：wait_on(kind=user, ref=本question) 的其他等待者唤醒。
         # 提问者此刻正被 future 解阻塞（在跑），跳过其 trigger ——

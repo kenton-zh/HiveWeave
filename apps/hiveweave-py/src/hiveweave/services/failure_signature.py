@@ -592,6 +592,9 @@ async def recent_failure_memories_hint(
             if m.get("type") != "failure_signature":
                 continue
             meta = m.get("metadata") or {}
+            # P1-10（批22）：voided 条目（证实为环境噪声）不再注入。
+            if _is_voided(meta):
+                continue
             if str(meta.get("tool_name") or "").strip() not in failed_tools:
                 continue
             updated = int(m.get("updated_at") or m.get("created_at") or 0)
@@ -624,16 +627,26 @@ async def recent_failure_memories_hint(
             content = m.get("content") or ""
             meta = m.get("metadata") or {}
             solution_line = ""
+            is_echo = False
             for ln in content.splitlines():
                 if ln.startswith(_SOLUTION_LINE_PREFIX) and ln.split(":", 1)[-1].strip():
                     solution_line = ln.split(":", 1)[1].strip()
                     break
                 if ln.startswith(_RETRY_ECHO_LINE_PREFIX):
                     solution_line = "同参重试曾成功（环境/代码已变化）"
+                    is_echo = True
                     break
             sig = str(meta.get("signature") or "")[:48]
             tool = str(meta.get("tool_name") or "?")
-            detail = solution_line or sig
+            # P1-10（批22）：注入文案带「已知解法:…」—— 告诉 agent「已知
+            # 怎么解」而不只是「你将撞什么」。回声行**不冒充解法**（ TEST_
+            # DSH_64 #2-3 同判据），保持中性述实；其余兜底按签名本身。
+            if solution_line and not is_echo:
+                detail = f"已知解法: {solution_line}"
+            elif solution_line:
+                detail = solution_line
+            else:
+                detail = f"已知撞点: {sig}"
             lines.append(f"- tool={tool}: {detail}")
         return "\n".join(lines)
     except Exception as e:  # noqa: BLE001 — 读侧注入绝不阻断回合
@@ -803,6 +816,10 @@ async def record_failure_signature(
                 _HITTERS_OVERFLOW_KEY,
                 _ORG_ESCALATED_AT_KEY,
                 _ORG_ESCALATED_TIERS_KEY,
+                # P1-10（批22）：void 事实位同样跨 rehit 继承 —— 作废是人工
+                # 判定（环境噪声），同签名复撞不得把条目复活。
+                _VOIDED_AT_KEY,
+                _VOIDED_REASON_KEY,
             ):
                 if _k in (prev_meta or {}):
                     metadata[_k] = prev_meta[_k]
@@ -948,6 +965,15 @@ async def known_signature_notice(
                 continue
             if not _entry_matches(sig, tool, m.get("metadata")):
                 continue
+            if _is_voided(m.get("metadata")):
+                # P1-10（批22）：voided 条目（证实为环境噪声/平台自管提示
+                # 文本）不再广播 —— 语义同「无解法不广播」，留 debug 痕迹。
+                log.debug(
+                    "failure_signature.hint_voided_skip",
+                    agent_id=(agent_id or "")[:12],
+                    sig=sig[:60],
+                )
+                return None
             content = m.get("content") or ""
             # 解法携带按 metadata.solution_status 门控（TEST_DSH_62 P7 断链1
             # / TEST_DSH_64 #2-3），**但正文行推导优先**（P2-1）：历史分叉
@@ -1130,6 +1156,31 @@ _SOLUTION_STATUSES = frozenset({
     SOLUTION_STATUS_VERIFIED,
     SOLUTION_STATUS_RETRIED_OK,
 })
+
+# ── P1-10（批22，2026-10-03）：void 事实位 —— 签名作废通道 ─────────────
+# 病灶（三轮在册，R7 s21=53 条签名）：签名条目一旦写入只能单调累积，被证实
+# 为**环境噪声**的签名（如 qoder 报告的「平台自管提示文本」被当成 agent 可
+# 行动的失败）会永久占坑并持续注入/广播。修法 = 条目 metadata 打上
+# ``voided_at``（ms）/ ``voided_reason``，读侧（hint 注入 / notice 广播 /
+# lessons 挂接 / 解法回填）一律跳过。
+#
+# ⚠ 存储口径（如实登记）：本模块的「签名表」= memories 行
+# （scope='project', type='failure_signature'），**没有**独立表 —— 任务书
+# 的「加列 solution TEXT + voided_at INTEGER」按本模块既有字段扩展模式
+# （solution_status 同款）落在 metadata 上；解法文本继续以正文
+# 「已验证解法:」行为单一权威（另立一份 solution 列 = 同一事实两处判，
+# 正是 _content_derived_status 要消灭的分叉形态）。
+_VOIDED_AT_KEY = "voided_at"
+_VOIDED_REASON_KEY = "voided_reason"
+
+
+def _is_voided(meta: dict | None) -> bool:
+    """条目 metadata 是否已打 void 事实位（缺字段/脏值 = 未作废，老库兼容）。"""
+    m = meta or {}
+    try:
+        return int(m.get(_VOIDED_AT_KEY) or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 #: 解法文本长度下限 —— 低于此阈值视为无实质内容，不回填（防噪音）。
 _MIN_SOLUTION_LEN = 8
@@ -1462,6 +1513,235 @@ async def backfill_solution(
     except Exception as e:
         log.warning("failure_signature.backfill_failed", error=str(e))
         return False
+
+
+# ── P1-10（批22，2026-10-03）：void 通道 + 公开解法回填 API + lessons 挂接 ──
+# 读侧只告知「你将撞什么」不告知「已知怎么解」的闭环收口：解法写入的既有
+# 通道（executor pending 回填 / backfill_solution）之外，补 ① 人工作废通道
+# （环境噪声签名退场）；② 按 module_id 的公开回填 API；③ lessons 归档时
+# 按签名（前缀）自动挂接 —— R7 s21=53 条签名「只记错不记解」的最小闭环。
+
+
+async def void_failure_signature(
+    project_id: str,
+    signature_key: str,
+    tool_name: str,
+    *,
+    reason: str = "",
+    module_id: str | None = None,
+) -> bool:
+    """作废通道（P1-10 d）：签名被证实为环境噪声 ⇒ 打 ``metadata.voided_at``。
+
+    典型场景：qoder 报告的「平台自管提示文本」被当成 agent 可行动的失败
+    广播 —— 这类条目对读侧（hint 注入 / notice 广播 / lessons 挂接 /
+    ``record_failure_solution``）从此不可见，但行保留（审计可溯源）。
+    幂等：已 voided ⇒ 原样返回 True（reason 不覆盖）。
+
+    定位 = ``module_id`` 或按 ``(project, tool, sig)`` 重算（与
+    ``backfill_solution`` 同一判据，非前缀猜测）。best-effort：失败只记
+    日志返回 False。
+    """
+    sig = (signature_key or "").strip()
+    if not project_id or not sig:
+        return False
+    try:
+        from hiveweave.services.memory import MemoryService
+
+        memory_service = MemoryService()
+        expected_mid = (module_id or "").strip() or make_module_id(
+            project_id, sig, tool_name
+        )
+        target = None
+        for m in (await memory_service.get_project_memories(project_id)) or []:
+            if m.get("type") != "failure_signature":
+                continue
+            if (m.get("module_id") or "") == expected_mid:
+                target = m
+                break
+        if target is None or not target.get("module_id"):
+            log.info(
+                "failure_signature.void_no_entry",
+                sig=sig[:60],
+                tool=tool_name,
+            )
+            return False
+        metadata = dict(target.get("metadata") or {})
+        if _is_voided(metadata):
+            return True
+        metadata[_VOIDED_AT_KEY] = int(time.time() * 1000)
+        if (reason or "").strip():
+            metadata[_VOIDED_REASON_KEY] = reason.strip()[:200]
+        await memory_service.save_memory(
+            agent_id=_SIGNATURE_WRITER,
+            project_id=project_id,
+            scope="project",
+            content=target.get("content") or "",
+            type="failure_signature",
+            module_id=target.get("module_id"),
+            source_agent_id=target.get("source_agent_id"),
+            metadata=metadata,
+        )
+        log.info(
+            "failure_signature.voided",
+            project_id=project_id,
+            sig=sig[:60],
+            reason=reason[:80],
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — 作废 best-effort
+        log.warning("failure_signature.void_failed", error=str(e))
+        return False
+
+
+async def record_failure_solution(
+    project_id: str,
+    signature_id: str,
+    solution: str,
+    *,
+    status: str = SOLUTION_STATUS_VERIFIED,
+) -> bool:
+    """公开 API（P1-10 b）：按条目 id（``module_id``）回填解法。
+
+    ``signature_id`` = ``record_failure_signature`` 回传的 ``module_id``；
+    签名/工具名从条目 metadata 反查 —— 调用方只需持有条目 id（典型调用方：
+    lessons 归档、平台管理通道）。voided 条目拒绝回填（作废即冻结）。
+    幂等/实质门/best-effort 语义同 ``backfill_solution``。
+    """
+    mid = (signature_id or "").strip()
+    if not project_id or not mid or not _is_substantive_solution(solution):
+        return False
+    try:
+        from hiveweave.services.memory import MemoryService
+
+        memory_service = MemoryService()
+        target = None
+        for m in (await memory_service.get_project_memories(project_id)) or []:
+            if m.get("type") != "failure_signature":
+                continue
+            if (m.get("module_id") or "") == mid:
+                target = m
+                break
+        if target is None:
+            log.info(
+                "failure_signature.solution_no_entry",
+                signature_id=mid[:40],
+            )
+            return False
+        meta = target.get("metadata") or {}
+        if _is_voided(meta):
+            log.info(
+                "failure_signature.solution_rejected_voided",
+                signature_id=mid[:40],
+            )
+            return False
+        return await backfill_solution(
+            str(meta.get("signature") or ""),
+            str(meta.get("tool_name") or ""),
+            solution,
+            project_id=project_id,
+            module_id=mid,
+            status=status,
+        )
+    except Exception as e:  # noqa: BLE001 — 回填 best-effort
+        log.warning("failure_signature.solution_record_failed", error=str(e))
+        return False
+
+
+async def attach_lesson_to_signatures(
+    project_id: str,
+    lesson_text: str,
+    *,
+    root_cause: str = "",
+    fix: str = "",
+) -> int:
+    """lessons 归档 → 失败签名挂接（P1-10 b：lessons 内容含签名前缀时自动挂接）。
+
+    lesson 文本（正文 + root_cause + fix 拼接）引用了项目里某条失败签名的
+    **全签名**（``metadata.signature`` 原文子串）或其前缀（``sig[:48]``，
+    须 ≥ ``_MIN_SIG_LEN`` 且**全项目唯一** —— 前缀塌缩会把解法挂进别条，
+    本仓明写「错解比无解更贵」）⇒ 把 ``fix`` 按 verified 语义回填进该条目
+    （``backfill_solution`` 幂等：已有「已验证解法:」行则跳过）。voided
+    条目不挂。``root_cause`` 是「为什么」不是「怎么解」，不冒充解法回填
+    （fix 缺省 = 不挂）。
+
+    Returns 挂接成功的条目数（0 = 无引用 / 命中 ≥2 条歧义 / 无 fix /
+    幂等跳过）。调用方保证 best-effort（lessons 归档旁支，绝不阻断归档）。
+    """
+    text = "\n".join(
+        part
+        for part in (
+            (lesson_text or "").strip(),
+            (root_cause or "").strip(),
+            (fix or "").strip(),
+        )
+        if part
+    )
+    if not project_id or not text:
+        return 0
+    try:
+        from hiveweave.services.memory import MemoryService
+
+        memory_service = MemoryService()
+        entries: list[tuple[str, dict]] = []
+        for m in (await memory_service.get_project_memories(project_id)) or []:
+            if m.get("type") != "failure_signature":
+                continue
+            meta = m.get("metadata") or {}
+            if _is_voided(meta):
+                continue
+            sig = str(meta.get("signature") or "").strip()
+            if not sig:
+                continue
+            entries.append((sig, m))
+        if not entries:
+            return 0
+        matched: list[tuple[str, dict]] = []
+        for sig, m in entries:
+            if sig in text:
+                matched.append((sig, m))
+                continue
+            prefix = sig[:48]
+            if len(prefix) >= _MIN_SIG_LEN and prefix in text:
+                matched.append((sig, m))
+        if not matched:
+            return 0
+        # 歧义守卫：≥2 条命中（前缀塌缩 / 一课多签）⇒ 不猜，全不挂。
+        if len(matched) > 1:
+            log.info(
+                "failure_signature.lesson_attach_ambiguous",
+                project_id=project_id,
+                matched=len(matched),
+            )
+            return 0
+        sig, target = matched[0]
+        solution = (fix or "").strip()
+        if not solution:
+            log.debug(
+                "failure_signature.lesson_attach_no_fix",
+                project_id=project_id,
+                sig=sig[:60],
+            )
+            return 0
+        meta = dict(target.get("metadata") or {})
+        ok = await backfill_solution(
+            sig,
+            str(meta.get("tool_name") or ""),
+            solution,
+            project_id=project_id,
+            module_id=target.get("module_id") or None,
+            status=SOLUTION_STATUS_VERIFIED,
+        )
+        if ok:
+            log.info(
+                "failure_signature.lesson_attached",
+                project_id=project_id,
+                sig=sig[:60],
+            )
+            return 1
+        return 0
+    except Exception as e:  # noqa: BLE001 — 挂接旁支
+        log.warning("failure_signature.lesson_attach_failed", error=str(e))
+        return 0
 
 # ══════════════════════════════════════════════════════════════════
 # #16-③ · 组织级升级（distinct_hitters 梯度）

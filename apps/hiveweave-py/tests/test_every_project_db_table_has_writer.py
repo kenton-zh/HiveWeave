@@ -21,8 +21,9 @@ per-project DB 的唯一权威源，见 ``db/project.py:215`` 的建表循环）
 ``docs/AI工程组织_MVP蓝图.md:283-287``，含 ``parent_module_id`` 自引用模块树），
 写侧由**批次 7** 在 ``services/modules.py::create_module`` 落地（INSERT INTO
 modules）。因此 ``modules`` 已从 ``_KNOWN_WRITERLESS_PENDING`` 白名单**移出**。
-**现状（I14 · 批 5，2026-09-27）**：白名单仅剩 ``user_pings``（读方真实、写方
-特性未立项，见白名单处注释）。
+**现状（P1-12 · 批22，2026-10-03）**：白名单已清空 —— user_pings 的写方
+（question 创建 INSERT / 收口 UPDATE status）已在 tools/question.py 落地，
+门禁恢复全覆盖。
 
 **反向断言（I14 · 批 5，2026-09-27）**：本门禁原先只单向保证「清单里的表都有
 写入方」，**清单外的表根本不看** —— ``user_pings`` 正是钻了这个盲区（读接口
@@ -163,15 +164,11 @@ def test_canonical_tables_extracted():
 # 这些表的存在是有意为之（先建对形状、接线随后），不是遗漏；
 # 门禁对它们放行，但仍会在它们之外的任何新死表上打红。
 #
-# user_pings（I14 · fixplan 批 5，2026-09-27）：DDL 已收进 PROJECT_DB_TABLES
-# （原先是 api/communications.py 读接口自建，门禁看不见）。**读方真实存在**：
-# GET /api/user-pings、POST /api/user-pings/{id}/read、前端 pending 面板与
-# OrgTree「需关注」徽标都在消费它。**写方全仓为零**：ping 的生产特性从未立项
-# （没有任何代码路径 INSERT INTO user_pings），表按设计保持空 ⇒ 属「形状先建、
-# 写侧未落地」而非下一个 modules 死表。接管状态：无既定批次——若将来落地
-# ping 生产特性请接上 INSERT 并把本条目移出；若读侧也被判废弃，则应把 DDL
-# 从正典清单整体摘除（二选一，不许长期挂账）。
-_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset({"user_pings"})
+# user_pings（P1-12 · 批22，2026-10-03）：写方已立项 —— question 创建时
+# INSERT（tools/question.py::_insert_user_ping），收口（answered / 超时
+# 裁决）/ 迟到改判时 UPDATE status。**已从本白名单移出**，门禁恢复对它
+# 的覆盖（test_known_writerless_allowlist_does_not_rot 会盯住不许挂回）。
+_KNOWN_WRITERLESS_PENDING: frozenset[str] = frozenset()
 
 
 def test_every_project_db_table_has_a_writer():

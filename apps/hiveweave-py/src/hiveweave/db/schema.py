@@ -1043,10 +1043,15 @@ PROJECT_DB_TABLES = [
     # 由该文件的 AST 门禁管住「新增旁路」。本清单的正典地位靠「反向断言
     # （库表 ≡ 清单，管正典路径自身漂移）+ AST 门禁（管旁路）」两道合力，
     # 不是靠本注释自证。
-    # 列形状 = 旧自建路径原样迁移（存量库由旧路径建的表与新库形状一致，无
-    # 迁移需求）。⚠ 现状：读方真实存在（GET /api/user-pings + 前端 pending
-    # 面板/OrgTree 徽标），**写方全仓为零** —— ping 生产特性尚未立项，见
-    # tests/test_every_project_db_table_has_writer.py 的白名单条目。
+    # 列形状 = 旧自建路径 7 列 + 批22 增列（新库 CREATE 直带；存量库由下方
+    # ALTER 补齐）。
+    # ⚠ 批22（P1-12，2026-10-03）写方立项：question 创建（无人值守场景）时
+    # INSERT 一行（tools/question.py::execute_question），收口（answered /
+    # 超时裁决）/ 迟到改判时 UPDATE status —— 此前「读方真实、写方全仓为零」
+    # 的挂账条目已从 tests/test_every_project_db_table_has_writer.py 白名单
+    # 移出。新增两列：question_id（ping ↔ question 关联键，status 同步按它
+    # UPDATE）；status ∈ 'pending'|'answered'|'timed_out'|'readjudicated'
+    # （人类侧台账状态；agent_waits(kind='user') 门铃是等待机制，不重复）。
     """
     CREATE TABLE IF NOT EXISTS user_pings (
         id TEXT PRIMARY KEY,
@@ -1055,9 +1060,13 @@ PROJECT_DB_TABLES = [
         message TEXT,
         is_read INTEGER DEFAULT 0,
         created_at INTEGER,
-        read_at INTEGER
+        read_at INTEGER,
+        question_id TEXT,
+        status TEXT DEFAULT 'pending'
     )
     """,
+    """ALTER TABLE user_pings ADD COLUMN question_id TEXT""",
+    """ALTER TABLE user_pings ADD COLUMN status TEXT""",
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
@@ -1099,6 +1108,10 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     # （ALTER 排错位被吞 / 旧库没跑 ALTER）在启动时 fail-loud，而不是让
     # pending question 继续「无界挂账 + 裁决无事实位可查」。
     "questions": {"expires_at", "timed_out_at", "resolved_by"},
+    # P1-12（批22，2026-10-03）：user_pings 写方立项两列。登记进自检 ⇒ 存量库
+    # （旧自建路径的 7 列形状）ALTER 补列断裂时启动即崩，而不是让 ping 台账
+    # 的 status 同步静默失败（INSERT 带列名，缺列 = 行写不进 = 台账退回死表）。
+    "user_pings": {"question_id", "status"},
 }
 
 # ── Meta DB 建表自检（I6，fixplan 批 11，2026-09-27）────────────

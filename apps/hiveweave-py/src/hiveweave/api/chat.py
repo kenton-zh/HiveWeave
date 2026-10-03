@@ -648,16 +648,77 @@ async def get_questions(
 
 @router.post("/questions/{question_id}/answer")
 async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
-    """回答问题。"""
+    """回答问题。
+
+    P1-12（批22）语义：``pending``/``cancelled`` = 正常作答（原行为）；
+    ``timed_out`` = **迟到人类裁决** —— 应用用户选择、给 agent 投递
+    ``[QUESTION RE-ADJUDICATED]`` 平台通知（wake=1，原自动裁决被推翻）、
+    user_pings 置 ``readjudicated``；``answered`` = 已收口 —— 同答案重复
+    提交幂等放行（不重投），不同答案拒绝（重判语义只开 timed_out）。
+    """
     validate_id(question_id, "question_id")
+    now_ms = int(time.time() * 1000)
     try:
-        now_ms = int(time.time() * 1000)
-        await project_db.execute(
+        rows = await project_db.query(
             body.agentId,
-            "UPDATE questions SET answer = ?, status = 'answered', "
-            "answered_at = ? WHERE id = ?",
-            [body.answer, now_ms, question_id],
+            "SELECT id, agent_id, project_id, question, options, answer, "
+            "status, resolved_by FROM questions WHERE id = ?",
+            [question_id],
         )
+    except Exception as e:
+        log.error("answer_question_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to answer question")
+    row = dict(rows[0]) if rows else None
+    status = str((row or {}).get("status") or "")
+    prev_answer = str((row or {}).get("answer") or "")
+
+    # 已收口（answered）：同答案 = 幂等 no-op；不同答案 = 拒绝（409）。
+    # 在写事务 try 之外 raise —— 外层 except Exception 会把 HTTPException
+    # 重包成 500，冲突语义必须原样透出。
+    if row is not None and status == "answered":
+        if (body.answer or "").strip() == prev_answer.strip():
+            return {
+                "ok": True,
+                "answer": body.answer,
+                "readjudicated": False,
+                "idempotent": True,
+            }
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "question already answered; re-adjudication is only available "
+                "for timed_out questions"
+            ),
+        )
+
+    readjudicated = row is not None and status == "timed_out"
+    try:
+        if readjudicated:
+            # 迟到裁决：应用用户选择（行留痕 resolved_by='user_readjudicated'）。
+            await project_db.execute(
+                body.agentId,
+                "UPDATE questions SET answer = ?, status = 'answered', "
+                "answered_at = ?, resolved_by = 'user_readjudicated' "
+                "WHERE id = ?",
+                [body.answer, now_ms, question_id],
+            )
+        else:
+            await project_db.execute(
+                body.agentId,
+                "UPDATE questions SET answer = ?, status = 'answered', "
+                "answered_at = ? WHERE id = ?",
+                [body.answer, now_ms, question_id],
+            )
+            # 正常作答也同步 ping 台账（晚到答案不走 execute_question 的
+            # future 分支，无这条会永远停在 pending）。
+            if row is not None:
+                from hiveweave.tools.question import _update_user_ping_status
+
+                await _update_user_ping_status(
+                    str(row.get("project_id") or ""),
+                    question_id,
+                    "answered",
+                )
         # BUG-037: resolve 内存中的 Future，让阻塞中的 execute_question 继续
         from hiveweave.tools.question import resolve_question
         resolved = resolve_question(question_id, body.answer)
@@ -666,10 +727,23 @@ async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
                      question_id=question_id,
                      msg="Question answered in DB but no in-memory Future found "
                          "(may have timed out or been cancelled)")
+        if readjudicated and row is not None:
+            # P1-12：迟到裁决投递 —— 同答案不重投（幂等由 changed 判定）。
+            from hiveweave.tools.question import deliver_question_readjudication
+
+            await deliver_question_readjudication(
+                str(row.get("project_id") or ""),
+                str(row.get("agent_id") or body.agentId),
+                question_id,
+                question_text=str(row.get("question") or ""),
+                previous_choice=prev_answer,
+                new_answer=body.answer,
+                changed=(body.answer or "").strip() != prev_answer.strip(),
+            )
     except Exception as e:
         log.error("answer_question_failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to answer question")
-    return {"ok": True, "answer": body.answer}
+    return {"ok": True, "answer": body.answer, "readjudicated": readjudicated}
 
 
 # ── SSE 流式端点 ─────────────────────────────────────────────

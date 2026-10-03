@@ -169,6 +169,20 @@ class LessonService:
                 await conn.rollback()
                 raise
         _cache_invalidate(project_id)
+        # P1-10（批22）：lessons → 失败签名自动挂接 —— lesson 文本/根因/修复
+        # 引用了项目里某条失败签名（全签名或唯一前缀）⇒ 把 fix 沉淀为该条目
+        # 的解法（读侧注入从此带「已知解法:」）。旁支 best-effort：挂接失败
+        # 不影响归档本身（attach 内部也全兜底，这里再兜一层防 import 失败）。
+        try:
+            from hiveweave.services.failure_signature import (
+                attach_lesson_to_signatures,
+            )
+
+            await attach_lesson_to_signatures(
+                project_id, content, root_cause=rc, fix=fx
+            )
+        except Exception as exc:  # noqa: BLE001 — 挂接是旁支
+            log.debug("lesson_signature_attach_failed", error=str(exc))
         log.info(
             "lesson_saved",
             project_id=project_id,
