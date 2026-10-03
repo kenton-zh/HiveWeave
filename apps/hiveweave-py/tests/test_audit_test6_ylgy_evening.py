@@ -215,7 +215,73 @@ async def test_ensure_skips_recreate_without_write_tasks():
 
 @pytest.mark.asyncio
 async def test_ensure_broken_binding_missing_path_recreates(tmp_path: Path):
-    """DB workspace_path set but dir gone → do not idle-skip; recreate."""
+    """批20 修复1：树确已删除（目录消失）+ 闲置 ⇒ 清悬空绑定，**绝不重建**。
+
+    旧行为（本用例旧名 "recreates"）是 broken-binding 无条件重建 —— 与
+    close-GC / merge teardown 每 6min 拔河（实测 33 轮）。红线：绑定只在
+    树确已删除后才清；忙 agent（本文件的另一用例）不受影响。
+    """
+    from hiveweave.services.git_worktree.ensure import ensure_executor_worktree
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+    missing = ws / ".hiveweave" / "worktrees" / "A004"
+    agent = {
+        "id": "a1",
+        "short_id": "A004",
+        "permission_type": "executor",
+        "role": "qa",
+        "workspace_path": str(missing),
+    }
+    org = MagicMock()
+    org.resolve_agent = AsyncMock(return_value=agent)
+    org.update_agent = AsyncMock()
+    create_mock = AsyncMock(
+        return_value={
+            "success": True,
+            "path": str(missing),
+            "branch": "hw/A004/work",
+        }
+    )
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_project_workspace",
+            AsyncMock(return_value=str(ws)),
+        ),
+        patch("hiveweave.services.org.OrgService", return_value=org),
+        patch(
+            "hiveweave.services.git_worktree.reconcile._assignee_needs_write_worktree",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.ensure.GitWorktreeService",
+        ) as GWT,
+    ):
+        GWT.return_value.create = create_mock
+        result = await ensure_executor_worktree("p1", "a1")
+
+    assert result.get("skipped") is True
+    assert result.get("success") is False
+    create_mock.assert_not_awaited()
+    # 绑定被清（workspace_path=None），worktree_error 一并清空
+    cleared = [
+        c.args[1] for c in org.update_agent.await_args_list
+        if len(c.args) >= 2 and isinstance(c.args[1], dict)
+        and c.args[1].get("workspace_path") is None
+        and "workspace_path" in c.args[1]
+    ]
+    assert cleared, "悬空绑定必须被清（workspace_path=None）"
+    assert all("worktree_error" in c for c in cleared)
+
+
+@pytest.mark.asyncio
+async def test_ensure_busy_agent_broken_binding_still_recreates(tmp_path: Path):
+    """批20 修复1 反向：忙 agent（有在途写任务）+ 目录已消失 ⇒ 照旧重建。
+
+    忙 agent 根本不进 idle-skip 分支 —— 既有 ensure/重建行为必须原样保留。
+    """
     from hiveweave.services.git_worktree.ensure import ensure_executor_worktree
 
     ws = tmp_path / "repo"
@@ -249,7 +315,7 @@ async def test_ensure_broken_binding_missing_path_recreates(tmp_path: Path):
         patch("hiveweave.services.org.OrgService", return_value=org),
         patch(
             "hiveweave.services.git_worktree.reconcile._assignee_needs_write_worktree",
-            AsyncMock(return_value=False),
+            AsyncMock(return_value=True),
         ),
         patch(
             "hiveweave.services.git_worktree.ensure.GitWorktreeService",
@@ -261,6 +327,78 @@ async def test_ensure_broken_binding_missing_path_recreates(tmp_path: Path):
     assert result.get("skipped") is not True
     assert result.get("success") is True
     create_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_heal_tick_skips_idle_agent_with_cleared_binding(tmp_path: Path):
+    """批20 修复1 ③：绑定已清的闲置 agent，heal tick 不再动作（不重建）。
+
+    heal_project_executor_worktrees 对 workspace_path 为空的闲置 writer
+    必须 skipped_idle，而不是触发 ensure/重建 —— 拔河从此断根。
+    """
+    from hiveweave.services.git_worktree.ensure import (
+        heal_project_executor_worktrees,
+    )
+
+    ws = tmp_path / "repo"
+    (ws / ".git").mkdir(parents=True)
+    agents_rows = [
+        {
+            "id": "a1",
+            "name": "qa",
+            "role": "qa",
+            "short_id": "A004",
+            "workspace_path": None,  # 绑定已清（批20 修复1 的产物）
+            "permission_type": "executor",
+        }
+    ]
+
+    class _FakeCursor:
+        async def fetchall(self):
+            return agents_rows
+
+        async def close(self):
+            return None
+
+    class _FakeConn:
+        async def execute(self, _sql, _params=None):
+            return _FakeCursor()
+
+    async def _fake_get_db(_project_id):
+        return _FakeConn()
+
+    with (
+        patch(
+            "hiveweave.db.meta.get_project_workspace",
+            AsyncMock(return_value=str(ws)),
+        ),
+        patch(
+            "hiveweave.db.project.get_project_db_by_project_id",
+            AsyncMock(side_effect=_fake_get_db),
+        ),
+        patch("hiveweave.services.org.OrgService"),
+        patch(
+            "hiveweave.services.git_worktree.ensure._git",
+            AsyncMock(return_value=(True, "")),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.reconcile._assignee_needs_write_worktree",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.reconcile._assignee_is_verify_only",
+            AsyncMock(return_value=False),
+        ),
+        patch(
+            "hiveweave.services.git_worktree.ensure.ensure_executor_worktree",
+            AsyncMock(),
+        ) as ensure,
+    ):
+        result = await heal_project_executor_worktrees("p1")
+
+    ensure.assert_not_awaited()
+    assert result.get("skipped_idle") == 1
+    assert result.get("recovered") == 0
 
 
 @pytest.mark.asyncio

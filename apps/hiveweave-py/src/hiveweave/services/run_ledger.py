@@ -799,6 +799,53 @@ class RunLedger:
         except Exception as e:
             log.warning("run_ledger.set_run_fact_failed", error=str(e))
 
+    async def _finalize_orphan_steps(
+        self, agent_id: str, run_id: str, run_status: str
+    ) -> None:
+        """批20 修复3（N1）：run 落终态时同点收口该 run 未终态的 run_steps。
+
+        实测（DSH browse 步）：步 00:31 开始、父 run 00:48 completed，步至今
+        status='running' —— 运行期没有步级收口，只有 create_activation 的
+        M3 清扫（下次激活才跑）与 startup sweep 兜底；agent 不再激活 ⇒
+        孤儿步永久悬挂，agent_activity 的「未收口步骤」也一直显示它在跑
+        工具。挂在 complete_run / interrupt_run / error_run 这个**单一咽喉**
+        （勿在 agents/completion.py 等调用方散改）：
+
+        - status='interrupted' + ended_at 非空 ⇒ 开放步判据（``ended_at IS
+          NULL``）立即解除；
+        - error 前缀 ``run_<status>: step orphaned at finalize`` —— 归因是
+          「run 落终态时步骤没等到自己的 end」，不是工具自身失败（不匹配
+          ``orphan step %`` 模式，不会蹭到 M3 清扫的 timeout_kind 分类）；
+        - timeout_kind='swept'：与 startup sweep 同语义（schema.py F7 注释
+          取值域）—— 这一行终态是收口员写的，不是执行器写的。直接 SET
+          安全：record_step_end 写 timeout_kind 时必写终态，running 行不
+          可能有值；
+        - 幂等：已终态步（completed/failed/error/interrupted）不动；
+        - 性能：单条 indexed UPDATE（idx_run_steps_run 前缀 run_id）；
+        - 不双写：本方法置 'interrupted' 后，M3 清扫 / startup sweep 的
+          ``status = 'running'`` 谓词不再命中这些行。
+
+        best-effort：失败不影响 run 终态本身（只记 warning）。
+        """
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE run_steps SET status = 'interrupted', ended_at = ?, "
+                "error = ?, timeout_kind = 'swept' "
+                "WHERE run_id = ? AND status NOT IN "
+                "('completed', 'failed', 'error', 'interrupted')",
+                [
+                    _now_ms(),
+                    f"run_{run_status}: step orphaned at finalize",
+                    run_id,
+                ],
+            )
+        except Exception as e:
+            log.warning(
+                "run_ledger.finalize_orphan_steps_failed",
+                agent_id=agent_id, run_id=run_id, error=str(e),
+            )
+
     async def complete_run(
         self,
         agent_id: str,
@@ -816,6 +863,10 @@ class RunLedger:
             )
         except Exception as e:
             log.warning("run_ledger.complete_run_failed", error=str(e))
+            return
+        # 批20 修复3：run 已终态 ⇒ 步级立即收口（run UPDATE 成功才收，
+        # 保持「run 终态 ⇒ 步收口」的单向蕴含）
+        await self._finalize_orphan_steps(agent_id, run_id, "completed")
 
     async def interrupt_run(
         self,
@@ -841,6 +892,9 @@ class RunLedger:
             )
         except Exception as e:
             log.warning("run_ledger.interrupt_run_failed", error=str(e))
+            return
+        # 批20 修复3：同 complete_run —— run 终态 ⇒ 步级立即收口
+        await self._finalize_orphan_steps(agent_id, run_id, "interrupted")
 
     async def error_run(
         self,
@@ -877,6 +931,10 @@ class RunLedger:
                 "error_reason = ?, result_summary = ? WHERE id = ?",
                 [now, error_reason[:500], summary[:500], run_id],
             )
+            # 批20 修复3：run 终态 ⇒ 步级立即收口（finalize 自吞异常，
+            # 不影响下方占位补账；UPDATE 失败则不收 —— 保持「run 终态
+            # ⇒ 步收口」的单向蕴含）
+            await self._finalize_orphan_steps(agent_id, run_id, "error")
         except Exception as e:
             log.warning("run_ledger.error_run_failed", error=str(e))
         try:

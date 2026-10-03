@@ -376,3 +376,61 @@ def resolve_policy(
         extra_sids=[extra_sid(d) for d in extra_paths],
         shared_sid_str=shared_sid(project),
     )
+
+
+def resolve_boundary_root(workspace_path: str, workdir: str) -> str:
+    """批20 修复2：cwd 落在 worktree **子目录**时把边界上溯到真实树根。
+
+    病灶（start_dev_server 实测）：工具把 cwd（如 ``<wt>/src/halyard``）当
+    workspace_path 传进来 ⇒ `resolve_policy` 取 boundary_root=子目录 ⇒
+    `service` 的 worktree gitdir 指针身份校验要求 ``<boundary>/.git`` 是
+    指向期望 gitdir 的**文件** —— 指针只在树根，子目录没有 ⇒ isfile 为假
+    fail-closed（树其实是活的）⇒ 误拒。
+
+    上溯顺序（``workspace_path`` = agent 绑定的授权树根，即工具入参的
+    workspace）：
+    ① workspace_path 自身有 ``.git`` 且包含 workdir ⇒ 用它（worktree 根 /
+       项目根，天然盖过 worktree 内嵌套 git 仓库的干扰）；
+    ② 否则从 workdir 沿父目录向上找含 ``.git`` 的最近祖先 —— **不越过**
+       workspace_path（边界不得越出授权树，防上溯到项目外层仓库）；
+    ③ workspace_path 为空（无授权锚）或都找不到 ⇒ 原样返回 workdir
+       （保持既有 fail-closed 语义，不掩盖异常状态，边界绝不因上溯变宽）。
+
+    纯 stat、无副作用；与 bash 的 ``workspace_path`` / ``workdir`` 双参
+    口径一致（boundary 管授权树，workdir 管进程 cwd）。
+    """
+    wd = (workdir or "").strip()
+    if not wd:
+        return wd
+    try:
+        wd_real = Path(wd).resolve()
+    except OSError as e:
+        log.debug("resolve_boundary_root_workdir_unresolvable", workdir=wd, error=str(e))
+        return wd
+    ws_real: Path | None = None
+    ws = (workspace_path or "").strip()
+    if ws:
+        try:
+            ws_real = Path(ws).resolve()
+        except OSError as e:
+            log.debug("resolve_boundary_root_workspace_unresolvable", error=str(e))
+            ws_real = None
+        if ws_real is not None and (ws_real / ".git").exists():
+            try:
+                wd_real.relative_to(ws_real)
+                return str(ws_real)
+            except ValueError:
+                # workdir 不在授权树内 —— 交由调用方既有校验拒绝
+                log.debug("resolve_boundary_root_workdir_outside_workspace",
+                          workspace=str(ws_real), workdir=wd)
+                pass
+    for anc in wd_real.parents:
+        if ws_real is None:
+            break  # 无授权锚 ⇒ 不上溯（边界绝不因上溯变宽），原样返回
+        try:
+            anc.relative_to(ws_real)
+        except ValueError:
+            break  # 走出授权树还没找到 ⇒ 停，边界绝不外溢
+        if (anc / ".git").exists():
+            return str(anc)
+    return wd

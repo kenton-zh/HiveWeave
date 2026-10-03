@@ -107,6 +107,12 @@ async def ensure_executor_worktree(
     instead of leaving a stale path. Empty path after merge GC still skips.
     A healthy ``-b/-c/-d`` relocate that has git is already returned above.
 
+    批20 修复1：闲置 agent 的 broken binding 按目录状态分两路 —— 目录**已
+    消失**（merge teardown / close-GC 删树成功但未回写绑定）⇒ 清掉悬空
+    绑定并 skip（绝不重建，否则与 GC 每 6min 拔河）；目录**还在**但无
+    ``.git``（husk）⇒ 维持既有重建（create 的 repair 链清 husk）。忙
+    agent 不经此分支，重建行为不变。
+
     task_name: DEPRECATED — 保留兼容旧调用方, 不再参与分支命名;
     task_id 驱动 P0 稳定命名 (hw/<sid>/t-<id8>)。
 
@@ -205,6 +211,47 @@ async def ensure_executor_worktree(
             from .reconcile import _assignee_needs_write_worktree
 
             if not await _assignee_needs_write_worktree(ws, short_id):
+                # 批20 修复1（拔河根因）：merge teardown / close-GC 经
+                # delete() 删树成功后不回写 agents.workspace_path ⇒ 闲置
+                # agent 绑定悬空 ⇒ 本函数的 broken-binding 分支原样重建 ⇒
+                # heal tick 与 GC 每 6min 拔河（实测 33 轮、9 步 agent 失败）。
+                # 降级语义（红线）：
+                #   · 树**确已删除**（目录不存在）⇒ 清掉悬空绑定 + skip，
+                #     绝不重建 —— 绑定是 merge/reconcile 的路标，树没了
+                #     路标就该撤；
+                #   · 目录还在但无 .git（husk）⇒ 维持既有重建（create 的
+                #     repair/relocation 链负责清 husk，绑定先不动）；
+                #   · 忙 agent（有在途写任务）根本进不了本分支，重建行为
+                #     不变；不新增任何 rmtree。
+                if cur and not _has_git(cur) and not Path(cur).exists():
+                    log.info(
+                        "worktree_binding_cleared_idle_tree_gone",
+                        agent_id=agent_id,
+                        short_id=short_id,
+                        project_id=project_id,
+                        workspace_path=cur,
+                        task_id=task_id,
+                    )
+                    try:
+                        await org.update_agent(
+                            agent_id,
+                            {"workspace_path": None, "worktree_error": None},
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "worktree_binding_clear_failed",
+                            agent_id=agent_id,
+                            error=str(e),
+                        )
+                    return {
+                        "success": False,
+                        "skipped": True,
+                        "short_id": short_id,
+                        "message": (
+                            "worktree binding cleared: tree already removed "
+                            f"for idle agent {short_id}; no recreate"
+                        ),
+                    }
                 # Broken binding (DB path set, dir missing or no .git)
                 # overrides idle-skip. Empty path after merge GC still skips.
                 if cur and not _has_git(cur):

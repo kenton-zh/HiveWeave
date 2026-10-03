@@ -43,7 +43,10 @@ from hiveweave.tools.fact_positions import classify_error_text
 from hiveweave.tools.result import finalize_fact_dict
 # F5（2026-09-17）：spawn 面事实的**唯一登记点**（决策面 + 加固面 + 执行面）。
 # 上方 `_SHELL_FACT_FLAG_KEYS` 从此派生 —— 新增一种事实只在 policy 登记一次。
-from hiveweave.services.acl_sandbox.policy import ALL_SPAWN_STAMP_KEYS
+from hiveweave.services.acl_sandbox.policy import (
+    ALL_SPAWN_STAMP_KEYS,
+    resolve_boundary_root,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -533,7 +536,12 @@ async def _run_registered_dev_server(
         routed = await spawn_agent_command(
             entry="dev_server",
             agent_id=agent_id or "unknown",
-            workspace_path=cwd,
+            # 批20 修复2：cwd 可能是 worktree 内子目录 —— boundary 必须上溯
+            # 到真实树根（与 dev_server_tools 同款病灶/同款修法），否则受限
+            # 路径的 gitdir 指针身份校验对子目录 fail-closed 误拒。
+            workspace_path=resolve_boundary_root(
+                workspace_path or cwd, cwd
+            ),
             workdir=cwd,
             project_id=project_id,
             confined=_confined,
@@ -1192,6 +1200,45 @@ async def _run_sandboxed(
     result = routed.result
     if result.get("long_running"):
         return result
+    # 批23（N2）：blocked_by_environment 的 **native 路由同判**。
+    # 病灶（G10/N2 归因分裂）：环境拒绝位只有一个生产点
+    #（``acl_sandbox.service._maybe_append_rejection_hint``），它只挂在
+    # **confined** 路由（``spawn_confined`` 尾）⇒ 同一环境拒绝（非零退出 +
+    # stderr 拒绝方言）在 confined run 上 blocked=1、native run 上恒 NULL
+    # —— 三工具（bash/pwsh/bash_main/pwsh_main 走 entry="bash"、
+    # run_command 走 entry="run_command"）是否带位取决于当时走哪条路由，
+    # 而不是取决于故障本身。此处把**同一个判定函数**
+    #（``fact_positions.classify_denied_by``）在两条路由的汇合点上补跑：
+    # ① 只在两条位都缺席时判（confined 路由已显式盖戳 ⇒ 显式位优先，
+    #    绝不二次裁判）；② 位与 confined 侧同构（denied_by 先落，
+    #    blocked_by_environment 按 exit_code 三态）；③ **只盖位不贴文案**
+    #    —— 沙箱提示模板（"写入被沙箱拒绝…"）在 native 下是假话
+    #    （enforcement=native 时既有提示门本就拦它，此处同纪律）。
+    # 诚实边界：native 侧拿不到封条上下文 ⇒ ``sealed_git`` 细分在此路
+    # 由不可判（落入 unknown_acl / outside_boundary 等其余格）。
+    if (
+        result.get("blocked_by_environment") is None
+        and result.get("denied_by") is None
+    ):
+        try:
+            from hiveweave.tools.fact_positions import classify_denied_by
+
+            _native_denied = classify_denied_by(
+                result.get("stderr", "") or "",
+                result.get("exit_code"),
+                boundary_root=workspace_path,
+            )
+        except Exception as e:  # noqa: BLE001 — 判定失败不挡执行结果
+            log.debug("native_denied_classify_failed", error=str(e))
+            _native_denied = None
+        if _native_denied is not None:
+            result = dict(result)
+            result["denied_by"] = _native_denied
+            # P0-3 同款三态判据（状态不用文案）：exit_code 非 None =
+            # 进程确实跑过 ⇒ 1；否则 None（未确定不落）。
+            result["blocked_by_environment"] = (
+                True if result.get("exit_code") is not None else None
+            )
     return _native_shaped(result)
 
 

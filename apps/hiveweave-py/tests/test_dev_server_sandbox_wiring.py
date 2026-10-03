@@ -571,3 +571,141 @@ async def test_start_dev_server_no_listen_export_carries_enforcement_stamp(tmp_p
         f"「有没有沙箱」这条观测是适用的；实测键："
         f"{sorted(k for k in d if 'enforc' in k)}"
     )
+
+
+# ── 批20 修复2：boundary 必须是真实 worktree/git 根（cwd 子目录不再误拒）──
+
+
+def test_resolve_boundary_root_prefers_bound_workspace(tmp_path):
+    """agent 绑定的 workspace（worktree 根）有 .git ⇒ 直接用作边界。"""
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    ws = tmp_path / "wt-A011"
+    ws.mkdir()
+    (ws / ".git").write_text("gitdir: D:/proj/.git/worktrees/A011", encoding="utf-8")
+    sub = ws / "src" / "halyard"
+    sub.mkdir(parents=True)
+
+    assert resolve_boundary_root(str(ws), str(sub)) == str(ws.resolve())
+
+
+def test_resolve_boundary_root_prefers_workspace_over_nested_repo(tmp_path):
+    """worktree 内嵌套 git 仓库不得劫持边界 —— ① workspace 优先命中。"""
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    ws = tmp_path / "wt"
+    ws.mkdir()
+    (ws / ".git").write_text("gitdir: x", encoding="utf-8")
+    nested = ws / "vendor" / "lib"
+    nested.mkdir(parents=True)
+    (nested / ".git").mkdir()
+
+    assert resolve_boundary_root(str(ws), str(nested)) == str(ws.resolve())
+
+
+def test_resolve_boundary_root_walks_up_within_workspace(tmp_path):
+    """workspace 无 .git（异常形态）⇒ 从 cwd 沿父目录找 .git（不越界）。"""
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    repo = ws / "repo"
+    (repo / ".git").mkdir(parents=True)
+    sub = repo / "src"
+    sub.mkdir()
+
+    assert resolve_boundary_root(str(ws), str(sub)) == str(repo.resolve())
+
+
+def test_resolve_boundary_root_never_escapes_workspace(tmp_path):
+    """上溯不得越过授权树：外层仓库的 .git 绝不当边界，兜底原样返回。"""
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    (outer / ".git").mkdir()
+    ws = outer / "proj"
+    ws.mkdir()
+    sub = ws / "src"
+    sub.mkdir()
+
+    assert resolve_boundary_root(str(ws), str(sub)) == str(sub)
+
+
+def test_resolve_boundary_root_noop_when_cwd_is_root(tmp_path):
+    """cwd 就是树根（常态）⇒ 原样返回，行为不变。"""
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    ws = tmp_path / "wt"
+    ws.mkdir()
+    (ws / ".git").mkdir()
+
+    assert resolve_boundary_root(str(ws), str(ws)) == str(ws)
+
+
+@pytest.mark.asyncio
+async def test_cwd_subdirectory_spawns_with_worktree_root_boundary(tmp_path):
+    """★ 批20 修复2 验收：cwd 在子目录 ⇒ 不再误拒，boundary 指向 worktree 根。
+
+    病灶（start_dev_server 实测）：`workspace_path=work_cwd` 把子目录当边界
+    ⇒ 受限路径的 gitdir 指针身份校验（`<boundary>/.git` 必须是指向期望
+    gitdir 的文件）在子目录 isfile 为假 ⇒ fail-closed 误拒（树其实活着）。
+    修复后 boundary=树根、workdir 仍是子目录。
+    """
+    from pathlib import Path
+
+    ws = tmp_path / "wt-A011"
+    ws.mkdir()
+    (ws / ".git").write_text(
+        "gitdir: D:/proj/.git/worktrees/A011", encoding="utf-8"
+    )
+    sub = ws / "src" / "halyard"
+    sub.mkdir(parents=True)
+
+    confined = AsyncMock(return_value={"job": _Job()})
+    native = MagicMock()
+    patchers = _patch_common(confined, native)
+    for p in patchers:
+        p.start()
+    try:
+        with _decide(R_CONFINED), \
+             patch("hiveweave.services.acl_sandbox.integration.build_confined_argv",
+                   side_effect=lambda c: ["cmd.exe", "/c", c]):
+            await start_dev_server_tool(
+                StartDevServerParams(
+                    command="npm run dev -- --port 3100 --strictPort",
+                    preferred_port=3100,
+                    cwd="src/halyard",
+                ),
+                "agent-1",
+                str(ws),
+            )
+    finally:
+        for p in reversed(patchers):
+            p.stop()
+
+    assert confined.await_count == 1, "受限 spawn 必须发生（未在边界校验前被误拒）"
+    kwargs = confined.await_args.kwargs
+    assert Path(kwargs["workspace_path"]).resolve() == ws.resolve(), (
+        "boundary 必须上溯到 worktree 根（.git 指针所在），不能是 cwd 子目录"
+    )
+    assert Path(kwargs["workdir"]).resolve() == sub.resolve(), (
+        "进程 cwd 仍是子目录 —— 边界与 cwd 是两个正交口径"
+    )
+    assert native.call_count == 0
+
+
+def test_resolve_boundary_root_no_anchor_no_walk(tmp_path):
+    """workspace 锚为空（无授权锚）⇒ 不上溯，原样返回 —— 边界绝不因上溯变宽。
+
+    OCR 评审修复：无锚时旧稿会一路 stat 到盘根找 .git，可能把授权树外层
+    仓库当边界（边界变宽）。fail-closed：无锚不上溯。
+    """
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    outer = tmp_path / "outer"
+    (outer / ".git").mkdir(parents=True)
+    sub = outer / "proj" / "src"
+    sub.mkdir(parents=True)
+
+    assert resolve_boundary_root("", str(sub)) == str(sub)

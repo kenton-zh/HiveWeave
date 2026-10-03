@@ -456,11 +456,21 @@ async def start_dev_server_tool(
     #   再在每个出口 `**stamp` 展开。新增出口时**必须**带上它。
     _stamp: dict[str, Any] = {}
 
+    # ── 批20 修复2：boundary 必须是真实 worktree/git 根 ─────────────────
+    # work_cwd 可以是 worktree 内子目录（如 src/halyard）；resolve_policy
+    # 把 boundary_root 取为 workspace_path，而 worktree 的 .git gitdir 指针
+    # 只在树根 —— 子目录当边界 ⇒ gitdir 指针身份校验 isfile 为假 fail-closed
+    # （树其实是活的）⇒ 误拒。上溯到树根（优先 agent 绑定的 workspace），
+    # workdir 仍是 work_cwd（进程 cwd 不变）。
+    from hiveweave.services.acl_sandbox.policy import resolve_boundary_root
+
+    sandbox_boundary = resolve_boundary_root(workspace, work_cwd)
+
     try:
         routed = await spawn_agent_command(
             entry="dev_server",
             agent_id=agent_id or "unknown",
-            workspace_path=work_cwd,
+            workspace_path=sandbox_boundary,
             workdir=work_cwd,
             project_id=project_id,
             confined=_confined,

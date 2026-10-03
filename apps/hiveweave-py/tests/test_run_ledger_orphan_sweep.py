@@ -22,9 +22,12 @@ _SCHEMA = [
     # agent_runs 带上事实位列（与 _FACT_COLUMNS 对齐）——这样 _ensure_fact_columns
     # 的 ALTER 走 "duplicate column" 幂等路径，测试不依赖 _fact_columns_ready
     # 的跨测试缓存（否则第二个测试会因缓存命中而 ALTER 被跳过 → 列缺失）。
+    # 批20 修复3：complete/interrupt/error_run 会写 ended_at / result_summary /
+    # checkpoint_data —— fake schema 必须带上，否则 run 终态 UPDATE 走异常分支。
     "CREATE TABLE agent_runs ("
     "id TEXT PRIMARY KEY, agent_id TEXT, activation_id TEXT, "
     "status TEXT NOT NULL DEFAULT 'running', started_at INTEGER, "
+    "ended_at INTEGER, result_summary TEXT, checkpoint_data TEXT, "
     # F7 补出口（TEST_DSH_50/51）：孤儿步骤的 timeout_kind 归属要看 run 的
     # error_reason 是否总超时，所以 fake schema 必须带上这一列。
     "error_reason TEXT, "
@@ -548,3 +551,130 @@ def test_sqlite_alter_with_default_would_backfill_zero():
 
 
 
+
+
+# ── 批20 修复3（N1）：run 落终态时同点收口未终态 run_steps ──────────────
+#
+# 实测（DSH browse 步）：步 00:31 开始、父 run 00:48 completed，步至今
+# status='running' —— 运行期没有步级收口，只有 create_activation 的 M3 清扫
+# （下次激活才跑）与 startup sweep 兜底。修法：complete_run / interrupt_run /
+# error_run 这个单一咽喉（勿在 agents/completion.py 散改）同点收口。
+
+
+def test_complete_run_finalizes_non_terminal_steps():
+    """run 完成 ⇒ 未终态子步被收口为 interrupted；已终态子步不动。"""
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s-running", "running", step_status="running",
+                       started=1)
+    # 幂等对照：已终态步（completed / failed）必须原样
+    fake.seed_run_step("r1", "s-done", "running", step_status="completed",
+                       started=1)
+    fake.seed_run_step("r1", "s-failed", "running", step_status="failed",
+                       started=1)
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.complete_run("a1", "r1", "done"))
+
+    status, ended_at, error = fake.step_status("s-running")
+    assert status == "interrupted", "run completed 但仍 running 的步必须被收口"
+    assert ended_at is not None
+    assert error.startswith("run_completed: step orphaned at finalize")
+    assert fake.step_timeout_kind("s-running") == "swept", (
+        "终态是收口员写的 ⇒ timeout_kind='swept'（与 startup sweep 同语义）"
+    )
+    # 幂等：已终态步不动
+    assert fake.step_status("s-done")[0] == "completed"
+    assert fake.step_status("s-failed")[0] == "failed"
+    run_status = fake.conn.execute(
+        "SELECT status FROM agent_runs WHERE id = 'r1'"
+    ).fetchone()[0]
+    assert run_status == "completed"
+
+
+def test_error_run_finalizes_with_run_error_prefix():
+    """run error ⇒ 未终态步收口，error 前缀 run_error: step orphaned at finalize。"""
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "running", step_status="running", started=0)
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.error_run("a1", "r1", "boom"))
+
+    status, _ended, error = fake.step_status("s1")
+    assert status == "interrupted"
+    assert error.startswith("run_error: step orphaned at finalize")
+
+
+def test_interrupt_run_finalizes_with_run_interrupted_prefix():
+    """run interrupted ⇒ 未终态步收口，error 前缀 run_interrupted: ...。"""
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "running", step_status="running")
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.interrupt_run("a1", "r1", "hard timeout"))
+
+    status, _ended, error = fake.step_status("s1")
+    assert status == "interrupted"
+    assert error.startswith("run_interrupted: step orphaned at finalize")
+
+
+def test_finalize_is_idempotent_on_repeat():
+    """重复终态（重放/双写调用方）不重复改写 —— interrupted 已是终态。"""
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "running", step_status="running", started=1)
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.complete_run("a1", "r1", "done"))
+        _s1, _e1, err1 = fake.step_status("s1")
+        asyncio.run(ledger.complete_run("a1", "r1", "done again"))
+
+    _s2, _e2, err2 = fake.step_status("s1")
+    assert _s2 == "interrupted"
+    assert err2 == err1, "第二次 finalize 不得改写已收口步的 error 文案"
+
+
+def test_finalize_does_not_double_write_with_activation_sweep():
+    """对照 M3 清扫不双写：complete_run 收口后的步，create_activation 不再改写。
+
+    M3 清扫的谓词是 `status = 'running'`；本修复把收口值定为 'interrupted'
+    ⇒ 清扫不再命中 —— 孤儿步只有一个收口员。
+    """
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "running", step_status="running", started=1)
+    ledger = RunLedger()
+
+    with _patched_db(fake):
+        asyncio.run(ledger.complete_run("a1", "r1", "done"))
+        _s1, _e1, err1 = fake.step_status("s1")
+        asyncio.run(ledger.create_activation("a1", "wake"))
+
+    s2, _e2, err2 = fake.step_status("s1")
+    assert s2 == "interrupted", "M3 清扫不得把已收口的步改成 error"
+    assert err2 == err1
+    # run 级 orphan_steps 事实位也不把已收口步计成 outcome_unknown/not_started
+    assert fake.run_orphan_steps("r1") == 0
+
+
+def test_finalize_skipped_when_run_update_fails():
+    """run 终态 UPDATE 失败 ⇒ 不收步（「run 终态 ⇒ 步收口」单向蕴含）。"""
+    fake = _FakeDb()
+    fake.seed_run_step("r1", "s1", "running", step_status="running")
+    ledger = RunLedger()
+
+    real_execute = fake.execute
+
+    async def guarded_execute(agent_id, sql, params=None):
+        if sql.strip().startswith("UPDATE agent_runs"):
+            raise RuntimeError("simulated run update failure")
+        return await real_execute(agent_id, sql, params)
+
+    with patch("hiveweave.services.run_ledger.project_db.execute",
+               new=guarded_execute):
+        asyncio.run(ledger.complete_run("a1", "r1", "done"))
+
+    assert fake.step_status("s1")[0] == "running", (
+        "run 仍 running ⇒ 步不得被收口（活 run 的步可能仍会被补 end）"
+    )
