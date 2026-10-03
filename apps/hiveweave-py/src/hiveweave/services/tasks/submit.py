@@ -130,8 +130,26 @@ class SubmitMixin:
             if _coverage.has_gaps:
                 # F1：处方必须按本任务 policy 渲染 kind（否则 agent 照抄
                 # `test_run` 示例 → 撞 attestation 门）。
+                # 批21 修复1（T37 范式）：查本任务已 attest 的合格凭证 id
+                # 实时填进可照抄模板（照抄即过同一张门）；查不到 fail-open。
+                _cov_ids: list[str] = []
+                try:
+                    from ..attestation import attestation_service as _att_svc
+
+                    _cov_ids = await _att_svc.find_recent_for_agent(
+                        project_id,
+                        agent_id=str(task.get("assignee_id") or "") or "",
+                        task_id=task_id,
+                        kinds=list(_cov_kinds),
+                    )
+                except Exception as e:  # noqa: BLE001 — 模板尽力填充
+                    log.debug(
+                        "submit_coverage_template_lookup_failed", error=str(e)
+                    )
                 raise ValueError(
-                    format_acceptance_coverage_verdict(_coverage, _cov_kinds)
+                    format_acceptance_coverage_verdict(
+                        _coverage, _cov_kinds, credential_ids=_cov_ids
+                    )
                 )
             # E5 断流收口纪律：降级中提交 verdict=FAIL 属「waiver 型就地
             # 收口」——必须续跑重验或升级 coordinator，不许抢在续跑前

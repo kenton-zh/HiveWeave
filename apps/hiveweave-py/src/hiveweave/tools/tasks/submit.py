@@ -966,15 +966,30 @@ async def _submit_preflight(
             kinds=_cov_kinds,
         )
         if _coverage.has_gaps:
+            # 批21 修复1（T37 范式）：查本任务已 attest 的合格凭证 id 实时
+            # 填进可照抄模板（照抄即过同一张门）；查不到 fail-open 退示例值。
+            _cov_ids: list[str] = []
+            try:
+                _cov_ids = await attestation_service.find_recent_for_agent(
+                    project_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    kinds=list(_cov_kinds),
+                )
+            except Exception as _cov_e:  # noqa: BLE001 — 模板尽力填充
+                log.debug(
+                    "submit_coverage_template_lookup_failed", error=str(_cov_e)
+                )
             issues.append({
                 "code": "acceptance_coverage",
                 # F1：处方按本任务 policy 渲染 kind（防照抄 test_run 示例）。
                 "message": format_acceptance_coverage_verdict(
-                    _coverage, _cov_kinds
+                    _coverage, _cov_kinds, credential_ids=_cov_ids
                 ),
                 "remedy": (
                     "按回执逐条补齐缺失 kind 的执行凭证（以本任务 policy 渲染"
-                    "的 kind 为准），再重新 submit_task。"
+                    "的 kind 为准）；已填真实凭证 id 的 COPY-PASTE 模板可原样"
+                    "照抄重交。"
                 ),
             })
 

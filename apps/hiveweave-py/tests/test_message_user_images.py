@@ -6,6 +6,11 @@
 
 报告截图直传（2026-09-05）：`.hiveweave/reports/` 下验收截图路径由平台
 读文件转 data URL 内联（CEO 无 bash/SOURCE_WRITE，转不了 base64）。
+
+批21 修复3：非法图**不再整条拒** —— 文本照发（降级），未附的图逐条说明
+（原因 + 处方）进回执（DSH CEO 截图路径外发被拒、ship 消息延迟 4.5h 的
+实证修法）。合法图照旧内联；无图路径零变化；fail-closed 只收窄到「这张
+图不附」，reports 白名单/防逃逸读取面一字不松。
 """
 
 from __future__ import annotations
@@ -65,6 +70,9 @@ def _reports_env(_msg_env, tmp_path):
     return _msg_env, tmp_path, shot, data_url
 
 
+# ── ① 合法图照旧 ─────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_images_land_on_user_visible_chat_message(_msg_env):
     saved, bus = _msg_env
@@ -85,6 +93,8 @@ async def test_images_land_on_user_visible_chat_message(_msg_env):
     # WebSocket 实时推送同样带图
     _, kwargs = bus.publish_chat_message.call_args
     assert kwargs["message"]["images"] == [_SMALL_IMG, _SMALL_IMG2]
+    # 合法图回执无降级注记
+    assert "图片未附" not in str(result.output or "")
 
 
 @pytest.mark.asyncio
@@ -96,72 +106,6 @@ async def test_bare_string_image_coerced_to_list(_msg_env):
     assert result.success is True, result.error
     payload = saved.call_args[0][0]
     assert payload["images"] == [_SMALL_IMG]
-
-
-@pytest.mark.asyncio
-async def test_too_many_images_rejected_with_remedy(_msg_env):
-    saved, _bus = _msg_env
-    result = await message_user_tool(
-        MessageUserParams(
-            message="太多图", images=[_SMALL_IMG] * 6
-        ),
-        "ceo-uuid",
-        "/ws",
-        None,
-    )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "5 张上限" in err and "分多条" in err  # 处方
-    saved.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_oversized_image_rejected_with_remedy(_msg_env):
-    saved, _bus = _msg_env
-    big = "data:image/png;base64," + "A" * 2_800_001
-    result = await message_user_tool(
-        MessageUserParams(message="巨图", images=[big]),
-        "ceo-uuid",
-        "/ws",
-        None,
-    )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "2MB" in err and "压缩" in err  # 处方
-    saved.assert_not_called()
-
-
-# ── 备注②：前缀白名单（data:image/ 或 http(s)://）──────
-
-
-@pytest.mark.asyncio
-async def test_bare_base64_without_data_prefix_rejected(_msg_env):
-    """裸 base64（缺 data:image/ 前缀）→ 拒绝并给补前缀处方。"""
-    saved, _bus = _msg_env
-    result = await message_user_tool(
-        MessageUserParams(message="裸base64", images=["iVBORw0KGgoAAAANSUhEUg=="]),
-        "ceo-uuid",
-        "/ws",
-        None,
-    )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "data:image/" in err and "处方" in err
-    saved.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_local_path_image_rejected(_msg_env):
-    saved, _bus = _msg_env
-    result = await message_user_tool(
-        MessageUserParams(message="本地路径", images=["C:\\Users\\pics\\a.png"]),
-        "ceo-uuid",
-        "/ws",
-        None,
-    )
-    assert result.success is not True
-    assert "http" in str(result.error or "")
-    saved.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -183,7 +127,7 @@ async def test_https_image_url_accepted(_msg_env):
 
 @pytest.mark.asyncio
 async def test_no_images_regression(_msg_env):
-    """不带图回归：payload 不含 images/metadata 键（既有纯文本路径不变）。"""
+    """③ 无图回归：payload 不含 images/metadata 键（既有纯文本路径不变）。"""
     saved, bus = _msg_env
     result = await message_user_tool(
         MessageUserParams(message="普通汇报"), "ceo-uuid", "/ws", None
@@ -194,6 +138,107 @@ async def test_no_images_regression(_msg_env):
     assert "metadata" not in payload
     _, kwargs = bus.publish_chat_message.call_args
     assert "images" not in kwargs["message"]
+    assert "图片未附" not in str(result.output or "")
+
+
+# ── ② 非法图 ⇒ 文本送达 + 回执含处方（批21 修复3 主语义）──────────
+
+
+@pytest.mark.asyncio
+async def test_too_many_images_degraded_with_remedy(_msg_env):
+    """超 5 张 ⇒ 前 5 张照附、文本照发，回执给压缩/分条处方。"""
+    saved, bus = _msg_env
+    result = await message_user_tool(
+        MessageUserParams(message="太多图", images=[_SMALL_IMG] * 6),
+        "ceo-uuid",
+        "/ws",
+        None,
+    )
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "太多图"
+    assert payload["images"] == [_SMALL_IMG] * 5
+    _, kwargs = bus.publish_chat_message.call_args
+    assert kwargs["message"]["images"] == [_SMALL_IMG] * 5
+    receipt = str(result.output or "")
+    assert "图片未附" in receipt and "5 张上限" in receipt and "分多条" in receipt
+
+
+@pytest.mark.asyncio
+async def test_oversized_image_degraded_text_still_sent(_msg_env):
+    """单张超 ~2MB ⇒ 图不附、文本照发，回执含压缩处方。"""
+    saved, _bus = _msg_env
+    big = "data:image/png;base64," + "A" * 2_800_001
+    result = await message_user_tool(
+        MessageUserParams(message="巨图", images=[big]),
+        "ceo-uuid",
+        "/ws",
+        None,
+    )
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "巨图"
+    assert "images" not in payload  # 全部图未附 ⇒ 与纯文本同形态
+    receipt = str(result.output or "")
+    assert "图片未附" in receipt and "2MB" in receipt and "压缩" in receipt
+
+
+@pytest.mark.asyncio
+async def test_bare_base64_without_prefix_degraded_with_remedy(_msg_env):
+    """裸 base64（缺 data:image/ 前缀）⇒ 文本照发 + 补前缀处方。"""
+    saved, _bus = _msg_env
+    result = await message_user_tool(
+        MessageUserParams(message="裸base64", images=["iVBORw0KGgoAAAANSUhEUg=="]),
+        "ceo-uuid",
+        "/ws",
+        None,
+    )
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "裸base64"
+    assert "images" not in payload
+    receipt = str(result.output or "")
+    assert "data:image/" in receipt and "处方" in receipt
+
+
+@pytest.mark.asyncio
+async def test_local_path_image_degraded_text_still_sent(_msg_env):
+    """reports 外本地路径（DSH 实锤形态）⇒ 文本照发 + 通道处方。"""
+    saved, _bus = _msg_env
+    result = await message_user_tool(
+        MessageUserParams(message="本地路径", images=["C:\\Users\\pics\\a.png"]),
+        "ceo-uuid",
+        "/ws",
+        None,
+    )
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "本地路径"
+    assert "images" not in payload
+    receipt = str(result.output or "")
+    assert "图片未附" in receipt and "http" in receipt
+
+
+@pytest.mark.asyncio
+async def test_mixed_valid_and_invalid_images_partial_degradation(_msg_env):
+    """混用合法/非法图：合法图照附，非法图单张降级（不整条拒）。"""
+    saved, bus = _msg_env
+    result = await message_user_tool(
+        MessageUserParams(
+            message="混合",
+            images=[_SMALL_IMG, "C:\\outside\\x.png"],
+        ),
+        "ceo-uuid",
+        "/ws",
+        None,
+    )
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["images"] == [_SMALL_IMG]
+    receipt = str(result.output or "")
+    assert "图片未附" in receipt and "images[2]" in receipt
+    _, kwargs = bus.publish_chat_message.call_args
+    assert kwargs["message"]["images"] == [_SMALL_IMG]
 
 
 # ── 报告截图直传（.hiveweave/reports/ 路径 → 平台内联 data URL）──────
@@ -271,9 +316,12 @@ async def test_ctx_project_root_wins_over_workspace(_reports_env):
     assert saved.call_args[0][0]["images"] == [data_url]
 
 
+# ── 读取面 fail-closed 不松：越界图不附，但文本照发 ───────────────
+
+
 @pytest.mark.asyncio
-async def test_reports_traversal_dotdot_rejected(_reports_env):
-    """`..` 穿越 → 直接拒绝（fail-closed），不读 reports 外文件。"""
+async def test_reports_traversal_dotdot_dropped_not_read(_reports_env):
+    """`..` 穿越 ⇒ 这张图不附（fail-closed 不读 reports 外文件），文本照发。"""
     (saved, _bus), tmp_path, _shot, _data_url = _reports_env
     assert (tmp_path / "secret.png").exists()  # 越界目标真实存在也不可读
     result = await message_user_tool(
@@ -285,15 +333,17 @@ async def test_reports_traversal_dotdot_rejected(_reports_env):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert ".." in err and "防穿越" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "偷图"
+    assert "images" not in payload  # 绝无 reports 外内容内联
+    receipt = str(result.output or "")
+    assert ".." in receipt and "防穿越" in receipt
 
 
 @pytest.mark.asyncio
-async def test_absolute_path_outside_reports_whitelist_rejected(_reports_env):
-    """reports 外绝对路径 → 白名单拒绝（非报告路径形态），提示 reports 通道。"""
+async def test_absolute_path_outside_reports_degraded(_reports_env):
+    """reports 外绝对路径 ⇒ 图不附 + reports 通道处方，文本照发。"""
     (saved, _bus), tmp_path, _shot, _data_url = _reports_env
     result = await message_user_tool(
         MessageUserParams(
@@ -303,15 +353,16 @@ async def test_absolute_path_outside_reports_whitelist_rejected(_reports_env):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "不是可渲染的图片串" in err and ".hiveweave/reports" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert "images" not in payload
+    receipt = str(result.output or "")
+    assert "不是可渲染的图片串" in receipt and ".hiveweave/reports" in receipt
 
 
 @pytest.mark.asyncio
-async def test_report_path_escape_via_symlink_rejected(_reports_env, tmp_path):
-    """reports 内符号链接指向外部 → resolve 后越出，拒绝（防逃逸）。"""
+async def test_report_path_escape_via_symlink_dropped(_reports_env, tmp_path):
+    """reports 内符号链接指向外部 ⇒ 这张图不附（防逃逸不松），文本照发。"""
     (saved, _bus), _tmp, _shot, _data_url = _reports_env
     link = tmp_path / ".hiveweave" / "reports" / "38709daf" / "leak.png"
     try:
@@ -327,15 +378,16 @@ async def test_report_path_escape_via_symlink_rejected(_reports_env, tmp_path):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "越出" in err or "防逃逸" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert "images" not in payload
+    receipt = str(result.output or "")
+    assert "越出" in receipt or "防逃逸" in receipt
 
 
 @pytest.mark.asyncio
-async def test_report_non_image_ext_rejected(_reports_env):
-    """后缀不在图片类型白名单 → 拒绝。"""
+async def test_report_non_image_ext_degraded(_reports_env):
+    """后缀不在图片类型白名单 ⇒ 图不附，文本照发。"""
     (saved, _bus), tmp_path, _shot, _data_url = _reports_env
     result = await message_user_tool(
         MessageUserParams(
@@ -346,14 +398,14 @@ async def test_report_non_image_ext_rejected(_reports_env):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    assert "不是图片文件" in str(result.error or "")
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    assert "images" not in saved.call_args[0][0]
+    assert "不是图片文件" in str(result.output or "")
 
 
 @pytest.mark.asyncio
-async def test_missing_report_screenshot_error_with_remedy(_reports_env):
-    """截图文件不存在 → 报错附处方（确认路径在 .hiveweave/reports/ 下）。"""
+async def test_missing_report_screenshot_degraded_with_remedy(_reports_env):
+    """截图文件不存在 ⇒ 图不附 + 处方，文本照发。"""
     (saved, _bus), tmp_path, _shot, _data_url = _reports_env
     result = await message_user_tool(
         MessageUserParams(
@@ -364,15 +416,17 @@ async def test_missing_report_screenshot_error_with_remedy(_reports_env):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "不存在" in err and ".hiveweave/reports" in err and "处方" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    assert payload["content"] == "还没截图"
+    assert "images" not in payload
+    receipt = str(result.output or "")
+    assert "不存在" in receipt and ".hiveweave/reports" in receipt and "处方" in receipt
 
 
 @pytest.mark.asyncio
-async def test_report_oversized_file_rejected(_reports_env):
-    """截图超过单张 ~2MB 上限 → 拒绝附压缩处方（限幅沿用既有软上限）。"""
+async def test_report_oversized_file_degraded(_reports_env):
+    """截图超过单张 ~2MB 上限 ⇒ 图不附 + 压缩处方，文本照发。"""
     (saved, _bus), tmp_path, _shot, _data_url = _reports_env
     big = tmp_path / ".hiveweave" / "reports" / "38709daf" / "big.png"
     big.write_bytes(b"x" * 64)
@@ -387,10 +441,10 @@ async def test_report_oversized_file_rejected(_reports_env):
             str(tmp_path),
             None,
         )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "2MB" in err and "压缩" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    assert "images" not in saved.call_args[0][0]
+    receipt = str(result.output or "")
+    assert "2MB" in receipt and "压缩" in receipt
 
 
 @pytest.mark.asyncio
@@ -413,7 +467,7 @@ async def test_mixed_data_url_and_report_path(_reports_env):
 @pytest.mark.asyncio
 async def test_image_count_cap_counts_report_paths(_reports_env):
     """张数限幅把路径条目一并计数（5 张 reports 路径 + 1 张 data URL = 6）。"""
-    (saved, _bus), tmp_path, _shot, _data_url = _reports_env
+    (saved, _bus), tmp_path, _shot, data_url = _reports_env
     images = [".hiveweave/reports/38709daf/shot-1.png"] * 5 + [_SMALL_IMG]
     result = await message_user_tool(
         MessageUserParams(message="超张", images=images),
@@ -421,7 +475,9 @@ async def test_image_count_cap_counts_report_paths(_reports_env):
         str(tmp_path),
         None,
     )
-    assert result.success is not True
-    err = str(result.error or "")
-    assert "5 张上限" in err and "分多条" in err
-    saved.assert_not_called()
+    assert result.success is True, result.error
+    payload = saved.call_args[0][0]
+    # 前 5 张（reports 路径内联后）保留，第 6 张降级
+    assert payload["images"] == [data_url] * 5
+    receipt = str(result.output or "")
+    assert "5 张上限" in receipt and "分多条" in receipt

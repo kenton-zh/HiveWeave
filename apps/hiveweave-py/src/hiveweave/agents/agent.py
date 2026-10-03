@@ -315,6 +315,64 @@ def _activation_trigger_fields(
     return trigger_type, trigger_source
 
 
+# ── 批21 修复4：恢复简报逐唤醒重放去重 ──────────────────────────────
+# 实锤（DSH 归零 ×2、木槿 ×3）：重启后同一 agent 7 分钟收到 6 次逐字相同的
+# [RUN RECOVERY]（同失败步清单）——每次平台内唤醒（stall/补偿/ productive
+# continue…）都重新生成同一份 checkpoint 并全文注入。修法：同 agent 同内容
+# 指纹在一次唤醒周期内只注入一次全文；重复触发改注入一行 stub；跨外部唤醒
+# 或内容变化则重置重新注入。纯函数 + 显式 state，便于单测锁死判据。
+
+_RECOVERY_BRIEF_FULL_HEAD = "[RUN RECOVERY] Previous run was interrupted."
+_RECOVERY_BRIEF_STUB_TMPL = (
+    "[RUN RECOVERY] （同前次，第 {n} 次——内容未变，勿重读，"
+    "按已登记的等待/动作继续。）"
+)
+
+
+def recovery_brief_fingerprint(run_id: str | None, summary: str) -> str:
+    """恢复简报的内容指纹（失败步集合在同一 run 内不变 ⇒ 摘要逐字稳定）。
+
+    ``run_id`` 参与哈希：**不同**中断 run 即使摘要凑巧相同也是新事件，
+    必须重新全文注入（agent 需要知道「又中断了一次」）。
+    """
+    import hashlib
+
+    return hashlib.sha1(
+        f"{run_id or ''}|{summary or ''}".encode("utf-8")
+    ).hexdigest()
+
+
+def format_recovery_brief(
+    state: dict | None,
+    fingerprint: str,
+    external_wake: bool,
+    summary: str,
+) -> tuple[str, dict]:
+    """恢复简报注入判据（纯函数）：返回 (注入前缀, 新状态)。
+
+    - 外部唤醒（用户真消息，非平台 trigger）⇒ 重新全文注入并重置计数
+      —— 用户到场是新上下文，agent 该重新拿到完整中断图景；
+    - 指纹变化（新中断 run / 失败步集合变化）⇒ 重新全文注入并重置；
+    - 其余（同指纹的平台内重复唤醒）⇒ 一行 stub，计数累加（第 N 次）。
+    全文形态与修前逐字一致（含结尾句号），只多出 stub 分支。
+    """
+    full = (
+        f"{_RECOVERY_BRIEF_FULL_HEAD} "
+        f"Completed steps:\n{summary}\n"
+        f"Please continue from where you left off."
+    )
+    prev = state or {}
+    prev_fp = prev.get("fingerprint")
+    prev_n = int(prev.get("count") or 0)
+    if external_wake or not prev_fp or prev_fp != fingerprint:
+        return full, {"fingerprint": fingerprint, "count": 1}
+    n = prev_n + 1
+    return _RECOVERY_BRIEF_STUB_TMPL.format(n=n), {
+        "fingerprint": fingerprint,
+        "count": n,
+    }
+
+
 async def broadcast_agent_health(
     agent_id: str, health: str, message: str = ""
 ) -> None:
@@ -356,6 +414,9 @@ class Agent:
     不是长驻 task — LLM 调用是短生命周期 asyncio.Task。
     Agent 对象本身是长期存在的状态容器。
 
+    批21 恢复简报去重的状态位用类级默认兜底——测试桩常以 object.__new__
+    构造 Agent（不跑 __init__），实例级赋值会让它们撞 AttributeError。
+
     生命周期:
         am = AgentManager()
         agent = await am.start_agent(agent_id, project_id, config)
@@ -363,6 +424,9 @@ class Agent:
         # ... agent 内部异步处理 ...
         await am.stop_agent(agent_id)
     """
+
+    # 批21：恢复简报去重状态位（类级默认 —— stub 构造不跑 __init__ 也安全）
+    _recovery_brief: dict | None = None
 
     def __init__(
         self,
@@ -484,6 +548,10 @@ class Agent:
         self._run_step_counter: int = 0
         # P1 escape valve(TEST10): 连续被 UNREPLIED_ASKS 阻塞的次数
         self._unreplied_asks_streak: int = 0
+        # 批21 修复4：恢复简报逐唤醒重放去重 —— {"fingerprint": str, "count": int}
+        # （None = 本进程内还没注入过）。同指纹的平台内重复唤醒只注入 stub，
+        # 跨外部唤醒或内容变化则重置重新注入全文（判据见 format_recovery_brief）。
+        self._recovery_brief: dict | None = None
 
         # ── 缓存 ──
         self._identity_prompt: str | None = None
@@ -949,12 +1017,18 @@ class Agent:
             self._run_step_counter = 0
 
             # If we have an interrupted run checkpoint, prepend it to the message
+            # 批21 修复4：同指纹的平台内重复唤醒只注入一行 stub（防 7 分钟
+            # 6 次逐字重放）；外部唤醒 / 内容变化重置重新全文注入。
             if interrupted_summary:
-                message = (
-                    f"[RUN RECOVERY] Previous run was interrupted. "
-                    f"Completed steps:\n{interrupted_summary}\n"
-                    f"Please continue from where you left off.\n\n{message}"
+                _brief_prefix, self._recovery_brief = format_recovery_brief(
+                    self._recovery_brief,
+                    recovery_brief_fingerprint(
+                        interrupted_run_id, interrupted_summary
+                    ),
+                    external_wake=not opts.get("trigger"),
+                    summary=interrupted_summary,
                 )
+                message = f"{_brief_prefix}\n\n{message}"
 
             # Drop leftover streaming rows from a prior incomplete turn before
             # inserting a new placeholder (product auto-heal — no manual clear).

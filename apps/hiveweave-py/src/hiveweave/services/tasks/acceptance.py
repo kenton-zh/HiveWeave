@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -537,6 +537,10 @@ class CoverageAssessment:
     credential_notes: dict[str, list[str]]
     waived: bool
     gap_lines: list[str]
+    # 批21 修复1：与 ``gap_lines`` 同序平行的**条目 id** —— 可照抄模板
+    # （:func:`format_acceptance_coverage_copyable`）按 id 实例化必须结构对取，
+    # 不能从标签字符串反解（条目 id 自身含 ``:`` 时反解错位，同 P0-1a 教训）。
+    gap_ids: list[str] = field(default_factory=list)
 
     @property
     def has_gaps(self) -> bool:
@@ -637,6 +641,7 @@ async def assess_acceptance_coverage_verified(
         credential_notes=credential_notes,
         waived=waived,
         gap_lines=gap_lines,
+        gap_ids=[it.id for it in items if it.id not in covered],
     )
 
 
@@ -742,6 +747,17 @@ def _coverage_kinds_or_default(kinds: tuple[str, ...] | None) -> tuple[str, ...]
     return _ks or ("test_run",)
 
 
+def _coverage_example_value(kinds: tuple[str, ...]) -> str:
+    """处方示例里的凭证 id 占位串（批21 修复1）。
+
+    ⚠ 旧值 ``"<test_run 凭证 id>"`` 以 ``<`` 开头，正好落在
+    ``delivery_contract._PLACEHOLDER_LEADS`` 占位前缀上（P0-4 同款自相矛盾：
+    照抄示例必被同一判据判占位）。新值不落在任何占位前缀上，且把「要换成
+    什么」写进值本身。
+    """
+    return f"{kinds[0]}凭证id-替换为本任务真实凭证id"
+
+
 def _prescription_block(_ks: tuple[str, ...]) -> str:
     """三态回执共用的处方块（单一来源；F1：kind 按本任务 policy 渲染）。"""
     # 逐 kind 给出「怎么产出」的可操作指引 —— 只报 kind 名等于把问题
@@ -757,8 +773,9 @@ def _prescription_block(_ks: tuple[str, ...]) -> str:
     _hint_lines = "\n".join(
         f"  - `{k}`：{_HOW.get(k, '平台认可的该 kind 凭证')}" for k in _ks
     )
+    _example_value = _coverage_example_value(_ks)
     _example = (
-        f'{{"1": {{"attestation_ids": ["<{_ks[0]} 凭证 id>"]}}}}'
+        f'{{"1": {{"attestation_ids": ["{_example_value}"]}}}}'
     )
     _multi = (
         f"（本任务认这 {len(_ks)} 类：" + "、".join(f"`{k}`" for k in _ks) + "）"
@@ -781,9 +798,56 @@ def _prescription_block(_ks: tuple[str, ...]) -> str:
     )
 
 
+def format_acceptance_coverage_copyable(
+    assessment: CoverageAssessment,
+    kinds: tuple[str, ...] | None,
+    credential_ids: list[str] | None,
+) -> str:
+    """批21 修复1（T37 处方化范式）：可照抄的 ``acceptanceCoverage`` JSON 块。
+
+    与 dc 回执的 ``COPY-PASTE`` 模板同构：把缺口条目**逐条按 id** 实例化成
+    标准声明；库里有本任务合格凭证时**实时填真 id**（照抄即过同一张门），
+    查不到时给非占位前缀的示例值 + 明示「先产出凭证再填」。
+
+    - ``assessment.gap_ids`` 提供缺口条目 id（与 gap_lines 同源同序）；
+    - ``credential_ids`` = 调用方查到的本任务合格凭证 id（可空）；
+    - 纯渲染函数，不做核验/不改判定 —— 拒绝语义全在上游。
+    """
+    _ks = _coverage_kinds_or_default(kinds)
+    ids = list(assessment.gap_ids)
+    if not ids:
+        # 无缺口条目（如仅 unknown-id 声明）时不造模板——回执正文已点名。
+        return ""
+    real = [str(x).strip() for x in (credential_ids or []) if str(x or "").strip()]
+    template: dict[str, dict[str, list[str]]] = {}
+    if real:
+        for iid in ids:
+            template[iid] = {"attestation_ids": [real[0]]}
+        body = json.dumps(template, ensure_ascii=False)
+        note = (
+            "（attestation_ids 已填本任务真实凭证 id，照抄即可通过本门；"
+            "若上方【未核验】诊断显示该凭证对不上条目，则需按处方补跑产出"
+            "新凭证后再交）"
+        )
+    else:
+        example_value = _coverage_example_value(_ks)
+        for iid in ids:
+            template[iid] = {"attestation_ids": [example_value]}
+        body = json.dumps(template, ensure_ascii=False)
+        note = (
+            "（当前查不到本任务已 attest 的合格凭证——先按处方产出凭证拿到"
+            "真实 id，再替换示例值；直接照抄示例 id 不会通过核验）"
+        )
+    return (
+        "\nCOPY-PASTE: 把下面的 JSON 原样作为 submit_task 的 "
+        f"acceptanceCoverage 参数重交{note}：\n{body}"
+    )
+
+
 def format_acceptance_coverage_verdict(
     assessment: CoverageAssessment,
     kinds: tuple[str, ...] | None = None,
+    credential_ids: list[str] | None = None,
 ) -> str:
     """P0-1a 三态分解回执：未声明 / 形状错 / 未核验 各说各的话。
 
@@ -791,6 +855,11 @@ def format_acceptance_coverage_verdict(
     丢弃后 agent 收到的是「你没声明」——无从自我纠正（37 次拒收、110′
     拉锯的根因）。形状错态必须回显**收到的原始形态摘要**；未核验态必须
     逐条点名「哪条凭证对不上哪个条目」（P0-1c 绑定诊断）。
+
+    批21 修复1（T37 范式）：调用方传入 ``credential_ids``（本任务已 attest
+    的合格凭证 id）时，回执末尾附**逐条按缺口 id 实例化**的可照抄模板
+    （见 :func:`format_acceptance_coverage_copyable`）——把「爬墙猜测」变
+    「照抄即过」。None（旧调用方/纯单测）不附加，行为不变。
     """
     _ks = _coverage_kinds_or_default(kinds)
     sections: list[str] = []
@@ -845,7 +914,12 @@ def format_acceptance_coverage_verdict(
         "acceptance_criteria，verdict evidence 的覆盖声明未通过验收门，"
         f"共 {sum(1 for s in sections)} 类问题：\n"
     )
-    return head + "\n".join(sections) + _prescription_block(_ks)
+    out = head + "\n".join(sections) + _prescription_block(_ks)
+    if credential_ids is not None:
+        out += format_acceptance_coverage_copyable(
+            assessment, _ks, credential_ids
+        )
+    return out
 
 
 def format_acceptance_coverage_error(

@@ -2129,16 +2129,6 @@ def _normcase_inside(child: str, base: str) -> bool:
     return c.startswith(b)
 
 
-def _report_image_error(i: int, problem: str, raw: str) -> str:
-    """报告截图路径解析/读取失败 —— fail-closed 报错附处方，不静默丢图。"""
-    return (
-        f"message_user rejected: images[{i}] {problem}（收到：{raw}）。"
-        "处方：确认路径在项目 .hiveweave/reports/ 下、指向已生成的截图"
-        "（browse 取证保存后才可引用），后缀限 .png/.jpg/.jpeg/.gif/.webp；"
-        "或改用 data:image/… / http(s)://… 图片串。"
-    )
-
-
 def _resolve_report_image_path(
     reports_root: Path, raw: str
 ) -> tuple[Path | None, str | None]:
@@ -2210,37 +2200,42 @@ def _read_report_image_data_url(path: Path) -> tuple[str | None, str | None]:
 def _validate_message_user_images(
     images: list[str],
     reports_root: Path | None = None,
-) -> tuple[list[str], str | None]:
-    """校验并解析 images 参数；返回 (落库 images, 错误文案或 None)。
+) -> tuple[list[str], list[str]]:
+    """校验并解析 images 参数；返回 (落库 images, 逐条降级说明)。
 
-    - data:image/… 与 http(s)://… 原样保留（既有前缀白名单）。
-    - `.hiveweave/reports/` 下的截图路径：平台读文件转 data URL 内联
-      （与既有 data URL 同形态，前端零改动）。解析/读取失败 → 报错附
-      处方（fail-closed，绝不静默丢图）。
+    批21 修复3：**非法图不再整条拒**——文本照发（降级），每张非法图落一条
+    「图未附 + 原因 + 正确形态处方」说明进回执（DSH CEO 22:26 附截图路径
+    外发被拒、ship 消息延迟 4.5h 的实证修法）。合法图照旧内联；fail-closed
+    语义只收窄到「这张图不附」，读取面（reports 白名单/防逃逸）一字不松。
     """
+    drops: list[str] = []
     if len(images) > _MESSAGE_USER_MAX_IMAGES:
-        return [], (
-            f"message_user rejected: images 超过 {_MESSAGE_USER_MAX_IMAGES} 张上限"
-            f"（收到 {len(images)} 张）。处方：压缩合并图片，或减少张数、"
-            "分多条 message_user 发送。"
+        drops.append(
+            f"images 超过 {_MESSAGE_USER_MAX_IMAGES} 张上限"
+            f"（收到 {len(images)} 张）——仅保留前 "
+            f"{_MESSAGE_USER_MAX_IMAGES} 张。处方：压缩合并图片，或减少"
+            "张数、分多条 message_user 发送。"
         )
+        images = images[:_MESSAGE_USER_MAX_IMAGES]
     resolved: list[str] = []
     for i, img in enumerate(images, 1):
         if not isinstance(img, str) or not img.strip():
-            return [], (
-                f"message_user rejected: images[{i}] 必须是非空字符串"
-                "（data:image/ 开头的 data URL、http(s):// 图片 URL，"
-                "或 .hiveweave/reports/ 下的截图路径）。"
+            drops.append(
+                f"图未附：images[{i}] 必须是非空字符串（收到非字符串/空白）。"
+                "处方：传 data:image/ 开头的 data URL、http(s):// 图片 URL，"
+                "或 .hiveweave/reports/ 下的截图路径。"
             )
+            continue
         raw = img.strip()
         low = raw.lower()
         if low.startswith(("data:image/", "http://", "https://")):
             if len(raw) > _MESSAGE_USER_MAX_IMAGE_CHARS:
-                return [], (
-                    f"message_user rejected: images[{i}] 超过单张 ~2MB 软上限"
+                drops.append(
+                    f"图未附：images[{i}] 超过单张 ~2MB 软上限"
                     f"（{len(raw)} chars）。处方：压缩或降分辨率后重发，"
                     "或减少张数分多条发送。"
                 )
+                continue
             resolved.append(raw)
             continue
         if reports_root is not None:
@@ -2250,20 +2245,33 @@ def _validate_message_user_images(
                 if data_url is not None:
                     resolved.append(data_url)
                     continue
-                return [], _report_image_error(i, rerr or "截图读取失败", raw)
+                drops.append(
+                    f"图未附：images[{i}] {rerr or '截图读取失败'}"
+                    f"（收到：{raw[:160]}）。处方：确认截图已生成在项目 "
+                    ".hiveweave/reports/ 下（≤2MB、.png/.jpg/.jpeg/.gif/"
+                    ".webp），或改用 data:image/… / http(s)://… 图片串。"
+                )
+                continue
             if perr is not None:
-                return [], _report_image_error(i, perr, raw)
+                drops.append(
+                    f"图未附：images[{i}] {perr}（收到：{raw[:160]}）。"
+                    "处方：确认路径在项目 .hiveweave/reports/ 下、指向已"
+                    "生成的截图（browse 取证保存后才可引用），或改用 "
+                    "data:image/… / http(s)://… 图片串。"
+                )
+                continue
         # 备注②（审计 2026-09-05）：前缀白名单 —— 只收 data:image/ /
         # http(s):// / .hiveweave/reports/ 截图路径三种；裸 base64 缺 mime
         # 头前端 <img> 渲染不出，reports 外本地路径/文本则完全是噪音。
-        return [], (
-            f"message_user rejected: images[{i}] 不是可渲染的图片串"
-            "（仅接受 data:image/…、http(s)://… 或 .hiveweave/reports/ 下的"
-            "截图路径）。处方：裸 base64 请补前缀成 data:image/<格式>;base64,"
+        # 批21 修复3：白名单外的条目只降级这一张（不整条拒）。
+        drops.append(
+            f"图未附：images[{i}] 不是可渲染的图片串（收到：{raw[:160]}）。"
+            "仅接受 data:image/…、http(s)://… 或 .hiveweave/reports/ 下的"
+            "截图路径。处方：裸 base64 请补前缀成 data:image/<格式>;base64,"
             "<数据>；验收截图可直接传 .hiveweave/reports/ 下的路径（平台自动"
             "内联），或提供可访问的图片 URL。"
         )
-    return resolved, None
+    return resolved, drops
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2688,19 +2696,27 @@ async def message_user_tool(
         return ToolResult.err("message_user requires 'message' (body text)")
 
     # 件3（agent→用户发图 2026-09-05）：可选 images 校验（≤5 张、单张
-    # ~2MB 软上限），超限报错并附处方（压缩/降张数）。
-    # 报告截图直传（2026-09-05）：`.hiveweave/reports/` 下截图路径在此处
-    # 由平台读文件转 data URL 内联（与 CEO 是否有 shell 无关，平台内联更省令牌）。
+    # ~2MB 软上限）。报告截图直传（2026-09-05）：`.hiveweave/reports/` 下
+    # 截图路径在此处由平台读文件转 data URL 内联。
+    # 批21 修复3：非法图**不再整条拒**——文本照发（降级），未附的图逐条
+    # 说明（原因 + 处方）进回执（DSH CEO 截图路径外发被拒、ship 消息延迟
+    # 4.5h 的实证修法）；badge/发送语义不动。
     images = params.images or []
+    image_drops: list[str] = []
     if images:
         # 报告截图读文件+b64 最坏 ~10MiB 同步 IO：to_thread 防阻塞事件循环。
-        images, images_err = await asyncio.to_thread(
+        images, image_drops = await asyncio.to_thread(
             _validate_message_user_images,
             images,
             _message_user_reports_root(ctx, workspace),
         )
-        if images_err:
-            return ToolResult.err(images_err)
+        if image_drops:
+            log.warning(
+                "message_user_images_degraded",
+                agent_id=agent_id,
+                dropped=len(image_drops),
+                attached=len(images),
+            )
 
     # fixplan #8：本出口**不做任何文本判断**（旧形态的 8 词中英词表已下线）。
     # 只读项目交付状态位，把**真实状态**挂到 metadata 上 ⇒ 无论这条消息写
@@ -2753,7 +2769,13 @@ async def message_user_tool(
     except Exception as evt_err:
         log.debug("message_user_event_push_failed", error=str(evt_err))
 
-    return ToolResult.ok("Message sent to user. " + delivery_badge_line(badge))
+    receipt = "Message sent to user. " + delivery_badge_line(badge)
+    if image_drops:
+        receipt += (
+            "\n[图片未附] 文本已照发，但以下图片没有附上（文本/徽章投递"
+            "不受影响）：\n- " + "\n- ".join(image_drops)
+        )
+    return ToolResult.ok(receipt)
 
 
 class MarkDeliveryCompleteParams(BaseModel):

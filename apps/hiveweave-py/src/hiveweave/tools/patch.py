@@ -389,19 +389,67 @@ from .result import ToolResult
 _OLD_STRING_KEYS = (
     "oldString", "old_string", "old_str", "oldText", "search",
 )
+# 模型实测（s3-clone_21 芋圆）：数组项用 `$text` **顶替** `newString`
+# （agent 原话「我用 `$text` 代替 `newString`」）——既然它语义上就是
+# 替换文本，op 推断必须把它当 update 信号，否则会误推成 add 覆盖文件。
+_DOLLAR_TEXT_KEY = "$text"
+_NEW_STRING_KEYS = ("newString", "new_string", "new_str", "newText")
+_TEXT_ALIAS_KEYS = (_DOLLAR_TEXT_KEY, *_NEW_STRING_KEYS)
 
 
 def _infer_op(patch: dict) -> str:
     """从可见字段推断缺失的 `op`（与模型从 edit_file 学来的分布一致）。
 
     规则（刻意保守，与既有顶层直传行为逐字一致）：
-    - 提供 oldString 族字段 ⇒ ``update``
+    - 提供 oldString 族 / newString 族（含 ``$text`` 别名）字段 ⇒ ``update``
     - 提供 content ⇒ ``add``
     - 都没有 ⇒ ``add``（删除**无法**从"缺字段"推断，必须显式传 op='delete'）
     """
-    if any(k in patch for k in _OLD_STRING_KEYS):
+    if any(
+        k in patch for k in (*_OLD_STRING_KEYS, *_TEXT_ALIAS_KEYS)
+    ):
         return "update"
     return "add"
+
+
+# ── 批21 修复2：参数别名收编（真实错用形态，样本取自 2026-10-02 实跑）──
+# server.out.log 实测分布：`'item': Extra inputs` ×6、
+# `'newString'/'old_string': Extra inputs; 'item': Extra inputs` ×11、
+# `'patches.N.$text': Extra inputs + 'patches.N.filePath': Field required` ×5。
+# 模型实传形态（agent 自述）：① 顶层 `item` 群体形态（补丁项写在
+# `item` 而非 `patches[]`）；② `patches` 数组 + 顶层散落 `newString`/
+# `old_string` 直传键的混合形态；③ 数组项内 `$text` 顶替 `newString`。
+# 收编口径与 TEST_DSH_70 P1-6（coerce_list_param）一致：pydantic 层吸收，
+# **不**把病态键名播进 LLM 可见 schema（那是容错面，不是推荐面）。
+_ITEM_GROUP_KEY = "item"
+# 顶层直传形态的合法键（原 `_normalize_direct_params` 内联集合提升为常量，
+# 供混合形态的「散落已知键」判定复用 —— 判据单一来源）。
+_DIRECT_KEYS = {
+    "filePath", "file_path", "file", "path",
+    "oldString", "old_string", "old_str", "oldText", "search",
+    "newString", "new_string", "new_str", "newText", "replace",
+    "content", "op", "replaceAll", "replace_all",
+}
+
+
+def _absorb_item_aliases(item: dict[str, Any]) -> dict[str, Any]:
+    """单个 patch 条目的别名吸收（返回新 dict；不认识的键原样保留）。
+
+    - ``$text`` → ``newString``（仅当 newString 族键全部缺失时收编，
+      收编后**移除** ``$text``，否则 extra="forbid" 仍会拒）；
+    - oldString/newString 传成 list/tuple（逐行文本）→ ``"\n".join`` 归一
+      （实测 `'patches.1.oldString': Input should be a valid string`）。
+    """
+    out = dict(item)
+    if _DOLLAR_TEXT_KEY in out and not any(
+        k in out for k in _NEW_STRING_KEYS
+    ):
+        out["newString"] = out.pop(_DOLLAR_TEXT_KEY)
+    for key in ("oldString", "newString"):
+        v = out.get(key)
+        if isinstance(v, (list, tuple)):
+            out[key] = "\n".join(str(x) for x in v)
+    return out
 
 
 class PatchItem(BaseModel):
@@ -480,24 +528,61 @@ class ApplyPatchParams(BaseModel):
 
         This validator detects direct params and wraps them into a patches array,
         mirroring the legacy _normalize_patches() logic.
+
+        批21 修复2（实跑样本收编，见模块 ``批21 修复2`` 注释块）：
+        - 顶层 ``{"item": […]}`` 群体形态（无 patches/直传键）⇒ 解包成
+          patches（与 TEST_DSH_70 P1-6 coerce_list_param 同口径）；
+        - ``patches`` 数组 + 顶层散落已知 patch 字段名（``newString``/
+          ``old_string``/``item`` …）的混合形态 ⇒ 丢弃散落键（有日志，不是
+          静默）—— 实测 11 次「整批被拒」的根因；**未知键照旧 extra 报错**
+          （fail-closed 不放宽，回执由 pipeline 附正确形状样例）。
         """
         if not isinstance(data, dict):
             return data
-        # Already has patches — let field_validator handle coercion
-        if "patches" in data and data["patches"]:
+        patches_val = data.get("patches")
+        if patches_val is not None and not isinstance(
+            patches_val, (list, tuple, str)
+        ):
+            # patches 本身形状已坏（dict 等）——保持 fail-closed 交 pydantic
+            # 报「should be a valid list」，不做任何静默丢弃。
             return data
+        stray_known = [
+            k for k in data
+            if k != "patches" and (k == _ITEM_GROUP_KEY or k in _DIRECT_KEYS)
+        ]
+        if patches_val:
+            if stray_known:
+                # 已有权威 payload（patches 数组）——顶层散落的已知字段名是
+                # 模型把直传形态混进来的残渣，丢弃并留痕；未知键仍保留给
+                # pydantic extra 报错。
+                log.info(
+                    "apply_patch_stray_top_level_keys_dropped",
+                    keys=sorted(stray_known),
+                )
+                return {
+                    k: v for k, v in data.items()
+                    if k == "patches" or k not in stray_known
+                }
+            return data
+        # 空/缺 patches：item 群体形态优先（agent 自述「把补丁项写在了
+        # 顶层 item」）—— item 值即 patches 载荷；直传键若同时散落则丢弃。
+        if _ITEM_GROUP_KEY in data and isinstance(
+            data[_ITEM_GROUP_KEY], (list, tuple, dict)
+        ):
+            log.info(
+                "apply_patch_item_group_form_unwrapped",
+                extra_keys=sorted(k for k in data if k != _ITEM_GROUP_KEY),
+            )
+            inner = data[_ITEM_GROUP_KEY]
+            return {"patches": [inner] if isinstance(inner, dict) else inner}
         # Check for direct single-patch params
-        direct_keys = {"filePath", "file_path", "file", "path",
-                       "oldString", "old_string", "old_str", "oldText", "search",
-                       "newString", "new_string", "new_str", "newText", "replace",
-                       "content", "op", "replaceAll", "replace_all"}
-        found_keys = direct_keys & data.keys()
+        found_keys = _DIRECT_KEYS & data.keys()
         if not found_keys:
             return data
         # Build a single patch entry from direct params
         patch: dict[str, Any] = {}
         for k, v in data.items():
-            if k in direct_keys:
+            if k in _DIRECT_KEYS:
                 patch[k] = v
         # Infer op if not provided
         if not patch.get("op"):
@@ -518,6 +603,10 @@ class ApplyPatchParams(BaseModel):
         契约的模型可见面与代码强制面必须一致：这里让数组项缺 `op` 也走
         同一套推断（唯一实现 `_infer_op`），而不是让模型为平台的字段
         设计付往返成本。
+
+        批21 修复2：数组项逐条过 `_absorb_item_aliases`（`$text`→newString、
+        list 形态 old/newString 归一）—— 实测 `'patches.N.$text': Extra
+        inputs are not permitted` 家族的收编点。
         """
         if isinstance(v, str):
             import json
@@ -530,9 +619,10 @@ class ApplyPatchParams(BaseModel):
             return v
         out: list[Any] = []
         for item in v:
-            if isinstance(item, dict) and not item.get("op"):
-                item = dict(item)
-                item["op"] = _infer_op(item)
+            if isinstance(item, dict):
+                item = _absorb_item_aliases(item)
+                if not item.get("op"):
+                    item["op"] = _infer_op(item)
             out.append(item)
         return out
 
