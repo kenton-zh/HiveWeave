@@ -415,6 +415,10 @@ class TokenMeter:
             # "total"，批 B 在判死异常上随行）。只在能确定时写（缺键 →
             # SQL NULL），正常完成行恒 NULL —— 与事实位「未确定不落」同纪律。
             _timeout_layer = r.get("timeout_layer") or None
+            # 批23（5-6）：round 级事实优先 —— failover 切换后该轮的
+            # model_id 由 streamer 盖在轮 dict 上（当轮实际模型）；缺省
+            # （未切换 run 不带键）回退批量值，落库逐字节不变。
+            _round_model = str(r.get("model_id") or "").strip() or model_id
             statements.append((
                 _USAGE_INSERT_ROUNDS,
                 [
@@ -423,7 +427,7 @@ class TokenMeter:
                     project_id,
                     run_id,
                     task_id,
-                    model_id,
+                    _round_model,
                     request_type,
                     provider,
                     int(r.get("input", 0) or 0),

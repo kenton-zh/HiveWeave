@@ -352,6 +352,28 @@ class CacheWarmer:
         except Exception as e:  # noqa: BLE001 — 观测不得影响主流程
             log.debug("cache_warmer_observe_failed", agent_id=agent_id, error=str(e))
 
+    def latest_snapshot(self, agent_id: str) -> dict[str, Any] | None:
+        """该 agent 最近一次真实请求的只读快照副本（无则 None）。
+
+        批23 P1-9：working_set 压缩请求（``llm/streamer/context.py``）据此
+        判定「主前缀是否已暖」——快照 = 上次主请求的 wire 形态（"exactly
+        as it was sent"）+ 请求时刻（``ts``，monotonic）。只读副本：
+        消费方不得改写（``messages`` 列表浅拷贝，dict 与 observe 时共享）。
+        best-effort 纯读，永不 raise。
+        """
+        try:
+            snap = self._latest.get(agent_id)
+            if not isinstance(snap, dict):
+                return None
+            out = dict(snap)
+            msgs = out.get("messages")
+            out["messages"] = list(msgs) if isinstance(msgs, list) else None
+            return out
+        except Exception as e:  # noqa: BLE001 — 读口不得影响任何调用方
+            log.debug("cache_warmer_snapshot_read_failed", agent_id=agent_id,
+                      error=str(e))
+            return None
+
     def on_agent_settled(self, agent_id: str) -> None:
         """run 收尾武装续暖（pi ``onAgentSettled`` 的 idle 语义）。
 

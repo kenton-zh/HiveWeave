@@ -209,6 +209,33 @@ class ToolLoopMixin:
 
         return normalize_usage(usage, provider)
 
+    def _stamp_round_model(self, usage: dict) -> None:
+        """批23（5-6）：给单轮 usage 盖**当轮实际模型**（round 级事实）。
+
+        病灶：failover（T34）切换发生在 ``_stream_single_round`` 内部 ——
+        切换后该 run 的 wire 请求全走新模型，但本循环的 ``provider`` 变量
+        与 agent 侧批量记账的 ``model_id`` 仍来自主 model_config ⇒
+        ``llm_failover_switched``（longcat→space-bunny）后该 run 的
+        llm_usage 行 model_id 仍记 longcat。
+
+        修法（最小侵入）：切换态（``RunFailover.active_config``）非空时把
+        切换后模型的 ``model_id`` 盖进该轮 usage dict；``token_meter.
+        record_rounds`` 按行优先取它（缺省仍用批量值）。**只在已切换时盖**
+        —— 未切换 run 不带该键，落库逐字节不变。切上文的时序自洽：切换
+        只发生在 round 内部的失败重启链里，带 usage 返回的 round 必然
+        已经跑在当时的生效模型上。best-effort：状态机缺失/异常 ⇒ 不盖。
+        """
+        try:
+            fo = getattr(self, "_failover", None)
+            active = getattr(fo, "active_config", None) if fo else None
+            if not active:
+                return
+            mid = str(active.get("model_id") or "").strip()
+            if mid:
+                usage["model_id"] = mid
+        except Exception as e:  # noqa: BLE001 — 盖戳失败绝不影响记账本体
+            log.debug("round_model_stamp_failed", error=str(e))
+
     def _budget_exhausted_result(
         self,
         *,
@@ -850,6 +877,10 @@ class ToolLoopMixin:
                                 )
                             p_usage["ts"] = int(time.time() * 1000)
                             p_usage["partial"] = True
+                            # 批23（5-6）：round 级事实 —— failover 切换后
+                            # 该轮 usage 记**当轮实际模型**（批量侧 model_id
+                            # 来自 agent 的主 model_config，切换后失真）。
+                            self._stamp_round_model(p_usage)
                             # L4（2026-09-11）：**只经 sink**推送 —— result 里
                             # 的 usage_rounds 已退役（两个权威源会分叉）。
                             if usage_sink is not None:
@@ -915,6 +946,10 @@ class ToolLoopMixin:
                 # 在 run 结束，created_at 若统一盖 end 章，按小时指标与时间
                 # 对齐分析全部失真（本轮审计两度被误导）。写路径不变，仅补时刻。
                 usage["ts"] = int(time.time() * 1000)
+                # 批23（5-6）：round 级事实 —— failover 切换后该轮 usage
+                # 记**当轮实际模型**（切换发生在 _stream_single_round 内部，
+                # 本循环的 provider 变量仍是主模型 ⇒ 批量 model_id 失真）。
+                self._stamp_round_model(usage)
                 # P1-6：usage 实时推给调用方（取消/中断路径不依赖最终 return ——
                 # 用户取消时 result 永不返回，账本会蒸发）。
                 # L4（2026-09-11）：sink 是**唯一权威源** —— 原 `usage_rounds`

@@ -137,6 +137,16 @@ class Settings(BaseSettings):
     # HIVEWEAVE_CACHE_WARMER_ENABLED=0 关闭。
     cache_warmer_enabled: bool = True
 
+    # 批23 P1-9（2026-10-03）：working_set 压缩请求携带已暖主前缀（默认开）。
+    # 压缩旁路此前刻意不带主前缀（批10/I5 只对齐了 tools 半）⇒ 每次
+    # 全价重写长 transcript（实测 compaction_working_set 命中仅 33-43%）。
+    # 开=工作集头摘要请求带逐字节一致的主前缀（命中缓存读 1/10 价）；
+    # 关=回切旧行为（transcript 单消息）。判定细节见
+    # ``llm/streamer/context.py::_warm_main_prefix_for_working_set``：
+    # 无快照/超缓存窗口/换缓存域/前缀被改写任一命中即视为冷 run 回旧行为。
+    # HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX=0 关闭。
+    compaction_working_set_warm_prefix: bool = True
+
     # Round-robin across active models to spread rate limits (default on)
     model_pool_enabled: bool = True
 

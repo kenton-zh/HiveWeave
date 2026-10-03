@@ -220,7 +220,7 @@ class DispatchTaskParams(BaseModel):
             "(assignee recorded, not woken). VERIFY titles skip auto-block. "
             "People-waiting is not this list — suspend via the turn's "
             "park channel with kind=agent (wait_on(refs=[…]) in auto mode; "
-            "commit_turn(waiting, waiting_on=[…]) in legacy mode)."
+            "legacy mode declares waiting_on via commit_turn)."
         ),
         json_schema_extra={"aliases": ["dependsOn", "depends_on"]},
     )

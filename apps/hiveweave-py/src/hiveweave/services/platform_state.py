@@ -343,7 +343,11 @@ async def build_platform_state(
                         "pending_turn.summary",
                         str(summary)[:400],
                         epistemic="claimed",
-                        source="commit_turn",
+                        # 批23（5-7）：source 改 turn_result 语义命名 ——
+                        # 数据源是 services/turn_session 的 pending
+                        # turn_result（set/get_pending_turn_result），
+                        # "commit_turn" 是旧工具名标签。
+                        source="turn_result",
                         note="Agent-authored; not platform-verified.",
                     )
                 )
@@ -354,7 +358,7 @@ async def build_platform_state(
                         "pending_turn.waiting_on",
                         waiting_on,
                         epistemic="claimed",
-                        source="commit_turn",
+                        source="turn_result",
                         note="Agent-declared wait; check waits contract below.",
                     )
                 )
@@ -365,7 +369,8 @@ async def build_platform_state(
                     None,
                     epistemic="verified",
                     source="turn_session",
-                    note="No pending commit_turn this wake.",
+                    # 批23（5-7）：同步 turn_result 语义命名（旧文案提旧工具名）。
+                    note="No pending turn_result this wake.",
                 )
             )
     except Exception as e:

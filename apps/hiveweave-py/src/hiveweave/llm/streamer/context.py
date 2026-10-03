@@ -461,6 +461,7 @@ class ContextMixin:
         session_id: str | None = None,
         agent_id: str | None = None,
         tools: list[dict] | None = None,
+        prefix_messages: list[dict] | None = None,
     ) -> str | None:
         """One-shot non-tool LLM call. Empty/error → None (caller hard-trims).
 
@@ -471,11 +472,20 @@ class ContextMixin:
 
         ``tools``（批 10 / I5，2026-09-27）：旁路请求**不再丢工具表** ——
         照抄 ``conversation/compaction.py`` P1-2 的同构形态（真实 tools 进
-        ``build_body``），与主链路同源 ⇒ 不换缓存域。消息体仍是独立的
-        transcript 形态（有意不带主前缀：压力路径再把全量上下文重发一遍
-        与「缩工作集」的目标相悖），故缓存对齐只做工具表这半。
-        模型真回了 tool_call 时只读 ``message.content`` ⇒ 空 → 返回 None
-        → 调用方硬裁兜底，路径本来就有，无新增风险。
+        ``build_body``），与主链路同源 ⇒ 不换缓存域。模型真回了 tool_call
+        时只读 ``message.content`` ⇒ 空 → 返回 None → 调用方硬裁兜底，
+        路径本来就有，无新增风险。
+
+        ``prefix_messages``（批23 P1-9，2026-10-03）：工作集摘要请求**携带
+        已暖主前缀** —— 照抄同文件 P1-2 的形态
+        ``messages=[*prefix_messages, {"role": "user", "content": prompt}]``
+        （qoder 处方：命中缓存读 1/10 价 + 保持前缀热）。I5 时期「有意不带
+        主前缀」的裁决就此被批23 推翻：transcript 是长上下文的截断重写
+        （实测 compaction_working_set 命中仅 33-43%），带主前缀后命中段
+        走 cache_read。前缀由 ``_warm_main_prefix_for_working_set`` 判定：
+        冷 run / 开关关 / 前缀被改写 ⇒ None ⇒ 请求与旧行为**逐字节一致**
+        （transcript 单消息）。摘要指令与 transcript 内容不变 ⇒ 摘要输出
+        语义不变（与 compaction.py P1-2「前缀 + 摘要 prompt」同构先例一致）。
         """
         prompt = (
             "Summarize the following in-progress agent tool-loop history.\n"
@@ -484,7 +494,13 @@ class ContextMixin:
             "Do not mention that this is a summary. Use short bullets.\n\n"
             f"{transcript}"
         )
-        summary_messages = [{"role": "user", "content": prompt}]
+        # 批23 P1-9：前缀可选——None 时与旧行为逐字节一致（单 user 消息）。
+        # ⚠ 前缀必须与主请求**逐字相同**才有意义（compaction.py P1-2 同款
+        # 纪律）：不在此做任何改写/裁剪，messages 原样透传。
+        summary_messages = [
+            *(prefix_messages or []),
+            {"role": "user", "content": prompt},
+        ]
         url = provider.build_url()
         headers = provider.build_headers(session_id=session_id)
         body = provider.build_body(
@@ -535,6 +551,77 @@ class ContextMixin:
         finally:
             await client.aclose()
 
+    def _warm_main_prefix_for_working_set(
+        self,
+        agent_id: str | None,
+        provider: ProviderConfig,
+        messages: list[dict],
+    ) -> list[dict] | None:
+        """批23 P1-9：working_set 摘要请求的**已暖主前缀判定**。
+
+        返回 ``messages``（原样透传作前缀）或 ``None``（冷 run ⇒ 调用方
+        维持旧行为）。判定门（任一不满足即 None）：
+
+        - **开关**：``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX``
+          （默认开，config.compaction_working_set_warm_prefix）；
+        - **快照存在**：``cache_warmer.latest_snapshot`` —— 前缀来源 =
+          agent 每次真实请求收尾时 observe 的 wire 形态（agent.py）；
+        - **同缓存域**：快照的 model_id/base_url 与当前 provider 一致
+          （failover 换模型 ⇒ 换域 ⇒ 前缀必然 miss）；
+        - **新鲜度**：距上次真实请求 ≤ 协议缓存窗口
+          （``estimate_prompt_cache_ttl_ms``，与 cache_warmer 同源推断；
+          无 TTL 证据的协议（google 等）不判暖）；
+        - **前缀未被改写**：快照 messages 必须是当前 messages 的原样前缀
+          （逐字节）—— 本 run prune/trim 改写过 ⇒ 前缀缓存早已在那个点
+          断掉，带全量前缀只会全价多付（不引入新改写点，宁可不带）。
+
+        best-effort：任何异常按冷 run 处理（绝不影响压缩主流程）。
+        """
+        if not agent_id or not messages:
+            return None
+        try:
+            from hiveweave.config import settings
+
+            if not getattr(
+                settings, "compaction_working_set_warm_prefix", True
+            ):
+                return None
+            from hiveweave.services.cache_warmer import (
+                cache_warmer,
+                estimate_prompt_cache_ttl_ms,
+            )
+
+            snap = cache_warmer.latest_snapshot(agent_id)
+            if not snap:
+                return None
+            mc = snap.get("model_config") or {}
+            if (
+                str(mc.get("model_id") or "") != str(provider.model_name or "")
+                or str(mc.get("base_url") or "").rstrip("/")
+                != str(provider.base_url or "").rstrip("/")
+            ):
+                return None
+            ttl_ms = estimate_prompt_cache_ttl_ms(provider.api_format.value)
+            if ttl_ms is None:
+                return None
+            ts = snap.get("ts")
+            if not isinstance(ts, (int, float)):
+                return None
+            age_ms = (time.monotonic() - float(ts)) * 1000.0
+            if age_ms < 0 or age_ms > ttl_ms:
+                return None
+            snap_messages = snap.get("messages")
+            if not isinstance(snap_messages, list) or not snap_messages:
+                return None
+            if len(snap_messages) > len(messages):
+                return None
+            if messages[: len(snap_messages)] != snap_messages:
+                return None
+            return messages
+        except Exception as e:  # noqa: BLE001 — 判定失败 = 冷 run，不影响主流程
+            log.debug("working_set_warm_prefix_gate_failed", error=str(e))
+            return None
+
     async def _pressure_compact_if_needed(
         self,
         messages: list[dict],
@@ -556,6 +643,10 @@ class ContextMixin:
         ``tools``（批 10 / I5）：透传给 ``_summarize_working_set_head``，
         工作集头摘要请求与主链路同源工具表（不换缓存域）；缺省 None 保持
         旧调用方行为（summarize 回调路径不用 tools）。
+
+        ``prefix_messages``（批23 P1-9）：直连路径按
+        ``_warm_main_prefix_for_working_set`` 判定后携带已暖主前缀（冷 run
+        ⇒ None ⇒ 旧行为）；summarize 回调路径不涉及。
         """
         messages = self._drop_orphan_tool_artifacts(messages)
         _usable, pressure_at, retain_at = self._working_set_budgets(provider)
@@ -596,9 +687,15 @@ class ContextMixin:
                 if summarize is not None:
                     summary_text = await summarize(transcript)
                 else:
+                    # 批23 P1-9：直连路径（无 summarize 回调）按暖门判定
+                    # 携带已暖主前缀；冷 run ⇒ None ⇒ 旧行为逐字节一致。
+                    # summarize 回调路径维持旧契约（只收 transcript）。
                     summary_text = await self._summarize_working_set_head(
                         provider, transcript, session_id=session_id,
                         agent_id=agent_id, tools=tools,
+                        prefix_messages=self._warm_main_prefix_for_working_set(
+                            agent_id, provider, messages
+                        ),
                     )
             except Exception as e:
                 log.warning("working_set_summarize_failed", error=str(e))
