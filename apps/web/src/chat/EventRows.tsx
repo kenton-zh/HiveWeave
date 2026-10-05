@@ -43,7 +43,7 @@ export function ThinkingBlock({ content }: { content: string }) {
         className="w-full flex items-center gap-2 text-left py-1 px-1 -mx-1 rounded-gm hover:bg-g-bg-muted/70 transition-colors"
       >
         <svg
-          className="w-3 h-3 shrink-0 text-g-purple-vivid"
+          className="w-3 h-3 shrink-0 text-g-purple"
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -56,7 +56,7 @@ export function ThinkingBlock({ content }: { content: string }) {
             d="M12 3a6 6 0 00-3.6 10.8V17a1 1 0 001 1h5.2a1 1 0 001-1v-3.2A6 6 0 0012 3z"
           />
         </svg>
-        <span className="text-[11px] font-medium text-g-purple-vivid shrink-0">Think</span>
+        <span className="text-[11px] font-medium text-g-purple shrink-0">Think</span>
         <span className="text-g-fg-4 text-[11px] shrink-0">·</span>
         <span className={`text-[11px] text-g-fg-4 min-w-0 ${open ? "hidden" : "truncate"}`}>
           {preview}
@@ -100,7 +100,7 @@ export function ToolStatusIcon({ status }: { status?: ToolCall["status"] }) {
   if (status === "error") {
     return (
       <svg
-        className="w-3 h-3 text-g-red-vivid shrink-0"
+        className="w-3 h-3 text-g-red shrink-0"
         fill="none"
         viewBox="0 0 24 24"
         stroke="currentColor"
@@ -114,7 +114,7 @@ export function ToolStatusIcon({ status }: { status?: ToolCall["status"] }) {
   }
   return (
     <svg
-      className="w-3 h-3 text-g-green-vivid shrink-0"
+      className="w-3 h-3 text-g-green shrink-0"
       fill="none"
       viewBox="0 0 24 24"
       stroke="currentColor"
@@ -202,7 +202,7 @@ export function FileToolChip({ call, path }: { call: ToolCall; path: string }) {
         >
           {copied ? (
             <svg
-              className="w-3 h-3 text-g-green-vivid"
+              className="w-3 h-3 text-g-green"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"

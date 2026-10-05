@@ -138,18 +138,18 @@ function ToolEntry({ entry }: { entry: ActivityEntry }) {
         <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow shrink-0">工具</span>
         <span className="text-[11px] text-g-fg font-mono truncate">{entry.toolName}</span>
         {inputPreview && <span className="text-[10px] text-g-fg-4 truncate flex-1">{inputPreview}</span>}
-        <span className="text-[10px] text-g-fg-4/70">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
         <div className="mt-1 space-y-1">
           {input && (
             <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded-gm px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-              <span className="text-g-yellow-vivid/60">input: </span>{input}
+              <span className="text-g-yellow">input: </span>{input}
             </div>
           )}
           {result && (
             <div className="text-[10px] text-g-fg-3 bg-g-bg-soft rounded-gm px-2 py-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
-              <span className="text-g-green-vivid/60">result: </span>{result}
+              <span className="text-g-green">result: </span>{result}
             </div>
           )}
         </div>
@@ -200,11 +200,11 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {hasThinking && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-purple-vivid/10 text-g-purple">思考</span>}
           {toolCount > 0 && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow">{toolCount}工具</span>}
           {hasText && <span className="text-[10px] px-1 py-0.5 rounded-gm bg-g-blue-vivid/10 text-g-blue">输出</span>}
-          {durationStr && <span className="text-[10px] text-g-fg-4/70">{durationStr}</span>}
+          {durationStr && <span className="text-[10px] text-g-fg-4">{durationStr}</span>}
         </div>
 
-        <span className="text-[10px] text-g-fg-4/70 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
-        <span className="text-[10px] text-g-fg-4/70 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4 shrink-0 mt-0.5">{formatClock(conv.startTime)}</span>
+        <span className="text-[10px] text-g-fg-4 shrink-0 mt-0.5">{expanded ? "▲" : "▼"}</span>
       </div>
 
       {/* Expanded content — full conversation */}
@@ -250,7 +250,7 @@ function ConversationCard({ conv }: { conv: Conversation }) {
           {!conv.isLive && !hasError && (
             <div className="flex items-center gap-1.5 ml-3">
               <span className="text-[10px] px-1.5 py-0.5 rounded-gm bg-g-green-vivid/10 text-g-green">完成</span>
-              <span className="text-[10px] text-g-fg-4/70">{formatTime(conv.endTime)}</span>
+              <span className="text-[10px] text-g-fg-4">{formatTime(conv.endTime)}</span>
             </div>
           )}
         </div>
@@ -274,7 +274,7 @@ function ThinkingBlock({ content }: { content: string }) {
             {content.slice(0, 120)}{content.length > 120 ? "…" : ""}
           </span>
         )}
-        <span className="text-[10px] text-g-fg-4/70 shrink-0">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
       {expanded && (
         <div className="mt-1 text-[11px] text-g-fg-3 leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto bg-g-bg-soft rounded-gm px-2 py-1.5">
@@ -375,7 +375,7 @@ export function ActivityLog({ agentId }: { agentId?: string | null }) {
       <div className="border-t border-g-border bg-g-bg shrink-0">
         <div className="px-4 py-2 flex items-center justify-between">
           <span className="text-xs font-medium text-g-fg-4">Live Activity</span>
-          <span className="text-xs text-g-fg-4/70 flex items-center gap-1.5">
+          <span className="text-xs text-g-fg-4 flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-g-border-strong" />
             空闲
           </span>
@@ -447,10 +447,10 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
           <span className="text-[10px] px-1.5 py-0.5 rounded-gm bg-g-yellow-vivid/10 text-g-yellow shrink-0">{toolCount} 工具</span>
         )}
         {olderCount > 0 && (
-          <span className="text-[10px] text-g-fg-4/70 shrink-0">+{olderCount}</span>
+          <span className="text-[10px] text-g-fg-4 shrink-0">+{olderCount}</span>
         )}
         <span className="text-[10px] text-g-fg-4 ml-auto shrink-0">{formatClock(conv.startTime)}</span>
-        <span className="text-[10px] text-g-fg-4/70 shrink-0">{expanded ? "▲" : "▼"}</span>
+        <span className="text-[10px] text-g-fg-4 shrink-0">{expanded ? "▲" : "▼"}</span>
       </div>
 
       {!expanded && preview && (
@@ -463,9 +463,9 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
           {mergedThinking && (
             <details className="group">
               <summary className="text-[11px] text-g-purple cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[10px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
+                <span className="text-[10px] text-g-fg-4 group-open:rotate-90 transition-transform">▶</span>
                 <span>思考</span>
-                <span className="text-[10px] text-g-fg-4/70">{mergedThinking.length} 字符</span>
+                <span className="text-[10px] text-g-fg-4">{mergedThinking.length} 字符</span>
               </summary>
               <div className="mt-1 text-[11px] text-g-fg-3 bg-g-bg-soft/90 rounded-gm px-2.5 py-1.5 whitespace-pre-wrap break-words max-h-32 overflow-y-auto leading-relaxed">
                 {mergedThinking}
@@ -480,9 +480,9 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
           {mergedText && (
             <details className="group" open={conv.isLive}>
               <summary className="text-[11px] text-g-blue cursor-pointer list-none flex items-center gap-1.5 select-none">
-                <span className="text-[10px] text-g-fg-4/70 group-open:rotate-90 transition-transform">▶</span>
+                <span className="text-[10px] text-g-fg-4 group-open:rotate-90 transition-transform">▶</span>
                 <span>输出</span>
-                <span className="text-[10px] text-g-fg-4/70">{mergedText.length} 字符</span>
+                <span className="text-[10px] text-g-fg-4">{mergedText.length} 字符</span>
               </summary>
               <div className="mt-1 text-[12px] text-g-fg bg-g-bg-soft/90 rounded-gm px-2.5 py-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto leading-relaxed">
                 {mergedText}
@@ -500,7 +500,7 @@ function ActivityRow({ conv, olderCount }: { conv: Conversation; olderCount: num
           ))}
 
           {!conv.isLive && !hasError && (
-            <div className="text-[10px] text-g-green-vivid pt-0.5">完成 · {formatTime(conv.endTime)}</div>
+            <div className="text-[10px] text-g-green pt-0.5">完成 · {formatTime(conv.endTime)}</div>
           )}
         </div>
       )}

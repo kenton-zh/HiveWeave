@@ -145,7 +145,7 @@ function GroupSection({
           {group.items.length}
         </span>
         {failed ? (
-          <span className="ml-auto text-[11px] text-g-red-vivid">部分加载失败</span>
+          <span className="ml-auto text-[11px] text-g-red">部分加载失败</span>
         ) : null}
       </header>
       {failed ? (

@@ -1,7 +1,9 @@
 /* text 段 markdown 渲染样式基线（P0）。
    对标 DSH ui-primitives/markdown/MarkdownText.module.css 的做法：排版节奏
    收敛在这一个作用域（.hw-md），组件 override 只管安全属性，不散落样式。
-   色板沿用气泡的 slate 系（assistant 气泡白底 + g-fg 前景）。 */
+   色板对齐 g-* 令牌（apps/web/tailwind.config.js）：中性档用 g-fg/fg-2/fg-3/
+   fg-4、边框 g-border/border-strong、浅底 g-bg-soft/bg-muted、链接 g-blue。
+   ⚠ 此文件是纯 CSS，无法直接引用 Tailwind theme；改令牌值须同步本文件对应 hex。 */
 
 .hw-md {
   min-width: 0;
@@ -18,20 +20,20 @@
 
 /* ── 链接 ── */
 .hw-md a {
-  color: #2563eb;
+  color: #4f46e5; /* g-blue */
   text-decoration: underline;
   text-underline-offset: 2px;
   overflow-wrap: anywhere;
 }
 .hw-md a:hover {
-  color: #1d4ed8;
+  color: #4338ca; /* indigo-700，与 gm-btn-primary:hover 一致 */
 }
 
 /* ── 行内代码 ── */
 .hw-md code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
   font-size: 0.875em;
-  background: rgba(15, 23, 42, 0.06);
+  background: rgba(24, 27, 35, 0.06); /* g-fg @ 6% */
   border-radius: 4px;
   padding: 0.1em 0.35em;
   overflow-wrap: anywhere;
@@ -41,8 +43,8 @@
 .hw-md pre {
   margin: 0.375rem 0;
   padding: 0.625rem 0.875rem;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+  background: #f6f7f9; /* g-bg-soft */
+  border: 1px solid #e4e6ed; /* g-border */
   border-radius: 8px;
   overflow-x: auto;
   font-size: 12px;
@@ -79,7 +81,7 @@
   margin: 0.125rem 0;
 }
 .hw-md li::marker {
-  color: #94a3b8;
+  color: #6b7280; /* g-fg-4 */
 }
 .hw-md input[type="checkbox"] {
   margin-right: 0.375rem;
@@ -119,13 +121,13 @@
 .hw-md blockquote {
   margin: 0.375rem 0;
   padding: 0.125rem 0.75rem;
-  border-left: 3px solid #cbd5e1;
-  color: #475569;
+  border-left: 3px solid #d3d7e1; /* g-border-strong */
+  color: #404654; /* g-fg-2 */
 }
 .hw-md hr {
   margin: 0.625rem 0;
   border: none;
-  border-top: 1px solid #e2e8f0;
+  border-top: 1px solid #e4e6ed; /* g-border */
 }
 
 /* ── 表格：窄表贴气泡宽，溢出横向滚动 ── */
@@ -139,13 +141,13 @@
 }
 .hw-md th,
 .hw-md td {
-  border: 1px solid #e2e8f0;
+  border: 1px solid #e4e6ed; /* g-border */
   padding: 0.25rem 0.5rem;
   text-align: left;
   vertical-align: top;
 }
 .hw-md th {
-  background: #f8fafc;
+  background: #f6f7f9; /* g-bg-soft */
   font-weight: 600;
 }
 
@@ -156,7 +158,7 @@
   margin: 0.25rem 0;
 }
 .hw-md .hw-md-img-alt {
-  color: #64748b;
+  color: #575e6c; /* g-fg-3 */
   font-size: 0.85em;
 }
 
@@ -164,10 +166,10 @@
 /* pre 原有样式（.hw-md pre）不变；外壳承载工具条，负 margin 贴生气泡内边距 */
 .hw-md .hw-md-code {
   margin: 0.375rem 0;
-  border: 1px solid #e2e8f0;
+  border: 1px solid #e4e6ed; /* g-border */
   border-radius: 8px;
   overflow: hidden;
-  background: #f8fafc;
+  background: #f6f7f9; /* g-bg-soft */
 }
 .hw-md .hw-md-code pre {
   margin: 0;
@@ -180,10 +182,10 @@
   align-items: center;
   justify-content: space-between;
   padding: 0.125rem 0.5rem;
-  border-bottom: 1px solid #e2e8f0;
-  background: #f1f5f9;
+  border-bottom: 1px solid #e4e6ed; /* g-border */
+  background: #eceef3; /* g-bg-muted */
   font-size: 12px;
-  color: #64748b;
+  color: #575e6c; /* g-fg-3 */
   user-select: none;
 }
 .hw-md .hw-md-code-lang {
@@ -192,12 +194,12 @@
 .hw-md .hw-md-code-copy {
   border: 0;
   background: transparent;
-  color: #2563eb;
+  color: #4f46e5; /* g-blue */
   font-size: 12px;
   cursor: pointer;
   padding: 0.125rem 0.375rem;
   border-radius: 4px;
 }
 .hw-md .hw-md-code-copy:hover {
-  background: #e2e8f0;
+  background: #e4e6ed; /* g-border */
 }

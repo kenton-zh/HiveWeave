@@ -256,7 +256,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
       refreshOrgTree();
       useAppStore.getState().setSelectedAgent(null);
     } catch (err: any) {
-      useAppStore.getState().showToast(err.message || "Failed to delete agent", "error");
+      useAppStore.getState().showToast(err.message || "删除成员失败", "error");
       setConfirmingDelete(false);
     }
   }, [
@@ -552,7 +552,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
           <div className="flex justify-start hw-msg-in">
             <div className="max-w-[80%] rounded-gmLg px-4 py-3 bg-g-bg-muted border border-g-border shadow-gm-sm">
               <div className="flex items-center gap-2">
-                <svg className="w-4 h-4 text-g-yellow-vivid animate-spin" fill="none" viewBox="0 0 24 24">
+                <svg className="w-4 h-4 text-g-yellow animate-spin" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path
                     className="opacity-75"
@@ -563,7 +563,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
                 <span className="text-sm text-g-yellow">
                   重试中... {retryInfo.attempt}/{retryInfo.maxRetries}
                 </span>
-                <span className="text-xs text-g-yellow-vivid/70">{retryInfo.reason}</span>
+                <span className="text-xs text-g-yellow">{retryInfo.reason}</span>
               </div>
             </div>
           </div>
@@ -734,7 +734,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             data-testid="queue-reload-lost"
             className="flex items-center gap-1.5 w-fit text-xs text-g-yellow bg-g-yellow-bg border border-g-yellow/50 rounded-gm px-3 py-1.5 mb-2"
           >
-            <svg className="w-3 h-3 text-g-yellow-vivid" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg className="w-3 h-3 text-g-yellow" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4.99a2 2 0 00-3.5 0L3.16 16.25A2 2 0 005 19z" />
             </svg>
             页面刷新，未发送的排队消息已丢失
@@ -787,7 +787,7 @@ function ChatPanel({ agentId, hidden }: { agentId: string | null; hidden?: boole
             onCompositionStart={onCompositionStart}
             onCompositionEnd={onCompositionEnd}
             placeholder="输入消息... (Enter 发送, Shift+Enter 换行, 支持粘贴图片)"
-            className="flex-1 bg-transparent border-0 px-1 py-3 text-sm text-g-fg leading-relaxed resize-none outline-none overflow-y-auto min-h-[46px] max-h-[200px] placeholder:text-g-fg-4/60"
+            className="flex-1 bg-transparent border-0 px-1 py-3 text-sm text-g-fg leading-relaxed resize-none outline-none overflow-y-auto min-h-[46px] max-h-[200px] placeholder:text-g-fg-4"
           />
           </div>
           {(isStreaming || isAgentProcessing) && (

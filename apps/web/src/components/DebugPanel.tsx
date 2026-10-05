@@ -4,11 +4,11 @@ import { useState, useEffect, useRef } from "react";
 import { useAppStore, type DebugLogEntry } from "../store";
 
 const CATEGORY_COLORS: Record<string, string> = {
-  api: "text-g-blue-vivid",
-  ws: "text-g-green-vivid",
-  error: "text-g-red-vivid",
+  api: "text-g-blue",
+  ws: "text-g-green",
+  error: "text-g-red",
   info: "text-g-fg-3",
-  state: "text-g-yellow-vivid",
+  state: "text-g-yellow",
 };
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -104,7 +104,7 @@ export default function DebugPanel() {
               onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
             >
               <div className="flex items-start gap-2 px-2 py-1">
-                <span className="text-g-fg-4/70 shrink-0">{formatTime(entry.timestamp)}</span>
+                <span className="text-g-fg-4 shrink-0">{formatTime(entry.timestamp)}</span>
                 <span className={`shrink-0 font-bold w-8 ${CATEGORY_COLORS[entry.category]}`}>
                   {CATEGORY_LABELS[entry.category]}
                 </span>

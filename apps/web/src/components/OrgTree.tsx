@@ -328,9 +328,9 @@ function Connectors({
 /** export：OrgRail 头像同色（角色色单一真值源） */
 export const ROLE_COLORS: Record<string, string> = {
   ceo: "#d97706", hr: "#e11d48", architect: "#9333ea",
-  manager: "#4f46e5", developer: "#189a52", module_dev: "#189a52",
-  test_engineer: "#c77400", qa: "#c77400", code_reviewer: "#7c3aed",
-  security_auditor: "#e5484d", web_perf_auditor: "#0891b2",
+  manager: "#4f46e5", developer: "#0f7a3d", module_dev: "#0f7a3d",
+  test_engineer: "#946200", qa: "#946200", code_reviewer: "#7c3aed",
+  security_auditor: "#c0272d", web_perf_auditor: "#0891b2",
   devops: "#0d9488",
 };
 
@@ -575,7 +575,7 @@ function ZoomControls({
       {[
         { label: "−", onClick: onZoomOut, title: "缩小" },
         null, // divider
-        { label: `${Math.round(scale * 100)}%`, onClick: onFit, title: "适应屏幕", isText: true },
+        { label: `${Math.round(scale * 100)}%`, onClick: onFit, title: "当前缩放（点击适应屏幕）", isText: true },
         null,
         { label: "+", onClick: onZoomIn, title: "放大" },
         null,

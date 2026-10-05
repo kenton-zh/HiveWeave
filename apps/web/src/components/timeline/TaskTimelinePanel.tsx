@@ -334,7 +334,7 @@ export default function TaskTimelinePanel() {
       <div className="h-full flex flex-col items-center justify-center gap-1.5 text-center px-6">
         <span className="text-2xl">🗂️</span>
         <p className="text-sm text-g-fg-4">未选中任务</p>
-        <p className="text-[11px] text-g-fg-4/70">
+        <p className="text-[11px] text-g-fg-4">
           在时间轴视图里用任务选择器打开一个任务
         </p>
       </div>
@@ -349,7 +349,7 @@ export default function TaskTimelinePanel() {
         <div className="h-full flex flex-col items-center justify-center gap-2 px-6 text-center">
           <span className="text-2xl">⚠️</span>
           <p className="text-sm text-g-red">{error}</p>
-          <p className="text-[11px] text-g-fg-4/70">
+          <p className="text-[11px] text-g-fg-4">
             task_id 直达时请确认任务存在于本项目（含已归档）
           </p>
           <button
@@ -374,7 +374,7 @@ export default function TaskTimelinePanel() {
               <div className="py-8 flex flex-col items-center justify-center gap-1.5 text-center">
                 <span className="text-2xl">📭</span>
                 <p className="text-sm text-g-fg-4">暂无事件</p>
-                <p className="text-[11px] text-g-fg-4/70">
+                <p className="text-[11px] text-g-fg-4">
                   该任务还没有产生任何流转记录
                 </p>
               </div>

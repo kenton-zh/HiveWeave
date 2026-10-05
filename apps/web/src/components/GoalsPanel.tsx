@@ -13,8 +13,8 @@ interface Props {
 const STATUS_ICON = { todo: "○", doing: "◐", done: "●" } as const;
 const STATUS_COLOR = {
   todo: "text-g-fg-4",
-  doing: "text-g-yellow-vivid",
-  done: "text-g-green-vivid",
+  doing: "text-g-yellow",
+  done: "text-g-green",
 } as const;
 const STATUS_BG = {
   todo: "bg-g-fg-3/10",
@@ -239,7 +239,7 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.objective}
           onChange={(e) => updateField("objective", e.target.value)}
           placeholder="项目总体目标..."
-          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
       </div>
 
@@ -250,7 +250,7 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.focus}
           onChange={(e) => updateField("focus", e.target.value)}
           placeholder="当前开发重点..."
-          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
       </div>
 
@@ -261,9 +261,9 @@ export default function GoalsPanel({ projectId }: Props) {
           value={goals.userInvolvement || ""}
           onChange={(e) => updateField("userInvolvement", e.target.value)}
           placeholder="例如:宏观决策+技术选型"
-          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
+          className="w-full px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
         />
-        <p className="text-xs text-g-fg-4/70">定义哪些类型的问题该问用户。例如"宏观决策+技术选型"表示用户参与宏观和技术选型决策;改为"纯宏观决策"则技术问题由 AI 链式上报。</p>
+        <p className="text-xs text-g-fg-4">定义哪些类型的问题该问用户。例如"宏观决策+技术选型"表示用户参与宏观和技术选型决策;改为"纯宏观决策"则技术问题由 AI 链式上报。</p>
       </div>
       </div>
 
@@ -312,7 +312,7 @@ export default function GoalsPanel({ projectId }: Props) {
                 value={kr.owner || ""}
                 onChange={(e) => updateOwner(idx, e.target.value)}
                 placeholder="负责人"
-                className="w-16 px-1.5 py-0.5 bg-transparent border border-g-border/40 hover:border-g-border rounded-gm text-xs text-g-fg-3 placeholder-g-fg-4/60 focus:border-g-blue/30 shrink-0 text-right"
+                className="w-16 px-1.5 py-0.5 bg-transparent border border-g-border/40 hover:border-g-border rounded-gm text-xs text-g-fg-3 placeholder-g-fg-4 focus:border-g-blue/30 shrink-0 text-right"
               />
 
               {/* Task binding input (批次 G: KR↔任务绑定) */}
@@ -320,7 +320,7 @@ export default function GoalsPanel({ projectId }: Props) {
                 value={kr.taskIds?.join(", ") || ""}
                 onChange={(e) => updateTaskIds(idx, e.target.value)}
                 placeholder="绑任务 ID（逗号分隔）"
-                className="w-32 px-2 py-0.5 bg-g-bg-soft border border-g-border/60 rounded-gm text-[10px] font-mono text-g-fg-3 placeholder-g-fg-4/50 focus:border-g-blue/40 shrink-0"
+                className="w-32 px-2 py-0.5 bg-g-bg-soft border border-g-border/60 rounded-gm text-[10px] font-mono text-g-fg-3 placeholder-g-fg-4 focus:border-g-blue/40 shrink-0"
               />
 
               {/* KR 进度徽章 */}
@@ -333,7 +333,7 @@ export default function GoalsPanel({ projectId }: Props) {
               {/* Delete */}
               <button
                 onClick={() => removeKR(idx)}
-                className="p-1 rounded-gm text-g-fg-4/70 hover:text-g-red hover:bg-g-red-bg transition-colors shrink-0"
+                className="p-1 rounded-gm text-g-fg-4 hover:text-g-red hover:bg-g-red-bg transition-colors shrink-0"
                 title="删除"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -358,7 +358,7 @@ export default function GoalsPanel({ projectId }: Props) {
             onChange={(e) => setNewKR(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") addKeyResult(); }}
             placeholder="添加关键结果..."
-            className="flex-1 px-3 py-1.5 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
+            className="flex-1 px-3 py-1.5 bg-g-bg-soft border border-g-border rounded-gm text-sm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue/50 focus:ring-2 focus:ring-g-blue/15 transition-shadow"
           />
           <button
             onClick={addKeyResult}
@@ -371,7 +371,7 @@ export default function GoalsPanel({ projectId }: Props) {
       </div>
 
       {/* Info note */}
-      <p className="text-xs text-g-fg-4/70 leading-relaxed px-3 py-2.5 bg-g-bg-soft border border-g-border/60 rounded-gm">
+      <p className="text-xs text-g-fg-4 leading-relaxed px-3 py-2.5 bg-g-bg-soft border border-g-border/60 rounded-gm">
         此工作簿对所有 AI Agent 可见。高层和用户共同决定开发方向，每位 Agent 会在系统提示中看到这些目标并据此对齐工作。
         点击状态图标切换: ○ 待办 → ◐ 进行中 → ● 已完成。
       </p>

@@ -26,21 +26,21 @@ function TokenBar({ input, output }: { input: number; output: number }) {
   const inPct = total > 0 ? (input / total) * 100 : 50;
   return (
     <div className="flex items-center gap-2 text-[10px] font-mono">
-      <span className="text-g-blue-vivid shrink-0">in:{tokenLabel(input)}</span>
+      <span className="text-g-blue shrink-0">in:{tokenLabel(input)}</span>
       <div className="flex-1 h-1.5 bg-g-bg-muted rounded-full overflow-hidden">
         <div className="flex h-full">
           <div className="bg-g-blue-vivid/60 h-full" style={{ width: `${inPct}%` }} />
           <div className="bg-g-green-vivid/60 h-full" style={{ width: `${100 - inPct}%` }} />
         </div>
       </div>
-      <span className="text-g-green-vivid shrink-0">out:{tokenLabel(output)}</span>
+      <span className="text-g-green shrink-0">out:{tokenLabel(output)}</span>
     </div>
   );
 }
 
 function ToolBadge({ name }: { name: string }) {
   return (
-    <span className="inline-flex items-center gap-1 text-[10px] font-mono text-g-yellow-vivid bg-g-yellow-vivid/10 border border-g-yellow-vivid/25 px-1.5 py-0.5 rounded-gm">
+    <span className="inline-flex items-center gap-1 text-[10px] font-mono text-g-yellow bg-g-yellow-vivid/10 border border-g-yellow-vivid/25 px-1.5 py-0.5 rounded-gm">
       🔧 {name}
     </span>
   );
@@ -60,7 +60,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
       : content;
     return (
       <div className="ml-4 pl-3 border-l-2 border-g-yellow-vivid/20 text-[10px] text-g-fg-4 font-mono">
-        <span className="text-g-yellow-vivid/60">→ result:</span>{" "}
+        <span className="text-g-yellow">→ result:</span>{" "}
         <span className="whitespace-pre-wrap break-all">{preview}</span>
       </div>
     );
@@ -77,7 +77,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
         <details className="group mb-1">
           <summary
             onClick={(e) => { e.preventDefault(); setShowThinking(!showThinking); }}
-            className="text-[10px] text-g-purple-vivid cursor-pointer hover:text-g-purple select-none flex items-center gap-1"
+            className="text-[10px] text-g-purple cursor-pointer hover:text-g-purple select-none flex items-center gap-1"
           >
             <span className="text-[10px] transition-transform" style={showThinking ? {} : {}}>
               {showThinking ? "▼" : "▶"}
@@ -85,7 +85,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
             💭 思考过程 ({thinking.length} chars)
           </summary>
           {showThinking && (
-            <div className="hw-sec-in mt-1 ml-4 pl-2 border-l-2 border-g-purple text-[10px] text-g-purple-vivid whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
+            <div className="hw-sec-in mt-1 ml-4 pl-2 border-l-2 border-g-purple text-[10px] text-g-purple whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed">
               {thinking}
             </div>
           )}
@@ -106,7 +106,7 @@ function MessageView({ msg, idx }: { msg: RawTraceMessage; idx: number }) {
         return (
           <div key={i} className="ml-2 mt-1 flex items-center gap-1.5">
             <ToolBadge name={name} />
-            {hint && <span className="text-[10px] text-g-fg-4/70 truncate">{hint}</span>}
+            {hint && <span className="text-[10px] text-g-fg-4 truncate">{hint}</span>}
           </div>
         );
       })}
@@ -184,11 +184,11 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
               {turn.message_count} msgs
             </span>
             {turn.tool_call_count > 0 && (
-              <span className="text-[10px] text-g-yellow-vivid">
+              <span className="text-[10px] text-g-yellow">
                 {turn.tool_call_count} tools
               </span>
             )}
-            <span className="text-[10px] text-g-fg-4/70">
+            <span className="text-[10px] text-g-fg-4">
               ~{tokenLabel(turn.approx_tokens)} tok est.
             </span>
           </div>
@@ -200,7 +200,7 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
           </div>
         )}
 
-        <span className="text-[10px] text-g-fg-4/70 shrink-0">{formatTime(turn.created_at)}</span>
+        <span className="text-[10px] text-g-fg-4 shrink-0">{formatTime(turn.created_at)}</span>
         <svg
           className={`w-4 h-4 text-g-fg-4 transition-transform shrink-0 ${expanded ? "rotate-180" : ""}`}
           fill="none" viewBox="0 0 24 24" stroke="currentColor"
@@ -221,11 +221,11 @@ function TurnCard({ turn, events, expanded, onToggle }: { turn: TraceTurn; event
               </div>
               <div className="space-y-0.5">
                 {turnEvents.map((ev, i) => (
-                  <div key={ev.id} className="flex items-center gap-2 text-[10px] font-mono text-g-fg-4/70">
-                    <span className="text-g-blue-vivid w-6">R{i}</span>
+                  <div key={ev.id} className="flex items-center gap-2 text-[10px] font-mono text-g-fg-4">
+                    <span className="text-g-blue w-6">R{i}</span>
                     <span>in:{tokenLabel(ev.payload?.input_tokens)}</span>
                     <span>out:{tokenLabel(ev.payload?.output_tokens)}</span>
-                    {ev.payload?.model && <span className="text-g-fg-4/50">{ev.payload.model}</span>}
+                    {ev.payload?.model && <span className="text-g-fg-4">{ev.payload.model}</span>}
                     {ev.payload?.finish_reason && (
                       <span className="text-g-fg-4">finish:{ev.payload.finish_reason}</span>
                     )}
@@ -281,7 +281,7 @@ function EventRow({ event }: { event: TraceEvent }) {
             {p.tokens != null && `${p.tokens} tok`}
           </span>
         )}
-        <span className="text-[10px] text-g-fg-4/70 ml-auto">{formatTime(event.created_at)}</span>
+        <span className="text-[10px] text-g-fg-4 ml-auto">{formatTime(event.created_at)}</span>
       </div>
     </div>
   );
@@ -378,10 +378,10 @@ export default function MonitorPanel({ agentId }: { agentId: string }) {
           <span className="w-px h-3.5 bg-g-border" />
           <span>
             Tokens:
-            <span className="text-g-blue-vivid font-mono ml-1">in:{tokenLabel(totalInput)}</span>
-            <span className="text-g-fg-4/70 mx-1">/</span>
-            <span className="text-g-green-vivid font-mono">out:{tokenLabel(totalOutput)}</span>
-            <span className="text-g-fg-4/70 mx-1">=</span>
+            <span className="text-g-blue font-mono ml-1">in:{tokenLabel(totalInput)}</span>
+            <span className="text-g-fg-4 mx-1">/</span>
+            <span className="text-g-green font-mono">out:{tokenLabel(totalOutput)}</span>
+            <span className="text-g-fg-4 mx-1">=</span>
             <span className="text-g-fg font-mono font-medium">{tokenLabel(totalTokens)}</span>
           </span>
           <span className="w-px h-3.5 bg-g-border" />

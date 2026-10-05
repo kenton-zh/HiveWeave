@@ -225,13 +225,13 @@ function EditableFieldBlock({ label, value, editor, displayClassName }: {
         {!editing && (
           <button
             onClick={editor.startEdit}
-            className="text-xs text-g-blue hover:text-g-blue/80 transition-colors"
+            className="text-xs text-g-blue hover:text-g-blue transition-colors"
           >
             编辑
           </button>
         )}
         {editing && state.dirty && state.phase !== "saving" && (
-          <span className="text-[10px] text-g-yellow-vivid">未保存</span>
+          <span className="text-[10px] text-g-yellow">未保存</span>
         )}
       </div>
       {editing ? (
@@ -687,7 +687,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
                           onClick={() => setPendingUnbind(s)}
                           disabled={mcpBusy}
                           title={`解绑 ${s}`}
-                          className="text-g-blue/60 hover:text-g-red transition-colors disabled:opacity-50"
+                          className="text-g-blue hover:text-g-red transition-colors disabled:opacity-50"
                         >
                           ×
                         </button>
@@ -761,7 +761,7 @@ export default function AgentDetailPanel({ agentId }: { agentId: string }) {
               {agent.parentId ? (
                 <button
                   onClick={() => setSelectedAgent(agent.parentId)}
-                  className="text-sm text-g-blue hover:text-g-blue/80 transition-colors"
+                  className="text-sm text-g-blue hover:text-g-blue transition-colors"
                 >
                   查看上级 Agent →
                 </button>

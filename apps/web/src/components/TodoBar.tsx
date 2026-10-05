@@ -9,7 +9,7 @@ const statusLabels: Record<string, { icon: string; color: string }> = {
   completed: { icon: "✅", color: "text-g-green" },
   in_progress: { icon: "🔄", color: "text-g-yellow" },
   pending: { icon: "⬜", color: "text-g-fg-3" },
-  cancelled: { icon: "❌", color: "text-g-red-vivid/60" },
+  cancelled: { icon: "❌", color: "text-g-red" },
 };
 
 export default function TodoBar({ agentId }: Props) {

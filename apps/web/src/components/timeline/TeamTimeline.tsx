@@ -445,7 +445,7 @@ export default function TeamTimeline() {
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-center px-6">
             <span className="text-2xl">🏜️</span>
             <p className="text-sm text-g-fg-4">暂无团队活动</p>
-            <p className="text-[11px] text-g-fg-4/70">
+            <p className="text-[11px] text-g-fg-4">
               项目还没有成员或任务事件；试试切换时间范围或「全部」
             </p>
           </div>
