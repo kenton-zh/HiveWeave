@@ -5,7 +5,9 @@
     "paths": [
       "skills",
       ".opencode/skills-sources/agent-skills/skills",
-      ".opencode/skills-sources/emilkowalski-skills/skills"
+      ".opencode/skills-sources/emilkowalski-skills/skills",
+      ".opencode/skills-sources/ponytail/skills",
+      ".opencode/skills-sources/impeccable/.opencode/skills"
     ]
   },
   "mcp": {

@@ -305,3 +305,6 @@ tasks/hr-frontdesk/**/*.png
 tasks/hr-frontdesk/**/*.mp4
 tasks/hr-frontdesk/**/_*.json
 tasks/hr-frontdesk/runs/sweep/
+
+# Impeccable 设计评审快照（开发过程产物，本地留档，不入库）
+.impeccable/
