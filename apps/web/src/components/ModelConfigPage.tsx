@@ -8,6 +8,7 @@ import {
 import type { ImageGenConfig, LlmModel, TierConfig } from "../api";
 import { useAppStore } from "../store";
 import ConfirmDialog from "./ConfirmDialog";
+import Modal from "./Modal";
 import ProviderPickerDialog from "./model-config/ProviderPickerDialog";
 import ModelFormDialog from "./model-config/ModelFormDialog";
 import ModelCard from "./model-config/ModelCard";
@@ -48,12 +49,6 @@ export default function ModelConfigPage({ onClose }: Props) {
   const [showPicker, setShowPicker] = useState(false);
   const [formMode, setFormMode] = useState<FormMode | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
 
   const loadModels = useCallback(async () => {
     try {
@@ -102,13 +97,11 @@ export default function ModelConfigPage({ onClose }: Props) {
   };
 
   return (
-    <div
-      className={`fixed inset-0 bg-black/50 backdrop-blur-[2px] flex items-center justify-center z-50 transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-      onClick={onClose}
-    >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-pop w-[960px] max-h-[88vh] flex flex-col transform transition-all duration-200 ease-gm-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-        onClick={(e) => e.stopPropagation()}
+    <>
+      <Modal
+        onClose={onClose}
+        ariaLabel="模型配置"
+        className="w-[960px] max-w-[calc(100vw-2rem)] max-h-[88vh] flex flex-col shadow-gm-pop"
       >
         {/* Header */}
         <div className="flex items-center justify-between px-7 py-5 border-b border-g-border shrink-0">
@@ -183,7 +176,7 @@ export default function ModelConfigPage({ onClose }: Props) {
             onSaved={loadImageGenConfig}
           />
         </div>
-      </div>
+      </Modal>
 
       {showPicker && !formMode && (
         <ProviderPickerDialog
@@ -224,6 +217,6 @@ export default function ModelConfigPage({ onClose }: Props) {
           onCancel={() => setConfirmDeleteId(null)}
         />
       )}
-    </div>
+    </>
   );
 }

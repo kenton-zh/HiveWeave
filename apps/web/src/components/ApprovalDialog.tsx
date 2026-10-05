@@ -1,5 +1,6 @@
 import EmptyState from "./EmptyState";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useId } from "react";
+import Modal from "./Modal";
 import { useAppStore } from "../store";
 import { getPendingApprovals, respondToApproval, type PendingApproval } from "../api";
 
@@ -16,16 +17,10 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
   const [processing, setProcessing] = useState<string | null>(null);
   const [remember, setRemember] = useState(false);
   const [userNote, setUserNote] = useState("");
+  const titleId = useId();
 
   const setPendingApprovals = useAppStore((s) => s.setPendingApprovals);
   const removeApproval = useAppStore((s) => s.removeApproval);
-
-  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
 
   const fetchApprovals = useCallback(async () => {
     try {
@@ -101,32 +96,26 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
   const actionableCount = approvals.filter((a) => !a.malformed).length;
 
   return (
-    <div
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-      onClick={onClose}
-    >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-full max-w-lg max-h-[80vh] flex flex-col transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy={titleId} className="w-full max-w-lg max-h-[80vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-g-border">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-g-yellow-bg ring-1 ring-g-yellow/60 rounded-gm flex items-center justify-center">
-              <svg className="w-5 h-5 text-g-yellow-vivid" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <svg className="w-5 h-5 text-g-yellow" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
               </svg>
             </div>
             <div>
-              <h3 className="text-base font-semibold text-g-fg">权限审批请求</h3>
+              <h3 id={titleId} className="text-base font-semibold text-g-fg">权限审批请求</h3>
               <p className="text-xs text-g-fg-3">{approvals.length} 个待审批</p>
             </div>
           </div>
           <button
             onClick={onClose}
+            aria-label="关闭"
             className="text-g-fg-3 hover:text-g-fg transition-colors"
           >
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
@@ -140,7 +129,11 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
             </div>
           ) : approvals.length === 0 ? (
             <EmptyState
-              icon={<span className="text-g-green text-2xl leading-none">✓</span>}
+              icon={
+                <svg className="w-6 h-6 text-g-green" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+              }
               title="暂无待审批的请求"
               description="Agent 发起敏感操作时会出现在这里"
             />
@@ -154,8 +147,8 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
                     data-testid="approval-malformed"
                     className="bg-g-bg rounded-gmLg border border-g-red/50 shadow-gm-sm p-4"
                   >
-                    <div className="flex items-center gap-2 text-sm font-medium text-g-red-vivid">
-                      <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <div className="flex items-center gap-2 text-sm font-medium text-g-red">
+                      <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
                       </svg>
                       数据异常：该审批请求缺少关键字段
@@ -264,7 +257,8 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
               value={userNote}
               onChange={(e) => setUserNote(e.target.value)}
               placeholder="添加备注（可选）"
-              className="w-full px-3 py-2 text-sm bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 transition-shadow"
+              aria-label="审批备注（可选）"
+              className="w-full px-3 py-2 text-sm bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 transition-shadow"
             />
 
             {/* Bulk actions（畸形条目自动排除） */}
@@ -288,7 +282,6 @@ export default function ApprovalDialog({ agentId, onClose }: ApprovalDialogProps
             )}
           </div>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }

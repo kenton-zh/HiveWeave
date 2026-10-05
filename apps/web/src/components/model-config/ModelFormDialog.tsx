@@ -11,6 +11,7 @@ import {
   PROTOCOL_OPTIONS,
   applyWireEndpoint,
 } from "../../utils/wireEndpoint";
+import Modal from "../Modal";
 import AdvancedFields from "./AdvancedFields";
 import type { FormMode, ModelFormState } from "./types";
 import { EMPTY_FORM, formFromModel } from "./types";
@@ -246,14 +247,12 @@ export default function ModelFormDialog({ mode, onBack, onSaved, onClose }: Prop
       : "自定义模型";
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 backdrop-blur-[2px] flex items-center justify-center z-[60]"
-      onClick={onClose}
+    <Modal
+      onClose={onClose}
+      ariaLabel={title}
+      overlayClassName="z-[60]"
+      className="w-[620px] max-w-[calc(100vw-2rem)] max-h-[86vh] flex flex-col shadow-gm-pop"
     >
-      <div
-        className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-pop w-[620px] max-h-[86vh] flex flex-col animate-slide-up"
-        onClick={(e) => e.stopPropagation()}
-      >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-g-border shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -514,7 +513,6 @@ export default function ModelFormDialog({ mode, onBack, onSaved, onClose }: Prop
             </button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

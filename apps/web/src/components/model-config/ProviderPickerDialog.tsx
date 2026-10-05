@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getProviderPresets } from "../../api";
 import type { ProviderPreset } from "../../api";
+import Modal from "../Modal";
 import type { FormMode } from "./types";
 
 interface Props {
@@ -60,14 +61,12 @@ export default function ProviderPickerDialog({ onPick, onClose }: Props) {
   }, []);
 
   return (
-    <div
-      className="fixed inset-0 bg-black/50 backdrop-blur-[2px] flex items-center justify-center z-[60]"
-      onClick={onClose}
+    <Modal
+      onClose={onClose}
+      ariaLabel="添加模型"
+      overlayClassName="z-[60]"
+      className="w-[560px] max-w-[calc(100vw-2rem)] max-h-[80vh] flex flex-col shadow-gm-pop"
     >
-      <div
-        className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-pop w-[560px] max-h-[80vh] flex flex-col animate-slide-up"
-        onClick={(e) => e.stopPropagation()}
-      >
         <div className="flex items-center justify-between px-6 py-4 border-b border-g-border shrink-0">
           <h3 className="text-base font-semibold text-g-fg">添加模型</h3>
           <button
@@ -106,7 +105,6 @@ export default function ProviderPickerDialog({ onPick, onClose }: Props) {
             知名服务商只需填写 API Key，地址与模型能力已预置；其他 OpenAI / Anthropic 兼容网关走「自定义模型」。
           </p>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

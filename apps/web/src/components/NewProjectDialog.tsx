@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useId, useState } from "react";
 import { useAppStore } from "../store.js";
+import Modal from "./Modal";
 
 interface Props {
   ceoAgentId: string;
@@ -45,13 +46,7 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
   const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
   const setRightPanelTab = useAppStore((s) => s.setRightPanelTab);
   const setPendingInitialMessage = useAppStore((s) => s.setPendingInitialMessage);
-
-  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
+  const titleId = useId();
 
   const handleSend = (message: string) => {
     setSelectedAgent(ceoAgentId);
@@ -61,24 +56,20 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
   };
 
   return (
-    <div
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-      onClick={onClose}
-    >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg p-6 w-full max-w-lg mx-4 transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} labelledBy={titleId} className="p-6 w-full max-w-lg mx-4">
         {/* Header */}
         <div className="flex items-center justify-between mb-5">
-          <h2 className="text-lg font-semibold text-g-fg">
+          <h2 id={titleId} className="text-lg font-semibold text-g-fg">
             项目已创建 — 选择开局方式
           </h2>
           <button
             onClick={onClose}
-            className="w-7 h-7 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted text-base leading-none transition-colors"
+            aria-label="关闭"
+            className="w-7 h-7 flex items-center justify-center rounded-gm text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted transition-colors"
           >
-            ✕
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
           </button>
         </div>
 
@@ -149,18 +140,18 @@ export default function NewProjectDialog({ ceoAgentId, onClose }: Props) {
               }
             }}
             placeholder="自己写开局指令…"
-            className="flex-1 px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4/60 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 text-sm transition-shadow"
+            aria-label="自定义开局指令"
+            className="flex-1 px-3 py-2 bg-g-bg-soft border border-g-border rounded-gm text-g-fg placeholder-g-fg-4 focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 text-sm transition-shadow"
 
           />
           <button
             disabled={!customInput.trim()}
             onClick={() => customInput.trim() && handleSend(customInput.trim())}
-            className="px-4 py-2 bg-g-blue text-white hover:bg-g-blue disabled:opacity-40 text-white rounded-gm text-sm font-medium shadow-gm-sm active:scale-[0.97] transition-all"
+            className="px-4 py-2 bg-g-blue text-white hover:bg-g-blue disabled:opacity-40 rounded-gm text-sm font-medium shadow-gm-sm active:scale-[0.97] transition-all"
           >
             发送
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { browseDirectory, pickFolderNative, type BrowseResult } from "../api";
+import Modal from "./Modal";
 
 interface FolderPickerProps {
   initialPath?: string;
@@ -86,23 +87,13 @@ function PickerWaitingOverlay({
   onCancel: () => void;
   onSwitchToWeb: () => void;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onCancel]);
-
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-[2px]"
-      onClick={onCancel}
+    <Modal
+      onClose={onCancel}
+      ariaLabel={text}
+      overlayClassName="bg-black/60"
+      className="px-6 py-4 flex flex-col items-center gap-3"
     >
-      <div
-        className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg px-6 py-4 flex flex-col items-center gap-3"
-        onClick={(e) => e.stopPropagation()}
-      >
         <div className="flex items-center gap-3">
           <div className="animate-spin w-4 h-4 border-2 border-g-blue border-t-transparent rounded-full" />
           <span className="text-sm text-g-fg-3">{text}</span>
@@ -121,8 +112,7 @@ function PickerWaitingOverlay({
             取消
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -213,9 +203,13 @@ function NativeThenWebPicker(props: FolderPickerProps) {
   }
   if (mode === "busy") {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-        <div className="bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[360px] px-5 py-4 flex flex-col gap-3">
-          <span className="text-sm text-g-fg font-medium">已有选择窗口在等待</span>
+      <Modal
+        onClose={props.onCancel}
+        ariaLabel="已有选择窗口在等待"
+        overlayClassName="bg-black/60"
+        className="w-[360px] max-w-[calc(100vw-2rem)] px-5 py-4 flex flex-col gap-3"
+      >
+        <span className="text-sm text-g-fg font-medium">已有选择窗口在等待</span>
           <span className="text-xs text-g-fg-3">{busyReason}</span>
           <button
             onClick={props.onCancel}
@@ -223,8 +217,7 @@ function NativeThenWebPicker(props: FolderPickerProps) {
           >
             知道了
           </button>
-        </div>
-      </div>
+      </Modal>
     );
   }
   return <WebFolderPicker {...props} />;
@@ -265,13 +258,6 @@ function WebFolderPicker({
    * **已经渲染成功的列表**被同一组件另一路失败清空成错误卡片。
    */
   const seqRef = useRef(0);
-
-  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
 
   /**
    * 导航到 dirPath（undefined = 后端默认目录）。
@@ -334,14 +320,12 @@ function WebFolderPicker({
   };
 
   return (
-    <div
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-      onClick={onCancel}
+    <Modal
+      onClose={onCancel}
+      ariaLabel="选择工作区目录"
+      overlayClassName="bg-black/60"
+      className="w-[640px] max-w-[calc(100vw-2rem)] max-h-[80vh] flex flex-col"
     >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[640px] max-h-[80vh] flex flex-col transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-        onClick={(e) => e.stopPropagation()}
-      >
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-g-border">
           <svg className="w-5 h-5 text-g-blue shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -371,7 +355,12 @@ function WebFolderPicker({
               onChange={(e) => setAddressBar(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleAddressSubmit();
-                if (e.key === "Escape") { setAddressEditing(false); if (data) setAddressBar(data.currentPath ?? ""); }
+                if (e.key === "Escape") {
+                  // 就地还原地址编辑，不关闭整个选择器（阻止冒泡到 Modal 的 Esc）
+                  e.stopPropagation();
+                  setAddressEditing(false);
+                  if (data) setAddressBar(data.currentPath ?? "");
+                }
               }}
               onBlur={handleAddressSubmit}
               className="flex-1 px-2 py-1 text-xs bg-g-bg-muted border border-g-blue rounded-gm text-g-fg font-mono"
@@ -483,7 +472,7 @@ function WebFolderPicker({
                   onClick={() => entry.fullPath && navigate(entry.fullPath)}
                   className="flex items-center gap-2 px-3 py-2 rounded-gm text-left group transition-colors hover:bg-g-blue-bg/50 border border-transparent hover:border-g-blue/20"
                 >
-                  <svg className="w-5 h-5 text-g-yellow-vivid/80 shrink-0 group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5 text-g-yellow shrink-0 group-hover:scale-110 transition-transform" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z" />
                   </svg>
                   <span className="text-sm text-g-fg group-hover:text-g-fg truncate">{entry.name}</span>
@@ -514,7 +503,6 @@ function WebFolderPicker({
             </button>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

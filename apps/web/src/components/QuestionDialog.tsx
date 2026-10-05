@@ -1,12 +1,14 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useId } from "react";
 import { getQuestions, answerQuestion, type PendingQuestion } from "../api";
 import { useAppStore } from "../store";
 import { getJoinedLobbyChannel } from "../api/ws";
+import Modal from "./Modal";
 
 /**
  * UX-05（方案 §11.2「关闭不等于回答」）交互契约：
  *
  * | 操作            | 业务请求              | 后续状态                          |
+ * | --------------- | --------------------- | --------------------------------- |
  * | 关闭 / Esc / 遮罩 | 无（纯 UI 收起）       | 后端仍 pending；可经收起入口/刷新找回 |
  * | 「跳过此问题」     | 是（answerQuestion 固定跳过文案） | 移出弹窗 + toast 说明后果           |
  * | 提交回答（选项/输入）| 是                    | 服务器确认后才移出                   |
@@ -30,13 +32,7 @@ export default function QuestionDialog() {
   const selectedProjectId = useAppStore((s) => s.selectedProjectId);
   const questionVersion = useAppStore((s) => s.questionVersion);
   const showToast = useAppStore((s) => s.showToast);
-
-  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
+  const titleId = useId();
 
   // 立即拉取一次 pending questions（WebSocket question_asked 事件触发）
   useEffect(() => {
@@ -144,17 +140,6 @@ export default function QuestionDialog() {
     }
   };
 
-  // Esc 关闭最上层弹窗：纯 UI 关闭（不提交业务操作、不清草稿）。
-  // 刻意不设依赖数组：每次渲染重挂监听，闭包始终读到最新的 visible/handler。
-  useEffect(() => {
-    if (visible.length === 0) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") handleCloseDialog();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  });
-
   // 无可见问题：若还有被收起但仍 pending 的，给一个找回入口
   if (visible.length === 0) {
     if (recoverable.length === 0) return null;
@@ -166,7 +151,9 @@ export default function QuestionDialog() {
           className="flex items-center gap-2 px-4 py-2 rounded-full bg-white border border-g-border shadow-gm-md text-xs font-medium text-g-fg-2 hover:text-g-blue hover:border-g-blue/40 transition-all active:scale-[0.97]"
           title="这些问题仍处于待处理状态，点击重新打开（不会丢失已输入内容）"
         >
-          <span className="text-sm">📋</span>
+          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+          </svg>
           <span>{recoverable.length} 个问题待处理（已收起，点击查看）</span>
         </button>
       </div>
@@ -178,24 +165,25 @@ export default function QuestionDialog() {
   const error = errors[q.id] ?? null;
 
   return (
-    <div
-      data-testid="question-overlay"
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-      onClick={(e) => { if (e.target === e.currentTarget) handleCloseDialog(); }}
+    <Modal
+      onClose={handleCloseDialog}
+      labelledBy={titleId}
+      overlayTestId="question-overlay"
+      className="w-[480px] max-w-[calc(100vw-2rem)] max-h-[80vh] overflow-auto p-6"
     >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg w-[480px] max-h-[80vh] overflow-auto p-6 transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-      >
         <div className="flex items-center gap-2 mb-4">
-          <span className="text-lg">📋</span>
-          <h3 className="text-sm font-semibold text-g-fg flex-1">Agent 需要你的决定</h3>
+          <svg className="w-4 h-4 text-g-fg-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+          </svg>
+          <h3 id={titleId} className="text-sm font-semibold text-g-fg flex-1">Agent 需要你的决定</h3>
           <button
             data-testid="question-dialog-close"
             onClick={handleCloseDialog}
+            aria-label="关闭"
             className="text-g-fg-4 hover:text-g-fg transition-colors p-1 rounded-gm hover:bg-g-bg-soft"
             title="关闭（不发送任何回答，问题保持待处理，可稍后在下方入口找回）"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           </button>
@@ -246,6 +234,7 @@ export default function QuestionDialog() {
           <input
             type="text"
             placeholder="或输入自定义回答..."
+            aria-label="自定义回答"
             value={customAnswers[q.id] || ""}
             onChange={(e) => setCustomAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
             onKeyDown={(e) => {
@@ -254,7 +243,7 @@ export default function QuestionDialog() {
               }
             }}
             disabled={submitting}
-            className="flex-1 min-w-0 px-3 py-2 rounded-gm bg-g-bg-soft border border-g-border text-g-fg placeholder-g-fg-4/70 text-sm focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 disabled:opacity-50 transition-shadow"
+            className="flex-1 min-w-0 px-3 py-2 rounded-gm bg-g-bg-soft border border-g-border text-g-fg placeholder-g-fg-4 text-sm focus:outline-none focus:border-g-blue focus:ring-2 focus:ring-g-blue/15 disabled:opacity-50 transition-shadow"
           />
           <button
             onClick={() => {
@@ -266,7 +255,6 @@ export default function QuestionDialog() {
             发送
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

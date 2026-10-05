@@ -9,6 +9,7 @@ import {
 } from "../api";
 import type { McpServer } from "../api";
 import ConfirmDialog from "./ConfirmDialog";
+import Modal from "./Modal";
 
 /**
  * 设置面板——两个分区：无人值守模式（按项目开关）+ MCP 服务器管理。
@@ -35,13 +36,6 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState(false);
 
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
-
-  // 入场动效（纯视觉）：遮罩淡入 + 面板滑入
-  const [entered, setEntered] = useState(false);
-  useEffect(() => {
-    const raf = requestAnimationFrame(() => setEntered(true));
-    return () => cancelAnimationFrame(raf);
-  }, []);
 
   const refresh = async () => {
     try {
@@ -167,16 +161,19 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
 
   return (
     <>
-      <div
-        className={`fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px] transition-opacity duration-200 ${entered ? "opacity-100" : "opacity-0"}`}
-        onClick={onClose}
-      >
-      <div
-        className={`bg-g-bg border border-g-border rounded-gmLg shadow-gm-lg p-6 w-[30rem] max-w-[90vw] max-h-[85vh] overflow-y-auto transform transition-all duration-200 ease-out ${entered ? "opacity-100 translate-y-0 scale-100" : "opacity-0 translate-y-3 scale-[0.98]"}`}
-        onClick={(e) => e.stopPropagation()}
+      <Modal
+        onClose={onClose}
+        ariaLabel="设置"
+        overlayClassName="bg-black/40"
+          className="p-6 w-[30rem] max-w-[min(30rem,calc(100vw-2rem))] max-h-[85vh] overflow-y-auto"
       >
         <div className="flex items-center gap-2.5 mb-4">
-          <span className="w-7 h-7 rounded-gm bg-g-blue-bg flex items-center justify-center text-sm shrink-0">🔌</span>
+          <span className="w-7 h-7 rounded-gm bg-g-blue-bg flex items-center justify-center shrink-0">
+            <svg className="w-4 h-4 text-g-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </span>
           <h2 className="text-sm font-semibold text-g-fg">设置</h2>
         </div>
 
@@ -280,7 +277,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="名称"
-              className="flex-1 min-w-0 px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue transition-shadow"
+              className="flex-1 min-w-0 px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4 focus:border-g-blue transition-shadow"
             />
             <select
               value={transport}
@@ -295,7 +292,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             value={endpoint}
             onChange={(e) => setEndpoint(e.target.value)}
             placeholder={transport === "http" ? "URL（如 http://localhost:8080/mcp）" : "可执行文件（如 npx 或 python）——参数填下方，勿拼整条命令"}
-            className="w-full px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue transition-shadow"
+            className="w-full px-3 py-2 text-xs border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4 focus:border-g-blue transition-shadow"
           />
           {transport === "stdio" && (
             <textarea
@@ -303,7 +300,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
               onChange={(e) => setArgsText(e.target.value)}
               rows={2}
               placeholder={"启动参数，每行一个（如：\n-y\n@some/mcp-server）"}
-              className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue resize-none transition-shadow"
+              className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4 focus:border-g-blue resize-none transition-shadow"
             />
           )}
           <textarea
@@ -311,7 +308,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             onChange={(e) => setEnvJson(e.target.value)}
             rows={2}
             placeholder='env JSON（如 {"API_KEY": "sk-..."}）'
-            className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4/70 focus:border-g-blue resize-none transition-shadow"
+            className="w-full px-3 py-2 text-xs font-mono border border-g-border rounded-gm bg-g-bg-soft text-g-fg placeholder-g-fg-4 focus:border-g-blue resize-none transition-shadow"
           />
           <div className="flex justify-end gap-2">
             <button onClick={onClose} className="px-3 py-1.5 text-xs text-g-fg-3 hover:text-g-fg rounded-gm hover:bg-g-bg-muted active:scale-[0.97] transition-all">
@@ -326,8 +323,7 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             </button>
           </div>
         </div>
-      </div>
-      </div>
+      </Modal>
 
       {/* 删除确认（overlay 外层 sibling，避免点击冒泡关闭面板） */}
       {pendingDelete !== null && (
