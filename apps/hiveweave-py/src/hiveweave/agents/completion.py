@@ -859,6 +859,30 @@ async def handle_completion(
     facts.unreplied_asks = unreplied_asks
     exit_decision = evaluate_turn_exit(facts.to_context())
 
+    # 批24 修复3：空唤醒断路器记账 —— trigger 唤醒 + 零工具调用 + 收口
+    # 干净（exit ok ⇒ 无未回 ask / 无未声明义务）+ 名下无 open obligations
+    # ⇒ 空唤醒连击 +1（达 HIVEWEAVE_IDLE_WAKE_BREAKER 阈值置抑制位，唤醒
+    # 入口 chat() 拦截）；任一不满足 ⇒ 连击清零。只记账，不改收口流程；
+    # stub 假 agent（tests）缺属性时按空串/缺省处理，不抛。
+    # （complete-disposition 的 complete_no_reminder 早退不经过这里 ——
+    # 那条路径连 LLM 都不启动，本就不烧 token。）
+    try:
+        from hiveweave.agents.agent import idle_wake_record_turn
+
+        _wake_is_trigger = bool((opts or {}).get("trigger"))
+        _turn_empty = (
+            _wake_is_trigger
+            and not tool_calls
+            and not open_obligations
+            and not tasks_advanced
+            and exit_decision.ok
+        )
+        idle_wake_record_turn(
+            str(getattr(agent, "id", "") or ""), empty=_turn_empty
+        )
+    except Exception as e:  # noqa: BLE001 — 断路器记账绝不影响收口
+        log.debug("idle_wake_breaker_record_failed", error=str(e))
+
     # T16 auto：消费 5 连停强挂标记（auto 门禁接缝置位）。pop 即清 ——
     # 无论本次收口走哪条分支，标记都不跨 run 存活（chat() 入口另有兜底清）。
     _t16_force_block = None

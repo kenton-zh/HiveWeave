@@ -373,6 +373,126 @@ def format_recovery_brief(
     }
 
 
+# ── 批24 修复3：空唤醒断路器（进程内状态，模块级共享）────────
+# 病灶：agent 连续 17 轮被唤醒、每轮零工具调用且账本无任何未了义务
+# （idle_wakeup sole-advancer / 沉默看门狗空转唤醒 / dormant 类非关键
+# 唤醒源互相接力）。本断路器在唤醒入口（Agent.chat）拦截：同一 agent
+# 连续 N 次「唤醒后零工具调用 + 收口时名下无义务且无未回 ask」⇒ 进入
+# 空唤醒抑制；真实外部事件（新任务派入 / 人类消息 / @点名 / 上级指令 /
+# 审批 / 任务流转通知）强制解除。
+# 铁律：**只拦唤醒源，不拦任务流转** —— 任务派发、submit/review/merge
+# 等账本动作不经本闸；被抑制 agent 的未读 inbox 原样保留（不 ACK），
+# 下一个真实外部事件照常投递。
+# 类级默认安全：状态挂在**模块级 dict**（键=agent_id，跨实例存活——
+# supervisor 会重建 Agent 实例）；全部经函数访问，stub 构造的假 agent
+# （无完整 __init__）也不会 AttributeError。
+#: agent_id → {"streak": int, "suppressed": bool, "since_ms": int}
+_IDLE_WAKE_STATE: dict[str, dict] = {}
+
+#: 非关键唤醒源（抑制中跳过）：泛 trigger（sole-advancer / 沉默看门狗 /
+#: dormant 空转唤醒都经 trigger 通道落到它）+ 平台自续跑家族。
+_IDLE_WAKE_INTERNAL_SOURCES = frozenset({
+    "trigger",
+    "open_task_reminder",
+    "productive_continue",
+    "interrupted_resume",
+    "turn_continue",
+})
+
+
+def idle_wake_breaker_threshold() -> int:
+    """空唤醒断路阈值（env ``HIVEWEAVE_IDLE_WAKE_BREAKER``，默认 3）。
+
+    每次判定现读（测试可 monkeypatch env）；非法/非正值回落默认 3。
+    """
+    try:
+        raw = str(os.environ.get("HIVEWEAVE_IDLE_WAKE_BREAKER") or "").strip()
+        value = int(raw) if raw else 3
+        return value if value >= 1 else 3
+    except Exception:
+        return 3
+
+
+def idle_wake_record_turn(agent_id: str, *, empty: bool) -> None:
+    """回合收口记账：empty=True 累加空唤醒连击（达阈值置抑制位）。
+
+    empty=False（本轮有工具调用 / 有义务 / 有推进）⇒ 连击清零并解除抑制。
+    """
+    if not agent_id:
+        return
+    entry = _IDLE_WAKE_STATE.get(agent_id)
+    if not empty:
+        if entry is not None and (entry.get("streak") or entry.get("suppressed")):
+            log.info(
+                "idle_wake_breaker_reset",
+                agent_id=agent_id,
+                reason="productive_turn",
+            )
+        _IDLE_WAKE_STATE.pop(agent_id, None)
+        return
+    if entry is None:
+        entry = {"streak": 0, "suppressed": False, "since_ms": 0}
+    entry["streak"] = int(entry.get("streak") or 0) + 1
+    threshold = idle_wake_breaker_threshold()
+    if not entry.get("suppressed") and entry["streak"] >= threshold:
+        entry["suppressed"] = True
+        entry["since_ms"] = int(time.time() * 1000)
+        log.warning(
+            "idle_wake_breaker_tripped",
+            agent_id=agent_id,
+            streak=entry["streak"],
+            threshold=threshold,
+        )
+    _IDLE_WAKE_STATE[agent_id] = entry
+
+
+def idle_wake_suppressed(agent_id: str) -> bool:
+    """该 agent 是否处于空唤醒抑制态（唤醒源跳过判据）。"""
+    if not agent_id:
+        return False
+    entry = _IDLE_WAKE_STATE.get(agent_id)
+    return bool(entry and entry.get("suppressed"))
+
+
+def idle_wake_force_clear(agent_id: str, *, reason: str = "") -> None:
+    """真实外部事件强制解除抑制（新任务派入 / 人类消息 / @点名 …）。"""
+    entry = _IDLE_WAKE_STATE.get(agent_id)
+    if entry is None:
+        return
+    _IDLE_WAKE_STATE.pop(agent_id, None)
+    log.info(
+        "idle_wake_breaker_cleared",
+        agent_id=agent_id,
+        reason=reason or "external_event",
+        streak=int(entry.get("streak") or 0),
+    )
+
+
+def _idle_wake_is_external_event(opts: dict) -> bool:
+    """唤醒是否携带真实外部事件证据（⇒ 强制解除抑制，永不拦）。
+
+    - 非 trigger = 用户直聊（人类消息）；
+    - task 类（task_id / message_type=task|user_message / 任务态 source）；
+    - wake_category ∈ ask|command|approval|task_transition（@点名 / 上级
+      指令 / 审批 / 任务流转 —— 都是别人对**你**做的动作）；
+    - source 不在非关键清单里（wait_satisfied / message_from_ref /
+      upstream_recovery / chat / user …）。
+    """
+    if not opts.get("trigger"):
+        return True
+    if opts.get("from_user"):
+        return True
+    if str(opts.get("message_type") or "") in ("task", "user_message"):
+        return True
+    if opts.get("task_id"):
+        return True
+    if str(opts.get("wake_category") or "") in (
+        "ask", "command", "approval", "task_transition",
+    ):
+        return True
+    return (opts.get("source") or "trigger") not in _IDLE_WAKE_INTERNAL_SOURCES
+
+
 async def broadcast_agent_health(
     agent_id: str, health: str, message: str = ""
 ) -> None:
@@ -789,6 +909,24 @@ class Agent:
                     source=(opts or {}).get("source") or "trigger",
                 )
                 return {"ok": True, "suppressed": True}
+
+            # 批24 修复3：空唤醒断路器 —— 真实外部事件强制解除；非关键
+            # 唤醒源（sole-advancer / 沉默看门狗空转 / dormant / 平台自续跑）
+            # 在抑制态直接跳过（不启动 LLM、不 ACK 未读）。只拦唤醒源，
+            # 不拦任务流转（dispatch/submit/review 等账本动作不经此闸）。
+            if _idle_wake_is_external_event(opts):
+                idle_wake_force_clear(
+                    self.id,
+                    reason=str((opts or {}).get("source") or "user"),
+                )
+            elif idle_wake_suppressed(self.id):
+                log.info(
+                    "idle_wake_breaker_skip",
+                    agent_id=self.id,
+                    source=(opts or {}).get("source") or "trigger",
+                    wake_category=(opts or {}).get("wake_category"),
+                )
+                return {"ok": True, "suppressed": "idle_wake_breaker"}
 
             # Complete + non-user trigger: skip unless admit_wake pierces
             # (same gate as inbox wake bits — ask / superior command / task).

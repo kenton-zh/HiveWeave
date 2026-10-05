@@ -184,6 +184,36 @@ async def _update_user_ping_status(
         )
 
 
+async def backfill_user_ping_read_at(
+    project_id: str | None, question_id: str, *, now_ms: int | None = None
+) -> None:
+    """用户作答 ⇒ 回填关联 user_pings.read_at（批24 修复5，best-effort）。
+
+    病灶：answer_question 只同步 status，ping 行 is_read=0 / read_at=NULL
+    永不落值 —— 用户明明已作答，台账却永远显示未读。只回填**本次作答
+    关联的行**（question_id 关联），历史 NULL 不追（无迁移）；
+    ``read_at IS NULL`` 谓词保证幂等（已有值不覆盖，首答时刻为准）。
+    """
+    if not project_id or not question_id:
+        return
+    ts = int(now_ms or time.time() * 1000)
+    try:
+        conn = await project_db.get_project_db_by_project_id(project_id)
+        cur = await conn.execute(
+            "UPDATE user_pings SET read_at = ? "
+            "WHERE question_id = ? AND read_at IS NULL",
+            [ts, question_id],
+        )
+        await conn.commit()
+        await cur.close()
+    except Exception as exc:  # noqa: BLE001 — 台账回填是旁支
+        log.warning(
+            "question.user_ping_read_at_backfill_failed",
+            question_id=question_id[:8],
+            error=str(exc),
+        )
+
+
 async def _insert_user_ping(
     project_id: str,
     agent_id: str,

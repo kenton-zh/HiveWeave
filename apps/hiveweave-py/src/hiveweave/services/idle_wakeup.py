@@ -278,6 +278,20 @@ async def maybe_wake_sole_advancer(
     now_ms = int(time.time() * 1000)
     if not await _wake_budget_allows(project_id, aid, now_ms):
         return None
+    # 批24 修复3：空唤醒断路器 —— 抑制中的 agent 不再被 sole-advancer
+    # 空转唤醒（连击 ≥ 阈值说明唤醒只烧 token；真实外部事件会强制解除）。
+    try:
+        from hiveweave.agents.agent import idle_wake_suppressed
+
+        if idle_wake_suppressed(aid):
+            log.info(
+                "idle_wake_breaker_skip_sole_advancer",
+                project_id=project_id,
+                agent_id=aid,
+            )
+            return None
+    except Exception as e:  # noqa: BLE001 — 探针故障不拦唤醒主链
+        log.debug("idle_wake_breaker_probe_failed", agent_id=aid, error=str(e))
 
     from hiveweave.agents.trigger import (
         is_coordinator,

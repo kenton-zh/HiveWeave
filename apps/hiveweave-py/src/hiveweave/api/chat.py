@@ -702,6 +702,13 @@ async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
                 "WHERE id = ?",
                 [body.answer, now_ms, question_id],
             )
+            # 批24 修复5：迟到裁决同样是用户作答动作 ⇒ 回填 read_at（幂等）。
+            if row is not None:
+                from hiveweave.tools.question import backfill_user_ping_read_at
+
+                await backfill_user_ping_read_at(
+                    str(row.get("project_id") or ""), question_id, now_ms=now_ms
+                )
         else:
             await project_db.execute(
                 body.agentId,
@@ -712,12 +719,20 @@ async def answer_question(question_id: str, body: QuestionAnswerBody) -> dict:
             # 正常作答也同步 ping 台账（晚到答案不走 execute_question 的
             # future 分支，无这条会永远停在 pending）。
             if row is not None:
-                from hiveweave.tools.question import _update_user_ping_status
+                from hiveweave.tools.question import (
+                    _update_user_ping_status,
+                    backfill_user_ping_read_at,
+                )
 
                 await _update_user_ping_status(
                     str(row.get("project_id") or ""),
                     question_id,
                     "answered",
+                )
+                # 批24 修复5：作答 ⇒ 回填关联 user_pings.read_at
+                # （幂等：read_at 已有值不覆盖；历史 NULL 不追）。
+                await backfill_user_ping_read_at(
+                    str(row.get("project_id") or ""), question_id, now_ms=now_ms
                 )
         # BUG-037: resolve 内存中的 Future，让阻塞中的 execute_question 继续
         from hiveweave.tools.question import resolve_question

@@ -2619,6 +2619,61 @@ async def _write_delivery_state(
     await conn.commit()
 
 
+async def _clear_all_waits_on_delivery(project_id: str) -> tuple[int, int]:
+    """交付成功 ⇒ 清空该项目全部活跃 agent_waits + 逐 agent 通知（批24 修复1）。
+
+    病灶：`mark_delivery_complete` 只写 delivery_state 不清 agent_waits，
+    `recover_wait_timeouts`（game_time）到期无条件开火 ⇒ 交付后 CEO 仍被
+    [WAIT_TIMEOUT] 空唤醒 5-6 次。
+
+    走 wait_contract_service 既有清理通道（``clear_waits`` per-agent），
+    受影响名单来自 ``list_all_active``（清前快照）。每个受影响 agent 投一条
+    ``[PROJECT DELIVERED]``（wake=1，幂等键 per-agent，重复标记不重投）。
+    调用方只在交付状态**成功写入后**触发（blocked 路径不进这里）。
+    """
+    from hiveweave.services.inbox import InboxService
+    from hiveweave.services.wait_contract import wait_contract_service
+
+    active = await wait_contract_service.list_all_active(project_id)
+    if not active:
+        return 0, 0
+    affected: list[str] = []
+    seen: set[str] = set()
+    for w in active:
+        aid = str(w.get("agentId") or "")
+        if aid and aid not in seen:
+            seen.add(aid)
+            affected.append(aid)
+    cleared = 0
+    inbox = InboxService()
+    for aid in affected:
+        cleared += await wait_contract_service.clear_waits(project_id, aid)
+        try:
+            await inbox.send_message(
+                from_agent_id="system",
+                to_agent_id=aid,
+                message=(
+                    "[PROJECT DELIVERED] 项目已交付，全部等待已随交付清空"
+                    "——不会再有等待类唤醒。"
+                ),
+                message_type="system",
+                priority="normal",
+                wake=True,
+                idempotency_key=f"delivery-clear:{project_id}:{aid}",
+            )
+        except Exception as e:  # noqa: BLE001 — 通知失败不回滚清理
+            log.warning(
+                "delivery_wait_notice_failed", agent_id=aid, error=str(e)
+            )
+    log.info(
+        "delivery_cleared_project_waits",
+        project_id=project_id,
+        agents=len(affected),
+        cleared=cleared,
+    )
+    return len(affected), cleared
+
+
 async def delivery_badge_metadata(agent_id: str) -> dict[str, Any] | None:
     """交付状态徽章（挂 ``chat_messages.metadata``，用户侧渲染）。
 
@@ -2854,6 +2909,17 @@ async def mark_delivery_complete_tool(
         return ToolResult.err(
             f"核验已通过，但交付状态写入失败（{e}）。请重试；"
             "在此之前用户侧仍会看到「未标记完工」徽章。"
+        )
+    # 批24 修复1：交付成功 ⇒ 清空该项目全部活跃 agent_waits + 逐 agent
+    # [PROJECT DELIVERED] 通知（清不掉的遗留 WAIT_TIMEOUT 空唤醒源头）。
+    # 仅在此成功路径触发；blocked / 写入失败路径均不进这里。
+    try:
+        await _clear_all_waits_on_delivery(project_id)
+    except Exception as e:  # noqa: BLE001 — 清理失败不推翻交付成功事实
+        log.warning(
+            "delivery_clear_waits_failed",
+            project_id=project_id,
+            error=str(e),
         )
     return ToolResult.ok(
         f"已标记交付完成（核验快照：tasks {snapshot.get('tasks_closed')}/"

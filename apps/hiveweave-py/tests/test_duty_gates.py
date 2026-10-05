@@ -254,6 +254,12 @@ async def test_dispatch_tool_skips_wake_when_blocked():
                 }
             ),
         ),
+        # 批24：dependsOn 建单即拒 —— 本测试聚焦 wake-skip 语义，
+        # 依赖校验按「真实 id」放行（resolver 原样回显 ref）。
+        patch(
+            "hiveweave.services.task.TaskService.require_task_id",
+            AsyncMock(side_effect=lambda _pid, ref: ref),
+        ),
         patch("hiveweave.agents.trigger.trigger_subordinate", trigger),
     ):
         result = await dispatch_task_tool(

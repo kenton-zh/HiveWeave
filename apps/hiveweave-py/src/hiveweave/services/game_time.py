@@ -966,6 +966,11 @@ class GameTimeService:
             groups.setdefault(gkey, []).append(w)
 
         watchdog_agents: set[str] = set()
+        # 批24 修复2：交付态空出口 —— 项目已交付（delivery_state=complete）
+        # 且被唤醒 agent 名下无 open obligations 时，WAIT_TIMEOUT 正文替换为
+        # 出口文案（不要重登等待，直接停）。交付态每次调用只读一次；
+        # 非交付态 / 判定异常一律回落原文（逐字保留，fail-open 不改语义）。
+        _delivered_project: bool | None = None
         for (aid, kind, ref), group in groups.items():
             ask_outstanding = False
             ref_agent_id: str | None = None
@@ -1049,18 +1054,62 @@ class GameTimeService:
                         f"details={struct}"
                     )
                 else:
-                    prefix = (
-                        "wakeup_reason=target_reached — timer target reached. "
-                        if wakeup_reason == "target_reached"
-                        else ""
-                    )
-                    body = (
-                        f"[WAIT_TIMEOUT] {prefix}"
-                        f"Your wait ({kind}:{ref}) expired. "
-                        f"ask_outstanding={ask_outstanding}. "
-                        "Resume work or re-establish a wait. "
-                        f"details={struct}"
-                    )
+                    # 批24 修复2：交付态 + 被唤醒 agent 名下无义务 ⇒ 出口
+                    # 文案（不再引导 resume/re-wait —— 那正是交付后 CEO 被
+                    # 空唤醒 5-6 次后重新登记等待、循环继续的根因）。
+                    _exit_body: str | None = None
+                    if _delivered_project is None:
+                        try:
+                            from hiveweave.tools.misc_tools import (
+                                _read_delivery_state,
+                            )
+
+                            _delivered_project = (
+                                (await _read_delivery_state(project_id))
+                                .get("state")
+                                == "complete"
+                            )
+                        except Exception as e:
+                            log.debug(
+                                "wait_timeout_delivery_probe_failed",
+                                project_id=project_id,
+                                error=str(e),
+                            )
+                            _delivered_project = False
+                    if _delivered_project:
+                        try:
+                            from hiveweave.services.task import TaskService
+
+                            _obls = await TaskService().get_open_work_obligations(
+                                project_id, aid
+                            )
+                            if not _obls:
+                                _exit_body = (
+                                    "项目已交付且你名下无义务：不要重新登记"
+                                    "等待，直接停止输出；本等待已清除，"
+                                    "不会再因此唤醒你"
+                                )
+                        except Exception as e:
+                            log.debug(
+                                "wait_timeout_obligation_probe_failed",
+                                agent_id=aid,
+                                error=str(e),
+                            )
+                    if _exit_body:
+                        body = f"[WAIT_TIMEOUT] {_exit_body}。"
+                    else:
+                        prefix = (
+                            "wakeup_reason=target_reached — timer target reached. "
+                            if wakeup_reason == "target_reached"
+                            else ""
+                        )
+                        body = (
+                            f"[WAIT_TIMEOUT] {prefix}"
+                            f"Your wait ({kind}:{ref}) expired. "
+                            f"ask_outstanding={ask_outstanding}. "
+                            "Resume work or re-establish a wait. "
+                            f"details={struct}"
+                        )
                 await inbox.send_message(
                     from_agent_id="system",
                     to_agent_id=aid,

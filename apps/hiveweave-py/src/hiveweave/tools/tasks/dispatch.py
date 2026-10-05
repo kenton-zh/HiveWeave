@@ -339,6 +339,38 @@ async def dispatch_task_tool(
     if coord_err:
         return ToolResult.err(coord_err)
 
+    # 批24 修复4：dependsOn 建单即拒（fail-closed）——逐个校验依赖 ref 是
+    # 本项目真实 task id（复用既有解析器 require_task_id：全 id / 唯一短前缀
+    # 皆可，缺失/歧义抛 ValueError）。占位符（"task-2"、"dep-1" 这类编造 id）
+    # 此前会整单落账成永久 blocked 的死任务。任一坏 ref ⇒ 整单拒绝，
+    # 回执点名坏 ref + 处方；混合（真+假）只点名假的。
+    if params.depends_on:
+        _dep_bad: list[tuple[str, str]] = []
+        _dep_seen: set[str] = set()
+        for _dep_raw in params.depends_on:
+            _dep_ref = str(_dep_raw or "").strip()
+            if not _dep_ref or _dep_ref in _dep_seen:
+                continue
+            _dep_seen.add(_dep_ref)
+            try:
+                await _task_svc.TaskService().require_task_id(
+                    project_id, _dep_ref
+                )
+            except ValueError as e:
+                _dep_bad.append((_dep_ref, str(e)))
+            except Exception as e:  # noqa: BLE001 — 校验通道故障同样 fail-closed
+                _dep_bad.append((_dep_ref, f"依赖校验失败：{e}"))
+        if _dep_bad:
+            _dep_lines = "\n".join(f'- "{ref}": {reason}' for ref, reason in _dep_bad)
+            return ToolResult.err(
+                "拒绝派单：dependsOn 含非真实 task id（fail-closed，本单未创建、"
+                "未入账）。坏 ref：\n"
+                f"{_dep_lines}\n"
+                "处方：先 get_tasks 确认依赖任务——未建则先 dispatch 依赖任务、"
+                "拿到真实 task_id 再回填 dependsOn；不需要的依赖直接去掉该项。"
+                "（等人是 wait_on(kind=agent)，不是 dependsOn。）"
+            )
+
     # Dedup (TEST21 M3): structured + title similarity + cross-assignee force gate
     force_note = ""
     if not params.task_id:

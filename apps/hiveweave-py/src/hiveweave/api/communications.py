@@ -163,9 +163,12 @@ async def mark_ping_read(ping_id: str, agentId: str | None = Query(default=None)
             status_code=422, detail="agentId query param required to locate project DB"
         )
     try:
+        # 批24 修复5：read_at 走 COALESCE 回填语义 —— 首读时刻为准，重复
+        # mark-read / 作答侧已回填过的值不被覆盖（幂等）。
         await project_db.execute(
             key,
-            "UPDATE user_pings SET is_read = 1, read_at = ? WHERE id = ?",
+            "UPDATE user_pings SET is_read = 1, "
+            "read_at = COALESCE(read_at, ?) WHERE id = ?",
             [int(time.time() * 1000), ping_id],
         )
     except Exception as e:
