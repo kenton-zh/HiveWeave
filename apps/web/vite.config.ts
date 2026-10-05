@@ -169,7 +169,6 @@ export default defineConfig({
       "react-dom",
       "zustand",
       "phoenix",
-      "@xyflow/react",
       "pixi.js",
     ],
   },
