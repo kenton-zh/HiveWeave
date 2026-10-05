@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ComponentType } from "react";
+import { Info, Check, CircleAlert, TriangleAlert, X } from "lucide-react";
 import { useAppStore } from "../store";
 import type { ToastType } from "../store";
 
-const STYLES: Record<ToastType, { bg: string; border: string; icon: string; iconColor: string; iconBg: string; accent: string }> = {
+/** 图标统一 lucide-react（禁 emoji / 字符图标，见前端设计规范）。 */
+type IconComponent = ComponentType<{ className?: string; strokeWidth?: number; "aria-hidden"?: boolean }>;
+
+const STYLES: Record<ToastType, { bg: string; border: string; Icon: IconComponent; iconColor: string; iconBg: string; accent: string }> = {
   info: {
     bg: "bg-g-bg/95",
     border: "border-g-border",
-    icon: "i",
+    Icon: Info,
     iconColor: "text-g-blue",
     iconBg: "bg-g-blue-bg",
     accent: "bg-g-blue-vivid",
@@ -14,7 +19,7 @@ const STYLES: Record<ToastType, { bg: string; border: string; icon: string; icon
   success: {
     bg: "bg-g-green-bg/95",
     border: "border-g-green",
-    icon: "✓",
+    Icon: Check,
     iconColor: "text-g-green",
     iconBg: "bg-g-green-bg",
     accent: "bg-g-green-vivid",
@@ -22,7 +27,7 @@ const STYLES: Record<ToastType, { bg: string; border: string; icon: string; icon
   error: {
     bg: "bg-g-red-bg/95",
     border: "border-g-red",
-    icon: "!",
+    Icon: CircleAlert,
     iconColor: "text-g-red",
     iconBg: "bg-g-red-bg",
     accent: "bg-g-red-vivid",
@@ -30,7 +35,7 @@ const STYLES: Record<ToastType, { bg: string; border: string; icon: string; icon
   warning: {
     bg: "bg-g-yellow-bg/95",
     border: "border-g-yellow",
-    icon: "⚠",
+    Icon: TriangleAlert,
     iconColor: "text-g-yellow",
     iconBg: "bg-g-yellow-bg",
     accent: "bg-g-yellow-vivid",
@@ -119,20 +124,20 @@ export default function ToastContainer() {
             {/* Left accent bar */}
             <span className={`absolute left-0 top-0 bottom-0 w-1 ${s.accent} opacity-80`} aria-hidden="true" />
             <span
-              className={`${s.iconColor} ${s.iconBg} w-6 h-6 rounded-full flex items-center justify-center font-bold text-xs leading-none mt-0.5 shrink-0 shadow-gm-sm`}
+              className={`${s.iconColor} ${s.iconBg} w-6 h-6 rounded-full flex items-center justify-center mt-0.5 shrink-0 shadow-gm-sm`}
               aria-hidden="true"
             >
-              {s.icon}
+              <s.Icon className="w-3.5 h-3.5" strokeWidth={2.5} />
             </span>
             <p className="flex-1 text-sm text-g-fg leading-relaxed break-words whitespace-pre-wrap">
               {t.message}
             </p>
             <button
               onClick={() => exit(t.id)}
-              className="text-g-fg-4 hover:text-g-fg hover:bg-g-bg-muted rounded-full w-6 h-6 flex items-center justify-center transition-all text-base leading-none shrink-0 active:scale-90"
+              className="text-g-fg-4 hover:text-g-fg hover:bg-g-bg-muted rounded-full w-6 h-6 flex items-center justify-center transition-all shrink-0 active:scale-90"
               aria-label="关闭"
             >
-              ×
+              <X className="w-4 h-4" />
             </button>
           </div>
         );

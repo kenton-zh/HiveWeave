@@ -41,6 +41,8 @@ import { getProjects, createProject, deleteProject, leaveAgentChannel, subscribe
 import ProjectRunControls from "./components/ProjectRunControls";
 import EmptyState from "./components/EmptyState";
 import { SegmentItem } from "./components/SegmentTabs";
+import Modal from "./components/Modal";
+import { useMediaQuery } from "./hooks/useMediaQuery";
 import { PanelLeftClose } from "lucide-react";
 import type { DeleteProjectResponse, Project } from "./api";
 
@@ -66,6 +68,8 @@ function App() {
   const [workspaceMode, setWorkspaceMode] = useState<"office" | "workbench">(
     OFFICE_UI_ENABLED ? "office" : "workbench"
   );
+  // ≤767px：两栏改上下堆叠（组织图在上、对话/详情在下），避免左栏被压到不可用宽度
+  const isNarrow = useMediaQuery("(max-width: 767px)");
   // 顶栏「待我处理」抽屉（办公室关闭后由工作台承接，计数徽标 + 面板开合）
   const [pendingOpen, setPendingOpen] = useState(false);
   const [pendingTotal, setPendingTotal] = useState(0);
@@ -94,6 +98,7 @@ function App() {
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
   const [newProjectCEO, setNewProjectCEO] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
+  const [confirmRestart, setConfirmRestart] = useState<"backend" | "frontend" | null>(null);
   // P1 (§5.5b①)：项目设置 —— 外部只读参考目录
   const [showProjectSettings, setShowProjectSettings] = useState(false);
   const [readDirsDraft, setReadDirsDraft] = useState("");
@@ -465,6 +470,20 @@ function App() {
     setEditingName(false);
   };
 
+  const doRestart = async (target: "backend" | "frontend") => {
+    try {
+      if (target === "backend") {
+        await restartBackend();
+        showToast("后端正在重启…", "info");
+      } else {
+        await restartFrontend();
+        showToast("前端正在重启…", "info");
+      }
+    } catch {
+      showToast(target === "backend" ? "后端重启失败" : "前端重启失败", "error");
+    }
+  };
+
   const leftPanel = resolveLeftPanel(activeView, selectedProjectId);
 
   // ── 左栏折叠（2026-10-01「组织图太占地方」修复）────────────────
@@ -518,19 +537,19 @@ function App() {
   return (
     <div className="h-screen flex flex-col bg-g-bg-soft">
       {/* Top Bar */}
-      <header className="h-14 border-b border-g-border flex items-center px-5 bg-white shrink-0 relative z-30">
-        <div className="flex items-center gap-3 min-w-0">
+      <header className="h-14 border-b border-g-border flex items-center gap-2 px-3 sm:px-5 bg-white shrink-0 relative z-30">
+        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
           <div className="w-8 h-8 rounded-gm bg-gradient-to-br from-g-blue to-g-purple flex items-center justify-center shrink-0 shadow-gm-sm transition-transform duration-200 hover:scale-105">
             <span className="text-white font-bold text-sm">H</span>
           </div>
-          <h1 className="text-[14px] font-semibold text-g-fg tracking-tight shrink-0 select-none">
+          <h1 className="hidden sm:block text-[14px] font-semibold text-g-fg tracking-tight shrink-0 select-none">
             HiveWeave
           </h1>
           <ProjectTimeBadge projectId={selectedProjectId} />
         </div>
 
         {/* Project Selector */}
-        <div className="ml-6 relative" ref={projectMenuRef}>
+        <div className="ml-2 sm:ml-6 relative min-w-0" ref={projectMenuRef}>
           <button
             data-testid="project-trigger"
             onClick={() => setShowProjectMenu(!showProjectMenu)}
@@ -567,12 +586,13 @@ function App() {
                       p.id === selectedProjectId ? "text-g-blue bg-g-blue-bg" : "text-g-fg"
                     }`}
                   >
-                    <span
-                      className="flex-1 truncate"
+                    <button
+                      type="button"
                       onClick={() => handleSwitchProject(p.id)}
+                      className="flex-1 min-w-0 truncate text-left"
                     >
                       {p.name}
-                    </span>
+                    </button>
                     <button
                       type="button"
                       disabled={deletingProjectId === p.id || queuedDeleteIds.includes(p.id)}
@@ -657,38 +677,24 @@ function App() {
               与旧工作台左栏渲染同一个 ProjectRunControls 实例逻辑 */}
           <ProjectRunControls className="mr-1" />
           {/* Restart buttons */}
-          <div className="flex items-center gap-0.5 bg-g-bg-soft border border-g-border rounded-gm p-0.5">
+          <div className="hidden sm:flex items-center gap-0.5 bg-g-bg-soft border border-g-border rounded-gm p-0.5">
             <button
-              onClick={async () => {
-                if (!confirm("Restart backend? This will kill and relaunch the uvicorn server.")) return;
-                try {
-                  await restartBackend();
-                  showToast("Backend restarting...", "info");
-                } catch {
-                  showToast("Failed to trigger backend restart", "error");
-                }
-              }}
+              onClick={() => setConfirmRestart("backend")}
+              aria-label="重启后端"
               className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-gm p-1.5 transition-all active:scale-90"
-              title="Restart Backend"
+              title="重启后端（uvicorn）"
             >
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
             <button
-              onClick={async () => {
-                if (!confirm("Restart frontend? This will kill and relaunch the Vite dev server.")) return;
-                try {
-                  await restartFrontend();
-                  showToast("Frontend restarting...", "info");
-                } catch {
-                  showToast("Failed to trigger frontend restart", "error");
-                }
-              }}
+              onClick={() => setConfirmRestart("frontend")}
+              aria-label="重启前端"
               className="text-g-fg-3 hover:text-g-fg hover:bg-g-bg-muted rounded-gm p-1.5 transition-all active:scale-90"
-              title="Restart Frontend"
+              title="重启前端（Vite）"
             >
-              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
               </svg>
             </button>
@@ -696,17 +702,18 @@ function App() {
           {/* Model Config page (模型清单 + 层级配置) — 带文字的醒目入口 */}
           <button
             onClick={() => setShowModelConfig(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm transition-all duration-200 active:scale-[0.97]"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-g-fg-2 bg-white border border-g-border rounded-gm shadow-gm-sm hover:text-g-blue hover:border-g-blue/40 hover:shadow-gm transition-all duration-200 active:scale-[0.97] whitespace-nowrap"
             title="模型配置"
           >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 21v-7m0-4V3m8 18v-9m0-4V3m8 18v-5m0-4V3M1 14h6m2-6h6m2 8h6" />
             </svg>
-            模型配置
+            <span className="hidden lg:inline">模型配置</span>
           </button>
           {/* API Key 设置 */}
           <button
             onClick={() => setShowApiKeyDialog(true)}
+            aria-label="API Key 设置"
             className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
             title="API Key 设置"
           >
@@ -717,6 +724,7 @@ function App() {
           {/* 设置面板（无人值守 / MCP 服务器） */}
           <button
             onClick={() => setShowMcpPanel(true)}
+            aria-label="设置"
             className="text-g-fg-3 hover:text-g-blue hover:bg-g-blue-bg/60 rounded-full p-1.5 transition-all active:scale-90"
             title="设置"
           >
@@ -743,7 +751,7 @@ function App() {
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
               </svg>
-              <span>{userName}</span>
+              <span className="hidden sm:inline">{userName}</span>
             </button>
           )}
         </div>
@@ -765,8 +773,8 @@ function App() {
           右栏详情合并成一栏、对话成为页签之一 —— 三栏时 Chat 只有 ~31% 宽，
           消息流太挤。可拖拽分栏（autoSaveId 持久化栏宽到 localStorage）。 */}
       <PanelGroup
-        direction="horizontal"
-        autoSaveId="hw-main-columns-v2"
+        direction={isNarrow ? "vertical" : "horizontal"}
+        autoSaveId={isNarrow ? "hw-main-columns-v" : "hw-main-columns-v2"}
         className="flex-1 overflow-hidden"
       >
         {/* Left Panel - Org Tree / Office；collapsible：一键收成 OrgRail 窄条 */}
@@ -781,7 +789,7 @@ function App() {
           // 折叠态去掉 pl-3：窄条只有 ~40–56px，12px 内边距会让深层头像溢出（审计 L3）
           className={`min-w-0 pt-3 pb-3 ${leftCollapsed ? "" : "pl-3"}`}
         >
-        <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
+        <div className="hw-cq h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
           <div className={`px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-3 ${leftCollapsed ? "hidden" : ""}`}>
             {/* View tabs（办公室关闭时不渲染 Office 页签）。
                 pillId 统一 "hw-seg-left"：切换时白底指示条滑动（SegmentItem） */}
@@ -822,7 +830,7 @@ function App() {
 
             {/* Project-level start/stop button —— FE-05：与顶栏共用 ProjectRunControls，
                 业务实现只有一份（不再在 App 内维护第二套开关逻辑） */}
-            <ProjectRunControls className="ml-auto shrink-0" />
+            <ProjectRunControls className="hw-panel-run ml-auto shrink-0" />
             {/* 收起侧栏（2026-10-01）：组织图常驻占宽 → 一键变窄条 */}
             <button
               onClick={() => leftPanelRef.current?.collapse()}
@@ -871,7 +879,7 @@ function App() {
         {/* defaultSize 与左栏合计须 =100（32+68）：两栏都设 defaultSize 时
             库不会补差额，合计≠100 会触发归一化 warning 并持久化偏离值（审计 M2） */}
         <Panel id="work" defaultSize={68} minSize={40} className="min-w-0 pt-3 pr-3 pb-3">
-        <div className="h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
+        <div className="hw-cq h-full flex flex-col bg-white rounded-gmLg border border-g-border shadow-gm-sm overflow-hidden min-w-0">
           {/* Tab bar */}
           <div className="px-3 py-2.5 border-b border-g-border bg-white flex items-center gap-1">
             {/* pillId 统一 "hw-seg-right"：与左栏隔离，避免跨栏串联动画 */}
@@ -960,9 +968,16 @@ function App() {
                         <GoalsPanel projectId={selectedProjectId} />
                       </Suspense>
                     ) : (
-                      <div className="h-full flex items-center justify-center text-g-fg-3 text-sm">
-                        请先选择一个项目
-                      </div>
+                      <EmptyState
+                        icon={
+                          <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4" />
+                          </svg>
+                        }
+                        title="尚未选择项目"
+                        description="新建项目 → 点「上班」启动组织 → 与 CEO 对话，团队会出现在组织图中。"
+                        action={{ label: "新建项目", onClick: () => setShowFolderPicker(true) }}
+                      />
                     )}
                   </div>
                 </ErrorBoundary>
@@ -1038,13 +1053,31 @@ function App() {
           />
         )}
 
+        {confirmRestart && (
+          <ConfirmDialog
+            title={confirmRestart === "backend" ? "重启后端" : "重启前端"}
+            message={
+              confirmRestart === "backend"
+                ? "将结束并重新启动 uvicorn 服务，进行中的请求会中断。确定继续？"
+                : "将结束并重新启动 Vite 开发服务器，页面会短暂断开。确定继续？"
+            }
+            confirmLabel="重启"
+            danger
+            onConfirm={() => { const target = confirmRestart; setConfirmRestart(null); void doRestart(target); }}
+            onCancel={() => setConfirmRestart(null)}
+          />
+        )}
+
         {showProjectSettings && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 animate-fade-in" onClick={() => setShowProjectSettings(false)}>
-            <div className="w-full max-w-md bg-white rounded-gmLg border border-g-border shadow-gm-pop p-5 animate-scale-in" onClick={(e) => e.stopPropagation()}>
+          <Modal
+            onClose={() => setShowProjectSettings(false)}
+            ariaLabel={`项目设置 — ${currentProject?.name ?? ""}`}
+            className="w-full max-w-[min(28rem,calc(100vw-2rem))] p-5 shadow-gm-pop"
+          >
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-[14px] font-semibold text-g-fg">项目设置 — {currentProject?.name}</h3>
-                <button type="button" onClick={() => setShowProjectSettings(false)} className="text-g-fg-4 hover:text-g-fg rounded-full p-1 transition-colors">
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <button type="button" aria-label="关闭" onClick={() => setShowProjectSettings(false)} className="text-g-fg-4 hover:text-g-fg rounded-full p-1 transition-colors">
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                   </svg>
                 </button>
@@ -1088,8 +1121,7 @@ function App() {
                   {savingReadDirs ? "保存中..." : "保存"}
                 </button>
               </div>
-            </div>
-          </div>
+          </Modal>
         )}
 
         <QuestionDialog />

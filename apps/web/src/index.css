@@ -119,18 +119,6 @@
   }
 }
 
-/* ── React Flow overrides (legacy, kept harmless) ── */
-.react-flow__background {
-  background: #f4f5f9 !important;
-}
-.react-flow__minimap {
-  background: rgba(255, 255, 255, 0.85) !important;
-  border-radius: 8px;
-  border: 1px solid #e4e6ed !important;
-  backdrop-filter: blur(6px);
-  box-shadow: 0 2px 8px rgba(23, 25, 35, 0.08);
-}
-
 /* ── Focus ring (brand indigo) ── */
 @layer utilities {
   .focus-g {
@@ -331,4 +319,13 @@
     --hw-region-gutter: 8px;
   }
   /* 锚点（单列任务/成员列表、核心操作可达）—— 组件适配任务落地 */
+}
+
+/* 已落地的锚点（2026-10-05）：.hw-cq 挂在两栏的面板卡片上，容器宽度随栏宽
+   拖动而变化（媒体查询做不到这点）。窄容器下隐藏左栏里重复的「上班/下班」
+   开关（顶栏已常驻一份 ProjectRunControls）。 */
+@container hw-region (max-width: 640px) {
+  .hw-panel-run {
+    display: none;
+  }
 }
