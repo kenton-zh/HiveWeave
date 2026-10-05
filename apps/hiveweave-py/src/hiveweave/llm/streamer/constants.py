@@ -306,6 +306,24 @@ assert 0 < BUDGET_PACING_HINT_S < HARD_TOTAL_TIMEOUT_S, (
     "起就注入提示，纯白烧 token"
 )
 
+WALL_APPROACH_PCT = float(
+    _os.environ.get("HIVEWEAVE_STREAM_WALL_APPROACH_PCT", "0.85") or "0.85"
+)
+"""墙前收口提示阈值：累计墙钟走过硬预算该比例即注入一次
+``[WALL APPROACHING]`` 收口提示（批25 修复1a，2026-10-05 钦定）。
+
+与 ``FORCE_COMMIT_WALL_PCT``（legacy E14 疏导线，恰好同为 0.85）语义
+不同、互不引用：E14 是**回合预算**疏导（auto 下退役），本阈值是**绝对
+请求墙**的安全疏导 —— auto 模式下 tool_loop 不武装 hard_deadline，但
+core.py 外层 ``wait_for(HARD+30)`` 仍会在 ~1740s 整杀 run ⇒ A 桶实测
+33+10 条 run 全灭于该墙、下个 run 从头再来。提示 auto 与 legacy 都注入；
+``HARD_TOTAL_TIMEOUT_S`` 本身不动（分段疏导，不是提墙）。"""
+
+assert 0 < WALL_APPROACH_PCT < 1, (
+    "WALL_APPROACH_PCT 必须在 (0,1) 内 —— >=1 永不触发、<=0 第 2 轮起"
+    "每轮都注入"
+)
+
 FIRST_CHUNK_TIMEOUT_S = 90.0
 """首 chunk 超时（TS 防线②，thinking 模型首 token 可能 60-90s）。"""
 

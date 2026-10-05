@@ -106,11 +106,21 @@ async def _validate_span(
         if action == "派活"
         else ""
     )
+    # 批25 修复2c：跨级沟通拒补「正确通道一句话」—— 改道路径已有
+    #（上级转发/升级/transfer），再点名可直接使用的通道（直属下属/同级/
+    # 直属上级可直接消息/ask，范围外对象经直属上级转达），模型拿到拒收
+    # 后有确定下一步。派活向已有 B5 处方，不重复加。
+    channel_hint = (
+        "正确通道：直属下属、同级、直属上级可直接消息/ask；"
+        "范围外对象把要说的话发给你直属上级，请其转达或协调。"
+        if action != "派活"
+        else ""
+    )
     return (
         f"拒绝跨级{action}：只能联系{'/'.join(allowed)}。"
         f"「{tname}」不在你的指挥链直达范围内。"
         "跨级请让直属上级转发，或走升级/transfer，不要直接打穿组织。"
-        f"{dispatch_hint}"
+        f"{dispatch_hint}{channel_hint}"
     )
 
 

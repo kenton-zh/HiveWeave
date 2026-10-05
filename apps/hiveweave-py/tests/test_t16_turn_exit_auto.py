@@ -810,8 +810,11 @@ async def _run_tool_loop(streamer, *, max_tool_rounds, exit_gate_check=None):
 
 async def test_auto_budget_deadline_not_armed_legacy_still_cut(monkeypatch):
     """差分钉死：同样把 HARD_TOTAL_TIMEOUT_S 压到 0.05s ——
-    legacy 照旧预算掐断（budget_exhausted=True）；auto 不武装 ⇒ 跑到自然停，
-    且向下游传 budget_deadline=None（SSE wait_s 的 min(...) 退化）。
+    legacy 照旧预算掐断（budget_exhausted=True）；auto 不武装 SSE
+    budget_deadline（None，min(...) 退化），但批25 修复1b（2026-10-05
+    钦定）起轮边界到 100% 绝对墙会**软着陆**（budget_exhausted 优雅收口
+    → interrupted + 自动续跑），不再放任 core.py 外层 wait_for(HARD+30)
+    整杀成 error；墙未到时仍跑到自然停、零预算痕迹。
     （等价断言「wait_s 无 budget 项」的接缝事实位。）"""
     import asyncio as _asyncio
 
@@ -843,14 +846,28 @@ async def test_auto_budget_deadline_not_armed_legacy_still_cut(monkeypatch):
     assert legacy_result.get("budget_exhausted") is True
     assert all(c["budget_deadline"] is not None for c in legacy_calls)
 
-    # auto：不武装 ⇒ 同样的 mock 跑到自然停，零预算痕迹
+    # auto：SSE budget_deadline 不武装（恒 None）；越过 0.05s 绝对墙后
+    # 在轮边界软着陆（批25 修复1b）—— 优雅收口保产出，而非外层整杀。
     monkeypatch.setattr(settings, "turn_exit_mode", "auto")
     auto_result, auto_calls = await run_mode()
-    assert "budget_exhausted" not in auto_result
-    assert auto_result["status"] == "ok"
-    assert "[TURN BUDGET]" not in (auto_result.get("content") or "")
-    assert len(auto_calls) == 2  # 两轮请求都真的发生了
     assert all(c["budget_deadline"] is None for c in auto_calls)
+    assert auto_result["status"] == "ok"
+    assert auto_result.get("budget_exhausted") is True
+    assert "interrupted" in (auto_result.get("content") or "")
+    assert len(auto_result.get("tool_calls") or []) == 1  # tool 产出保留
+    assert len(auto_calls) == 1  # 软着陆后不再发起新 LLM 请求
+
+    # auto（墙未到）：跑到自然停，零预算痕迹（原契约保持）
+    monkeypatch.setattr(
+        tool_loop_mod, "HARD_TOTAL_TIMEOUT_S", 3600.0
+    )
+    natural_result, natural_calls = await run_mode()
+    assert "budget_exhausted" not in natural_result
+    assert natural_result["status"] == "ok"
+    assert "[TURN BUDGET]" not in (natural_result.get("content") or "")
+    assert "[WALL APPROACHING]" not in str(natural_calls)
+    assert len(natural_calls) == 2  # 两轮请求都真的发生了
+    assert all(c["budget_deadline"] is None for c in natural_calls)
 
 
 async def test_auto_round_cap_hint_then_grace_then_force_close(

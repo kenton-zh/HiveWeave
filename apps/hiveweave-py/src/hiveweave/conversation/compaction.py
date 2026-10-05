@@ -477,6 +477,48 @@ async def resolve_compactor_callback(
         return None
 
 
+def warm_compaction_prefix(
+    agent_id: str | None, config
+) -> tuple[list[dict] | None, list | None]:
+    """批25 修复3（2026-10-05）：compaction_conversation / compaction_memory
+    通道的**已暖主前缀判定**。
+
+    复用 ``llm/streamer/context.py::warm_main_prefix_gate`` 同一个五重暖门
+    （开关 / 快照存在 / 同缓存域 / 新鲜度 / 前缀未改写 —— 开关即批23 的
+    ``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX`` 总开关）。候选前缀 =
+    快照 messages 自身（最后真实请求的 wire 形态，逐字节可命中主链路
+    前缀缓存）；``config`` 是 **compactor 实际模型的 ProviderConfig** ——
+    与快照（主链路模型身份）不同域（专用压缩模型 / failover 换模型）
+    ⇒ 门判冷 ⇒ 调用方维持旧行为（`[{user, prompt}]` 逐字节一致）。
+
+    Returns:
+        ``(prefix_messages, tools)``：暖 run 时 tools 一并同源回传
+        （快照的真实 tools —— 与批23「主链路同源工具表不换缓存域」同
+        纪律，``tools=None`` 的请求级工具表差异同样会换缓存域）；冷 run
+        返回 ``(None, None)``。best-effort：任何异常按冷 run 处理。
+    """
+    if not agent_id:
+        return None, None
+    try:
+        from hiveweave.services.cache_warmer import cache_warmer
+
+        snap = cache_warmer.latest_snapshot(agent_id)
+        snap_messages = (snap or {}).get("messages")
+        if not isinstance(snap_messages, list) or not snap_messages:
+            return None, None
+
+        from hiveweave.llm.streamer.context import warm_main_prefix_gate
+
+        prefix = warm_main_prefix_gate(agent_id, config, snap_messages)
+        if prefix is None:
+            return None, None
+        snap_tools = (snap or {}).get("tools")
+        return prefix, snap_tools if isinstance(snap_tools, list) else None
+    except Exception as e:  # noqa: BLE001 — 判定失败 = 冷 run，不影响压缩主流程
+        logger.warning("compaction_warm_prefix_gate_failed", error=str(e))
+        return None, None
+
+
 async def _call_compactor_llm(
     model: dict,
     prompt: str,
@@ -524,6 +566,28 @@ async def _call_compactor_llm(
     # 主链路前缀缓存（省压缩侧 input 钱），故同 session 而非关缓存。
     headers = config.build_headers(session_id=agent_id)
     budget = max_tokens if max_tokens is not None else SUMMARY_MAX_TOKENS_ESCALATED
+
+    # ⭐ 批25 修复3（2026-10-05）：compaction_conversation / compaction_memory
+    # 两通道接**已暖主前缀**（此前恒 `prefix_messages=None` ⇒ `[{user,prompt}]`
+    # 第 0 个 token 即偏离 ⇒ 全价，实测命中率 11.9-13.3% / 2.9-10.6%）。
+    # 五重暖门与 working_set 通道同源（`warm_main_prefix_gate`），开关复用
+    # 批23 的 HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX；判定失败/冷 run
+    # ⇒ 两参数维持 None ⇒ 请求与旧行为**逐字节一致**。tools 同源回传同理
+    # （不换缓存域）。显式传入的 prefix_messages / tools 永不覆盖（P1-2
+    # 既有契约不动）。
+    if prefix_messages is None and agent_id:
+        _warm_msgs, _warm_tools = warm_compaction_prefix(agent_id, config)
+        if _warm_msgs is not None:
+            prefix_messages = _warm_msgs
+            if not tools:
+                tools = _warm_tools
+                logger.info(
+                    "compaction_warm_prefix_attached",
+                    agent_id=agent_id,
+                    kind=kind,
+                    prefix_messages=len(_warm_msgs),
+                    tools=bool(tools),
+                )
 
     for attempt in (1, 2):
         # ⭐ P1-2（2026-09-21）：**带上主前缀**（`prefix_messages`）+ **真实 tools**。

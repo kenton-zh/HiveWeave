@@ -557,6 +557,11 @@ class MergeMixin:
                     "若你预期合并已发生：检查分支名与 worktree 状态"
                     "（git_worktree_list / git_worktree_status），"
                     "或向任务相关方确认。"
+                    # 批25 修复2b：补下一步精确处方 —— 最常见根因是改动
+                    # 还没落提交（0 ahead），checkpoint 后重试即可。
+                    "下一步：改动若尚未提交，先在该 worktree 里 "
+                    "git_worktree_checkpoint 生成提交，再重试 merge；"
+                    "若工作不在本分支，核对分支归属后再合并正确分支。"
                 ),
                 "branch": branch,
                 "ahead": 0,

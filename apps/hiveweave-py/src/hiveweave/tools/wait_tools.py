@@ -420,7 +420,12 @@ async def wait_on_tool(
             remedy=(
                 "修正在场的 ref（用 get_tasks / read_roster 查真实 id；"
                 "user 只认你发出过的 question 的 question_id）；"
-                "或删掉该条；若无物可等，直接停止输出即可 —— "
+                "或删掉该条。处方：等任务完成用 kind=task"
+                "（ref=任务 id/8 位短号，任务须存在且未终态）；"
+                "等他人先 ask/question 发问拿到 question_id，"
+                "再以 kind=user 等用户答复；"
+                "等自己命名的未来事件用 kind=fact（如 merge_landed）。"
+                "若无物可等，直接停止输出即可 —— "
                 "平台会按 done_slice 收口。"
             ),
         )

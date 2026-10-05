@@ -30,6 +30,7 @@ from .constants import (
     TOTAL_TIMEOUT_S,
     TRUNCATED_TOOL_CALL_ROUNDS_LIMIT,
     TURN_STREAM_CUT_GRACE_S,
+    WALL_APPROACH_PCT,
 )
 from .doom_loop import (
     BLOCKED_STALL_LIMIT,
@@ -132,6 +133,22 @@ def _round_fact_flags(
     except Exception:
         pass
     return flags
+
+
+def _report_budget_exhausted(agent_id: str) -> None:
+    """预算收口观测打点（best-effort，绝不影响收口主流程）。
+
+    批25 修复1b（auto 墙软着陆）新增第 5 处打点时，把本文件 5 处逐字节
+    同款的「try telemetry / except Exception: pass」收敛为单源 —— 空
+    catch 棘轮（test_silent_except_ratchet）不许净增、鼓励净降：
+    tool_loop.py 9 → 6（4 处打点收敛进本 helper，helper 自身留 1 处）。
+    """
+    try:
+        from hiveweave.services.telemetry import telemetry
+
+        telemetry.stream_budget_exhausted(agent_id)
+    except Exception:  # noqa: BLE001 — 打点失败不影响预算收口主流程
+        pass
 
 
 def _is_valid_json_arguments(arguments: Any) -> bool:
@@ -302,14 +319,15 @@ class ToolLoopMixin:
             if not base:
                 base = self._strip_placeholder(text_acc)
         if note is None:
-            # T16 增补（回合墙钟预算退役，09-30 钦定）：auto 分支已【不可达】
-            # —— auto 模式下 _run_tool_loop 不武装 hard_deadline，本函数的
-            # 全部调用点（轮间硬检查 / E14 force / 轮闸 / budget_cut /
-            # 工具批闸）在 auto 下均被跳过。保留文案仅为防旁路结果误入时
-            # 退化为 legacy 的 commit_turn 指引（auto 已下架 commit_turn）。
+            # T16 增补（回合墙钟预算退役，09-30 钦定）：auto 分支的常规
+            # 调用点（轮间硬检查 / E14 force / 轮闸 / budget_cut / 工具批闸）
+            # 在 auto 下均被跳过 —— 批25 修复1b（2026-10-05）新增的
+            # 「auto 绝对墙轮边界软着陆」成为该分支唯一常规入口（A 桶实测
+            # run 死于 core.py 外层 wait_for(HARD+30) 整杀，需在轮边界
+            # 优先 interrupted + 自动续跑而非 error）。
             from hiveweave.config import turn_exit_mode as _turn_exit_mode
 
-            if _turn_exit_mode() == "auto":  # pragma: no cover — dead in auto
+            if _turn_exit_mode() == "auto":
                 note = (
                     "[TURN BUDGET] Hard turn budget exhausted — all progress "
                     "so far is kept. This run is marked interrupted and the "
@@ -463,6 +481,9 @@ class ToolLoopMixin:
             loop_start + TOTAL_TIMEOUT_S if _turn_budget_armed else None
         )
         budget_hint_injected = False
+        # 批25 修复1a：墙前收口提示一次性（auto 与 legacy 都注入；
+        # [WALL APPROACHING] 只进请求副本不落库，同 [TURN BUDGET] 纪律）。
+        wall_hint_injected = False
         # pacing 提示一次性；记录注入轮次供 soft 提示做【同轮】去重 ——
         # 永久性压制会让 soft（临近硬截止的最后通牒）在默认常量下成死代码：
         # pacing（剩余<300s）恒早于 soft（剩余≤30s）触发，凡走到 soft 的
@@ -498,12 +519,7 @@ class ToolLoopMixin:
                     elapsed_s=round(now_mono - loop_start, 1),
                     tools=len(tool_history),
                 )
-                try:
-                    from hiveweave.services.telemetry import telemetry
-
-                    telemetry.stream_budget_exhausted(agent_id)
-                except Exception:
-                    pass
+                _report_budget_exhausted(agent_id)
                 if tool_history:
                     return self._budget_exhausted_result(
                         text_acc=text_acc,
@@ -526,6 +542,68 @@ class ToolLoopMixin:
                 _r["timeout_kind"] = "turn"
                 _r["timeout_ms"] = int((HARD_TOTAL_TIMEOUT_S + 30.0) * 1000)
                 return _r
+            # ── 批25 修复1b（2026-10-05）：auto 绝对墙轮边界软着陆 ──────
+            # auto 无回合预算（hard_deadline=None ⇒ 上块跳过），但 core.py
+            # 外层 wait_for(HARD+30) 仍会在 ~1740s 把 run 整杀成 error ——
+            # A 桶第四轮实测 33+10 条 run 全灭于该墙，下个 run 从头再来
+            # （跨 run 重读税）。修法：轮边界到达 100% 墙时优先软着陆
+            # （budget_exhausted → completion._t16_budget_stop → run 标
+            # interrupted + 延续唤醒自动续跑），赶在外层整杀之前返回。
+            # 约束：不武装 budget_deadline（不在流中途打断 LLM 请求，只在
+            # 轮边界）；无工具产出的 run 不在此软着陆（外层墙仍是兜底，
+            # 与 legacy 无产出 error 出口对称）。legacy 走上块原路，不动。
+            if (
+                hard_deadline is None
+                and tool_history
+                and now_mono >= loop_start + HARD_TOTAL_TIMEOUT_S
+            ):
+                log.warning(
+                    "stream_wall_soft_landing",
+                    agent_id=agent_id,
+                    round=round_num,
+                    elapsed_s=round(now_mono - loop_start, 1),
+                    tools=len(tool_history),
+                )
+                _report_budget_exhausted(agent_id)
+                return self._budget_exhausted_result(
+                    text_acc=text_acc,
+                    thinking_acc=thinking_acc,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num,
+                    last_usage=last_usage,
+                )
+            # ── 批25 修复1a（2026-10-05）：墙前收口提示（85% 墙）────────
+            # auto 与 legacy 都注入（安全疏导非回合预算）：legacy 的 E14/
+            # [TURN BUDGET] 提示全部挂在 _turn_budget_armed 下，auto 对
+            # 绝对墙完全盲视；且 legacy 这批提示指挥 commit_turn，本提示
+            # 只要求「收尾当前步、停止输出工具调用」，两种出口模式都成立。
+            # 一次性；只进请求副本（messages.append）不落库 —— 与 pacing/
+            # soft 提示同形态，无 _acc。
+            if (
+                not wall_hint_injected
+                and (now_mono - loop_start)
+                >= HARD_TOTAL_TIMEOUT_S * WALL_APPROACH_PCT
+            ):
+                wall_hint_injected = True
+                _wall_remaining_s = max(
+                    0, int(loop_start + HARD_TOTAL_TIMEOUT_S - now_mono)
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[WALL APPROACHING] 请求墙钟即将到顶"
+                        f"（剩余 ~{_wall_remaining_s}s）：立即收尾当前步并"
+                        "停止输出工具调用——平台会收口本 slice 并自动续跑，"
+                        "上下文不丢。"
+                    ),
+                })
+                log.info(
+                    "wall_approach_hint_injected",
+                    agent_id=agent_id,
+                    round=round_num,
+                    remaining_s=_wall_remaining_s,
+                )
             # E14 (复盘 P2) + 09-02 双触发修正：轮数线 OR 累计墙钟线——
             # 纯轮数线在现实预算下永不触发（07 实测 ~52s/轮，40 轮 ≈35min
             # >> 1710s 硬顶，.env 一度被调到 400 当静音），疏导两阶段
@@ -611,12 +689,7 @@ class ToolLoopMixin:
                     remaining_s=round(hard_deadline - now_mono, 1),
                     tools=len(tool_history),
                 )
-                try:
-                    from hiveweave.services.telemetry import telemetry
-
-                    telemetry.stream_budget_exhausted(agent_id)
-                except Exception:
-                    pass
+                _report_budget_exhausted(agent_id)
                 return self._budget_exhausted_result(
                     text_acc=text_acc,
                     thinking_acc=thinking_acc,
@@ -1060,12 +1133,7 @@ class ToolLoopMixin:
                     round=round_num,
                     tools=len(tool_history),
                 )
-                try:
-                    from hiveweave.services.telemetry import telemetry
-
-                    telemetry.stream_budget_exhausted(agent_id)
-                except Exception:
-                    pass
+                _report_budget_exhausted(agent_id)
                 return self._budget_exhausted_result(
                     text_acc=combined_text,
                     thinking_acc=combined_thinking,
@@ -1263,12 +1331,7 @@ class ToolLoopMixin:
                         tool_budget_s=round(tool_budget_s, 1),
                         discarded_tools=len(tool_calls),
                     )
-                    try:
-                        from hiveweave.services.telemetry import telemetry
-
-                        telemetry.stream_budget_exhausted(agent_id)
-                    except Exception:
-                        pass
+                    _report_budget_exhausted(agent_id)
                     return self._budget_exhausted_result(
                         text_acc=combined_text,
                         thinking_acc=combined_thinking,

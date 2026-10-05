@@ -27,7 +27,7 @@
     "llm/streamer/core.py": 1,
     "llm/streamer/http_stream.py": 7,
     "llm/streamer/tool_exec.py": 1,
-    "llm/streamer/tool_loop.py": 9,
+    "llm/streamer/tool_loop.py": 6,
     "main.py": 9,
     "realtime/channels.py": 2,
     "realtime/event_bus.py": 1,

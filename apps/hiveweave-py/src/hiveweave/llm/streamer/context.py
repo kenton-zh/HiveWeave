@@ -33,6 +33,85 @@ from .types import DeltaCallback
 log = structlog.get_logger(__name__)
 
 
+def warm_main_prefix_gate(
+    agent_id: str | None,
+    provider: ProviderConfig,
+    messages: list[dict],
+) -> list[dict] | None:
+    """批23 P1-9 五重暖门（批25 修复3 起为模块级**单源**）。
+
+    返回 ``messages``（原样透传作前缀）或 ``None``（冷 run ⇒ 调用方
+    维持旧行为）。判定门（任一不满足即 None）：
+
+    - **开关**：``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX``
+      （默认开，config.compaction_working_set_warm_prefix；批25 起
+      compaction_conversation / compaction_memory 通道复用同一开关）；
+    - **快照存在**：``cache_warmer.latest_snapshot`` —— 前缀来源 =
+      agent 每次真实请求收尾时 observe 的 wire 形态（agent.py）；
+    - **同缓存域**：快照的 model_id/base_url 与当前 provider 一致
+      （failover 换模型 / 专用 compactor 模型不同 ⇒ 换域 ⇒ 前缀必然
+      miss ⇒ 冷 run）；
+    - **新鲜度**：距上次真实请求 ≤ 协议缓存窗口
+      （``estimate_prompt_cache_ttl_ms``，与 cache_warmer 同源推断；
+      无 TTL 证据的协议（google 等）不判暖）；
+    - **前缀未被改写**：快照 messages 必须是当前 messages 的原样前缀
+      （逐字节）—— 主链路 prune/trim 改写过 ⇒ 前缀缓存早已在那个点
+      断掉，带全量前缀只会全价多付（不引入新改写点，宁可不带）。
+
+    消费方：``ContextMixin._warm_main_prefix_for_working_set``（working_set
+    通道）与 ``conversation/compaction.py::warm_compaction_prefix``
+    （compaction_conversation / compaction_memory 通道 —— 后者把快照
+    messages 自身作候选前缀传入，第 5 门退化为自比较恒过，语义即
+    「快照即最后真实请求的 wire 形态，逐字节可命中」）。
+
+    best-effort：任何异常按冷 run 处理（绝不影响压缩主流程）。
+    """
+    if not agent_id or not messages:
+        return None
+    try:
+        from hiveweave.config import settings
+
+        if not getattr(
+            settings, "compaction_working_set_warm_prefix", True
+        ):
+            return None
+        from hiveweave.services.cache_warmer import (
+            cache_warmer,
+            estimate_prompt_cache_ttl_ms,
+        )
+
+        snap = cache_warmer.latest_snapshot(agent_id)
+        if not snap:
+            return None
+        mc = snap.get("model_config") or {}
+        if (
+            str(mc.get("model_id") or "") != str(provider.model_name or "")
+            or str(mc.get("base_url") or "").rstrip("/")
+            != str(provider.base_url or "").rstrip("/")
+        ):
+            return None
+        ttl_ms = estimate_prompt_cache_ttl_ms(provider.api_format.value)
+        if ttl_ms is None:
+            return None
+        ts = snap.get("ts")
+        if not isinstance(ts, (int, float)):
+            return None
+        age_ms = (time.monotonic() - float(ts)) * 1000.0
+        if age_ms < 0 or age_ms > ttl_ms:
+            return None
+        snap_messages = snap.get("messages")
+        if not isinstance(snap_messages, list) or not snap_messages:
+            return None
+        if len(snap_messages) > len(messages):
+            return None
+        if messages[: len(snap_messages)] != snap_messages:
+            return None
+        return messages
+    except Exception as e:  # noqa: BLE001 — 判定失败 = 冷 run，不影响主流程
+        log.debug("working_set_warm_prefix_gate_failed", error=str(e))
+        return None
+
+
 # ── 批 D 第 2 步任务 5：旁路 LLM 调用的记账 ────────────────────────
 # 病灶（审计 §6 第 2 步④）：本模块两条旁路 client.post（工作集头摘要、
 # 收尾总结）整条不进 llm_usage —— Token 页/命中率对这两类流量全盲，
@@ -557,70 +636,15 @@ class ContextMixin:
         provider: ProviderConfig,
         messages: list[dict],
     ) -> list[dict] | None:
-        """批23 P1-9：working_set 摘要请求的**已暖主前缀判定**。
+        """批23 P1-9：working_set 摘要请求的**已暖主前缀判定**（委托门）。
 
-        返回 ``messages``（原样透传作前缀）或 ``None``（冷 run ⇒ 调用方
-        维持旧行为）。判定门（任一不满足即 None）：
-
-        - **开关**：``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX``
-          （默认开，config.compaction_working_set_warm_prefix）；
-        - **快照存在**：``cache_warmer.latest_snapshot`` —— 前缀来源 =
-          agent 每次真实请求收尾时 observe 的 wire 形态（agent.py）；
-        - **同缓存域**：快照的 model_id/base_url 与当前 provider 一致
-          （failover 换模型 ⇒ 换域 ⇒ 前缀必然 miss）；
-        - **新鲜度**：距上次真实请求 ≤ 协议缓存窗口
-          （``estimate_prompt_cache_ttl_ms``，与 cache_warmer 同源推断；
-          无 TTL 证据的协议（google 等）不判暖）；
-        - **前缀未被改写**：快照 messages 必须是当前 messages 的原样前缀
-          （逐字节）—— 本 run prune/trim 改写过 ⇒ 前缀缓存早已在那个点
-          断掉，带全量前缀只会全价多付（不引入新改写点，宁可不带）。
-
-        best-effort：任何异常按冷 run 处理（绝不影响压缩主流程）。
+        批25 修复3（2026-10-05）起判定体抽为模块级
+        :func:`warm_main_prefix_gate` 单源 —— compaction_conversation /
+        compaction_memory 两通道（``conversation/compaction.py``）复用
+        **同一个**五重暖门。本方法保留为 working_set 调用点（含测试）的
+        兼容入口，行为逐字节不变。
         """
-        if not agent_id or not messages:
-            return None
-        try:
-            from hiveweave.config import settings
-
-            if not getattr(
-                settings, "compaction_working_set_warm_prefix", True
-            ):
-                return None
-            from hiveweave.services.cache_warmer import (
-                cache_warmer,
-                estimate_prompt_cache_ttl_ms,
-            )
-
-            snap = cache_warmer.latest_snapshot(agent_id)
-            if not snap:
-                return None
-            mc = snap.get("model_config") or {}
-            if (
-                str(mc.get("model_id") or "") != str(provider.model_name or "")
-                or str(mc.get("base_url") or "").rstrip("/")
-                != str(provider.base_url or "").rstrip("/")
-            ):
-                return None
-            ttl_ms = estimate_prompt_cache_ttl_ms(provider.api_format.value)
-            if ttl_ms is None:
-                return None
-            ts = snap.get("ts")
-            if not isinstance(ts, (int, float)):
-                return None
-            age_ms = (time.monotonic() - float(ts)) * 1000.0
-            if age_ms < 0 or age_ms > ttl_ms:
-                return None
-            snap_messages = snap.get("messages")
-            if not isinstance(snap_messages, list) or not snap_messages:
-                return None
-            if len(snap_messages) > len(messages):
-                return None
-            if messages[: len(snap_messages)] != snap_messages:
-                return None
-            return messages
-        except Exception as e:  # noqa: BLE001 — 判定失败 = 冷 run，不影响主流程
-            log.debug("working_set_warm_prefix_gate_failed", error=str(e))
-            return None
+        return warm_main_prefix_gate(agent_id, provider, messages)
 
     async def _pressure_compact_if_needed(
         self,

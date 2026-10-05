@@ -142,8 +142,11 @@ class Settings(BaseSettings):
     # 全价重写长 transcript（实测 compaction_working_set 命中仅 33-43%）。
     # 开=工作集头摘要请求带逐字节一致的主前缀（命中缓存读 1/10 价）；
     # 关=回切旧行为（transcript 单消息）。判定细节见
-    # ``llm/streamer/context.py::_warm_main_prefix_for_working_set``：
+    # ``llm/streamer/context.py::warm_main_prefix_gate``：
     # 无快照/超缓存窗口/换缓存域/前缀被改写任一命中即视为冷 run 回旧行为。
+    # 批25 修复3（2026-10-05）：compaction_conversation / compaction_memory
+    # 两通道（conversation/compaction.py::_call_compactor_llm）复用本开关
+    # 与同一个暖门 —— 关=两通道回 `[{user,prompt}]` 旧行为。
     # HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX=0 关闭。
     compaction_working_set_warm_prefix: bool = True
 
