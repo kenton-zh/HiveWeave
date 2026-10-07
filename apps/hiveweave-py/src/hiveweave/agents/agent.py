@@ -1105,23 +1105,12 @@ class Agent:
 
             # ── Durable Run Ledger: create activation ──
             # Check for interrupted run from previous activation
-            interrupted_summary = None
-            interrupted_run_id = None
-            try:
-                prev_interrupted = await self._run_ledger.find_interrupted_run(self.id)
-                if prev_interrupted:
-                    interrupted_run_id = prev_interrupted["run_id"]
-                    interrupted_summary = await self._run_ledger.generate_checkpoint(
-                        self.id, interrupted_run_id
-                    )
-                    log.info(
-                        "run_ledger.found_interrupted",
-                        agent_id=self.id,
-                        interrupted_run_id=interrupted_run_id,
-                        summary_preview=interrupted_summary[:200],
-                    )
-            except Exception as e:
-                log.debug("run_ledger.check_interrupted_failed", error=str(e))
+            # 批26-A（回合收尾契约）：装载逻辑（含 freshness 守卫）提取为
+            # `_load_recovery_context` —— 陈旧中断 run 不再产出恢复简报，
+            # 判据与语义见该方法 docstring。
+            interrupted_run_id, interrupted_summary = (
+                await self._load_recovery_context()
+            )
 
             # ⭐ P1-5：承接判定**不在本函数求值** —— `interrupted_run_id` 只在这里
             # 派生（它同时要给下面的 `create_activation`），值本身必须在 `_run_llm`
@@ -3695,6 +3684,67 @@ class Agent:
             log.debug("resume_upstream_attempt_failed", agent_id=self.id,
                       interrupted_run_id=rid, error=str(e))
             return 0
+
+    async def _load_recovery_context(self) -> tuple[str | None, str | None]:
+        """装载「上一条中断 run」上下文：``(interrupted_run_id, checkpoint_summary)``。
+
+        批26-A（回合收尾契约设计收敛，第五轮诊断 C5 头号）：恢复简报让位于
+        **收口事实** —— 加 ``is_latest_run`` freshness 守卫（与 P1-5
+        ``_resume_upstream_attempt`` 同一判据、同一理由）。
+
+        ## 为什么必须守（芥末 s23-A667 实锤，DB 站在 agent 一边）
+
+        ``find_interrupted_run`` 只取「最新一条 interrupted」，而
+        ``status='interrupted'`` 全仓无人清除 ⇒ 一条陈旧中断 run 在其后每次
+        唤醒都会再次当选：芥末 10-05 11:20 一条 safety_timeout 中断 run 之后
+        又完成了 52 个 run，每次唤醒仍注入 ``[RUN RECOVERY]``（stub 计数到
+        「第 45 次」）。模型看到的是平台每次都宣称「上一回合未结束、继续」，
+        而其任务早已 closed、disposition=waiting_human、wait 有效 —— 控诉
+        「反复唤醒来自运行时收口判定，不来自我的动作缺口」成立。这是
+        「『未以用户消息结束』类续跑判定必须让位于停泊事实」不变式的 run 侧
+        落点：**中断历史一旦被后续成功 run 覆盖，就不再是续跑判据。**
+
+        ## 语义
+
+        - 中断 run 是本 agent **最新一行**（其后没有任何 run 被创建）⇒
+          正在续跑 ⇒ 生成 checkpoint 简报（行为与修前一致）。
+        - 其后已有新 run（上次中断已被成功续跑/收口）⇒ 陈旧历史 ⇒
+          ``summary=None``（不注入简报，stub 计数链随之消失）；
+          ``interrupted_run_id`` 仍返回 —— ``create_activation`` 照实记录
+          「唤醒时存在一条中断 run」（取证位），P1-5 承接判定自身有同款守卫。
+        - fail 方向：读失败 ⇒ 不注入。恢复简报只是提示性附加物，对话历史
+          本就在上下文里；误注入的代价 = 芥末式 45 连醒（本次病灶），
+          漏注入的代价 = 单次唤醒少一段摘要，两害相权取后者。
+
+        错误路径语义与提取前逐字一致：``find_interrupted_run`` 成功而
+        checkpoint 生成失败 ⇒ ``run_id`` 保留、``summary=None``；整体异常 ⇒
+        ``(None, None)``。
+        """
+        interrupted_summary: str | None = None
+        interrupted_run_id: str | None = None
+        try:
+            prev_interrupted = await self._run_ledger.find_interrupted_run(self.id)
+            if prev_interrupted:
+                interrupted_run_id = prev_interrupted["run_id"]
+                if await self._run_ledger.is_latest_run(self.id, interrupted_run_id):
+                    interrupted_summary = await self._run_ledger.generate_checkpoint(
+                        self.id, interrupted_run_id
+                    )
+                    log.info(
+                        "run_ledger.found_interrupted",
+                        agent_id=self.id,
+                        interrupted_run_id=interrupted_run_id,
+                        summary_preview=interrupted_summary[:200],
+                    )
+                else:
+                    log.info(
+                        "run_recovery_stale_skipped",
+                        agent_id=self.id,
+                        interrupted_run_id=interrupted_run_id,
+                    )
+        except Exception as e:
+            log.debug("run_ledger.check_interrupted_failed", error=str(e))
+        return interrupted_run_id, interrupted_summary
 
     async def _maybe_self_retrigger(self) -> None:
         """自检 re-trigger。

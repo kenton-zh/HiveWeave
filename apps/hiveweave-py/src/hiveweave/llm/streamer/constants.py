@@ -145,23 +145,40 @@ def continue_sentinel_text() -> str:
 
     ⚠ 哨兵文本进入请求前缀（cache key）：http_stream 与 cache_warmer
     重放**必须**同源调用本函数，勿各写一份文案（P1-3 教训）。
+
+    批26-A（回合收尾契约设计收敛）：auto 分支文案改为**形状真实**的机械
+    续跑陈述 —— 旧文案「The platform treats your work as still open, so
+    you are woken again to continue」是**状态盲**的断言：模型刚执行完
+    wait_on（合法停泊）后的必然续跑轮里，这句话与 DB 事实（wait 契约有
+    效/义务空）直接矛盾，模型既不能重登记（回执禁止重复 wait_on）、又不
+    被给出生路 ⇒ 在「如何结束回合」决策点上打转（Emitting 循环，单响应
+    烧满 128k 输出预算）。新文案：① 只陈述机械事实（尾非 user ⇒ 平台补
+    静态 user 尾）；② 明确「这不代表你的工作未收口」；③ 给出与停泊状态
+    无关的确定出口 —— 有余步就继续；已停泊/无事就输出收尾文本并停止
+    （平台自动收口）。legacy 分支逐字节不动（兼容约束：commit_turn 在
+    legacy 仍是合法出口信号，其 wire 形态不变）。
     """
     from hiveweave.config import turn_exit_mode
 
     if turn_exit_mode() == "auto":
-        finish = (
-            "finish outstanding steps, or park with "
-            'wait_on(refs=[{"kind": "task|agent|fact|user", "ref": "<id>"}]) '
-            "then stop (commit_turn is delisted in this mode; the platform "
-            "auto-closes the turn when you stop)"
+        return (
+            "[HiveWeave runtime] Mechanical continuation, not a new human "
+            "instruction: the request did not end with a user message (your "
+            "previous message ended with tool output), so the platform "
+            "appended this static tail. This does NOT mean your work is "
+            "unresolved. Consume the tool results above — if outstanding "
+            "steps remain, continue them; if you have already parked "
+            "(wait_on registered) or nothing is outstanding, reply with "
+            "your closing message and then stop (the platform auto-closes "
+            "the turn when you stop; commit_turn is delisted in this mode). "
+            "To park a still-open wait: "
+            'wait_on(refs=[{"kind": "task|agent|fact|user", "ref": "<id>"}]).'
         )
-    else:
-        finish = "finish outstanding steps or commit_turn"
     return (
         "[HiveWeave runtime] Re-invoking this turn: the request did not end with a "
         "user message (usually after tool/assistant output). The platform treats "
-        "your work as still open, so you are woken again to continue — "
-        f"{finish}. This is not a new human instruction."
+        "your work as still open, so you are woken again to continue — finish "
+        "outstanding steps or commit_turn. This is not a new human instruction."
     )
 
 
