@@ -287,8 +287,10 @@ async def test_merge_reattaches_unregistered_tree(tmp_path: Path):
             AsyncMock(return_value=True),
         ) as reattach,
         patch(
-            "hiveweave.services.git_worktree.service_merge._current_branch",
-            AsyncMock(return_value="hw/A056/work"),
+            # 批26-B：check 3 改走 `_current_branch_strict`（锚拒单列）——
+            # (branch, refusal) 二元组，refusal=None 表示非锚拒。
+            "hiveweave.services.git_worktree.service_merge._current_branch_strict",
+            AsyncMock(return_value=("hw/A056/work", None)),
         ),
     ):
         result = await svc._validate_merge_preconditions(

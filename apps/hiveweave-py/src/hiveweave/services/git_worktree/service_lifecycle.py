@@ -22,6 +22,7 @@ from .constants import (
     _create_locks_guard,
 )
 from .conflict_markers import _reject_if_markers_landed, scan_conflict_markers
+from .git_anchor import clear_gitdir_identity_if_gone, is_anchor_refusal
 from hiveweave.services.acl_sandbox.service import unlock_git_lockdown
 
 
@@ -263,6 +264,10 @@ class LifecycleMixin:
         if not ok and Path(path).exists():
             # Still on disk — just prune registration; we'll move the dir
             await _git(["worktree", "prune"], workspace_path)
+        # 批26-B（remove→clear 单点）：remove/prune 后 gitdir 确已消失 ⇒ 清旧
+        # 指纹，同路径重建不再被旧 `.id` 卡死（A673 的洞的另一面）。gitdir 仍在
+        # （husk）时不清 —— 防 TOFU 窗口，见 `git_anchor.clear_gitdir_identity_if_gone`。
+        clear_gitdir_identity_if_gone(workspace_path, path)
 
         q_root = Path(workspace_path) / QUARANTINE_DIR
         q_root.mkdir(parents=True, exist_ok=True)
@@ -423,6 +428,12 @@ class LifecycleMixin:
             )
             removed = False
 
+        # 批26-B（remove→clear 单点）：gitdir 确已消失 ⇒ 清旧指纹 —— 这是 A673
+        # 的洞的另一面：remove 只删 `<proj>/.git/worktrees/<name>`，同路径重建
+        # （新 inode）后旧 `.id` 仍在 ⇒ 平台对新树永久拒跑。gitdir 仍在（husk）
+        # 时不清（防 TOFU 窗口），见 `git_anchor.clear_gitdir_identity_if_gone`。
+        clear_gitdir_identity_if_gone(workspace_path, path)
+
         # ②/③ 分支处置 (分支不存在时 _dispose_branch 直接返回 None)
         preserved = await self._dispose_branch(workspace_path, target, discard)
 
@@ -551,6 +562,11 @@ class LifecycleMixin:
         Porcelain hints (callers distinguish dirty vs git-error):
         ``uncommitted_files`` (≤12 paths) and ``git_status_error``.
         ``has_uncommitted`` stays True when ``git status`` fails (fail-closed).
+
+        批26-B（A673 读侧单列）：信任锚拒跑（gitdir 指纹失配等）**不再**吞成
+        ``{success: True, status: None}``（那会被工具层渲染成 found=false）——
+        单列返回 ``{success: False, anchor_refused: True, status: None,
+        message: <拒因+TOFU 处方>}``。判定用 `git_anchor.is_anchor_refusal`。
         """
         path = await self._resolve_effective_worktree_path(
             workspace_path, short_id
@@ -561,6 +577,24 @@ class LifecycleMixin:
         ok, head = await _git(["rev-parse", "--short", "HEAD"], path,
                                project_root=workspace_path)
         if not ok:
+            if is_anchor_refusal(head):
+                # A673 读侧单列：锚拒 ≠ 「worktree 不存在」。吞成 status=None
+                # 曾让 git_worktree_status 渲染 found=false（还配误导文案）。
+                log.warning(
+                    "git_worktree.info_anchor_refused",
+                    short_id=short_id, path=path, reason=(head or "")[:200],
+                )
+                return {
+                    "success": False,
+                    "anchor_refused": True,
+                    "status": None,
+                    "message": (
+                        f"{head}\n"
+                        "（worktree status 因此不可用：这不是 found=false —— "
+                        "目录与注册可能都还在，也不要按「已拆除/无分支」处理；"
+                        "先按处方恢复锚。）"
+                    ),
+                }
             return {"success": True, "status": None}
 
         ok2, branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], path,

@@ -32,15 +32,20 @@ from .git_cmd import (
     _current_branch,
     _git,
     _resolve_base_branch,
+    git_worktree_add_recorded,
     merge_in_progress,
     unmerged_paths,
 )
+from .git_anchor import platform_worktree_gitdir, verify_gitdir_identity
 
 
 def _anchor_gitdir(project_root: str, worktree_path: str) -> str:
-    """与 `git_anchor.resolve_anchor` 同一派生规则（保持单点一致）。"""
-    return os.path.join(str(project_root), ".git", "worktrees",
-                        os.path.basename(os.path.realpath(worktree_path)))
+    """已收敛到 `git_anchor.platform_worktree_gitdir`（单点，批26-B / A673）。
+
+    派生规则只有一份（与 `resolve_anchor` 同源）：add→record / remove→clear
+    两个 choke point 都以它派生 gitdir，散落的私有副本曾被证明是漏录的温床。
+    """
+    return platform_worktree_gitdir(project_root, worktree_path)
 
 
 async def _worktree_registration(
@@ -800,11 +805,22 @@ Gemfile.lock -text
             await self._retire_worktree_config_carrier(
                 workspace_path, result["path"], short_id
             )
-            # 身份指纹（R4）：worktree gitdir 同样在**创建点**记录
-            from .git_anchor import record_gitdir_identity
-
-            record_gitdir_identity(_anchor_gitdir(workspace_path,
-                                                  result["path"]))
+            # 身份指纹（R4/A673 收口）：**记录**只发生在 add→record 单点
+            # （`git_worktree_add_recorded`，本函数内所有 add——含重建/迁移
+            # 分支——都走它）。此处只做**后置校验**，不再无条件重录：
+            # 重录会把「同路径被替换的假仓」在幂等路径（树已存在、无 add）
+            # 上 TOFU 洗白（旧代码 `record_gitdir_identity` 无条件记，一并封掉）。
+            # 失配 ⇒ loud error；恢复走 git_anchor docstring「运维逃生门」
+            # （删 <data_root>/git-anchor/<hash>.id，TOFU 重采纳）。
+            gid = _anchor_gitdir(workspace_path, result["path"])
+            mismatch = verify_gitdir_identity(gid)
+            if mismatch:
+                log.error(
+                    "git_worktree.create_identity_mismatch",
+                    short_id=short_id,
+                    git_dir=gid,
+                    reason=mismatch,
+                )
             self._schedule_sandbox_grant(workspace_path, result["path"], short_id)
         return result
 
@@ -1076,8 +1092,9 @@ Gemfile.lock -text
             )
         )
         if branch_exists:
-            ok, out = await _git(
-                ["worktree", "add", fwd_path, branch], workspace_path
+            # 批26-B（A673）：create 路径全部 add 走唯一出口，成功即重录指纹。
+            ok, out = await git_worktree_add_recorded(
+                workspace_path, path, [fwd_path, branch]
             )
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
@@ -1098,8 +1115,8 @@ Gemfile.lock -text
             if "already exists" in err_l:
                 _force_clear_path(path)
                 await _git(["worktree", "prune"], workspace_path)
-                ok2, out2 = await _git(
-                    ["worktree", "add", fwd_path, branch], workspace_path
+                ok2, out2 = await git_worktree_add_recorded(
+                    workspace_path, path, [fwd_path, branch]
                 )
                 if ok2:
                     log.info(
@@ -1127,13 +1144,14 @@ Gemfile.lock -text
         # Use -b (create) when branch was absent; -B only as last resort after
         # attach failed (e.g. branch locked by another worktree).
         flag = "-B" if branch_exists else "-b"
+        # 批26-B（A673）：add_args 不含前导 ["worktree", "add"] —— 单点出口补。
         attempts = [
-            ["worktree", "add", fwd_path, flag, branch, f"origin/{base_branch}"],
-            ["worktree", "add", fwd_path, flag, branch, base_branch],
-            ["worktree", "add", fwd_path, flag, branch, "HEAD"],
+            [fwd_path, flag, branch, f"origin/{base_branch}"],
+            [fwd_path, flag, branch, base_branch],
+            [fwd_path, flag, branch, "HEAD"],
         ]
         for args in attempts:
-            ok, out = await _git(args, workspace_path)
+            ok, out = await git_worktree_add_recorded(workspace_path, path, args)
             if ok:
                 log.info("git_worktree.create", short_id=short_id,
                          branch=branch, base=base_branch)
@@ -1154,8 +1172,8 @@ Gemfile.lock -text
             if "already exists" in err_l:
                 _force_clear_path(path)
                 await _git(["worktree", "prune"], workspace_path)
-                ok_att, out_att = await _git(
-                    ["worktree", "add", fwd_path, branch], workspace_path
+                ok_att, out_att = await git_worktree_add_recorded(
+                    workspace_path, path, [fwd_path, branch]
                 )
                 if ok_att:
                     log.info(

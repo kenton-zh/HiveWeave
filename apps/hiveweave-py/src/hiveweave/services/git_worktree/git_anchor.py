@@ -44,12 +44,18 @@ rev-parse --show-toplevel` 输出 `.vite`、`ls-files -d` 报出**全部** track
   故另记 `(st_dev, st_ino)`（NTFS 上 = 卷序列号 + 文件索引；**同路径重建必变**，
   平台重写 `config` **不变** —— 都实测过）到 `get_data_root()/git-anchor/`
   （**在项目 ACL 授权面之外** ⇒ agent 读不到也写不到），每次跑 git 前比对；不符 ⇒ 拒绝。
-  **创建点主动记录**（`service_create` 的 `git init` / `worktree add` 之后），TOFU 只兜
-  「本机制上线前就存在的项目」。
-  ⚠ **运维逃生门**：若 `.git` 是**用户**（而非 agent）删掉重建的，平台会持续拒绝 ——
-  删掉 `<data_root>/git-anchor/<hash>.id` 让平台下次重新采用即可；而「用户删掉 `.git`
-  让平台重建」这条恢复路本身是通的（`ensure_git_repo` 的 `git init` 会覆盖记录），
-  只有「`.git` 仍在（agent 造的）」才会持续拒绝。
+  **创建点主动记录**（批26-B 收口为**单点**：全库唯一的 `worktree add` 出口是
+  `git_cmd.git_worktree_add_recorded` —— add 成功即 `ensure_gitdir_recorded` 重录；
+  `git init` 后的主 gitdir 由 `service_create.ensure_git_repo` 记录），
+  TOFU 只兜「本机制上线前就存在的项目」。⚠ 曾经 reconcile 的 reattach 与
+  service_merge 的 husk repair 各自裸跑 `worktree add` 不重录 ⇒ gitdir 同路径
+  重建（新 inode）后指纹仍旧 ⇒ 平台在该树上永久拒跑（A673）。
+  ⚠ **运维逃生门（TOFU 重采纳）**：若 `.git` 是**用户**（而非 agent）删掉重建的，
+  平台会持续拒绝 —— 删掉 `<data_root>/git-anchor/<hash>.id` 让平台下次重新采用
+  即可（`anchor_for_git` 的指纹失配拒因里附了这个文件的**具体路径**）；而
+  「用户删掉 `.git` 让平台重建」这条恢复路本身是通的（`ensure_git_repo` 的
+  `git init` 会覆盖记录），只有「`.git` 仍在（agent 造的）」才会持续拒绝。
+  remove 侧对称收口：`clear_gitdir_identity_if_gone`（gitdir 确已消失才清旧指纹）。
 """
 
 from __future__ import annotations
@@ -62,6 +68,18 @@ import structlog
 from .constants import WORKTREE_DIR
 
 log = structlog.get_logger(__name__)
+
+# 批26-B（A673 读侧单列）：`_git` 的锚拒以 ``(False, 拒因)`` 返回，此前读侧
+# （`service_lifecycle.info` / `service_merge.preflight_merge`）把它吞成
+# status=None / worktree_detached ⇒ 「list 正常、status 说找不到、merge 说
+# detached」三读数互斥。拒因统一带本标记；读侧判定用 `is_anchor_refusal()`，
+# 与文案解耦。
+ANCHOR_REFUSED = "[anchor_refused]"
+
+
+def is_anchor_refusal(output: str | None) -> bool:
+    """`_git` 的失败输出是否为**信任锚拒跑**（≠ 命令真实失败 / detached 等）。"""
+    return output is not None and output.startswith(ANCHOR_REFUSED)
 
 
 @dataclass(frozen=True)
@@ -253,12 +271,17 @@ def anchor_for_git(cwd: str, project_root: str | None = None
     3. 只是**派生不出**（兄弟目录布局等）⇒ 退回不钉锚（= 修复前行为）+ 一条
        warning —— 拒绝会把合法布局一起打死（实测：`test_checkpoint_dirty_contract`
        的夹具就是这种布局）。
+
+    拒因一律带 **`ANCHOR_REFUSED` 机器可读标记**（批26-B / A673 读侧单列）：
+    读侧（info / merge dry-run）据此把「锚拒跑」与「worktree 不存在 /
+    detached HEAD」分开渲染——此前两层吞拒因，三读数互斥。判定用
+    `is_anchor_refusal()`，与文案解耦。
     """
     try:
         anchor = resolve_anchor(cwd, project_root)
     except AnchorRefusal as exc:
         log.warning("git_anchor_refused", cwd=str(cwd), reason=str(exc))
-        return None, f"git 拒绝执行（信任锚校验失败）：{exc}"
+        return None, f"{ANCHOR_REFUSED} git 拒绝执行（信任锚校验失败）：{exc}"
     except AnchorUnderivable as exc:
         log.warning("git_anchor_underivable", cwd=str(cwd), reason=str(exc))
         return None, None
@@ -267,7 +290,12 @@ def anchor_for_git(cwd: str, project_root: str | None = None
         if mismatch is not None:
             log.warning("git_anchor_identity_mismatch", cwd=str(cwd),
                         git_dir=anchor.git_dir, reason=mismatch)
-            return None, f"git 拒绝执行（gitdir 身份指纹不符）：{mismatch}"
+            return None, (
+                f"{ANCHOR_REFUSED} git 拒绝执行（gitdir 身份指纹不符）：{mismatch}"
+                f"\n处方（运维）：确认该 gitdir 重建来自人工/可信操作后，删除指纹"
+                f"文件 {_identity_file(anchor.git_dir)} 让平台下次重新采用"
+                f"（TOFU，见本模块 docstring「运维逃生门」）；agent 侧勿自行处理。"
+            )
     return anchor, None
 
 
@@ -353,3 +381,82 @@ def verify_gitdir_identity(git_dir: str) -> str | None:
         return None
     return (f"{git_dir} 的身份与平台记录不符（记录 {expected[0]}:{expected[1]} / "
             f"现实 {live[0]}:{live[1]}）—— 该 gitdir 已被删除并重建（同路径替换）")
+
+
+# ── add→record / remove→clear 单点（批26-B / A673 状态机收口）────────────
+# A673 根因链：gitdir 同路径重建（新 inode）→ 指纹文件仍录旧 inode →
+# `anchor_for_git` fail-closed 拒跑（正确）→ 读侧两层吞拒因（错误，已单列）。
+# 本组函数把**写侧**收成两个 choke point：
+#   · add→record：全库唯一的 `worktree add` 出口 `git_cmd.git_worktree_add_recorded`
+#     在 add 成功后调 `ensure_gitdir_recorded` —— 漏录在构造上不可能；
+#   · remove→clear：删除链确认 gitdir 消失后 `clear_gitdir_identity_if_gone`
+#     清旧指纹 —— 同路径重建不再被旧 `.id` 卡死（即使不走 add 单点的手工恢复）。
+# 运维逃生门（TOFU 重采纳）见本模块 docstring「运维逃生门」段。
+def platform_worktree_gitdir(project_root: str, worktree_path: str) -> str:
+    """平台 worktree 的 gitdir 派生 —— 与 `resolve_anchor` 同一规则（单点）。
+
+    `<proj>/.git/worktrees/<basename(realpath(worktree))>`。此前 `service_create`
+    私有一份 `_anchor_gitdir`，其余 add 调用点连派生都没有 ⇒ 想重录都无从下手。
+    """
+    return os.path.join(str(project_root), ".git", "worktrees",
+                        os.path.basename(os.path.realpath(worktree_path)))
+
+
+def ensure_gitdir_recorded(project_root: str, worktree_path: str, *,
+                           source: str = "") -> tuple[int, int] | None:
+    """**add→record 单点**：平台 `git worktree add` 成功后**必须**重录身份指纹。
+
+    为什么是单点（A673）：全库曾经只有 `service_create` 在 add 后记录，
+    `reconcile._try_reattach_worktree`（两处 add）与 `service_merge._auto_repair_husk`
+    都不重录 ⇒ gitdir 同路径重建（新 inode）后指纹仍旧 ⇒ 平台在该树上永久
+    fail-closed 拒跑。重建路径统一走 `git_worktree_add_recorded` 后，漏录在
+    构造上不可能（新 add 调用点**不许**直接 `_git(["worktree", "add", …])`）。
+
+    记录失败**不静默**（返回 None + error 日志）：下次 verify 会 TOFU 兜底
+    （同一目录同一身份），但连续出现即缺陷信号。
+    """
+    git_dir = platform_worktree_gitdir(project_root, worktree_path)
+    ident = record_gitdir_identity(git_dir)
+    if ident is None:
+        log.error(
+            "git_anchor_identity_record_missing_after_add",
+            git_dir=git_dir,
+            worktree=str(worktree_path),
+            source=source,
+            hint="worktree add succeeded but identity record failed; "
+                 "next verify will TOFU-adopt. Repeated occurrences = defect.",
+        )
+    return ident
+
+
+def clear_gitdir_identity(git_dir: str) -> bool:
+    """删除该 gitdir 的指纹记录（remove→clear 单点的底层；幂等）。
+
+    与 `ensure_gitdir_recorded` 配对：重建侧的 add→record 会覆盖旧 `.id`，
+    本函数负责删除侧**不留陈旧指纹**。运维 TOFU 重采纳删的也是这个文件
+    （`<data_root>/git-anchor/<hash>.id`）。
+    """
+    key = os.path.realpath(git_dir)
+    _IDENTITY_CACHE.pop(key, None)
+    try:
+        os.remove(_identity_file(git_dir))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("git_anchor_identity_clear_failed", git_dir=git_dir,
+                    error=str(exc)[:120])
+        return False
+
+
+def clear_gitdir_identity_if_gone(project_root: str, worktree_path: str) -> bool:
+    """**remove→clear 单点**：gitdir **确已消失**才清旧指纹。
+
+    ⚠ gitdir 还在（husk / 锁死残留）时**不清**：指纹仍是该目录身份的真相，
+    贸然清掉会制造一个 TOFU 窗口（期间 agent 若在同路径造假仓会被重新采用）
+    —— 与「平台不洗白篡改」同一纪律（create 幂等路径不重录，见 service_create）。
+    """
+    git_dir = platform_worktree_gitdir(project_root, worktree_path)
+    if os.path.exists(git_dir):
+        return False
+    return clear_gitdir_identity(git_dir)

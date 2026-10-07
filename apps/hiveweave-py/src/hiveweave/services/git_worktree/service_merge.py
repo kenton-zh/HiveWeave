@@ -30,9 +30,11 @@ from .service_lifecycle import _surface_husk_left
 from .git_identity import agent_identity_args
 from .git_cmd import (
     _current_branch,
+    _current_branch_strict,
     _git,
     _resolve_base_branch,
     _target_tip_short,
+    git_worktree_add_recorded,
     merge_in_progress,
     unmerged_paths,
 )
@@ -352,9 +354,11 @@ class MergeMixin:
                 f"aside manually), then retry.",
                 diagnostics,
             )
-        ok, out = await _git(
-            ["worktree", "add", path.replace("\\", "/"), branch],
-            workspace_path,
+        # 批26-B（A673 add→record 单点）：husk 重建的 add 走唯一出口，
+        # 成功后 gitdir 身份指纹必被重录 —— 否则同路径重建（新 inode）后
+        # 旧指纹仍在，修完 husk 平台反而对该树永久拒跑（A673 现场）。
+        ok, out = await git_worktree_add_recorded(
+            workspace_path, path, [path.replace("\\", "/"), branch]
         )
         if not ok:
             diagnostics["code"] = WT_HUSK_REPAIR_ADD_FAILED
@@ -509,7 +513,29 @@ class MergeMixin:
                         }
 
             # 3. Source must have a registered branch (not detached HEAD)
-            actual_branch = await _current_branch(path)
+            #    ⚠ A673 读侧单列：信任锚拒跑 ≠ detached HEAD —— `_current_branch`
+            #    把两者都折叠成 None，指纹失配曾被伪装成「无分支可合并」。
+            #    `_current_branch_strict` 把锚拒单列出来，单独成档（fail-closed）。
+            actual_branch, anchor_refusal = await _current_branch_strict(
+                path, workspace_path
+            )
+            if anchor_refusal:
+                log.warning(
+                    "git_worktree.merge_precondition_anchor_refused",
+                    short_id=short_id, path=path, branch=branch,
+                    reason=anchor_refusal[:200],
+                )
+                return {
+                    "success": False,
+                    "reason": "anchor_refused",
+                    "anchor_refused": True,
+                    "message": (
+                        f"Merge precondition failed: 信任锚拒绝在 worktree "
+                        f"{path} 上执行 git，无法读取分支状态 —— 这不是 "
+                        f"detached HEAD、也不是 worktree 丢失。{anchor_refusal}"
+                    ),
+                    "branch": branch,
+                }
             if not actual_branch:
                 log.warning(
                     "git_worktree.merge_precondition_detached_head",
@@ -617,8 +643,18 @@ class MergeMixin:
                             ),
                         })
                     else:
-                        actual = await _current_branch(path)
-                        if not actual:
+                        # A673 读侧单列：锚拒（gitdir 指纹失配等）此前在这里被
+                        # `_current_branch` 的 None 折叠成 worktree_detached。
+                        actual, anchor_refusal = await _current_branch_strict(
+                            path, workspace_path
+                        )
+                        if anchor_refusal:
+                            missing.append({
+                                "code": "anchor_refused",
+                                # 拒因文本自带 [anchor_refused] 标记与 TOFU 处方
+                                "message": anchor_refusal,
+                            })
+                        elif not actual:
                             missing.append({
                                 "code": "worktree_detached",
                                 "message": (
@@ -749,6 +785,7 @@ class MergeMixin:
                 workspace_path, short_id, branch, target_branch, precond,
                 skip_codes={
                     "worktree_husk", "worktree_unregistered", "worktree_detached",
+                    "anchor_refused",
                 },
             )
 
@@ -946,7 +983,7 @@ class MergeMixin:
                     workspace_path, short_id, branch, target_branch, precond,
                     skip_codes={
                         "worktree_husk", "worktree_unregistered",
-                        "worktree_detached",
+                        "worktree_detached", "anchor_refused",
                     },
                 )
 

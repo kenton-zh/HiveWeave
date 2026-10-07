@@ -5,7 +5,7 @@ import asyncio
 import os
 
 from .constants import GIT_TIMEOUT
-from .git_anchor import anchor_for_git
+from .git_anchor import anchor_for_git, ensure_gitdir_recorded, is_anchor_refusal
 
 
 async def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
@@ -146,16 +146,65 @@ def _git_sync(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT,
     return (r.returncode == 0), output
 
 
+async def git_worktree_add_recorded(
+    workspace_path: str, worktree_path: str, add_args: list[str]
+) -> tuple[bool, str]:
+    """`git worktree add` 的**全库唯一出口**（批26-B / A673：add→record 单点）。
+
+    add 成功 ⇒ **必须**重录该 worktree gitdir 的身份指纹
+    （`git_anchor.ensure_gitdir_recorded`）。此前只有 service_create 在 add 后
+    记录，`reconcile._try_reattach_worktree`（两处）与
+    `service_merge._auto_repair_husk` 都不记 ⇒ gitdir 同路径重建（新 inode）
+    后指纹仍旧 ⇒ 平台在该树上永久 fail-closed 拒跑一切 git（A673）。
+
+    ⚠ 新的 `worktree add` 调用点**不许**直接 `_git(["worktree", "add", …])`，
+    一律走本函数（`add_args` 不含前导 ``["worktree", "add"]``）。
+    """
+    ok, out = await _git(["worktree", "add", *add_args], workspace_path,
+                         project_root=workspace_path)
+    if ok:
+        ensure_gitdir_recorded(workspace_path, worktree_path,
+                               source="git_worktree_add_recorded")
+    return ok, out
+
+
+async def _current_branch_strict(
+    worktree_path: str, project_root: str | None = None
+) -> tuple[str | None, str | None]:
+    """`(branch, anchor_refusal)` —— 锚拒单列，不与 detached HEAD 折叠（A673 读侧）。
+
+    `_current_branch` 把「信任锚拒跑」与「detached HEAD」都折叠成 ``None`` ⇒
+    merge 前置校验把 gitdir 指纹失配伪装成 ``worktree_detached``（B5 取证）。
+    需要区分的读侧（`_validate_merge_preconditions` / `preflight_merge`）用本
+    函数：``refusal`` 非 None ⇒ 信任锚拒跑（branch 必为 None），调用方按
+    ``anchor_refused`` 单列透出；``refusal`` 为 None 且 branch 为 None ⇒ 才是
+    detached HEAD 等真实形态。
+    """
+    if project_root is not None:
+        ok, out = await _git(["rev-parse", "--abbrev-ref", "HEAD"],
+                             worktree_path, project_root=project_root)
+    else:
+        # 与 `_current_branch` 既有调用形态一致（测试里的 fake git 多为
+        # `(args, cwd)` 签名，多传 kwarg 会炸）。
+        ok, out = await _git(["rev-parse", "--abbrev-ref", "HEAD"],
+                             worktree_path)
+    if not ok and is_anchor_refusal(out):
+        return None, out
+    if ok and out and out.strip() != "HEAD":
+        return out.strip(), None
+    return None, None
+
+
 async def _current_branch(worktree_path: str) -> str | None:
     """worktree 实际检出的分支 (``git -C <path> rev-parse --abbrev-ref HEAD``)。
 
     幂等/解析的唯一事实来源: 路径还在, 就以检出分支为准, 不按入参
     重算 (重算名与检出分支可能脱钩)。detached HEAD 返回 None。
+    ⚠ 信任锚拒跑同样返回 None（签名 ``str | None`` 装不下拒因）；需要区分
+    锚拒与 detached 的调用方用 `_current_branch_strict`（A673 读侧单列）。
     """
-    ok, out = await _git(["rev-parse", "--abbrev-ref", "HEAD"], worktree_path)
-    if ok and out and out.strip() != "HEAD":
-        return out.strip()
-    return None
+    branch, _ = await _current_branch_strict(worktree_path)
+    return branch
 
 async def _resolve_base_branch(workspace_path: str) -> str | None:
     """merged 判定的基准分支: main → master 二级回退。"""

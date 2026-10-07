@@ -1649,6 +1649,14 @@ async def git_worktree_status_tool(
     await gwt.ensure_git_repo(workspace_path)
 
     result = await gwt.info(workspace_path, target_sid)
+    if result.get("anchor_refused"):
+        # 批26-B（A673 读侧单列）：信任锚拒跑 ≠ worktree 不存在。此前 info()
+        # 把锚拒吞成 status=None，本工具渲染成 found=false（还配「合并时会自动
+        # 拆除」的误导文案）⇒ list 正常 / status 说找不到 / merge 说 detached
+        # 三读数互斥。单列透出；拒因文本自带 [anchor_refused] 标记与 TOFU 处方。
+        return ToolResult.err(
+            str(result.get("message") or "anchor_refused")
+        )
     if not result.get("success"):
         return ToolResult.err(result.get("message", "Failed to get worktree status"))
 
@@ -1690,11 +1698,18 @@ async def git_worktree_status_tool(
         # 真合并必拆 worktree（service_merge 清理链），此前按 failed 报
         # 「No worktree found」会误导重建。对齐服务层 info() 的
         # success:True/status:None 语义，success + found=false token。
+        # 批26-B 文案订正（A673 现场取证）：原文案「若此前合并过，合并时会自动
+        # 拆除，无需重建」把 found=false 说成 merge 的必然副作用 —— 但树消失
+        # 还有「从未创建 / 被外部删除或损坏（含 gitdir 重建后信任锚拒跑）」两路，
+        # 一律"无需重建"会让 executor 对着丢失的树干等。改为分原因陈述 + 核对
+        # 处方，不再替调用方断言「工作已合并」。
         return ToolResult.ok(
             f"found=false — No worktree found for short_id={target_sid} "
             f"(expected path under .hiveweave/worktrees/{target_sid}/). "
-            "该 worktree 不存在——若此前合并过，合并时会自动拆除"
-            "(cleaned up)，无需重建。"
+            "常见原因：①该 agent 此前合并完成，平台已拆除 worktree（此时无需"
+            "重建）；②树从未创建；③树被外部删除或损坏。若你预期该树应当存在"
+            "（agent 仍有在途任务、或任务尚未合并），先用 git_worktree_list "
+            "核对全部 worktree，再按需重建 —— 不要凭本回执断定工作已合并。"
         )
     branch = info.get("branch") or "?"
     dirty = bool(info.get("has_uncommitted"))

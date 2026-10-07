@@ -109,8 +109,11 @@ async def test_auto_repair_husk_success(tmp_path, monkeypatch):
             "hiveweave.services.git_worktree.service_merge.shutil.rmtree",
             side_effect=lambda *a, **k: husk.rmdir(),
         ),
+        # 批26-B（A673）：husk 重建的 add 走 add→record 单点
+        # `git_worktree_add_recorded`，不再直接 `_git` —— patch 单点。
         patch(
-            "hiveweave.services.git_worktree.service_merge._git",
+            "hiveweave.services.git_worktree.service_merge."
+            "git_worktree_add_recorded",
             new=AsyncMock(return_value=(True, "added")),
         ) as git,
     ):
@@ -120,8 +123,9 @@ async def test_auto_repair_husk_success(tmp_path, monkeypatch):
     assert err is None
     assert not husk.exists()
     git.assert_awaited_once()
-    cmd = git.await_args.args[0]  # _git(args, cwd)
-    assert cmd[:2] == ["worktree", "add"]
+    ws_arg, path_arg, add_args = git.await_args.args
+    assert path_arg == str(husk)
+    assert add_args[:2] == [str(husk).replace("\\", "/"), branch]
 
 
 @pytest.mark.asyncio
@@ -158,8 +162,10 @@ async def test_auto_repair_husk_git_add_failure_returns_error(tmp_path):
             "hiveweave.services.git_worktree.service_merge.shutil.rmtree",
             side_effect=lambda *a, **k: husk.rmdir(),
         ),
+        # 批26-B（A673）：add 走单点，patch 单点（不再直接 _git）
         patch(
-            "hiveweave.services.git_worktree.service_merge._git",
+            "hiveweave.services.git_worktree.service_merge."
+            "git_worktree_add_recorded",
             new=AsyncMock(return_value=(False, "fatal: branch in use")),
         ),
     ):
@@ -180,14 +186,15 @@ async def test_merge_preconditions_husk_auto_repairs(tmp_path, monkeypatch):
 
     calls = {"n": 0}
 
+    async def fake_add_recorded(_ws, _path, _add_args):
+        # 批26-B（A673）：add 走单点 —— 模拟 add 成功：重建目录 + 出现 .git 文件
+        husk.mkdir(parents=True, exist_ok=True)
+        (husk / ".git").write_text("gitdir: x")
+        calls["n"] += 1
+        return True, ""
+
     async def fake_git(cmd, cwd):
         head = cmd[0] if cmd else ""
-        if head == "worktree" and len(cmd) >= 2 and cmd[1] == "add":
-            # 模拟 add 成功：重建目录 + 出现 .git 文件
-            husk.mkdir(parents=True, exist_ok=True)
-            (husk / ".git").write_text("gitdir: x")
-            calls["n"] += 1
-            return True, ""
         if head == "worktree" and len(cmd) >= 2 and cmd[1] == "list":
             return True, f"{husk}  {branch}"
         if head == "rev-parse":  # current_branch
@@ -202,6 +209,11 @@ async def test_merge_preconditions_husk_auto_repairs(tmp_path, monkeypatch):
             side_effect=lambda *a, **k: husk.rmdir() if husk.exists() else None,
         ),
         patch(
+            "hiveweave.services.git_worktree.service_merge."
+            "git_worktree_add_recorded",
+            new=AsyncMock(side_effect=fake_add_recorded),
+        ),
+        patch(
             "hiveweave.services.git_worktree.service_merge._git",
             new=AsyncMock(side_effect=fake_git),
         ),
@@ -210,8 +222,10 @@ async def test_merge_preconditions_husk_auto_repairs(tmp_path, monkeypatch):
             side_effect=lambda p: (Path(p) / ".git").exists(),
         ),
         patch(
-            "hiveweave.services.git_worktree.service_merge._current_branch",
-            new=AsyncMock(return_value=branch),
+            # 批26-B：check 3 改走 `_current_branch_strict`（锚拒单列）——
+            # (branch, refusal) 二元组；refusal=None = 非锚拒。
+            "hiveweave.services.git_worktree.service_merge._current_branch_strict",
+            new=AsyncMock(return_value=(branch, None)),
         ),
     ):
         result = await gwt._validate_merge_preconditions(

@@ -18,7 +18,12 @@ from .constants import (
     _TASK_BRANCH_RE,
     WT_HUSK_REPAIR_RM_LOCKED,
 )
-from .git_cmd import _current_branch, _git, _resolve_base_branch
+from .git_cmd import (
+    _current_branch,
+    _git,
+    _resolve_base_branch,
+    git_worktree_add_recorded,
+)
 from .naming import compute_branch_name
 from .paths import _has_git, _worktree_path
 
@@ -440,14 +445,17 @@ async def _try_reattach_worktree(
         current = await _current_branch(path)
         if current:
             branch = current
-    ok, out = await _git(
-        ["worktree", "add", "--force", fwd, branch], workspace_path
+    # 批26-B（A673 add→record 单点）：两处 add 都走 `git_worktree_add_recorded`
+    # —— 重建成功后 gitdir 身份指纹**必**被重录。旧指纹正是 A673 的洞：
+    # gitdir 同路径重建（新 inode）后指纹仍旧 ⇒ 平台在该树上永久拒跑。
+    ok, out = await git_worktree_add_recorded(
+        workspace_path, path, ["--force", fwd, branch]
     )
     if ok:
         return True
     # Branch may not exist — try creating from HEAD
-    ok2, out2 = await _git(
-        ["worktree", "add", "-b", branch, fwd, "HEAD"], workspace_path
+    ok2, out2 = await git_worktree_add_recorded(
+        workspace_path, path, ["-b", branch, fwd, "HEAD"]
     )
     if ok2:
         return True
