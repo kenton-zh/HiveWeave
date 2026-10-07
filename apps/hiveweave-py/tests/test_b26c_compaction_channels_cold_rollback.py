@@ -1,26 +1,29 @@
-"""批25 修复3（compaction 洼地 · 暖前缀扩通道）。
+"""批26 修复4：compaction 两通道暖前缀接线**回退**（批25 修复3 实测证伪）。
 
-批23 已给 working_set 通道接暖前缀（``warm_main_prefix_gate`` 五重暖门
-+ ``cache_warmer.latest_snapshot``）；compaction_conversation（实测命中
-11.9-13.3%）与 compaction_memory（2.9-10.6%）此前恒 ``prefix_messages=
-None`` ⇒ `[{user, prompt}]` 第 0 个 token 即偏离 ⇒ 全价。
+第五轮 d89 诊断结论（详见 ``llm/streamer/context.py::
+warm_main_prefix_gate`` docstring「批26 结论」）：
 
-修法：``_call_compactor_llm``（两通道唯一咽喉）在未显式传前缀时按
-**同一个**五重暖门判定，携带逐字节一致的主前缀 + 同源 tools（不换缓存
-域）。开关复用批23 的 ``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX``。
+1. conversation 通道：completion.py 的 P1-2 接线恒显式传
+   ``prefix_messages=[identity system]`` ⇒ 批25 的「仅当 prefix_messages
+   is None 才判暖」分支结构性死代码，主路径上暖门从未执行；
+2. memory 通道：暖门 attach 全量快照前缀的唯一干净样本 provider 端
+   cache_read=143 / inp=491861 —— 前缀逐字节同源也命中不了（opencode zen
+   免费档对非主链路请求形态的前缀缓存不生效）；
+3. 换域判冷（压缩模型≠主模型）不是主因：30/30 压缩行与主链路模型一致。
 
-契约（镜像 test_p1_9_working_set_warm_prefix 四约束）：
-① 有暖快照 ⇒ 两通道请求带逐字节一致前缀（+同源 tools）；
-② 冷 run（无快照/换模型域）⇒ 请求与旧行为逐字节一致；
-③ 显式传入的 prefix_messages / tools 永不覆盖（P1-2 既有契约不动）；
-④ 开关关闭 ⇒ 恒冷回旧行为。
+⇒ 请求侧救不了 ⇒ 拆除 ``warm_compaction_prefix`` 及 ``_call_compactor_llm``
+的接线，compaction_conversation / compaction_memory 恢复冷形态；
+**working_set 通道不受影响**（同一暖门 + 快照机制原样保留）。
 
-不测真实 provider 缓存行为（线上观测面），只测请求侧成因已消除。
+契约（可机检）：
+① 两通道 prefix_messages=None ⇒ 请求恒冷 `[{user, prompt}]`（即使有暖快照）；
+② 显式传入的 prefix_messages / tools 永不覆盖（P1-2 既有契约不动）；
+③ ``warm_compaction_prefix`` 已不存在（防复活）；
+④ 暖门本身健在且 working_set 消费方委托不变。
 """
 
 from __future__ import annotations
 
-import json
 from unittest.mock import patch
 
 import pytest
@@ -152,120 +155,111 @@ async def _call(prompt: str, *, agent_id=None, kind="conversation",
     return text, _CapturingClient.bodies
 
 
-# ── ① 有暖快照：两通道请求带逐字节一致前缀 ─────────────────────────
+# ── ① 两通道恢复冷形态（即使有暖快照也不带前缀）──────────────────────
 
 
 @pytest.mark.asyncio
-async def test_conversation_channel_warm_prefix_byte_identical():
+async def test_conversation_channel_is_cold_even_with_warm_snapshot():
+    """回退核心断言：暖快照在 ⇒ 请求仍与旧行为逐字节一致（接线已拆）。"""
     _arm_snapshot("a1", MESSAGES)
     prompt = "Create a concise anchored summary ... ## Conversation to summarize:\n..."
     text, bodies = await _call(prompt, agent_id="a1", kind="conversation")
     assert text == "summary text"
     assert len(bodies) == 1
     body = bodies[0]
-    assert body["messages"][: len(MESSAGES)] == MESSAGES, (
-        "compaction_conversation 前缀必须与主链路请求逐字节一致"
+    assert body["messages"] == [{"role": "user", "content": prompt}], (
+        "compaction_conversation 必须恢复冷形态（不带主前缀白烧 input）"
     )
-    assert len(body["messages"]) == len(MESSAGES) + 1
-    tail = body["messages"][-1]
-    assert tail["role"] == "user"
-    assert tail["content"] == prompt  # 摘要指令本身不变
-    # tools 同源回传（不换缓存域；与主链路 build_body 产物一致）
-    ref = _provider().build_body(
-        messages=MESSAGES, stream=False, tools=TOOLS
-    )
-    assert body.get("tools") == ref.get("tools")
-
-
-@pytest.mark.asyncio
-async def test_memory_channel_warm_prefix_byte_identical():
-    """compaction_memory 通道（memory.py / task_memory.py 的 kind=memory
-    路径同走 _call_compactor_llm 咽喉）同样带逐字节一致前缀。"""
-    _arm_snapshot("a2", MESSAGES)
-    prompt = "Condense the following memories ...\n- fact one"
-    text, bodies = await _call(prompt, agent_id="a2", kind="memory")
-    assert text == "summary text"
-    body = bodies[0]
-    assert body["messages"][: len(MESSAGES)] == MESSAGES
-    assert body["messages"][-1]["content"] == prompt
-
-
-# ── ② 冷 run：请求与旧行为逐字节一致 ───────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_cold_run_without_snapshot_keeps_old_shape():
-    prompt = "Condense memories"
-    text, bodies = await _call(prompt, agent_id="a3", kind="memory")
-    assert text == "summary text"
-    body = bodies[0]
-    assert body["messages"] == [{"role": "user", "content": prompt}]
     assert not body.get("tools")
 
 
 @pytest.mark.asyncio
-async def test_model_mismatch_is_cold():
-    """专用压缩模型 ≠ 主链路模型 ⇒ 换缓存域 ⇒ 冷 run（不带前缀白烧）。
-    快照（主链路 "m"）与 compactor 实际模型（"other"）不同域。"""
-    _arm_snapshot("a4", MESSAGES)
-    _, bodies = await _call(
-        "p",
-        agent_id="a4",
-        kind="memory",
-        model_dict={**_MODEL_DICT, "model_id": "other"},
-    )
-    assert bodies[0]["messages"] == [{"role": "user", "content": "p"}]
+async def test_memory_channel_is_cold_even_with_warm_snapshot():
+    _arm_snapshot("a2", MESSAGES)
+    prompt = "Condense the following memories ...\n- fact one"
+    text, bodies = await _call(prompt, agent_id="a2", kind="memory")
+    assert text == "summary text"
+    assert bodies[0]["messages"] == [{"role": "user", "content": prompt}]
 
 
 @pytest.mark.asyncio
-async def test_snapshot_model_mismatch_is_cold():
-    _arm_snapshot("a5", MESSAGES, model_id="other-model")
-    _, bodies = await _call("p", agent_id="a5", kind="conversation")
+async def test_cold_without_snapshot_keeps_old_shape():
+    text, bodies = await _call("p", agent_id="a3", kind="memory")
+    assert text == "summary text"
     assert bodies[0]["messages"] == [{"role": "user", "content": "p"}]
+    assert not bodies[0].get("tools")
 
 
-@pytest.mark.asyncio
-async def test_gateway_mismatch_is_cold():
-    _arm_snapshot("a6", MESSAGES, base_url="https://other.example/v1")
-    _, bodies = await _call("p", agent_id="a6", kind="conversation")
-    assert bodies[0]["messages"] == [{"role": "user", "content": "p"}]
-
-
-# ── ③ 显式 prefix 永不覆盖（P1-2 契约不动）─────────────────────────
+# ── ② 显式 prefix 永不覆盖（P1-2 契约不动）─────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_explicit_prefix_messages_never_overridden():
-    _arm_snapshot("a7", MESSAGES)
+    _arm_snapshot("a4", MESSAGES)
     explicit = [{"role": "user", "content": "explicit prefix"}]
     _, bodies = await _call(
-        "p", agent_id="a7", kind="conversation", prefix_messages=explicit
+        "p", agent_id="a4", kind="conversation", prefix_messages=explicit
     )
     body = bodies[0]
     assert body["messages"][: len(explicit)] == explicit
     assert len(body["messages"]) == len(explicit) + 1
 
 
-# ── ④ 开关关闭 ⇒ 恒冷（复用批23 总开关）────────────────────────────
+# ── ③ warm_compaction_prefix 已拆除（防复活）────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_env_switch_off_is_cold(monkeypatch):
-    from hiveweave.config import settings
+def test_warm_compaction_prefix_is_gone():
+    """批25 修复3 的接线函数不得复活（要接先推翻批26 诊断结论）。"""
+    import hiveweave.conversation.compaction as compaction_mod
 
-    _arm_snapshot("a8", MESSAGES)
-    monkeypatch.setattr(
-        settings, "compaction_working_set_warm_prefix", False
+    assert not hasattr(compaction_mod, "warm_compaction_prefix"), (
+        "warm_compaction_prefix 复活 ⇒ 必须先推翻批26 修复4 的诊断结论"
+        "（见 warm_main_prefix_gate docstring「批26 结论」）"
     )
-    _, bodies = await _call("p", agent_id="a8", kind="conversation")
-    assert bodies[0]["messages"] == [{"role": "user", "content": "p"}]
 
 
-# ── 暖门单源：两处消费走同一函数 ────────────────────────────────────
+def test_no_attach_wiring_in_throat():
+    """咽喉函数内不得再引用暖门 / attach 日志（AST 级防回归）。"""
+    import ast
+    import inspect
+
+    from hiveweave.conversation import compaction as compaction_mod
+
+    src = inspect.getsource(compaction_mod)
+    tree = ast.parse(src)
+    names = {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
+    assert "warm_compaction_prefix" not in names
+    assert "warm_main_prefix_gate" not in names
+    assert "compaction_warm_prefix_attached" not in src
+
+
+# ── ④ working_set 通道不受影响（暖门 + 委托健在）────────────────────
+
+
+def test_warm_gate_still_attaches_for_working_set():
+    """同一份快照 + 同域 provider ⇒ 暖门照常返回前缀（working_set 语义）。"""
+    from hiveweave.llm.streamer.context import warm_main_prefix_gate
+
+    _arm_snapshot("a5", MESSAGES)
+    provider = _provider("m")
+    # working_set 生产形态：messages 是当前主链路消息（快照是其前缀）
+    current = MESSAGES + [{"role": "user", "content": "next round"}]
+    assert warm_main_prefix_gate("a5", provider, current) is not None
+
+
+def test_warm_gate_still_cold_on_domain_mismatch():
+    from hiveweave.llm.streamer.context import warm_main_prefix_gate
+
+    _arm_snapshot("a6", MESSAGES)
+    provider = _provider("other-model")
+    current = MESSAGES + [{"role": "user", "content": "next round"}]
+    assert warm_main_prefix_gate("a6", provider, current) is None
 
 
 def test_warm_gate_is_single_source():
-    """批25 抽出的模块级暖门与 ContextMixin 方法同源（方法只委托）。"""
+    """批23 抽出的模块级暖门与 ContextMixin 方法同源（方法只委托）。"""
     import inspect
 
     from hiveweave.llm.streamer.context import (
@@ -277,5 +271,4 @@ def test_warm_gate_is_single_source():
         ContextMixin._warm_main_prefix_for_working_set
     )
     assert "warm_main_prefix_gate" in src
-    # 模块级函数可直接消费（compaction 通道入口）
     assert callable(warm_main_prefix_gate)

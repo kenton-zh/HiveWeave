@@ -86,7 +86,61 @@ DEDUP_WINDOW_MS = 30 * 60 * 1000  # 30 分钟
 
 RESOLVED_BY_TIMEOUT = "timeout"
 RESOLVED_BY_LIFECYCLE_STOP = "lifecycle_stop"
+# 批26 修复2（2026-10-07）：事实确认型问题的超时**不代答**来源标注。
+# question 沿用既有终态 timed_out（扫描面/幂等语义不变），仅 resolved_by
+# 换标注 + answer 置 NULL —— 不产出「已按推荐项确认」的假事实。
+RESOLVED_BY_UNANSWERED_FACT_CHECK = "unanswered_fact_check"
 _ADJUDICABLE_STATUSES = ("pending", "cancelled")
+
+# ── 批26 修复2：事实确认形态判据 ─────────────────────────────────
+# 病灶（第五轮两次假裁决）：QUESTION 超时自动裁决在「事实确认型问题」上
+# 替用户断言假事实（「已重启，继续」—— backend 根本没重启，agent 实测
+# 戳穿）。命中下列任一形态 ⇒ 超时**不代答**（见 adjudicate_question）：
+#   ① 问题文本以「是否 / 有没有 / 已经 / 已重启 / 已完成」开头；
+#   ② 问题文本包含「是否已」类（是否已重启 / 是否已完成 / 是否已经…）；
+#   ③ 选项本身是「是 / 否 / 已 / 未」二元确认形态（精确匹配，全选才命中
+#      —— 「是，立即重试」这类带后续内容的实选项不算）。
+_FACT_CHECK_Q_LEADS = ("是否", "有没有", "已经", "已重启", "已完成")
+_FACT_CHECK_Q_CONTAINS = ("是否已",)
+_FACT_CHECK_BINARY_OPTIONS = frozenset({"是", "否", "已", "未"})
+_OPTION_TRAILING_PUNCT = "。.！!？?，,"
+
+
+def _fact_check_option_label(option: Any) -> str:
+    """取选项的可比文本（label/text/value/option 优先，照 _default_option_text）。"""
+    if isinstance(option, dict):
+        for key in ("label", "text", "value", "option"):
+            val = option.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        return ""
+    return str(option).strip()
+
+
+def is_fact_check_question(question: str, options: Any = None) -> bool:
+    """该问题是否为「事实确认型」（超时平台不代答）。
+
+    问题文本或选项命中事实确认形态即算（二者独立触发，见模块级判据注释）。
+    保守定向：只认精确的二元确认选项与明确的中文确认问法，普通选择题
+    （A 方案 / B 方案）不受影响。
+    """
+    q = str(question or "").strip()
+    if q.startswith(_FACT_CHECK_Q_LEADS):
+        return True
+    if any(marker in q for marker in _FACT_CHECK_Q_CONTAINS):
+        return True
+    opts = options
+    if isinstance(opts, str):
+        opts = _parse_options_json(opts)
+    if not isinstance(opts, list) or len(opts) < 2:
+        return False
+    labels: list[str] = []
+    for o in opts:
+        label = _fact_check_option_label(o).rstrip(_OPTION_TRAILING_PUNCT)
+        if not label:
+            return False
+        labels.append(label)
+    return all(label in _FACT_CHECK_BINARY_OPTIONS for label in labels)
 
 
 class QuestionTimeout(Exception):
@@ -422,7 +476,14 @@ async def wake_question_waiters(
         return []
 
     qshort = qid[:8]
-    if resolved_by:
+    if resolved_by == RESOLVED_BY_UNANSWERED_FACT_CHECK:
+        # 批26 修复2：事实确认型超时 —— 等待者收「不代答」通知，不是裁决。
+        body = (
+            "[QUESTION UNANSWERED] 你 wait_on 等待的问题"
+            f"（question_id={qshort}…）为事实确认型，平台不代答；"
+            "相关等待已按超时释放，请基于实测继续，勿将本问题视为已确认。"
+        )
+    elif resolved_by:
         reason_label = (
             "无人值守超时"
             if resolved_by == RESOLVED_BY_TIMEOUT
@@ -506,6 +567,11 @@ async def adjudicate_question(
     pre-park 时并进复工 briefing=交接摘要）。``trigger_agent`` 额外唤醒
     agent 继续（仅触发 A——project 在跑时）。
 
+    批26 修复2：**事实确认型**问题（:func:`is_fact_check_question` 命中）
+    超时**不代答** —— 不产出「按推荐项已确认」的假事实；落 timed_out 终态
+    但 ``resolved_by='unanswered_fact_check'``、``answer=NULL``，提问者与
+    wait_on 等待者收 ``[QUESTION UNANSWERED]`` 通知（wake=1）。
+
     Returns 裁决摘要 dict；question 不存在/已收口/被并发抢先裁决 → None。
     """
     if reason not in (RESOLVED_BY_TIMEOUT, RESOLVED_BY_LIFECYCLE_STOP):
@@ -534,9 +600,21 @@ async def adjudicate_question(
     agent_id = str(rowd.get("agent_id") or "")
 
     options = _parse_options_json(rowd.get("options"))
-    if default_text is None:
-        default_text = _default_option_text(options)
-    chosen = default_text or "（无推荐项——视为未获用户输入）"
+    # 批26 修复2：事实确认型 ⇒ 超时**不代答**。沿用 timed_out 终态（触发
+    # A/B/恢复补票的扫描面与幂等语义不变 —— 终态行不会被再拾起，无人值守
+    # 流不会因新形态卡死），但 resolved_by 标注 unanswered_fact_check、
+    # answer 置 NULL：不产出任何「按推荐项已确认」的假事实。
+    fact_check = is_fact_check_question(str(rowd.get("question") or ""), options)
+    if fact_check:
+        chosen: str | None = None
+        answer_out: str | None = None
+        resolved_by_out = RESOLVED_BY_UNANSWERED_FACT_CHECK
+    else:
+        if default_text is None:
+            default_text = _default_option_text(options)
+        chosen = default_text or "（无推荐项——视为未获用户输入）"
+        answer_out = chosen
+        resolved_by_out = reason
     now_ms = int(time.time() * 1000)
 
     # rowcount 守卫：与用户回答 / 另一触发并发时只赢一方（同 disk-guard
@@ -545,7 +623,7 @@ async def adjudicate_question(
         "UPDATE questions SET status = 'timed_out', answer = ?, "
         "timed_out_at = ?, resolved_by = ? "
         "WHERE id = ? AND status IN ('pending', 'cancelled')",
-        [chosen, now_ms, reason, question_id],
+        [answer_out, now_ms, resolved_by_out, question_id],
     )
     updated = cur.rowcount
     await conn.commit()
@@ -565,7 +643,7 @@ async def adjudicate_question(
         await wake_question_waiters(
             project_id,
             question_id,
-            resolved_by=reason,
+            resolved_by=resolved_by_out,
             chosen=chosen,
             trigger=trigger_agent,
             skip_trigger_agent_ids=frozenset({agent_id}),
@@ -583,35 +661,49 @@ async def adjudicate_question(
         agent_id=agent_id,
         project_id=project_id,
         reason=reason,
-        chosen=chosen[:80],
+        resolved_by=resolved_by_out,
+        fact_check=fact_check,
+        chosen=(chosen or "")[:80],
     )
 
     # 可见出口 1：chat 面板留痕（提问当时就在这里问的，裁决也回这里）
     try:
         from hiveweave.services.chat_message import ChatMessageService
 
-        await ChatMessageService().save_message({
-            "agent_id": agent_id,
-            "role": "assistant",
-            "content": (
+        if fact_check:
+            chat_content = (
+                f"[QUESTION UNANSWERED] 提问「{preview}」为事实确认型，"
+                f"{reason_label}，平台不代答；相关等待已按超时释放，"
+                "请基于实测继续，勿将本问题视为已确认。"
+            )
+            chat_kind = "question_unanswered"
+        else:
+            chat_content = (
                 f"[QUESTION AUTO-RESOLVED] 提问「{preview}」{reason_label}，"
                 f"已按推荐项裁决继续：{chosen}（resolved_by={reason}）。"
                 "用户此后仍可补答，但该轮决定已按上述默认项生效。"
-            ),
+            )
+            chat_kind = "question_adjudicated"
+        await ChatMessageService().save_message({
+            "agent_id": agent_id,
+            "role": "assistant",
+            "content": chat_content,
             "is_streaming": False,
             "is_background": False,
             "is_read": True,
             "metadata": {
                 "source": "platform",
-                "kind": "question_adjudicated",
+                "kind": chat_kind,
                 "question_id": question_id,
-                "resolved_by": reason,
+                "resolved_by": resolved_by_out,
             },
         })
     except Exception as exc:  # noqa: BLE001 — 留痕失败不影响裁决
         log.warning("question.adjudicate_chat_failed", error=str(exc))
 
-    # 可见出口 2：实时广播（前端 pending 面板/OrgTree 即时刷新）
+    # 可见出口 2：实时广播（前端 pending 面板/OrgTree 即时刷新）。
+    # ⚠ type 恒为 question_adjudicated：前端 pending 面板靠它清未决行，
+    #   事实确认型的「不代答」也必须同样清面板 —— 差异只在 resolvedBy。
     try:
         from hiveweave.realtime.event_bus import status_event_bus
 
@@ -621,7 +713,7 @@ async def adjudicate_question(
             "projectId": project_id,
             "questionId": question_id,
             "question": preview,
-            "resolvedBy": reason,
+            "resolvedBy": resolved_by_out,
             "chosenDefault": chosen,
         }
         await status_event_bus.publish("lobby", event)
@@ -633,15 +725,25 @@ async def adjudicate_question(
         try:
             from hiveweave.services.inbox import InboxService
 
-            await InboxService().send_message(
-                from_agent_id="system",
-                to_agent_id=agent_id,
-                message=(
+            if fact_check:
+                inbox_body = (
+                    f"[QUESTION UNANSWERED] 提问「{preview}」为事实确认型"
+                    f"（{reason_label}），平台不代答；相关等待已按超时释放，"
+                    "请基于实测继续，勿将本问题视为已确认。"
+                )
+                inbox_type = "question_unanswered"
+            else:
+                inbox_body = (
                     f"[QUESTION AUTO-RESOLVED] 提问「{preview}」{reason_label}，"
                     f"已按推荐项裁决：{chosen}（resolved_by={reason}）。"
                     "如需改判，向用户说明后继续。"
-                ),
-                message_type="question_timeout",
+                )
+                inbox_type = "question_timeout"
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=agent_id,
+                message=inbox_body,
+                message_type=inbox_type,
                 wake=True,
             )
         except Exception as exc:  # noqa: BLE001
@@ -662,6 +764,7 @@ async def adjudicate_question(
         "agentId": agent_id,
         "projectId": project_id,
         "reason": reason,
+        "resolved_by": resolved_by_out,
         "chosen": chosen,
     }
 

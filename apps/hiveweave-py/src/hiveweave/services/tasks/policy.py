@@ -43,6 +43,19 @@ _DC_FIELD_SHAPE = {
     "test": "test_run:<attestationId>（平台机器验证，须绑定本任务）",
 }
 
+# 批26 修复1（2026-10-07）：可照抄回执模板 —— submit 首过率前置化。
+# 第五轮 submit 首过失败主拒因 = 「Delivery contract 回执未填齐」74+64 次；
+# 拒收回执里的 COPY-PASTE 处方实测有效（重交 22s 过），但**首次通过**才是
+# 摩擦。模板值（照抄槽位）**不得落在占位前缀上**（is_placeholder_text 同源
+# 自查，delivery_contract._PLACEHOLDER_LEADS）—— 旧 _DC_FIELD_SHAPE 的
+# `<…>` 形态本身就是占位前缀，照抄必被占位门二次拒收。
+# ⚠ 槽位记号用全角〈〉而非 ASCII <：占位门只认**开头**的 ASCII "<"，
+#   全角记号在句中不会被误判，模板值本身可安全通过占位自查。
+_DC_TEMPLATE_SUMMARY = "把〈改动对象〉改成〈效果〉，与预期的偏差〈说明〉"
+_DC_TEMPLATE_TEST = (
+    "test_run:〈用 bash(taskId=本任务) 跑完测试后，从 bash 回执整条复制的凭证 id〉"
+)
+
 # required_attestation_kinds 对未知 policy 的 fail-close 哨兵：不是真 kind，
 # 不下发（下发会教 agent 去找一个不存在的凭证）。
 _UNKNOWN_POLICY_SENTINEL = "_unknown_policy"
@@ -141,6 +154,15 @@ def format_submit_expectations(task: dict[str, Any] | None) -> str:
             f"'not_applicable_reason': '<为什么跑不了>'}}，并请协调者 "
             f"waive_attestation 正式豁免 —— 未豁免的 not_applicable 不放行。"
             f"非代码交付显式 contractWaived=true，不要静默省略。"
+        )
+        # 批26 修复1：可照抄模板与上面的契约段合并在**同一个** [SUBMIT
+        # CONTRACT] 块内（不另起段落 ⇒ dispatch/claim 的整块去重仍然有效，
+        # 不会出现两段契约区）。
+        lines.append(
+            "- 可照抄回执模板（把〈槽位〉换成本任务真实值，其余原样提交——"
+            f'提交界面的模板照此填）：deliveryContract={{"summary": '
+            f'"{_DC_TEMPLATE_SUMMARY}", "test": "{_DC_TEMPLATE_TEST}"}}。'
+            "摘要必须写真实改动，凭证 id 以 bash 回执为准；只抄结构不抄槽位。"
         )
     lines.append(
         "- 无法满足时不要硬试：让协调者 waive_attestation(taskId, "

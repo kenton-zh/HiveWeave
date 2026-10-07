@@ -161,6 +161,62 @@ def test_format_kinds_and_contract_combined():
     assert "deliveryContract" in block
 
 
+# ── 批26 修复1：可照抄回执模板（submit 首过率前置化）────────────────
+
+
+def test_format_renders_copy_paste_template_for_dc_tasks():
+    """有 delivery 契约 ⇒ 下发块必须带**可照抄**的回执模板。
+
+    第五轮 submit 首过失败主拒因 = 「Delivery contract 回执未填齐」
+    74+64 次；模板前置到派单/认领时刻（本块随 P1-7 钉进任务卡与 claim
+    回显），不再等 submit 被拒才见处方。
+    """
+    block = format_submit_expectations(
+        _task(contract={"slice_type": "delivery_contract", "id": "dc-t1"})
+    )
+    assert "可照抄回执模板" in block
+    # 模板与契约段合并在同一个 [SUBMIT CONTRACT] 块内（不另起段落，
+    # dispatch/claim 侧的整块去重 `block not in description` 仍有效）
+    assert block.count("[SUBMIT CONTRACT]") == 1
+    # summary / test 两个槽位都在模板里（REQUIRED_REPLY_FIELDS 全覆盖）
+    from hiveweave.services.tasks.policy import (
+        _DC_TEMPLATE_SUMMARY,
+        _DC_TEMPLATE_TEST,
+    )
+
+    assert _DC_TEMPLATE_SUMMARY in block
+    assert _DC_TEMPLATE_TEST in block
+    assert "test_run:" in _DC_TEMPLATE_TEST
+
+
+def test_template_values_pass_placeholder_self_check():
+    """模板值不得落在占位前缀上 —— 照抄模板不能被占位门二次拒收。
+
+    旧 _DC_FIELD_SHAPE 的 `<…>` 形态本身就是占位前缀（is_placeholder_text
+    判 True），照抄必被 submit 占位门打回 —— 本测试锁死「模板值自查过
+    占位门」这条契约（与 delivery_contract._PLACEHOLDER_LEADS 同源）。
+    """
+    from hiveweave.services.delivery_contract import is_placeholder_text
+    from hiveweave.services.tasks.policy import (
+        _DC_TEMPLATE_SUMMARY,
+        _DC_TEMPLATE_TEST,
+    )
+
+    assert is_placeholder_text(_DC_TEMPLATE_SUMMARY) is False, (
+        "summary 模板值落在占位前缀上 ⇒ 照抄即被二次拒收"
+    )
+    assert is_placeholder_text(_DC_TEMPLATE_TEST) is False, (
+        "test 模板值落在占位前缀上 ⇒ 照抄即被二次拒收"
+    )
+
+
+def test_template_absent_without_delivery_contract():
+    """无 dc 契约（纯 kind 门 / 软策略）⇒ 不渲染模板（没得填的东西）。"""
+    block = format_submit_expectations(_task(policy_id="generic_tests"))
+    assert "可照抄回执模板" not in block
+    assert format_submit_expectations(_task()) == ""
+
+
 # ── 注入点集成（期望必须真的随 claim 下发）──────────────────
 
 

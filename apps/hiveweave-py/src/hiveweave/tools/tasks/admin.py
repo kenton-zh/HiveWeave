@@ -205,6 +205,141 @@ async def unclaim_task_tool(
     )
 
 
+# ── remove_task_dependency（批26 修复3：depends_on 摘边）──────────
+
+
+class RemoveTaskDependencyParams(BaseModel):
+    """Parameters for remove_task_dependency tool."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    task_id: str = Field(
+        alias="taskId",
+        description="The task whose dependency edge should be removed.",
+        json_schema_extra={"aliases": ["taskId", "task_id", "id"]},
+    )
+    dep_task_id: str = Field(
+        alias="depTaskId",
+        description=(
+            "The dependency edge to remove: the task id this task wrongly "
+            "depends on (full id or unique short prefix)."
+        ),
+        json_schema_extra={
+            "aliases": [
+                "depTaskId", "dep_task_id", "dependency", "dependencyTaskId",
+                "dependency_task_id", "removeDependency", "remove_dependency",
+                "dep", "edge",
+            ]
+        },
+    )
+    reason: str = Field(
+        default="",
+        description="Optional audit note (e.g. 'cycle a↔b built by mistake').",
+    )
+
+
+@tool(
+    "remove_task_dependency",
+    "Remove a wrongly-created depends_on edge from a task (task creator or "
+    "CEO only). Use when a dependency was built wrong (cycle / dead "
+    "dependency) — the platform has no other edge-removal path, and a bad "
+    "edge otherwise parks the task forever. Idempotent: removing an edge "
+    "that does not exist succeeds as a no-op. If the task was blocked only "
+    "on dependencies, it auto-unblocks and the assignee is woken.",
+    requires_workspace=False,
+    security_level="standard",
+)
+async def remove_task_dependency_tool(
+    params: RemoveTaskDependencyParams, agent_id: str, workspace: str
+) -> ToolResult:
+    """摘除建错的 depends_on 边（creator / CEO 专用，幂等）。"""
+    project_id = await _helpers.get_project_id(agent_id)
+    if not project_id:
+        return ToolResult.err(f"Agent {agent_id} has no project")
+
+    ts = _task_svc.TaskService()
+    try:
+        task = await ts.get_task(project_id, params.task_id)
+    except Exception:
+        task = None
+    if not task:
+        return ToolResult.err(f"Task not found: {params.task_id}")
+
+    # 权限门：仅任务 creator 或 CEO（batch26 修复3 钦定）。
+    if agent_id != str(task.get("creator_id") or ""):
+        from hiveweave.services.org import OrgService
+        from hiveweave.services.policy import infer_role_family
+
+        me = await OrgService().resolve_agent(agent_id)
+        family = infer_role_family(me or {})
+        if family != "ceo":
+            return ToolResult.err(
+                "拒绝摘边：只有任务 creator 或 CEO 可以摘除 depends_on 边"
+                f"（你的角色={family or 'unknown'}，creator="
+                f"{str(task.get('creator_id') or '')[:8]}…）。"
+                "请让 creator 或 CEO 执行；等人等待请用 wait_on(kind=agent)，"
+                "不要用依赖边表达。"
+            )
+
+    try:
+        info = await ts.remove_dependency_edge(
+            project_id, params.task_id, params.dep_task_id,
+            removed_by=agent_id,
+        )
+    except ValueError as e:
+        return ToolResult.err(str(e))
+    except Exception as e:
+        return ToolResult.err(f"Failed to remove dependency: {e}")
+
+    if not info.get("removed"):
+        return ToolResult.ok(
+            f"Dependency {params.dep_task_id} is not in task {params.task_id}'s "
+            f"depends_on (idempotent no-op). Current depends_on="
+            f"{info.get('depends_on') or []}, status={info.get('status')}."
+        )
+
+    output = (
+        f"Dependency edge {params.dep_task_id} removed from task "
+        f"{params.task_id} (remaining depends_on={info.get('depends_on') or []})."
+    )
+    if info.get("unblocked"):
+        output += " Task auto-unblocked (no unmet dependency remains)."
+        assignee = str(task.get("assignee_id") or "").strip()
+        if assignee and assignee != agent_id:
+            try:
+                from hiveweave.agents.trigger import trigger_subordinate
+                from hiveweave.services.inbox import InboxService
+
+                await InboxService().send_message(
+                    "system",
+                    assignee,
+                    (
+                        f"[DEPENDENCY EDGE REMOVED] 任务 {params.task_id[:8]} "
+                        f"「{str(task.get('title') or '')[:60]}」的一条依赖边"
+                        "已被摘除，阻塞解除。请继续推进并 submit_task。"
+                    ),
+                    message_type="system",
+                    priority="urgent",
+                    task_id=params.task_id,
+                    wake=True,
+                )
+                await trigger_subordinate(assignee)
+                output += " Assignee woken."
+            except Exception as e:
+                log.warning("remove_dependency_wake_failed", error=str(e))
+    else:
+        cur_status = str(info.get("status") or "")
+        if cur_status == "blocked":
+            output += (
+                " Task remains blocked (still-waiting timer/person wait, "
+                "remaining unmet dependency, or VERIFY serialization) — "
+                "reconcile keeps managing it."
+            )
+        else:
+            output += f" Task status={cur_status}."
+    return ToolResult.ok(output)
+
+
 # ── reassign_task ────────────────────────────────────────
 
 

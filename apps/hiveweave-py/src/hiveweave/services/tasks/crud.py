@@ -433,6 +433,95 @@ class CrudMixin:
             log.warning("apply_depends_on_wait_meta_failed", task_id=task_id, error=str(e))
         return True
 
+    async def remove_dependency_edge(
+        self, project_id: str, task_id: str, dep_ref: str, *,
+        removed_by: str | None = None,
+    ) -> dict:
+        """摘除一条 depends_on 边（批26 修复3：死依赖/循环依赖的平台账）。
+
+        病灶（d89 三条取消单）：依赖边建错（循环 / 死依赖）后平台不支持
+        摘除，只能整单 cancel 重铸。本入口做**最小摘边**：
+
+        - **幂等**：边不存在（或任务本无依赖）⇒ ``removed=False`` 原样
+          返回，不报错、不改动、不触发状态机；
+        - **重算 blocked**：摘除后任务仍 blocked 且 ``wait_kind ∈
+          ('', 'dependency')`` 且剩余依赖全部满足（或已为空）⇒ 自动
+          unblock（对齐 ``reconcile_blocked_tasks`` 的 deps_met 语义；
+          timer / user / external 等待另有关口，摘边**不**提前放行）；
+        - **不校验循环**：摘边只会减少边，不引入新依赖（建边侧
+          ``apply_depends_on`` / ``block_task`` 已有自依赖/校验门）。
+
+        Returns ``{removed, idempotent, unblocked, depends_on, status}``。
+        未知任务/未知 dep ref 语义：任务不存在抛 ValueError；dep ref 解析
+        不到真实任务按原样匹配（幂等摘不存在的边 = no-op）。
+        """
+        from .lifecycle import _same_task_id
+
+        task_id = await self.require_task_id(project_id, task_id)
+        row = await self.get_task(project_id, task_id)
+        if not row:
+            raise ValueError(f"Task not found: {task_id}")
+        deps = self._depends_on_list(row.get("depends_on"))
+        dep_id = (
+            await self.resolve_task_id(project_id, str(dep_ref or "").strip())
+            or str(dep_ref or "").strip()
+        )
+        remaining = [d for d in deps if not _same_task_id(d, dep_id)]
+        if len(remaining) == len(deps):
+            # 幂等：边不存在 ⇒ no-op 成功（不写行、不触发状态机）
+            return {
+                "removed": False,
+                "idempotent": True,
+                "unblocked": False,
+                "depends_on": deps,
+                "status": row.get("status"),
+            }
+        now_ms = int(time.time() * 1000)
+        await _execute(
+            project_id,
+            "UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?",
+            [json.dumps(remaining) if remaining else None, now_ms, task_id],
+        )
+        try:
+            await self.emit_task_event(
+                project_id,
+                task_id,
+                "dependency_removed",
+                agent_id=removed_by,
+                summary=(
+                    f"[dependency_removed] edge → {str(dep_ref)[:12]} removed"
+                    f" from task {task_id[:8]} (remaining={len(remaining)})"
+                ),
+            )
+        except Exception as e:
+            log.warning(
+                "remove_dependency_event_failed", task_id=task_id, error=str(e)
+            )
+        unblocked = False
+        st = (row.get("status") or "").lower()
+        wk = (row.get("wait_kind") or "").lower()
+        if st == "blocked" and wk in ("", "dependency"):
+            unmet = await self.unmet_depends_on(project_id, remaining)
+            if not unmet:
+                try:
+                    await self.unblock_task(project_id, task_id)
+                    unblocked = True
+                except Exception as e:  # noqa: BLE001 — VERIFY 串行占用等
+                    # 保持 blocked，回执层如实透出（不静默假装解锁）
+                    log.warning(
+                        "remove_dependency_unblock_failed",
+                        task_id=task_id,
+                        error=str(e),
+                    )
+        after = await self.get_task(project_id, task_id)
+        return {
+            "removed": True,
+            "idempotent": False,
+            "unblocked": unblocked,
+            "depends_on": remaining,
+            "status": (after or {}).get("status") or row.get("status"),
+        }
+
     async def find_task_by_slice_id(
         self, project_id: str, slice_id: str
     ) -> dict | None:

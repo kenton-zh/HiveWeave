@@ -1785,6 +1785,24 @@ TOOL_PARAM_SCHEMAS: dict[str, dict] = {
         },
         "required": ["taskId"],
     },
+    "remove_task_dependency": {
+        "description": (
+            "Remove a depends_on edge from a task you created (creator only; "
+            "CEO exempt). For dead/cyclic dependencies that would otherwise "
+            "leave the task permanently blocked — the platform cannot remove "
+            "edges any other way. Idempotent: removing a non-existent edge "
+            "succeeds as no-op. After removal the platform re-evaluates the "
+            "task's blocked state and wakes the assignee when it unblocks."
+        ),
+        "properties": {
+            "taskId": {"type": "string", "aliases": ["task_id", "id"],
+                "description": "The task whose dependency edge is removed."},
+            "dependencyTaskId": {"type": "string",
+                "aliases": ["dependency_task_id", "dependsOnTaskId", "depends_on_task_id"],
+                "description": "The dependency task id (full id or unique prefix) to remove from the task's depends_on."},
+        },
+        "required": ["taskId", "dependencyTaskId"],
+    },
     "update_progress": {
         "description": "Set task progress 0-100. Does not change status.",
         "properties": {

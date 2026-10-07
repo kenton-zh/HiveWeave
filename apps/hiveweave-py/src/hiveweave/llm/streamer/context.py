@@ -44,8 +44,9 @@ def warm_main_prefix_gate(
     维持旧行为）。判定门（任一不满足即 None）：
 
     - **开关**：``HIVEWEAVE_COMPACTION_WORKING_SET_WARM_PREFIX``
-      （默认开，config.compaction_working_set_warm_prefix；批25 起
-      compaction_conversation / compaction_memory 通道复用同一开关）；
+      （默认开，config.compaction_working_set_warm_prefix；批25 一度
+      让 compaction_conversation / compaction_memory 通道复用，批26
+      回退后仅 working_set 通道消费本门）；
     - **快照存在**：``cache_warmer.latest_snapshot`` —— 前缀来源 =
       agent 每次真实请求收尾时 observe 的 wire 形态（agent.py）；
     - **同缓存域**：快照的 model_id/base_url 与当前 provider 一致
@@ -59,10 +60,32 @@ def warm_main_prefix_gate(
       断掉，带全量前缀只会全价多付（不引入新改写点，宁可不带）。
 
     消费方：``ContextMixin._warm_main_prefix_for_working_set``（working_set
-    通道）与 ``conversation/compaction.py::warm_compaction_prefix``
-    （compaction_conversation / compaction_memory 通道 —— 后者把快照
-    messages 自身作候选前缀传入，第 5 门退化为自比较恒过，语义即
-    「快照即最后真实请求的 wire 形态，逐字节可命中」）。
+    通道）。批25 修复3 曾把 compaction_conversation / compaction_memory
+    两通道（``conversation/compaction.py``）也接上来，批26 修复4 已回退
+    （见下「批26 结论」）。
+
+    **批26 结论（2026-10-07，d89 第五轮库 + backend 日志诊断）——为何
+    本门对 compaction 类型结构上无效（后人勿再接）：**
+
+    1. **conversation 通道：门是结构性死代码。** completion.py 的 P1-2
+       接线恒显式传 ``prefix_messages=[identity system]`` + tools 进
+       append_turn → … → compact → ``_call_compactor_llm``，而批25 接线
+       只在 ``prefix_messages is None`` 时判暖 ⇒ 主路径上暖门**从未执行**。
+       实测（d89，30 行压缩样本）命中恰好 = 身份提示大小且 per-agent 恒定
+       （space-bunny cr=128-142 / longcat cr=32512-35840），其余全价。
+    2. **memory 通道：门能放行，但 provider 不认。** 暖门 attach 全量
+       快照前缀的唯一干净样本（10-06 13:33，距上次主请求 1.4min、快照
+       新鲜、575 条消息、inp=491861）cache_read=143 —— 即便前缀逐字节
+       同源，opencode zen 免费档对非主链路请求形态（stream=False / 跨
+       请求）的前缀缓存实测不命中；同窗另有 400/429 风暴（13:54-16:58
+       全部 compaction 请求被网关拒，冷暖皆灭；17:04 切 longcat 恢复）。
+    3. **换域判冷不是主因**：30/30 压缩行 model_id 与该 agent 主链路
+       模型一致（compactor_model_id=""，compactor 走 agent 自己的模型）。
+
+    ⇒ 请求侧前缀已对、provider 侧行为不可控，修法不存在 ⇒ 回退接线，
+    避免「带全量前缀零命中白烧 input 钱」。working_set 通道不受影响
+    （run 中段直连路径，实测长猫 85.6% 命中）。诊断数据：
+    ``TEST_DSH_89/.hiveweave/data.db`` llm_usage + backend-boot.log。
 
     best-effort：任何异常按冷 run 处理（绝不影响压缩主流程）。
     """
