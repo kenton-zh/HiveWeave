@@ -18,6 +18,7 @@ import pytest
 from hiveweave.tools.bash import (
     _ALIAS_FLAG_HINTS,
     _UNIX_ONLY_HINTS,
+    _find_unix_short_flag,
     _pwsh_dialect_gate,
     _segment_head_token,
     _split_command_segments,
@@ -567,3 +568,137 @@ def test_llm_facing_descriptions_do_not_claim_no_translation():
     assert "verbatim — no unix→pwsh translation" not in desc, desc
     # 且必须**如实**说明有窄集合转译（否则模型不知道可以直写 head -N）
     assert "auto-translation" in desc or "translated" in desc.lower(), desc
+
+
+# ── 批27-2：pwsh 守卫误报修复三件 ────────────────────────────
+# ① 环境前缀检查加花括号深度门（方案 a）；② unix 短 flag 排除 PS 具名参数；
+# ③ heredoc 检查引号感知。误报家族必须消除，真阳性基线一条不回归。
+#
+# Lena 三连拒实锤：第六轮 s24（s3-clone_24）executor 连续三次提交
+# `Select-Object @{n='F';e={Split-Path $_.Path -Leaf}}` 形态的查询被环境前缀
+# 守卫误拒 —— 切分器把计算属性内部的 `;` 当命令分隔符，碎片
+# `e={Split-Path $_.Path -Leaf}}` 撞上 `VAR=val` 正则。以下三条**逐字**取自
+# 该项目 data.db chat_messages id `b68e38ab` 的 tool_calls 原文。
+
+_LENA_S24_CMD_1 = (
+    '$files = @("$env:TEMP\\halyard-test-libs\\botocore\\signers.py",'
+    '"$env:TEMP\\halyard-test-libs\\botocore\\auth.py")\n'
+    "foreach ($f in $files) { Select-String -Path $f -Pattern "
+    "'presign|Presign|X-Amz-Expires|def generate_presigned|canonical_query|_presign' "
+    "| Select-Object @{n='F';e={Split-Path $_.Path -Leaf}}, LineNumber, Line "
+    "| Format-Table -AutoSize -Wrap }"
+)
+_LENA_S24_CMD_2 = (
+    '$env:PYTHONPATH="$env:TEMP\\halyard-test-libs"; '
+    '$files = @("$env:TEMP\\halyard-test-libs\\botocore\\signers.py",'
+    '"$env:TEMP\\halyard-test-libs\\botocore\\auth.py"); '
+    "foreach ($f in $files) { Select-String -Path $f -Pattern "
+    "'presign|Presign|X-Amz-Expires|generate_presigned|canonical_query' "
+    "| Select-Object @{n='F';e={Split-Path $_.Path -Leaf}}, LineNumber, Line "
+    "| Format-Table -AutoSize -Wrap }"
+)
+_LENA_S24_CMD_3 = (
+    '$files = @("$env:TEMP\\halyard-test-libs\\botocore\\signers.py",'
+    '"$env:TEMP\\halyard-test-libs\\botocore\\auth.py"); '
+    "foreach ($f in $files) { Select-String -Path $f -Pattern "
+    "'presign|Presign|X-Amz-Expires|generate_presigned|canonical_query' "
+    "| Select-Object @{n='F';e={Split-Path $_.Path -Leaf}}, LineNumber, Line "
+    "| Format-Table -AutoSize -Wrap }"
+)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # ① 误报家族：PS 计算属性 / 哈希字面量内部的 `;` 切出的假段
+        "Select-Object @{n='F';e={Split-Path $_.Path -Leaf}}",
+        "Select-Object @{Label='Size';Expression={ $_.Length / 1KB }}",
+        "@{a=1; b=2 }",  # 尾空格形态（假段 ` b=2 }` 命中 VAR= 正则）
+        # ② 误报家族：PS 四字母具名参数被当 unix 短 flag 连用
+        "ps -Name python",
+        "kill -Name worker",
+        "tee -Path f",
+        # ③ 误报家族：引号内的 `<<` 是字面量，不是 heredoc
+        "Select-String -Pattern '<<' f",
+        'Select-String -Pattern "a << b" notes.txt',
+        'Write-Output "a << b"',
+        "echo 'run a << b'",
+        # Lena 三连拒原文（三条都必须放行）
+        _LENA_S24_CMD_1,
+        _LENA_S24_CMD_2,
+        _LENA_S24_CMD_3,
+    ],
+)
+def test_bash27_false_positives_pass_the_gate(command):
+    """批27-2 三件误报家族全部放行（修前：①③ 误拒 + Lena 三连拒）。"""
+    assert detect_untranslated_unix(command) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 真阳性基线（既有回归底线，一条不许丢）
+        "FOO=bar python -m pytest -q",
+        "A=1 B=2 python -m x",
+        "git -c x=y commit; A=1 make",
+        # 花括号深度门不许把「深度回落 0 后」的真命中一起放走
+        "@{n='F';e={x}}; A=1 make",
+        "if ($true) { Write-Output hi }; A=1 make",  # 跨段深度记账
+    ],
+)
+def test_bash27_env_prefix_true_positives_still_blocked(command):
+    """① 真阳性：深度 0 的真 `VAR=val cmd` 照旧拒绝（基线不回归）。"""
+    msg = detect_untranslated_unix(command)
+    assert msg is not None, command
+    assert "environment-prefix" in msg, msg
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 真 unix 短 flag 组合照旧拦截（② 不许放走真方言证据）
+        "ls -la",
+        "ls -x src",
+        "kill -9 1234",
+        "ps -ef",
+        "rm -Rf tmp",  # 长度 ≤2 的大写开头不算 PS 具名参数
+    ],
+)
+def test_bash27_unix_short_flag_true_positives_still_blocked(command):
+    assert detect_untranslated_unix(command) is not None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 真 heredoc（引号外）照旧拦截（③ 只豁免引号内的字面量）
+        "cat << EOF",
+        "cat f << EOF | head -3",
+        'Write-Output "a << b" << EOF',  # 引号内的不算，引号外的算
+        "python - <<'PY'\nprint(1)\nPY",
+    ],
+)
+def test_bash27_heredoc_true_positives_still_blocked(command):
+    msg = detect_untranslated_unix(command)
+    assert msg is not None, command
+    assert "heredoc" in msg, msg
+
+
+def test_bash27_find_unix_short_flag_filters_pascalcase():
+    """② 判据单测：`-PascalCase`（首字母大写且长度>2）不算 unix 短 flag。"""
+    for ps_param in ("-Name", "-Path", "-Leaf", "-Last", "-Raw"):
+        assert _find_unix_short_flag(f"x {ps_param} y") is None, ps_param
+        assert _find_unix_short_flag(f"x {ps_param}") is None, ps_param
+    for unix_flag in ("-la", "-rf", "-9", "-Rf", "-l"):
+        assert _find_unix_short_flag(f"x {unix_flag} y") == unix_flag, unix_flag
+    # 混合：PS 具名参数之后的真短 flag 仍然命中（unix 方言证据）
+    assert _find_unix_short_flag("-Name -ef") == "-ef"
+    # `Split-Path` 的 `-Path` 有词边界保护，不因前缀字母误判
+    assert _find_unix_short_flag("Split-Path $_") is None
+
+
+def test_bash27_gate_entry_passes_all_three_families(gate_on):
+    """生产入口 `_pwsh_dialect_gate` 上三件误报家族同样放行（防只修 detect）。"""
+    assert _pwsh_dialect_gate(_LENA_S24_CMD_1) is None
+    assert _pwsh_dialect_gate("ps -Name python") is None
+    assert _pwsh_dialect_gate("Select-String -Pattern '<<' f") is None

@@ -2011,6 +2011,31 @@ _ALIAS_FLAG_HINTS: dict[str, str] = ALIAS_FLAG_HINTS
 # —— 那是 pwsh 自己的参数；`--long` 也不算（pwsh cmdlet 不用双横线）。
 _UNIX_SHORT_FLAG_RE = re.compile(r"(?<![\w-])-(?!-)(?:[A-Za-z]{1,4}|\d+)(?=\s|$)")
 
+
+def _is_unix_short_flag(token: str) -> bool:
+    """``-la`` / ``-9`` 是真 unix 短 flag；PS 具名参数（``-Name`` 等）不算。
+
+    批27-2：正则本身把 1-4 字母词全收 ⇒ `-Leaf`/`-Name`/`-Path` 这类 **PS
+    具名参数**（`-PascalCase` 词）被当 unix 短 flag 连用误拦（`ps -Name
+    python` / `kill -Name worker` / `tee -Path f`）。判据：首字母大写且
+    长度 >2 ⇒ 不算 unix 短 flag。长度 ≤2（`-Rf`/`-eu`）与纯数字（`-9`）
+    保持原语义；本表覆盖的 unix 命令（ls/ps/kill/tee…）没有 3-4 字母大写
+    短 flag 用法（unix `ps` 无 `-Name`）⇒ 排除安全。
+    """
+    body = token[1:]
+    if body.isdigit():
+        return True
+    return not (len(body) > 2 and body[0].isupper())
+
+
+def _find_unix_short_flag(args: str) -> str | None:
+    """``args`` 中第一个**真** unix 短 flag；PS 具名参数跳过（见上）。"""
+    for m in _UNIX_SHORT_FLAG_RE.finditer(args):
+        if _is_unix_short_flag(m.group(0)):
+            return m.group(0)
+    return None
+
+
 # 类 2 里少数命令的 unix 用法不带 flag（`ps aux`），靠首参数字面量识别。
 _ALIAS_BARE_ARG_HINTS: dict[str, tuple[frozenset[str], str]] = {
     "ps": (frozenset({"aux", "ax", "-ef", "auxww"}),
@@ -2209,6 +2234,64 @@ def _segment_head_token(segment: str) -> str:
     return head
 
 
+def _brace_depth_after(text: str, depth: int = 0) -> int:
+    """引号感知地扫过 ``text``，返回累计后的花括号 ``{}`` 深度。
+
+    批27-2 配套：`_split_command_segments_with_seps` 引号感知但**不感知花括号
+    深度** ⇒ PS 计算属性 `@{n='F';e={…}}` 内部的 `;` 被切成假段，碎片
+    `e={Split-Path … $_ …` 撞上环境前缀正则被误报（第六轮 s24 Lena 三连拒
+    实锤）。`detect_untranslated_unix` 用本函数**跨段累计**深度：段首深度
+    >0 的命中处于 `@{…}` / `{…}` 字面量内部 ⇒ 跳过。引号内的 `{`/`}` 不计；
+    多余的 `}` 截在 0（防孤立右括号把深度打成负值污染后续段）。
+    """
+    quote: str | None = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _has_unquoted_heredoc(command: str) -> bool:
+    """引号感知地找 `<<`（含 `<<<`）：引号内的 `<<` 是字面量，不是 heredoc。
+
+    批27-2：旧实现裸 ``re.search(r"<<", command)`` 对引号全盲 ⇒
+    `Select-String -Pattern '<<' f` / `Write-Output "a << b"` 被误拒。
+    """
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "<" and command.startswith("<<", i):
+            return True
+        i += 1
+    return False
+
+
 def detect_untranslated_unix(command: str) -> str | None:
     """残留 unix-only 命令 → 可操作错误文案；干净则 None。
 
@@ -2223,7 +2306,9 @@ def detect_untranslated_unix(command: str) -> str | None:
     # 40 轮 P0-3（方言税 98.2min）：语法层门禁——heredoc（<< / <<<）在 pwsh
     # 是 ParserError，词典层拦不住（它不是命令名）。12 次 heredoc 失败连提示
     # 都收不到。here-string 等价写法直接给出。
-    if re.search(r"<<", command):
+    # 批27-2：改为引号感知 —— 引号内的 `<<`（`-Pattern '<<'`）是字面量，
+    # 不再误拒。
+    if _has_unquoted_heredoc(command):
         return (
             "  << / <<< (bash heredoc) → pwsh 无 heredoc（直接 ParserError）。"
             "用 here-string：@'\n  …多行内容…\n  '@ | python -\n"
@@ -2245,20 +2330,28 @@ def detect_untranslated_unix(command: str) -> str | None:
     # 翻译、连这个 gate 都没有，故只借判据不借实现）。
     # ⇒ 交给下面的 unix-only 分支，由 `_cmd_substitution_bodies` 把内层命令
     #   喂进同一套检测（那段文案给的处方是对的）。
+    # 批27-2（方案 a）：切分器不感知花括号深度 ⇒ PS 计算属性
+    # `@{n='F';e={Split-Path …}}` 内部的 `;` 切出假段 `e={Split-Path … $_ …`，
+    # 撞上正则被误报（第六轮 s24 Lena 三连拒实锤）。门：跨段累计**引号感知**
+    # 的花括号深度（`_brace_depth_after`），命中位置深度 >0（处于 `@{…}` /
+    # `{…}` 字面量内部）⇒ 跳过该次命中继续查后续段；深度 0 的真
+    # `VAR=val cmd` 照旧拒绝（既有基线不回归）。
+    brace_depth = 0
     for segment in _split_command_segments(command):
         m = re.match(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+\S", segment)
-        if not m:
-            continue
-        if _cmd_substitution_bodies(segment):
-            # 右值里有命令替换 → 真病根在**内层**，不在此处归因
-            continue
-        return (
-            "Error: bash environment-prefix idiom fails in pwsh — "
-            "assignment is not a command there:\n"
-            "  VAR=val cmd → $env:VAR='val'; cmd（或 $env:VAR='val' "
-            "换行后再跑命令）\n"
-            "Rewrite with $env: assignments, then rerun."
-        )
+        if (
+            m is not None
+            and brace_depth == 0
+            and not _cmd_substitution_bodies(segment)
+        ):
+            return (
+                "Error: bash environment-prefix idiom fails in pwsh — "
+                "assignment is not a command there:\n"
+                "  VAR=val cmd → $env:VAR='val'; cmd（或 $env:VAR='val' "
+                "换行后再跑命令）\n"
+                "Rewrite with $env: assignments, then rerun."
+            )
+        brace_depth = _brace_depth_after(segment, brace_depth)
 
     hits: list[str] = []
     seen: set[str] = set()
@@ -2278,7 +2371,7 @@ def detect_untranslated_unix(command: str) -> str | None:
             bare = _ALIAS_BARE_ARG_HINTS.get(low)
             if bare is not None and args.strip().split(" ")[0] in bare[0]:
                 hint = bare[1]
-            elif low in _ALIAS_FLAG_HINTS and _UNIX_SHORT_FLAG_RE.search(args):
+            elif low in _ALIAS_FLAG_HINTS and _find_unix_short_flag(args):
                 # 类 2 只在带 unix 短 flag 时才判失败（裸 ls/cat/rm 走 pwsh 别名 OK）
                 hint = _ALIAS_FLAG_HINTS[low]
             else:
