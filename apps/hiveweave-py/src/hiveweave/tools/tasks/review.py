@@ -670,7 +670,11 @@ async def review_task_tool(
                 post = await _auto_rework_on_evidence_gate(
                     project_id, params, agent_id, task, ev_deny
                 )
-                if post == "reworked":
+                # 批27-1 顺手修：_auto_rework_on_evidence_gate 返回的是
+                # **实况状态**（rework 成功 ⇒ "running"），不是 "reworked"
+                # 字面量——旧判定恒假，成功也渲染成 "[auto-rework failed]
+                # （当前状态 running）" 的自相矛盾文案。按实况状态判。
+                if post == "running":
                     return ToolResult.err(
                         f"{ev_deny}\n\n[auto-rework] Task 已自动转回 running："
                         f"修正 filesChanged（只列 worktree 中真实存在的文件）"
@@ -1311,8 +1315,8 @@ async def _auto_rework_on_evidence_gate(
     手动 rework —— 团队在 B3 上死等 20 分钟。证据可修，自动转回 running，
     assignee 立即能重交。失败静默（不阻断 approve 的错误返回）。
 
-    Returns the task's post-state ("reworked" when both transitions ran,
-    otherwise the actual status string).
+    Returns the task's post-state status string ("running" when the rework
+    transitions succeeded, otherwise whatever state it actually landed in).
     """
     try:
         from hiveweave.agents.trigger import trigger_subordinate

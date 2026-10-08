@@ -14,6 +14,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from hiveweave.config import submit_audit_gate_enabled
 from hiveweave.services import task as _task_svc
 from hiveweave.services.param_shapes import coerce_list_param
+from hiveweave.services.tasks.submit import (
+    evidence_fingerprint_changed,
+    parse_stored_evidence,
+)
 from hiveweave.services.tasks.verify import is_verify_task
 from hiveweave.tools.base import tool
 from hiveweave.tools import helpers as _helpers
@@ -1673,6 +1677,64 @@ async def submit_task_tool(
                 "submit_record_code_audit_soft_fail_failed", error=str(_soft_e)
             )
 
+    # ── 批27-1 N1：submitted 态证据感知重提（A+B）────────────────────────
+    # 早判必须放在 preflight 完成之后（此时 files_changed 已可能由
+    # ``git diff main...HEAD`` 自动回填，指纹才算得全），透传与服务层的
+    # 幂等/证据更新判定共用同一把指纹（evidence_fingerprint_changed）。
+    # 三分流：
+    #   同指纹 + 入参显式带证据字段 ⇒ 无效重提，err + 处方（B）——防抖
+    #     语义不再掩盖「你没有任何新东西可交」；
+    #   同指纹 + 裸重提（双发/手滑）⇒ 幂等 ok 早退（A-3，防抖不动）；
+    #   指纹不同 ⇒ 不在此早退，透传 ts.submit_task 走服务层「证据更新」
+    #     路径（状态保持 submitted + reviewer 收 RESUBMITTED 通知）。
+    if ((task.get("status") or "").lower() == "submitted"):
+        # 状态可能在本轮 preflight 期间被 reviewer 改动（rework ⇒ running），
+        # 重读一次再判；非 submitted 态交回正常转移路径处理。
+        task_now = await ts.get_task(project_id, task_id) or task
+        if ((task_now.get("status") or "").lower() == "submitted"):
+            old_ev = parse_stored_evidence(task_now.get("evidence"))
+            if not evidence_fingerprint_changed(old_ev, evidence):
+                _explicit_evidence = bool(
+                    getattr(params, "commit", None)
+                    or getattr(params, "commit_hash", None)
+                    or getattr(params, "files_changed", None)
+                    or getattr(params, "attestation_ids", None)
+                )
+                if _explicit_evidence:
+                    _old_c = str((old_ev or {}).get("commit") or "")
+                    _new_c = str(evidence.get("commit") or "")
+                    return ToolResult.err(
+                        f"Task {task_id} 已处于 submitted，且本次提交无新证据"
+                        f"（账本 commit={_old_c or '∅'} = 你的 "
+                        f"commit={_new_c or '∅'}，files_changed / "
+                        "attestationIds 亦未变）——重复提交不会更新评审证据，"
+                        "也不会再次通知 reviewer。\n"
+                        "处方: QA 反馈已给出 ⇒ 等 reviewer "
+                        "review_task(rework)，或自行 "
+                        "update_task_status(running) 后修码重提；无反馈 ⇒ "
+                        "无需动作，等待评审即可。"
+                    )
+                log.info(
+                    "submit_task_tool_idempotent",
+                    project_id=project_id,
+                    task_id=task_id,
+                )
+                return ToolResult.ok(
+                    f"Task {task_id} already submitted (idempotent). "
+                    f"status={task_now.get('status')} "
+                    f"submitted_at={task_now.get('submitted_at')} — "
+                    "no new reviewer notification sent.",
+                    idempotent=True,
+                    task_id=task_id,
+                    status=task_now.get("status"),
+                    submitted_at=task_now.get("submitted_at"),
+                )
+            log.info(
+                "submit_task_tool_evidence_resubmit",
+                project_id=project_id,
+                task_id=task_id,
+            )
+
     try:
         # Auto-transition: if task is in 'created' or 'claimed' status,
         # automatically claim/start it before submitting.
@@ -1684,12 +1746,24 @@ async def submit_task_tool(
             elif status == "claimed":
                 await ts.start_task(project_id, task_id)
         _submit_result = await ts.submit_task(project_id, task_id, evidence)
+        # 批27-1 N1：服务层证据更新重提（submitted 态 + 指纹不同）——状态
+        # 保持 submitted，reviewer 已由服务层收到 [TASK RESUBMITTED]；此处
+        # 只渲染如实回执，不再走首提的 [TASK SUBMITTED] creator 唤醒（否则
+        # 同一次重提通知两次）。isinstance 守卫兼容测试里 submit_task 被
+        # mock 成非 dict 返回的调用方。
+        _resubmitted = (
+            isinstance(_submit_result, dict)
+            and bool(_submit_result.get("resubmitted"))
+        )
         # A4 让渡项（批 2）：消费服务层幂等出口 —— submitted 状态的重提在
         # 此早退，跳过 preflight 之后的 audit 提醒 / handoff 汇报 / reviewer
         # 唤醒（inbox wake + trigger_coordinator）。状态与证据均未变动，
-        # reviewer 不该多收一次 [TASK SUBMITTED]。isinstance 守卫兼容测试
-        # 里 submit_task 被 mock 成非 dict 返回的调用方。
-        if isinstance(_submit_result, dict) and _submit_result.get("idempotent"):
+        # reviewer 不该多收一次 [TASK SUBMITTED]。
+        if (
+            isinstance(_submit_result, dict)
+            and _submit_result.get("idempotent")
+            and not _resubmitted
+        ):
             return ToolResult.ok(
                 f"Task {task_id} already submitted (idempotent). "
                 f"status={_submit_result.get('status')} "
@@ -1748,8 +1822,13 @@ async def submit_task_tool(
         # ── 通知 reviewer 有 task 待审 ──
         # 正常路径：wake creator。自交（creator==assignee，如中层自建骨架任务）
         # 时改 wake org parent（中层→CEO），避免「通知自己 + 禁自审」死锁。
+        # 证据更新重提（N1）不进此块：reviewer 已由服务层收 RESUBMITTED。
         task_after = await ts.get_task(project_id, task_id)
-        if task_after and task_after.get("creator_id"):
+        if (
+            not _resubmitted
+            and task_after
+            and task_after.get("creator_id")
+        ):
             creator_id = task_after["creator_id"]
             from hiveweave.services.inbox import InboxService
             inbox = InboxService()
@@ -1782,7 +1861,14 @@ async def submit_task_tool(
             from hiveweave.agents.trigger import trigger_coordinator
             await trigger_coordinator(notify_id)
 
-        receipt = f"Task {task_id} submitted for review.{audit_reminder}"
+        if _resubmitted:
+            receipt = (
+                f"Task {task_id} resubmitted: evidence updated on the "
+                "already-submitted task (status stays submitted) — reviewer "
+                "notified with [TASK RESUBMITTED]."
+            )
+        else:
+            receipt = f"Task {task_id} submitted for review.{audit_reminder}"
         if claim_check_lines:
             receipt += (
                 "\n[claim_check] blockingIssues 文件级主张机械复核"

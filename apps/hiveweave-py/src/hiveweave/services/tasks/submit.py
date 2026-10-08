@@ -43,6 +43,58 @@ def _task_submit_lock(project_id: str, task_id: str) -> asyncio.Lock:
     return lock
 
 
+# ── 批27-1 N1（d90 实录）：submitted 重提「证据感知」指纹 ─────────────
+# 根因：A4-1 幂等分支把「证据未变」假设套到了所有 submitted 重提上——它
+# 只对并发双发成立；QA 反馈后修码重提时新 commit 被无声丢弃，approve 证据
+# 门核旧 files_changed ⇒ 自动推翻 reviewer 批准。修法：幂等出口先比指纹。
+# 指纹 = commit + files_changed + attestation id 集（显式门禁字段，不做
+# dict 全等——summary/test_output 等非门禁字段不参与防抖判定）。
+_EVIDENCE_FP_KEYS = ("commit", "files_changed", "attestation_ids")
+
+
+def parse_stored_evidence(raw: Any) -> dict:
+    """tasks.evidence 列（dict / JSON str / None）→ dict（容错解析）。"""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _fp_component(value: Any) -> tuple:
+    """单指纹字段归一：commit 大小写不敏感；列表去空/去重/排序。"""
+    if isinstance(value, list):
+        return tuple(sorted({str(x).strip() for x in value if str(x).strip()}))
+    text = str(value or "").strip().lower()
+    return (text,) if text else ()
+
+
+def evidence_fingerprint_changed(old_ev: dict, new_ev: Any) -> bool:
+    """submitted 重提是否带「明确不同的证据」。
+
+    只对**本次提交入参里已有的指纹字段**判等：入参未带的字段视为未变
+    （files_changed 常由工具层 preflight 从 ``git diff main...HEAD`` 自动
+    回填——缺席 ≠ 清空，不得误判成「证据变了」而抹掉库内清单）。全部
+    可比字段都相同（含两边都无可比字段）⇒ False 走幂等出口；任一不同
+    ⇒ True 走证据更新路径。
+    """
+    if not isinstance(new_ev, dict):
+        return False
+    for key in _EVIDENCE_FP_KEYS:
+        new_val = new_ev.get(key)
+        if not new_val:
+            continue
+        if _fp_component(new_val) != _fp_component(
+            (old_ev or {}).get(key)
+        ):
+            return True
+    return False
+
+
 class SubmitMixin:
     """submit_task / _resolve_evidence_workspace."""
 
@@ -58,11 +110,15 @@ class SubmitMixin:
                           evidence: dict) -> dict:
         """Submit a task (running → submitted). Sets evidence (JSON) + submitted_at.
 
-        A4（D76 实测，批 2）幂等 + 防抖：
-        - ``submitted → submitted`` 重复提交 = **幂等成功**：返回
-          ``{"idempotent": True, ...}``，不改状态 / 不覆盖既有 evidence /
-          不重建义务 / 不重跑门禁（不产生新凭证要求）——不再抛
+        A4（D76 实测，批 2）幂等 + 防抖，批27-1 N1 证据感知分流：
+        - ``submitted → submitted`` 且**证据指纹相同**（commit / files_changed
+          / attestation id 集，见 :func:`evidence_fingerprint_changed`）= 幂等
+          成功：返回 ``{"idempotent": True, ...}``，不改状态 / 不覆盖既有
+          evidence / 不重建义务 / 不重跑门禁（不产生新凭证要求）——不再抛
           ``Illegal transition`` 逼 agent 把任务移回 running 绕路。
+        - 指纹**不同**（QA 反馈后修码重提）= 证据更新：状态保持 submitted，
+          复用落库尾段写回新 evidence + 重激活 review 义务，并给 reviewer 发
+          一次 ``[TASK RESUBMITTED]``；返回 ``{"resubmitted": True, ...}``。
         - 同任务并发提交由 per-task 锁串行化（in-flight 防抖）：后到者
           拿到锁后重读状态，走幂等出口，不二次转移。
         assignee-only 的权限语义在工具层强制；本层按状态判定（API / merge
@@ -83,26 +139,79 @@ class SubmitMixin:
         """
         task_id = await self.require_task_id(project_id, task_id)
         async with _task_submit_lock(project_id, task_id):
-            return await self._submit_task_locked(project_id, task_id, evidence)
+            result = await self._submit_task_locked(
+                project_id, task_id, evidence
+            )
+        # N1：RESUBMITTED 通知在**锁外**发 —— trigger_coordinator 可能驱动
+        # reviewer 一整轮 turn（与工具层首提路径的 post-lock 唤醒同语义），
+        # 拿着 per-task 锁做这件事会卡死同任务的并发提交。
+        if isinstance(result, dict) and result.get("resubmitted"):
+            notify = result.pop("_resubmit_notify", None)
+            if notify:
+                await self._notify_evidence_resubmitted(
+                    project_id, task_id, notify
+                )
+        return result
 
     async def _submit_task_locked(self, project_id: str, task_id: str,
                                   evidence: dict) -> dict:
         task = await self.get_task(project_id, task_id)
 
-        # A4-1（D76）：submitted → submitted 同 assignee 重复提交 = 幂等成功。
-        # 门禁判定整体跳过：首次提交已验过一次，重复提交不产生新凭证要求。
+        # A4-1（D76）+ 批27-1 N1：submitted → submitted 重提，按证据分流。
+        # 指纹相同（并发双发/防抖）= 幂等成功，门禁判定整体跳过：首次提交
+        # 已验过一次，重复提交不产生新凭证要求。
+        # 指纹不同（QA 反馈后修码重提）= 证据更新：状态保持 submitted
+        # （证据刷新不是状态迁移，不走 _transition/门禁），复用落库尾段把
+        # 新 evidence 写回 + 给 reviewer 发一次 [TASK RESUBMITTED]——否则
+        # 新 commit 无声丢失，approve 证据门核旧 files_changed 会自动推翻
+        # 已有批准（d90：批准被推翻 + 33min 抖动）。
         if (task or {}).get("status") == "submitted":
+            old_ev = parse_stored_evidence((task or {}).get("evidence"))
+            if not evidence_fingerprint_changed(old_ev, evidence):
+                log.info(
+                    "submit_task_idempotent",
+                    project_id=project_id,
+                    task_id=task_id,
+                )
+                return {
+                    "idempotent": True,
+                    "task_id": task_id,
+                    "status": "submitted",
+                    "submitted_at": task.get("submitted_at"),
+                    "note": "already submitted (idempotent)",
+                }
             log.info(
-                "submit_task_idempotent",
+                "submit_task_evidence_resubmit",
                 project_id=project_id,
                 task_id=task_id,
             )
+            tail = await self._write_submission_evidence(
+                project_id, task_id, evidence
+            )
+            # 通知信息随返回值带出，由 submit_task 在锁外发送
+            # （trigger_coordinator 可能驱动 reviewer 整轮 turn，不可持锁）。
             return {
                 "idempotent": True,
+                "resubmitted": True,
                 "task_id": task_id,
                 "status": "submitted",
-                "submitted_at": task.get("submitted_at"),
-                "note": "already submitted (idempotent)",
+                "submitted_at": tail.get("submitted_at"),
+                "note": (
+                    "evidence updated on submitted task (resubmitted); "
+                    "reviewer notified"
+                ),
+                "_resubmit_notify": {
+                    "reviewer_id": str(
+                        tail.get("reviewer_id")
+                        or (task or {}).get("creator_id")
+                        or ""
+                    ),
+                    "old_commit": str((old_ev or {}).get("commit") or ""),
+                    "new_commit": str(
+                        (evidence or {}).get("commit") or ""
+                    ),
+                    "title": str((task or {}).get("title") or ""),
+                },
             }
 
         # E1 verdict gate：终验（VERIFY / milestoneVerify）任务 evidence 必须
@@ -286,6 +395,23 @@ class SubmitMixin:
 
         await self._transition(project_id, task_id, "submitted",
                                actor_id=(task or {}).get("assignee_id"))
+        await self._write_submission_evidence(project_id, task_id, evidence)
+        return {"idempotent": False, "task_id": task_id, "status": "submitted"}
+
+    async def _write_submission_evidence(
+        self, project_id: str, task_id: str, evidence: dict
+    ) -> dict:
+        """提交落库尾段（首提 / submitted 态证据更新重提共用）。
+
+        批27-1 N1：从 ``_submit_task_locked`` 尾段原样抽出（行为不变）——
+        门禁连拒清零 + merged_by/审计溯源键保护 + reviewer 钉定 +
+        evidence/submitted_at 写回 + ``submitted`` 事件 + review 义务激活。
+        重提路径不重走 ``_transition``/门禁（状态已是 submitted），但落库与
+        义务语义必须与首提一致（reviewer 看到的必须是新证据）。
+
+        Returns ``{"agent_id", "reviewer_id", "submitted_at"}``（重提通知
+        与返回值消费 ``reviewer_id`` / ``submitted_at``）。
+        """
         # TEST_DSH_70 P1-2：提交成功 ⇒ 门禁连拒计数清零（只有「连续」被拒
         # 才累计；出口护栏见 services/tasks/gate_reject_guard.py）。
         from .gate_reject_guard import reset_gate_rejections
@@ -435,7 +561,72 @@ class SubmitMixin:
                 error=str(e),
             )
 
-        return {"idempotent": False, "task_id": task_id, "status": "submitted"}
+        return {
+            "agent_id": agent_id,
+            "reviewer_id": reviewer_id,
+            "submitted_at": now_ms,
+        }
+
+    async def _notify_evidence_resubmitted(
+        self,
+        project_id: str,
+        task_id: str,
+        notify: dict,
+    ) -> None:
+        """证据更新重提 ⇒ 给 reviewer 发一次 ``[TASK RESUBMITTED]``。
+
+        由 ``submit_task`` 在 per-task 锁**释放后**调用（本函数会
+        trigger_coordinator，可能驱动 reviewer 一整轮 turn）。防抖：本通知
+        只在指纹变化路径组装；同指纹重提走幂等出口没有 ``_resubmit_notify``
+        载荷，故同一指纹至多发一次。reviewer 取落库尾段钉定结果，回退
+        creator。通知失败不回滚证据落库（观测面失败同语义）。
+        """
+        reviewer_id = str(notify.get("reviewer_id") or "")
+        if not reviewer_id:
+            return
+        old_commit = str(notify.get("old_commit") or "")
+        new_commit = str(notify.get("new_commit") or "")
+        if old_commit != new_commit:
+            detail = (
+                f"commit {old_commit[:12] or '∅'}→{new_commit[:12] or '∅'}"
+            )
+        else:
+            detail = "files_changed/attestations 更新"
+        title = str(notify.get("title") or "").split("\n")[0][:60]
+        try:
+            from hiveweave.services.inbox import InboxService
+
+            await InboxService().send_message(
+                from_agent_id="system",
+                to_agent_id=reviewer_id,
+                message=(
+                    f"[TASK RESUBMITTED] Task '{title}' 证据已更新"
+                    f"（{detail}）。此前评审结论（若有）基于旧证据，请重新 "
+                    f"review_task(taskId='{task_id}', "
+                    f"decision='approve'/'rework')。"
+                ),
+                message_type="task",
+                priority="normal",
+                task_id=task_id,
+                wake=True,
+            )
+            from hiveweave.agents.trigger import trigger_coordinator
+
+            await trigger_coordinator(reviewer_id)
+            log.info(
+                "submit_evidence_resubmit_notified",
+                project_id=project_id,
+                task_id=task_id,
+                reviewer_id=reviewer_id[:8],
+                detail=detail,
+            )
+        except Exception as e:
+            log.warning(
+                "submit_resubmit_notify_failed",
+                task_id=task_id,
+                reviewer_id=reviewer_id[:8],
+                error=str(e),
+            )
 
     @staticmethod
     def _validate_verdict_evidence(evidence: dict) -> None:
