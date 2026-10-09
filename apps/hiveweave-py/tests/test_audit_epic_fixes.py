@@ -803,10 +803,12 @@ def test_coordinator_prompt_auto_retry_wording():
     from hiveweave.prompts.coordinator import build_coordinator_script
 
     text = _norm(build_coordinator_script("后端负责人", "阿蓝"))
-    # 2026-09-29 审计门拆除：submit 不再触发代码审计，里程碑代码级审计归 QA 按需执行
+    # 2026-09-29 审计门拆除：submit 不再触发代码审计
+    # 2026-10-09 QA 职责收窄：常设代码级审计退役 —— QA 只做黑盒行为验收，
+    # 根因定位随 rework 落实现侧（不设常设代码级审计角色）；coordinator
+    # 剧本不再提及 request_code_audit（对质权是 QA 内部事务）
     assert "代码级审计" in text
-    assert "QA 的里程碑职责" in text
-    assert "request_code_audit" in text
+    assert "不设常设代码级审计" in text
     # 旧「两条路 / 等审计 / 时延口径 / 软失败指针」必须消失
     assert "CODE AUDIT DISCIPLINE" not in text
     assert "审计两条路" not in text

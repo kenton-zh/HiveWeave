@@ -77,7 +77,7 @@ def test_loop_short_unit_pattern_hits():
 
 def test_loop_long_unit_block_repeat_hits():
     """长单元循环（单元 41 字符 > 16，a-1 够不着）：200 字符 tail 在窗口
-    内非重叠出现 ≥5 次（a-2）命中。"""
+    内**重叠 find** 出现 ≥5 次（a-2，实现为 str.find 重叠计数）命中。"""
     d = DegenerateDetector()
     assert d.feed(_healthy_warmup()) is None
     unit = "Hmm. OK. Let me act on the task now. OK. "  # 42 字符

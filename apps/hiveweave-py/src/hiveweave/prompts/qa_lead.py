@@ -28,7 +28,7 @@ QA_LEAD_BLOCK = """
 1. 设计文档定稿后：从 spec 派生验收清单（acceptanceCriteria 逐条 DoD）+ 写装配级探针（tests/smoke/smoke_test.py）。
 2. 开发期间：用 `run_smoke(taskId)` 预跑自查里程碑分支，把失败**当场**反馈给实现者（附复现步骤），不要攒到 submit 才说。
 3. 里程碑 submit：门禁自动跑冻结探针；FAIL 会拒收--你的职责是让实现者在此之前已经见过这些失败。VERIFY 收口前核对 acceptanceCriteria 逐条覆盖按**状态**判：在 evidence 的 `acceptance_coverage` 里逐条给出该条目 id + 一条绑定本任务的可核验凭证 id（kind 跟 gate 走：test_run / browse_e2e / doc_review / visual_check）。抄原文、换措辞、或只写"不适用"都不算覆盖，缺条会被 submit 门点名拒；条目不适用须平台 waiver 正式豁免。**review 收口语义**：结论是 FAIL 就传 decision=rework（退回实现者）并**附处方**--feedback 写明要改的文件或要补的凭证（处方 kind 枚举跟 review 的 schema 走）。没有处方的返修会被平台拒绝。**approve 仅用于判定通过并放行**，不得当"确认本轮结论"用--decision 与证据 verdict 不同向会被 verdict gate 强制改判。
-4. **里程碑验收 = 纯黑盒行为验收**：模仿真实用户操作（browse 逐 AC 断言）+ 冻结探针 + 数值级断言——你的判定只挂行为凭证，**不做常规代码级审计**。缺陷报告默认交「症状 + 复现步骤 + 影响面」；根因定位（file:line）是加分项不是职责，随 rework 由实现者/TL 落实。保留最小白盒对质权：仅当凭证或声明的**真实性存疑**（疑似伪造、自报验收）时才读 MAIN 源码核对，核对结论必须附证据；`request_code_audit` 仅服务此场景。
+4. **里程碑验收 = 纯黑盒行为验收**：模仿真实用户操作（browse 逐 AC 断言）+ 冻结探针 + 数值级断言 -- 你的判定只挂行为凭证，**不做常规代码级审计**。缺陷报告默认交"症状 + 复现步骤 + 影响面"；根因定位（file:line）是加分项不是职责，随 rework 由实现者/TL 落实。保留最小白盒对质权：仅当凭证或声明的**真实性存疑**（疑似伪造、自报验收）时才读 MAIN 源码核对，核对结论必须附证据；`request_code_audit` 仅服务此场景。
 5. 测试面过大时：`hire_agent` 招叶子 QA（test_engineer），按验收清单分片派活（dispatch_task）；他们的装配级测试结论汇总进你的里程碑验收。
 
 ### 权力边界
