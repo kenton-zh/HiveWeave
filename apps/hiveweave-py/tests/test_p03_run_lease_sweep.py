@@ -6,16 +6,20 @@
 才被 startup sweep 收口（实测 5 条悬挂 ≈9 小时）。
 
 修复 = startup sweep 核心提取为公共核心 ``_sweep_running_rows_locked``，
-新增 ``sweep_expired_run_leases``（判据：lease 已过期 **且** 不在调用方
-传入的进程内活跃注册表），挂 game_time 30s tick
-（``GameTimeService._sweep_expired_run_leases``）。
+新增 ``sweep_expired_run_leases``（判据：lease 已过期；不在注册表的行直接
+收口），挂 game_time 30s tick（``GameTimeService._sweep_expired_run_leases``）。
+
+⚠ 批28-2（2026-10-08）语义更新：注册表内的过期 run 不再无条件豁免 ——
+改为 abort 先行 + 宽限 + 双保险（Robert 失控 run 超 lease 6 分钟仍 running
+的病灶，见 test_run_lease_active_harvest.py）。本文件聚焦 P0-3 原语义在
+**首个 tick** 内的不变量（单次 sweep 只发 abort、不收口活跃行）。
 
 验收判据（可机检）：
   ① lease 已过期 + 不在注册表 ⇒ sweep 后 interrupted（与启动 sweep 同语义：
     孤儿 step 分流 + R11 零账占位补账）；
   ② lease 未过期不动（健康 run 在 tick 间隙零写）；
-  ③ 在注册表中的 run 不动（防误杀 —— 健康长 run 的 lease 普遍已过期，
-    ``check_budget`` 不按墙钟停，注册表豁免是唯一防线）；
+  ③ 在注册表中的 run 单次 sweep 不动（首 tick 只发 abort 进宽限 ——
+    防「死行未收而活流先杀」的次序颠倒；宽限过后的收割归批28-2 测试）；
   ④ lease IS NULL 的老行不动（交还给启动 sweep）；
   ⑤ usage 补录与启动 sweep 同源（批 2 A7 占位行口径一致）。
 """
@@ -29,6 +33,7 @@ import pytest
 
 from hiveweave.db import meta as meta_db
 from hiveweave.db import project as project_db
+from hiveweave.services import run_ledger as rl_mod
 from hiveweave.services.run_ledger import (
     RUN_LEASE_SWEEP_CLOSE_REASON,
     sweep_expired_run_leases,
@@ -38,6 +43,14 @@ from hiveweave.services.run_ledger import (
 PROJECT_ID = "p03-proj-0001"
 AGENT_A = "p03-ceo-0001"
 AGENT_B = "p03-exec-0001"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_harvest_state():
+    """批28-2 活跃流收割状态隔离（模块级字典，防跨文件串扰）。"""
+    rl_mod.reset_lease_abort_state()
+    yield
+    rl_mod.reset_lease_abort_state()
 
 
 class _Project:
@@ -272,13 +285,15 @@ async def test_null_lease_left_to_startup_sweep(seeded_project):
     assert row["status"] == "interrupted", row
 
 
-# ── 验收 ③：在注册表中的 run 不动（防误杀）──────────────────────────────
+# ── 验收 ③：在注册表中的 run 首 tick 不动（批28-2：abort 先行进宽限）──
 
 
 @pytest.mark.asyncio
 async def test_registry_exempt_live_run_untouched(seeded_project):
-    """健康长 run（lease 已过期但 in 注册表）不动 —— check_budget 不按墙钟停，
-    长 run 的 lease 普遍已过期，注册表豁免是唯一防线。"""
+    """活跃 run（lease 已过期但在注册表）首 tick 不收口 —— 批28-2 起处置
+    改为 abort 先行 + 宽限 + 双保险（宽限过后的收割语义见
+    test_run_lease_active_harvest.py）。本用例钉住首 tick 不变量：
+    发 abort、不动 DB 行 —— 死行先收、活流后杀的次序不颠倒。"""
     await _seed_run(seeded_project, "p03-run-live", AGENT_A)  # 缺省已过期
 
     swept = await sweep_expired_run_leases(
@@ -289,6 +304,8 @@ async def test_registry_exempt_live_run_untouched(seeded_project):
     row = await _run_row(seeded_project, "p03-run-live")
     assert row["status"] == "running", row
     assert row["ended_at"] is None, row
+    # abort 已进宽限状态（收割周期开启但未收口）
+    assert "p03-run-live" in rl_mod._LEASE_ABORT_STATE
 
 
 @pytest.mark.asyncio
@@ -366,7 +383,8 @@ async def test_game_time_predicate_exempts_only_processing_current_run(
     seeded_project, monkeypatch: pytest.MonkeyPatch,
 ):
     """_sweep_expired_run_leases 的注册表判据：PROCESSING 中 agent 的
-    _current_run_id 豁免；IDLE agent 的遗留 _current_run_id 不豁免（悬挂行）。"""
+    _current_run_id 进活跃集（首 tick abort 进宽限、不收口）；IDLE agent 的
+    遗留 _current_run_id 不进活跃集（悬挂行直接收口）。"""
     from hiveweave.agents.supervisor import agent_manager
     from hiveweave.agents.types import AgentState
     from hiveweave.services.game_time import GameTimeService

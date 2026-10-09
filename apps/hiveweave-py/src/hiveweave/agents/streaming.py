@@ -166,6 +166,9 @@ async def on_delta(agent: Any, event: dict) -> None:
         if _run_id:
             try:
                 await agent._run_ledger.increment_llm_calls(agent.id, _run_id)
+                # N3 批28-2 施工2：LLM 轮开始 ⇒ 续约 run lease（收割活跃流
+                # 的公平性前提 —— 续约停止 = 流死/协程死，才轮到 sweep 收割）。
+                await agent._run_ledger.renew_lease(agent.id, _run_id)
             except Exception:
                 pass
         # 轮次结构标记已下线（2026-09-05 渲染统一）：此前这里往 DB content
@@ -251,6 +254,10 @@ async def on_tool_call(
             )
             # BUG-7: increment tool counter at step start (covers interrupt path)
             await agent._run_ledger.increment_tool_calls(agent.id, _run_id)
+            # N3 批28-2 施工2：工具步开始 ⇒ 续约 run lease（长工具轮不给
+            # lease sweep 误收活跃 run 的窗口；单步 ≤10min，续约下限 15min
+            # 已给足余量）。
+            await agent._run_ledger.renew_lease(agent.id, _run_id)
         except Exception as e:
             log.debug("run_ledger.step_start_failed", error=str(e))
 

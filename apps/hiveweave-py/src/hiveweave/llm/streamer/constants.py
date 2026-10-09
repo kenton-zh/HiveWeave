@@ -140,6 +140,45 @@ WORKING_SET_CHECKPOINT_MARKER = "[Working-set checkpoint]"
 OUTPUT_TOKEN_GLOBAL_CAP = 32_000
 """非 reasoning 模型的 max_tokens 全局上限。"""
 
+# ── N3 批28-1 施工1（2026-10-08）：finish=length 分类恢复 ────────────
+# 病灶（第六轮实锤）：模型烧满输出上限（Robert 两次 out=128000、各
+# 20-21.5 分钟）后 run 直接收口，下个 run 从头再来（跨 run 重读税）。
+# 修法对齐 pi（agent-session.ts:2936-2955 / overflow.ts:179
+# isRecoverableLength）：length 不走 error 整杀，而是同 run 内做恰好
+# 一次恢复（最小形态：截断本轮 assistant 输出 + 注入 [OUTPUT TRUNCATED]
+# 重问一轮）；第二次 length ⇒ interrupted/budget 型终态收口，不再重试；
+# 正常轮（非 length）复位恢复旗标。
+OUTPUT_LENGTH_TRUNCATED_CODE = "output_length_truncated"
+"""finish_reason=length 的稳定分类码（非 error/PermanentError —— run 不因
+烧满输出上限走 error 路径；下游按码机检：恢复/终态两形态都随行）。"""
+
+LENGTH_RECOVERY_KEEP_CHARS = 8_000
+"""length 恢复重问时本轮 assistant 输出保留的尾部字符数（正文与 thinking
+同帽）。pi 形态是 compact-and-retry（LLM 摘要压缩）；本最小形态用机械
+尾部截断 —— 不再续写上一段叙述，只保留最近的连续性锚点。"""
+
+OUTPUT_TRUNCATED_HINT = (
+    "[OUTPUT TRUNCATED] 上一输出撞输出上限被截断（finish_reason=length）。"
+    "不要继续上一段叙述：立即基于已保留的内容给出精简结论/下一步行动，"
+    "停止输出时自然收尾。"
+)
+"""length 恢复重问提示（只进请求副本，不落持久化历史 —— 与 pacing/
+[WALL APPROACHING] 等瞬态提示同纪律）。"""
+
+# ── N3 批28-1 施工2（2026-10-08）：abort 信号管道 ───────────────────
+# 抄 pi（openai-completions.ts:371/688/718）：signal 全 API 层透传，abort
+# 时 stopReason="aborted" 而非 error —— 下游可区分「人为掐」与「真失败」。
+# 我们的 httpx 层是同步线程 + queue 事件泵（Windows 上 CancelledError 掐
+# 不断 socket read），故落地为：模块级注册表（abort_source.py）+ 请求循环
+# 周期检查（每 chunk + 2s 心动 poller），置位 ⇒ 主动关 client 断流 +
+# 归类 aborted（run 走 interrupted 语义而非 error）。本件只做机制不接
+# 检测器（批28-2 的失控流检测器经 abort_stream 掐流）。
+ABORT_POLL_S = 2.0
+"""abort 源心动检查间隔（秒）：静默流（无 chunk）时唯一的掐流时钟。"""
+
+ABORTED_STOP_REASON = "aborted"
+"""人为掐流的 finish_reason 分类（对齐 pi stopReason="aborted" 语义）。"""
+
 def continue_sentinel_text() -> str:
     """T16 三期：续跑哨兵的挂起话术按模式分流（auto 下 commit_turn 已下架）。
 

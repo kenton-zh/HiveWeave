@@ -102,6 +102,10 @@ class Streamer(
         # 初值；每次 stream() 入口重置（同一实例可能因 empty 重试/failover
         # 被连续调用，跨 attempt 不得携带脏标志）
         self._context_rewrote = False
+        # N3 批28-1 施工2：本 run 的 ledger run_id（agent 侧传入）——
+        # abort 注册表用它做陈旧判废（老 run 的 abort 不掐新 run 的流）。
+        # 每次 stream() 入口重置（同上理由）；旁路调用不传 = None。
+        self._run_id: str | None = None
 
     # ── 主入口 ──────────────────────────────────────────────
 
@@ -118,6 +122,7 @@ class Streamer(
         skip_providers: set[str] | None = None,
         usage_sink: Callable[[dict], None] | None = None,
         exit_gate_check: Callable[[list[dict]], Awaitable[str | None]] | None = None,
+        run_id: str | None = None,
     ) -> dict:
         """流式调用 LLM，执行 tool loop，返回最终结果。
 
@@ -135,6 +140,8 @@ class Streamer(
                 收尾文本但未 commit_turn、run 关闭前调用一次；返回 hint 则在
                 同一 run 注入 user 消息续跑，返回 None 按原样收口。见
                 _run_tool_loop 文档。
+            run_id: 本 run 的 ledger run_id（N3 批28-1 施工2）—— 登记进
+                abort 注册表供 abort_stream 陈旧判废；不传 = 按 agent 掐。
 
         Returns:
             结果 dict（见类文档字符串）
@@ -143,6 +150,7 @@ class Streamer(
         # 每次 stream() 调用重置：empty 重试 / 同层 failover 会复用同一实例
         # 连续调用 stream()，上一 attempt 的改写标志不得泄漏到下一 attempt。
         self._context_rewrote = False
+        self._run_id = run_id
         # T34：先登记主模型（幂等），再把生效配置换成已切换的备用模型 ——
         # 同一 run 内 agent 主循环因 transport 错误重开 stream() 时，转移态
         # 跨调用续用（不回跳主模型）；下回合新实例自然恢复主模型。

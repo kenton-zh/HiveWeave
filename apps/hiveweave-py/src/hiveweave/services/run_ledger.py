@@ -16,6 +16,7 @@ Key design:
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -752,6 +753,41 @@ class RunLedger:
         except Exception as e:
             log.warning("run_ledger.increment_llm_calls_failed", error=str(e))
 
+    async def renew_lease(self, agent_id: str, run_id: str) -> None:
+        """N3 批28-2 施工2：run 有进展时续约 ``lease_expires_at``。
+
+        语义核对结论（读码，2026-10-08）：lease 此前是**一次性写** ——
+        ``create_run`` 写 ``now + budget_elapsed_ms`` 后全仓无任何续约方
+        （``check_budget`` 也不按墙钟停）。为了让「lease 过期收割活跃流」
+        只打真失控，续约必须先行：每个 LLM 轮开始（``round_start``，与
+        ``increment_llm_calls`` 同点）和每个工具步开始（与
+        ``increment_tool_calls`` 同点）都把 lease 推到
+        ``now + MAX(budget_elapsed_ms, RENEW_FLOOR)``。
+
+        续约窗口 = max(run 自身预算, 15min 下限)：python_script 等工具
+        单步上限 10min，legacy LLM 整轮硬预算 ≈ 10min —— 下限给足
+        「任一步开始后 ≥15min 内不被收割」的余量；auto 模式无墙钟，
+        单条失控流（Robert 形态）连续 >15min 无任何轮/步边界 ⇒ 过期
+        ⇒ 被施工2 的收割接管。``status='running'`` 守卫：不复活已收口
+        run 的 lease。best-effort，失败只告警。
+        """
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET lease_expires_at = ? + "
+                "MAX(COALESCE(budget_elapsed_ms, 0), ?) "
+                "WHERE id = ? AND status = 'running'",
+                [_now_ms(), run_lease_renew_floor_ms(), rid],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "run_ledger.renew_lease_failed",
+                agent_id=agent_id, run_id=rid, error=str(e),
+            )
+
     async def increment_tool_calls(self, agent_id: str, run_id: str) -> None:
         """Increment the tool-call counter for a run (BUG-7)."""
         try:
@@ -1222,6 +1258,65 @@ RUN_LEASE_SWEEP_CLOSE_REASON = (
     "(owner died without close)"
 )
 
+# ── N3 批28-2 施工2（2026-10-08）：lease 过期收割活跃流 ────────────────
+# 病灶（第六轮实锤）：Robert 第三次失控 run 超 lease（21:40 过期）6 分钟仍
+# running —— 活跃流（PROCESSING 注册表内）被 P0-3 的注册表豁免永久放过，
+# 只有「不在注册表」的死行才被收口。修法：豁免降级为「abort 先行 + 宽限 +
+# 双保险」（见 ``sweep_expired_run_leases``），配合 ``renew_lease`` 续约
+# 让收割只打真失控（续约停止 = 流死）。
+
+RUN_LEASE_RENEW_FLOOR_MS = 900_000
+"""续约窗口下限（15min = python_script 单步上限 10min + 5min 余量）。
+env ``HIVEWEAVE_RUN_LEASE_RENEW_FLOOR_MS`` 可调。"""
+
+RUN_LEASE_ABORT_GRACE_MS = 5_000
+"""活跃流收割的 abort 宽限：先 abort_stream 让批28-1 管道把 run 落
+interrupted（自收口优先）；宽限过后仍未终态 ⇒ 双保险收口。生产 tick 30s
+一次，实际宽限 ≥ max(grace, tick 间隔) —— 只会更保守，不会更激进。"""
+
+RUN_LEASE_ACTIVE_CLOSE_REASON = (
+    "run_lease_sweep_active_stream: lease expired while run still "
+    "registered active; abort issued but run failed to reach terminal "
+    "state within grace — reaped as double insurance"
+)
+"""活跃流双保险收口的来路文案（与 RUN_LEASE_SWEEP_CLOSE_REASON 分流：
+一个是从未收口的死行，一个是 abort 后仍不死的失控活流）。"""
+
+
+def run_lease_renew_floor_ms() -> int:
+    """续约窗口下限（env 可调；非法/非正值回退默认）。"""
+    raw = (os.environ.get("HIVEWEAVE_RUN_LEASE_RENEW_FLOOR_MS") or "").strip()
+    if not raw:
+        return RUN_LEASE_RENEW_FLOOR_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        return RUN_LEASE_RENEW_FLOOR_MS
+    return value if value > 0 else RUN_LEASE_RENEW_FLOOR_MS
+
+
+#: run_id → (agent_id, abort_issued_ms)：活跃流收割的幂等状态（同 run 只
+#: abort 一次；宽限过后仍未终态 ⇒ 下一次 tick 双保险收口）。
+_LEASE_ABORT_STATE: dict[str, tuple[str, int]] = {}
+
+
+def reset_lease_abort_state() -> None:
+    """清空活跃流收割状态（测试隔离用）。"""
+    _LEASE_ABORT_STATE.clear()
+
+
+def _trim_lease_abort_state(max_entries: int = 512) -> None:
+    """状态防膨胀：超限时按 abort 签发时间丢最旧条目（防御性 —— 正常路径
+    ``_cleanup_lease_abort_state_locked`` 会在 run 终态后清掉条目）。"""
+    overflow = len(_LEASE_ABORT_STATE) - max_entries
+    if overflow <= 0:
+        return
+    oldest = sorted(
+        _LEASE_ABORT_STATE.items(), key=lambda kv: kv[1][1]
+    )[:overflow]
+    for rid, _ in oldest:
+        _LEASE_ABORT_STATE.pop(rid, None)
+
 
 async def sweep_expired_run_leases(
     workspace_path: str | None,
@@ -1229,53 +1324,194 @@ async def sweep_expired_run_leases(
     now: int | None = None,
     exempt_run_ids: set[str] | frozenset[str] | None = None,
 ) -> int:
-    """P0-3：运行时租约 sweep —— 进程存活期间收口悬挂的 ``running`` run。
+    """P0-3 + 批28-2：运行时租约 sweep —— 收口悬挂/失控的 ``running`` run。
 
-    病灶：``agent_runs.lease_expires_at``（``create_run`` 写入）此前**只写
-    不读** —— 进程内 run 死亡（收口路径漏掉 / asyncio task 静默消失 /
-    OOM kill）后，running 行一直悬挂到下次重启才被 startup sweep 收口
-    （实测 5 条悬挂 ≈9 小时）。本函数由 game_time 周期 tick（30s 槽位，
-    ``GameTimeService._sweep_expired_run_leases``）调用，把 startup sweep
-    的收口语义搬到运行时。
+    P0-3 原始病灶：``agent_runs.lease_expires_at``（``create_run`` 写入）此前
+    **只写不读** —— 进程内 run 死亡后 running 行一直悬挂到重启。本函数由
+    game_time 周期 tick（30s 槽位）调用，把 startup sweep 的收口语义搬到
+    运行时。
 
     - 判据：``status='running'`` 且 ``lease_expires_at`` 已过期（NULL 视为
-      老行，交还给启动 sweep，不在运行时误收）。收口语义与启动 sweep
-      **同源复用**（``_sweep_running_rows_locked``）：interrupted + 孤儿
+      老行，交还给启动 sweep，不在运行时误收）。
+    - **不在注册表**的过期行：直接收口（P0-3 原路径不变）—— 与启动 sweep
+      同源复用（``_sweep_running_rows_locked``）：interrupted + 孤儿
       run_step 按 started 事实位分流 + R11 零账占位补账。
-    - **防误杀**（与启动 sweep 的唯一判据差异）：启动时进程内必然无活
-      run，startup sweep 无条件全收；运行时不行 —— 进程内仍在跑的 run
-      不能动。豁免 = 调用方传入的 ``exempt_run_ids``（进程内活跃注册表：
-      PROCESSING 中 agent 的 ``_current_run_id``，game_time 侧按项目汇总）。
-      ⚠ 预算语义：``check_budget`` 不按墙钟停（长任务预期活得比
-      ``budget_elapsed_ms`` 久），健康长 run 的 lease 普遍已过期 —— 注册表
-      豁免是唯一防线，不得在 DB 侧另行收窄判据。
-    - 性能：``idx_agent_runs_status`` 命中后按 lease 收窄的单查询；无过期
-      行时零写（只 SELECT）。全程持 per-workspace 写锁（与 create_run /
-      startup sweep 同锁串行化，见 ``sweep_stale_agent_runs`` 的 I8 注释）。
+    - **在注册表**（``exempt_run_ids`` = PROCESSING 中 agent 的
+      ``_current_run_id``）的过期行：批28-2 起不再无条件豁免（病灶：Robert
+      失控 run 超 lease 6 分钟仍 running，活跃流没人收）。处置三段式：
+      1. 先 ``abort_stream(run_id, reason='lease_expired')`` 给宽限
+         （``RUN_LEASE_ABORT_GRACE_MS``）—— 批28-1 abort 管道把 run 落
+         interrupted，自收口优先（保留产出、走 interrupted 语义）；
+      2. 同 run 只 abort 一次（``_LEASE_ABORT_STATE`` 幂等）；
+      3. 宽限过后（生产 tick 30s ⇒ 下一 tick）仍未终态 ⇒ 双保险收口
+         （``RUN_LEASE_ACTIVE_CLOSE_REASON``，同公共核心）。
+      配合 ``RunLedger.renew_lease``（LLM 轮/工具步边界续约）：健康 run 的
+      lease 始终新鲜，收割只打真失控（续约停止 = 流死）。
 
-    与 startup sweep 的语义一致性：usage 补录**同源**（批 2 A7 占位行，
-    见 ``_insert_placeholder_usage_for_swept_runs``）—— 两处都只补「零账 =
-    死亡、token 不可考」的机检占位，不补真实 token。运行时 sweep **不做**
-    close_running_runs 那样的内存 pending usage 预 flush：它面向的悬挂 run
-    的活账要么已被恢复路径接走、要么随死亡协程蒸发，中途抢 sink 反而可能
-    孤儿化活 run 的后续轮次（活 run 靠注册表豁免根本不会被本函数碰到）。
+    竞态防线：
+    - 「lease 刚续过但 sweep 用旧快照」：续约（``project_db.execute``）与本
+      sweep 的锁内快照/收口都经同一把 per-workspace 写锁串行；双保险与 abort
+      之间 run 若正常收口/续约，下一 tick 锁内重查（status='running' 且仍
+      过期）不会命中。
+    - 「老 run 的 abort 掐死新 run」：``abort_stream`` 的 run_id 陈旧判废
+      （批28-1 语义）—— run 换代后注册表挂的是新 run_id，迟到的 abort 被拒。
 
-    Returns 收口行数；任何失败只 warning（tick 路径绝不能炸）。
+    与 startup sweep 的语义一致性：usage 补录同源（批 2 A7 占位行）；运行时
+    sweep 不做内存 pending usage 预 flush（活 run 的后续轮次不被抢 sink）。
+
+    Returns 收口行数（含活跃流双保险）；任何失败只 warning（tick 路径绝不炸）。
     """
     if not workspace_path:
         return 0
     ts = int(now) if now is not None else _now_ms()
+    active = frozenset(exempt_run_ids or ())
+    reaped = 0
+
+    # ── Phase 1（锁内）：宽限已过的活跃过期 run ⇒ 双保险收口 ──────────
+    due = [
+        rid for rid, (_, issued_at) in _LEASE_ABORT_STATE.items()
+        if ts - issued_at >= RUN_LEASE_ABORT_GRACE_MS
+    ]
+    if due:
+        lock = await project_db.get_workspace_write_lock(workspace_path)
+        async with lock:
+            reaped += await _sweep_running_rows_locked(
+                workspace_path, ts, RUN_LEASE_ACTIVE_CLOSE_REASON,
+                run_filter=(
+                    "lease_expires_at IS NOT NULL AND lease_expires_at < ? "
+                    "AND id IN (%s)" % ", ".join("?" * len(due))
+                ),
+                filter_params=[ts, *sorted(due)],
+                step_note_prefix="run_lease_sweep_active_stream",
+                step_origin=(
+                    "an active stream that outlived its lease "
+                    "(abort issued, grace elapsed without terminal state)"
+                ),
+                log_event="run_lease_sweep_active_stream",
+                steps_fail_event="run_lease_sweep_active_steps_failed",
+                fail_event="run_lease_sweep_active_failed",
+                per_row_log_event="run_lease_sweep_active_reaped",
+            )
+            await _cleanup_lease_abort_state_locked(workspace_path, ts)
+
+    # ── Phase 2（锁内）：非活跃过期行直接收口（P0-3 原路径）+ 活跃行快照 ──
+    active_rows: list[dict] = []
     lock = await project_db.get_workspace_write_lock(workspace_path)
     async with lock:
-        return await _sweep_expired_run_leases_locked(
-            workspace_path, ts, frozenset(exempt_run_ids or ()),
+        reaped += await _sweep_expired_run_leases_locked(
+            workspace_path, ts, active,
+        )
+        active_rows = await _select_active_expired_rows_locked(
+            workspace_path, ts, active,
+        )
+
+    # ── Phase 3（锁外）：活跃过期行 ⇒ abort 先行（同 run 一次）────────
+    for row in active_rows:
+        rid = str(row["id"])
+        if rid in _LEASE_ABORT_STATE:
+            continue
+        from hiveweave.llm.streamer.abort_source import abort_stream
+
+        agent_id = str(row["agent_id"])
+        delivered = abort_stream(agent_id, run_id=rid, reason="lease_expired")
+        _LEASE_ABORT_STATE[rid] = (agent_id, ts)
+        lease_ts = row.get("lease_expires_at")
+        started_ts = row.get("started_at")
+        log.warning(
+            "run_lease_aborted_active_stream",
+            workspace=str(workspace_path),
+            run_id=rid,
+            agent_id=agent_id,
+            abort_delivered=delivered,
+            grace_ms=RUN_LEASE_ABORT_GRACE_MS,
+            overdue_ms=(
+                max(0, ts - int(lease_ts)) if lease_ts is not None else None
+            ),
+            hung_ms=(
+                max(0, ts - int(started_ts))
+                if started_ts is not None else None
+            ),
+        )
+    _trim_lease_abort_state()
+    return reaped
+
+
+async def _select_active_expired_rows_locked(
+    workspace_path: str, ts: int, active: frozenset[str],
+) -> list[dict]:
+    """锁内快照：注册表内（活跃）且 lease 已过期的 running run（发 abort 用）。
+
+    调用方必须已持有 per-workspace 写锁；直接用共享连接查询（不经
+    ``project_db.execute`` —— 那会再取同一把不可重入锁 ⇒ 死锁）。
+    """
+    if not active:
+        return []
+    try:
+        conn = await project_db.ensure_project_db(workspace_path)
+        cursor = await conn.execute(
+            "SELECT id, agent_id, started_at, lease_expires_at "
+            "FROM agent_runs WHERE status = 'running' "
+            "AND lease_expires_at IS NOT NULL AND lease_expires_at < ? "
+            "AND id IN (%s)" % ", ".join("?" * len(active)),
+            [ts, *sorted(active)],
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001 — tick 路径绝不炸
+        log.warning(
+            "run_ledger.run_lease_sweep_active_select_failed",
+            workspace=str(workspace_path), error=str(e),
+        )
+        return []
+
+
+async def _cleanup_lease_abort_state_locked(
+    workspace_path: str, ts: int,
+) -> None:
+    """收割状态卫生：清掉收割周期已结束的条目（锁内，best-effort）。
+
+    run 已终态（自收口 / 被双保险收口）或 lease 已续约 ⇒ 条目使命完成，
+    删除（同 run 若再次过期，按新周期重新 abort —— 每个周期自带宽限）。
+    本库查不到的 run（别的 workspace）不动 —— 归属库自己的 sweep 处置。
+    """
+    if not _LEASE_ABORT_STATE:
+        return
+    try:
+        conn = await project_db.ensure_project_db(workspace_path)
+        rids = sorted(_LEASE_ABORT_STATE)
+        cursor = await conn.execute(
+            "SELECT id, status, lease_expires_at FROM agent_runs "
+            "WHERE id IN (%s)" % ", ".join("?" * len(rids)),
+            rids,
+        )
+        found = {r["id"]: r for r in await cursor.fetchall()}
+        await cursor.close()
+        for rid in rids:
+            row = found.get(rid)
+            if row is None:
+                continue
+            still_eligible = (
+                row["status"] == "running"
+                and row["lease_expires_at"] is not None
+                and int(row["lease_expires_at"]) < ts
+            )
+            if not still_eligible:
+                _LEASE_ABORT_STATE.pop(rid, None)
+    except Exception as e:  # noqa: BLE001 — 状态卫生不拦 sweep 主流程
+        log.debug(
+            "run_ledger.lease_abort_state_cleanup_failed", error=str(e)
         )
 
 
 async def _sweep_expired_run_leases_locked(
     workspace_path: str, now: int, exempt_run_ids: frozenset[str],
 ) -> int:
-    """``sweep_expired_run_leases`` 的锁内实现：构建租约判据后走公共核心。"""
+    """``sweep_expired_run_leases`` Phase 2 的锁内实现：收口**非活跃**过期行。
+
+    注册表（exempt）内的行在此排除 —— 它们归批28-2 的 abort-宽限-双保险
+    路径（Phase 3 / 下一 tick Phase 1），不再无条件豁免。
+    """
     run_filter = "lease_expires_at IS NOT NULL AND lease_expires_at < ?"
     filter_params: list = [now]
     if exempt_run_ids:

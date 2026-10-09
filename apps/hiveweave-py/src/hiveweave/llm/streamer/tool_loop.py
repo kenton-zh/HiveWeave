@@ -11,6 +11,7 @@ import structlog
 from hiveweave.llm.provider import ProviderConfig
 
 from .constants import (
+    ABORTED_STOP_REASON,
     ACTIVITY_EXTEND_S,
     BUDGET_PACING_HINT_S,
     DEFAULT_PLACEHOLDER,
@@ -19,11 +20,14 @@ from .constants import (
     FORCE_COMMIT_ROUNDS,
     FORCE_COMMIT_WALL_PCT,
     HARD_TOTAL_TIMEOUT_S,
+    LENGTH_RECOVERY_KEEP_CHARS,
     MAX_TOOLS_PER_ROUND,
     MIN_ROUND_BUDGET_S,
     MIN_TOOL_BUDGET_S,
     NO_TEXT_HINT_MAX,
     NO_TEXT_ROUNDS_THRESHOLD,
+    OUTPUT_LENGTH_TRUNCATED_CODE,
+    OUTPUT_TRUNCATED_HINT,
     TOOL_BUDGET_GRACE_S,
     TOOL_LOOP_READONLY_STALL_LIMIT,
     TOOL_LOOP_STALL_LIMIT,
@@ -168,6 +172,19 @@ def _is_valid_json_arguments(arguments: Any) -> bool:
         return True
     except (json.JSONDecodeError, ValueError):
         return False
+
+
+def _tail_keep(text: str, cap: int) -> str:
+    """length 恢复重问用的机械尾部截断（N3 批28-1 施工1）。
+
+    超过 ``cap`` 字符 ⇒ 只保留尾部（最近的连续性锚点）并前置截断标记。
+    pi 形态是 compact-and-retry（LLM 摘要压缩上下文后重发）；本最小形态
+    用机械截断 —— 恢复轮的指令是「给出精简结论」而非「接着写」，保留
+    开头的长篇叙述只会把同一输出预算再烧一遍。
+    """
+    if not text or len(text) <= cap:
+        return text
+    return f"[... truncated, kept last {cap} chars ...]\n{text[-cap:]}"
 
 
 def _assistant_with_reasoning(
@@ -461,6 +478,11 @@ class ToolLoopMixin:
 
         # 连续「arguments 截断」轮计数（TRUNCATED_TOOL_CALL_ROUNDS_LIMIT 兜底）
         truncated_rounds = 0
+
+        # N3 批28-1 施工1：length 恢复旗标 —— per-run 恰好一次（对齐 pi
+        # agent-session 的 _overflowRecoveryAttempted；第二次 length 直接
+        # 终态收口，不循环）。正常轮（finish != length）复位（pi :1135）。
+        length_recovery_used = False
 
         # Turn budget（写死启用，见 constants.py 顶部说明）: session wall clock。
         # T16 增补（2026-09-30 钦定）：回合墙钟预算退役 —— auto 模式下
@@ -991,6 +1013,12 @@ class ToolLoopMixin:
             tool_calls = round_result["tool_calls"]
             finish_reason = round_result["finish_reason"]
 
+            # N3 批28-1 施工1（pi 对齐 :1135）：正常轮（非 length）复位恢复
+            # 旗标 —— length→恢复→正常轮→length 的序列里，第二次 length 允许
+            # 再做一次恢复（pi：成功响应即复位 _overflowRecoveryAttempted）。
+            if finish_reason != "length":
+                length_recovery_used = False
+
             # budget_cut 的流几乎必无 usage 事件（usage 在流末尾 chunk），
             # 无条件覆盖会把上一轮的记账抹成 None（审计 2026-08-08）。
             last_usage = round_result.get("usage") or last_usage
@@ -1147,6 +1175,70 @@ class ToolLoopMixin:
                     ),
                 )
 
+            # ── N3 批28-1 施工2：平台 abort（人为掐流）⇒ interrupted 语义 ──
+            # 对齐 pi：abort 是 stopReason="aborted" 而非 error —— 保留已
+            # 累积产出（不完整 tool_calls 已在流内丢弃），run 按 interrupted
+            # 收口（completion 的 _stream_aborted 分支 interrupt_run），
+            # 不做门禁收口/不自动续跑 —— 后续处置归 abort 发起方（批28-2
+            # 检测器）。
+            if round_result.get("aborted") or finish_reason == ABORTED_STOP_REASON:
+                _abort_reason = round_result.get("abort_reason") or "aborted"
+                log.warning(
+                    "stream_aborted_return",
+                    agent_id=agent_id,
+                    round=round_num,
+                    reason=_abort_reason,
+                    tools=len(tool_history),
+                    text_len=len(combined_text),
+                )
+                # N3 批28-2 施工1：退化掐流的 steering 说明 —— [STREAM
+                # ABORTED] 骨架之上补「请直接给出精简结论」的定向指引
+                #（Robert token soup 形态掐流后，下一唤醒最需要的行为纠偏
+                # 就是别再铺陈长输出；随 abort_reason 分类位机检）。
+                _degenerate_desc = ""
+                if _abort_reason.startswith("degenerate_output:"):
+                    _degenerate_kind = _abort_reason.split(":", 1)[1]
+                    _degenerate_desc = (
+                        "（输出退化："
+                        + ("短语循环" if _degenerate_kind == "loop"
+                           else "工具标签泄漏")
+                        + "已掐断——请直接给出精简结论，不要再铺陈长输出）"
+                    )
+                _abort_note = (
+                    "[STREAM ABORTED] 本轮流已被平台中止"
+                    f"（reason={_abort_reason}）—— 已完成的产出全部保留；"
+                    f"{_degenerate_desc}"
+                    "后续处置由平台安排，不要自行重试同一操作。"
+                )
+                _abort_base = self._strip_placeholder(new_text)
+                if not _abort_base.strip():
+                    for _m in reversed(tool_turn_acc):
+                        if _m.get("role") != "assistant":
+                            continue
+                        _c = _m.get("content")
+                        if isinstance(_c, str) and self._strip_placeholder(_c).strip():
+                            _abort_base = self._strip_placeholder(_c)
+                            break
+                _abort_final = (
+                    f"{_abort_base}\n\n{_abort_note}"
+                    if _abort_base.strip() else _abort_note
+                )
+                _acc(_assistant_with_reasoning(
+                    _abort_final, provider.supports_thinking, new_thinking
+                ))
+                return {
+                    "status": "ok",
+                    "content": _abort_final,
+                    "thinking": thinking_acc,
+                    "tool_calls": tool_history,
+                    "tool_turn_messages": tool_turn_acc,
+                    "rounds": round_num + 1,
+                    "usage": last_usage,
+                    "aborted": True,
+                    "abort_reason": _abort_reason,
+                    "steering_reason": "stream_aborted",
+                }
+
             # 处理截断的响应
             if finish_reason in ("length", "content_filter") and tool_calls:
                 # 截断的 tool_calls 可能不完整，丢弃
@@ -1158,7 +1250,7 @@ class ToolLoopMixin:
                 _acc(_assistant_with_reasoning(
                     real_text + warning, provider.supports_thinking, new_thinking
                 ))
-                return {
+                _trunc_tool_result = {
                     "status": "ok",
                     "content": real_text + warning,
                     "thinking": combined_thinking,
@@ -1167,23 +1259,83 @@ class ToolLoopMixin:
                     "rounds": round_num + 1,
                     "usage": last_usage,
                 }
+                if finish_reason == "length":
+                    # N3 批28-1 施工1：分类位随行（此形态不做恢复重问 ——
+                    # 截断 tool_calls 的重发已由 [STREAM TRUNCATED] 防御
+                    # 族覆盖，恢复语义只接管纯文本烧满形态）。
+                    _trunc_tool_result["output_length_truncated"] = True
+                    _trunc_tool_result["error_code"] = (
+                        OUTPUT_LENGTH_TRUNCATED_CODE
+                    )
+                return _trunc_tool_result
 
             if finish_reason == "length":
-                log.warning("response_truncated_length", round=round_num)
-                real_text = self._strip_placeholder(combined_text)
-                warning = "\n\n⚠️ 回复被截断（达到最大输出长度），请继续以完成。"
-                _acc(_assistant_with_reasoning(
-                    real_text + warning, provider.supports_thinking, new_thinking
-                ))
-                return {
-                    "status": "ok",
-                    "content": real_text + warning,
-                    "thinking": combined_thinking,
-                    "tool_calls": tool_history,
-                    "tool_turn_messages": tool_turn_acc,
-                    "rounds": round_num + 1,
-                    "usage": last_usage,
-                }
+                # ── N3 批28-1 施工1：length 分类恢复（对齐 pi 语义）─────
+                # 分类 = output_length_truncated（非 error/PermanentError，
+                # 稳定码随行）—— 烧满输出上限不再直接收口让下个 run 从头
+                # 再来（跨 run 重读税）。恢复恰好一次：第一次截断本轮
+                # assistant 输出 + 注入 [OUTPUT TRUNCATED] 重问一轮；第二次
+                # 走 interrupted/budget 型终态（budget_exhausted 收口），
+                # 不再重试（pi agent-session.ts:3019 第二次直接报错不循环）。
+                if not length_recovery_used:
+                    length_recovery_used = True
+                    log.warning(
+                        "output_length_truncated_recovery",
+                        agent_id=agent_id,
+                        round=round_num,
+                        text_len=len(new_text),
+                        thinking_len=len(new_thinking),
+                        keep_chars=LENGTH_RECOVERY_KEEP_CHARS,
+                        error_code=OUTPUT_LENGTH_TRUNCATED_CODE,
+                    )
+                    # 截断本轮 assistant 输出（正文/thinking 同帽保尾），落
+                    # 历史（持久化与请求同形）+ 注入重问提示（只进请求副本，
+                    # 不落库 —— 瞬态提示纪律）后续一轮。
+                    truncated_msg = _assistant_with_reasoning(
+                        _tail_keep(new_text, LENGTH_RECOVERY_KEEP_CHARS),
+                        provider.supports_thinking,
+                        _tail_keep(new_thinking, LENGTH_RECOVERY_KEEP_CHARS),
+                    )
+                    messages.append(truncated_msg)
+                    _acc(truncated_msg)
+                    messages.append({
+                        "role": "system",
+                        "content": OUTPUT_TRUNCATED_HINT,
+                    })
+                    text_acc = self._strip_placeholder(combined_text)
+                    thinking_acc = combined_thinking
+                    continue
+                log.warning(
+                    "output_length_truncated_terminal",
+                    agent_id=agent_id,
+                    round=round_num,
+                    error_code=OUTPUT_LENGTH_TRUNCATED_CODE,
+                    note="recovery re-ask already used once; closing as "
+                    "interrupted/budget terminal state",
+                )
+                result = self._budget_exhausted_result(
+                    text_acc=text_acc,
+                    thinking_acc=thinking_acc,
+                    tool_history=tool_history,
+                    tool_turn_acc=tool_turn_acc,
+                    round_num=round_num + 1,
+                    last_usage=last_usage,
+                    note=(
+                        "⚠️ 回复被截断（达到最大输出长度），且恢复重问一轮后"
+                        "再次撞上限 —— 本 run 按 interrupted 收口（全部产出已"
+                        "保留，平台会另行安排续跑）；下次请直接给出精简结论，"
+                        "不要铺陈长输出。"
+                    ),
+                    reason=OUTPUT_LENGTH_TRUNCATED_CODE,
+                    current_reasoning=(
+                        new_thinking if provider.supports_thinking else ""
+                    ),
+                    current_round_text=new_text,
+                )
+                # 分类位：稳定码 + 事实位（interrupted/budget 型终态可机检）
+                result["output_length_truncated"] = True
+                result["error_code"] = OUTPUT_LENGTH_TRUNCATED_CODE
+                return result
 
             if finish_reason == "content_filter":
                 log.warning("content_filtered", round=round_num)

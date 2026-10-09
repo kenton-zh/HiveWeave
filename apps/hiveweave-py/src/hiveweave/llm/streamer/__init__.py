@@ -14,6 +14,13 @@ from __future__ import annotations
 import sys
 from types import ModuleType
 
+from .abort_source import (
+    abort_stream,
+    active_abort_sources,
+    register_abort_source,
+    reset_abort_registry,
+    unregister_abort_source,
+)
 from .constants import (
     ACTIVITY_EXTEND_S,
     CONTEXT_TRIM_TRIGGER_RATIO,
@@ -47,6 +54,11 @@ from .constants import (
     _get_llm_semaphore,
 )
 from .core import Streamer
+from .degenerate_detect import (
+    DEGENERATE_KIND_LOOP,
+    DEGENERATE_KIND_TAG_LEAK,
+    DegenerateDetector,
+)
 from .doom_loop import (
     BLOCKED_STALL_LIMIT,
     DOOM_LOOP_DEFAULT_LIMIT,
@@ -94,6 +106,7 @@ _PATCH_CONSUMERS = (
     "hiveweave.llm.streamer.http_stream",
     "hiveweave.llm.streamer.context",
     "hiveweave.llm.streamer.core",
+    "hiveweave.llm.streamer.degenerate_detect",
     "hiveweave.llm.streamer.doom_loop",
     "hiveweave.llm.streamer.sse",
     "hiveweave.llm.streamer.constants",
@@ -114,6 +127,9 @@ _PATCH_NAMES = frozenset({
     "round_was_readonly_only",
     "Streamer",
     "CircuitBreakerOpenError",
+    "DegenerateDetector",
+    "DEGENERATE_KIND_LOOP",
+    "DEGENERATE_KIND_TAG_LEAK",
 })
 
 
@@ -140,8 +156,16 @@ __all__ = [
     "sse_to_chunks",
     "merge_tool_calls",
     "CircuitBreakerOpenError",
+    "DegenerateDetector",
+    "DEGENERATE_KIND_LOOP",
+    "DEGENERATE_KIND_TAG_LEAK",
     "DeltaCallback",
     "ToolCallCallback",
+    "abort_stream",
+    "register_abort_source",
+    "unregister_abort_source",
+    "reset_abort_registry",
+    "active_abort_sources",
     "DOOM_LOOP_DEFAULT_LIMIT",
     "DOOM_LOOP_READONLY_TOOLS",
     "DOOM_LOOP_READONLY_FUSE",

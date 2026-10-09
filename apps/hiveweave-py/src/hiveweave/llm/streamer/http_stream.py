@@ -36,6 +36,8 @@ from hiveweave.llm.unknown_error_samples import (
 )
 
 from .constants import (
+    ABORT_POLL_S,
+    ABORTED_STOP_REASON,
     continue_sentinel_text,
     EMPTY_RESPONSE_BACKOFF_MS,
     EMPTY_RESPONSE_MAX_RETRIES,
@@ -53,6 +55,12 @@ from .constants import (
     stream_chunk_wait_s,
     _get_llm_semaphore,
 )
+from .abort_source import (
+    abort_stream,
+    register_abort_source,
+    unregister_abort_source,
+)
+from .degenerate_detect import DegenerateDetector
 from .sse import merge_tool_calls, parse_sse
 from .types import DeltaCallback
 
@@ -288,6 +296,12 @@ class HttpStreamMixin:
 
             # 预算切断不是空响应，禁止退避重试（重试必然再次越预算）
             if result.get("budget_cut"):
+                return result
+
+            # N3 批28-1 施工2：平台 abort（人为掐流）不是空响应 —— 禁止
+            # 退避重试（重试 = 把刚掐掉的流再发一遍）。aborted 是终态分类，
+            # 交 tool_loop 按 interrupted 语义收口。
+            if result.get("aborted"):
                 return result
 
             # 检查空响应: 无文本 + 无 tool_calls
@@ -625,6 +639,11 @@ class HttpStreamMixin:
                 deadline=chain_deadline,
                 failover_gate=_failover_gate,
             )
+            if result.get("aborted"):
+                # N3 批28-1 施工2：aborted（人为掐流）不是链的 HTTP 成败 ——
+                # 既不算 provider 失败（不喂熔断/连败计数），也不冒充成功
+                # （掐流时上游可能一个字节都没给，成功无证据）。原样返回。
+                return result
             # 链成功（含 empty / budget_cut —— HTTP 交换本身完成）⇒ 瞬态
             # 成功重置连败计数（T33.2：第二次波次按新梯算，而非累计）。
             fo.observe_success()
@@ -844,6 +863,102 @@ class HttpStreamMixin:
                 except Exception:
                     pass
 
+        # ── N3 批28-1 施工2：per-request abort 源 ──────────────────────
+        # pi 形态适配：signal 无法传进同步 httpx 线程 ⇒ 注册表 + 周期检查
+        # （每 chunk 直读 + ABORT_POLL_S 心动 poller，静默流也有掐流时钟）。
+        # 置位 ⇒ 关 client 断流 + 归类 aborted（非 error；run 走 interrupted
+        # 语义）。run_id 来自 stream() 入口（agent 侧传 _current_run_id），
+        # 供 abort_stream 做陈旧判废；旁路调用缺省 None = 按 agent 掐。
+        _ABORT = object()
+        abort_src = register_abort_source(
+            agent_id,
+            run_id=getattr(self, "_run_id", None),
+            round_num=round_num,
+        )
+        abort_hit = False
+        abort_reason: str | None = None
+
+        # ── N3 批28-2 施工1：流内退化检测器 ────────────────────────────
+        # 病灶（第六轮）：failover 免费档输出坍塌（Robert 的「Hmm. OK. …」
+        # 循环 / DSH 星野的 </longcat_tool_call> 正文连吐）—— idle/首块看门狗
+        # 只看「有没有 chunk」，失控流稳定吐 chunk 直到烧满 128k。检测器
+        # 对正文/thinking 增量累积判退化（暖机 4k、判据见 degenerate_detect
+        # 模块注释），命中 ⇒ 经批28-1 abort 管道掐流（aborted ⇒ run 按
+        # interrupted 语义收口）。优先于 length 帽：失控流在烧满**之前**被掐。
+        # per-request 一次：命中即闩锁 + 直接投递 _ABORT 哨兵（本 chunk 即
+        # 收，不等下一 chunk / 2s poller —— 失控流每多跑一个 chunk 都在烧钱）。
+        degenerate_detector = DegenerateDetector()
+
+        # ── N3 批28-2 P2-1 修复：流活动续约 ────────────────────────────
+        # renew_lease 原只在轮/步边界续约 —— 慢 provider 上一轮 >15min 的
+        # 健康流（批28-1 length 恢复重问也会拉长）会在下一 tick 被误收割。
+        # 语义改为「chunk 在流 = 活」：收到新 chunk 且距上次续约 ≥60s ⇒
+        # _abort_poll 续约一次；流挂死（无 chunk）不续 ⇒ 15min floor 后由
+        # 收割接管（退化流在烧满前已被检测器掐掉，不占收割名额）。
+        _stream_activity = {"last_chunk": 0.0, "last_renew": 0.0}
+        _RENEW_EVERY_S = 60.0
+
+        def _check_degenerate(delta: str) -> None:
+            nonlocal abort_hit
+            if abort_hit:
+                return
+            kind = degenerate_detector.feed(delta)
+            if kind is None:
+                return
+            reason = f"degenerate_output:{kind}"
+            log.warning(
+                "degenerate_output_detected",
+                agent_id=agent_id,
+                round=round_num,
+                kind=kind,
+                text_len=len(text_acc),
+                thinking_len=len(thinking_acc),
+                note="degenerate output loop/tag-leak detected mid-stream; "
+                     "aborting via abort pipeline",
+            )
+            # 经注册表入口掐流（run_id 陈旧判废 + 统一日志）；再直接投递
+            # _ABORT 哨兵保证确定性收口（汇合到上方既有 _ABORT 处理分支，
+            # 单一收口路径，不另写第二套）。
+            abort_stream(
+                agent_id,
+                run_id=getattr(self, "_run_id", None),
+                reason=reason,
+            )
+            event_q.put_nowait((_ABORT, reason))
+
+        async def _abort_poll() -> None:
+            """2s 心动检查 abort 源：置位 ⇒ 投递 _ABORT 控制消息。
+
+            静默流（思考中/无 chunk，最长 IDLE 150s 无事件）唯一的掐流
+            时钟 —— 不改 SSE wait 的 idle 看门狗结构（wait_for 超时即判死
+            的语义不动），由本任务在旁路周期唤醒。
+            """
+            while True:
+                await asyncio.sleep(ABORT_POLL_S)
+                if abort_src.event.is_set():
+                    event_q.put_nowait((_ABORT, abort_src.reason or "aborted"))
+                    return
+                # 批28-2 P2-1：流活动续约（节流 60s）—— chunk 在流 = 活，
+                # 续 lease 防「慢而健康」的长轮被 lease 收割误杀；挂死流
+                # （无 chunk）不续 ⇒ floor 后由收割接管。
+                _run_id_now = getattr(self, "_run_id", None)
+                now_m = time.monotonic()
+                if (
+                    _run_id_now
+                    and _stream_activity["last_chunk"] > _stream_activity["last_renew"]
+                    and now_m - _stream_activity["last_renew"] >= _RENEW_EVERY_S
+                ):
+                    _stream_activity["last_renew"] = now_m
+                    try:
+                        from hiveweave.services.run_ledger import RunLedger
+
+                        await RunLedger().renew_lease(agent_id, _run_id_now)
+                    except Exception as renew_err:  # noqa: BLE001 — best-effort
+                        log.debug(
+                            "stream_lease_renew_failed",
+                            agent_id=agent_id, error=str(renew_err),
+                        )
+
         def _run_sync() -> None:
             """在线程中执行：HTTP 请求 + SSE 解析，事件即时入队。"""
             http_client = httpx.Client(timeout=read_to)
@@ -910,6 +1025,7 @@ class HttpStreamMixin:
                 http_client.close()
 
         executor_task = loop.run_in_executor(None, _run_sync)
+        abort_task = asyncio.ensure_future(_abort_poll())
 
         text_acc = ""
         thinking_acc = ""
@@ -919,6 +1035,7 @@ class HttpStreamMixin:
         budget_cut = False
         abandon_executor = False
         got_event = False
+        # N3 批28-1 施工2：aborted 状态（与 budget_cut 平行的提前收口位）
         # T3' #3：终止事件证据位 —— finish / message_stop / [DONE] 任一见过
         # 即置位；传输正常关闭但从未置位 = 截断流，不许当成功返回。
         saw_terminator = False
@@ -1054,6 +1171,25 @@ class HttpStreamMixin:
                     )
                     raise RetryableError(err_text)
 
+                if kind is _ABORT:
+                    # N3 批28-1 施工2：人为掐流 ⇒ 断流 + aborted 分类（pi：
+                    # stopReason="aborted" 而非 error —— 下游可区分「人为掐」
+                    # 与「真失败」）。已收文本保留；不完整 tool_calls 丢弃
+                    # （同 budget_cut 语义：半截 JSON 不可执行）。
+                    abort_hit = True
+                    abort_reason = payload
+                    abandon_executor = True
+                    _close_http_client()
+                    log.warning(
+                        "llm_stream_aborted",
+                        agent_id=agent_id,
+                        round=round_num,
+                        reason=abort_reason,
+                        text_len=len(text_acc),
+                        discarded_tool_deltas=len(tool_call_deltas),
+                    )
+                    break
+
                 got_event = True
                 if first_byte_budget is not None:
                     # T3'：首个真实上游字节到达 —— 零输出总帽对本重试链
@@ -1061,6 +1197,12 @@ class HttpStreamMixin:
                     # 判据与既有 got_event 同源：任何解析出的 SSE 事件都算
                     # 真实字节；queue ping / _DONE / _ERR 控制消息不置位。
                     first_byte_budget["seen"] = True
+
+                # N3 批28-1 施工2：活跃流快速检查 —— chunk 到达即查 abort 源
+                # （比 2s poller 更快掐）。置位 ⇒ 投递 _ABORT 哨兵，汇合到
+                # 上方同一处理分支（单一收口路径，不另写第二套）。
+                if abort_src.event.is_set():
+                    event_q.put_nowait((_ABORT, abort_src.reason or "aborted"))
 
                 # 逐事件预算检查（审计 2026-08-08 P1）：上面的切断只在 wait
                 # 超时分支判定 —— 连续事件流（间隔 <0.1s）会让 wait 永不超时，
@@ -1103,12 +1245,16 @@ class HttpStreamMixin:
                             "type": "text_delta", "content": content,
                             "delta_id": delta_id})
                         text_acc += content
+                        _stream_activity["last_chunk"] = time.monotonic()
+                        _check_degenerate(content)
                     elif ctype == "reasoning":
                         content = c["content"]
                         await self._fire_delta(on_delta, {
                             "type": "thinking_delta", "content": content,
                             "delta_id": delta_id})
                         thinking_acc += content
+                        _stream_activity["last_chunk"] = time.monotonic()
+                        _check_degenerate(content)
                     elif ctype == "tool_call_delta":
                         tool_call_deltas.append(c["tool_call"])
                     elif ctype == "tool_call_start":
@@ -1156,6 +1302,20 @@ class HttpStreamMixin:
                             agent_id=agent_id,
                         )
 
+            # N3 批28-1 施工2：流自然结束（_DONE 先于哨兵被读）但 abort 已
+            # 置位 ⇒ 按 aborted 收口（对齐 pi 的 post-stream signal.aborted
+            # 检查：掐晚了也是掐）。
+            if not budget_cut and not abort_hit and abort_src.event.is_set():
+                abort_hit = True
+                abort_reason = abort_src.reason or "aborted"
+                log.warning(
+                    "llm_stream_aborted_post_done",
+                    agent_id=agent_id,
+                    round=round_num,
+                    reason=abort_reason,
+                    text_len=len(text_acc),
+                )
+
             # T3' #3：空流终态校验 —— 传输正常关闭（字节收完）但从未见过
             # 终止事件（message_stop / finish / [DONE]）= 截断流。按 pi
             # 「ended without message_stop」先例抛 RetryableError（error_code
@@ -1164,7 +1324,11 @@ class HttpStreamMixin:
             # turn 的已知病灶）。budget_cut 有自己的收口语义（保留已收
             # 文本），不经本校验。放在 try 块内：partial_usage 随行与
             # unknown-sample flush 由本方法的 except 覆盖。
-            if not budget_cut and not saw_terminator:
+            if (
+                not budget_cut
+                and not abort_hit
+                and not saw_terminator
+            ):
                 raise RetryableError(
                     "Stream ended without terminator event "
                     "(message_stop/finish/[DONE])",
@@ -1193,6 +1357,10 @@ class HttpStreamMixin:
                     pass
             raise
         finally:
+            # N3 批28-1 施工2：请求结束（任何形态）—— 停 poller + 注销 abort
+            # 源（正常完成注销 ⇒ 注册表不残留；异常/取消路径同样经过这里）。
+            abort_task.cancel()
+            unregister_abort_source(agent_id, abort_src)
             if abandon_executor:
                 # 预算切断 / 首包 / 空闲超时都【不能】await executor 线程 ——
                 # 它正阻塞在 socket read 上；await 会把看门狗省下的时间耗光
@@ -1206,6 +1374,21 @@ class HttpStreamMixin:
                     await executor_task
                 except Exception:
                     pass
+
+        if abort_hit:
+            # N3 批28-1 施工2：aborted 结果形态 —— status ok（非 error），
+            # finish_reason="aborted"，事实位 aborted=True + abort_reason。
+            # tool_calls 已丢弃（半截不可执行）；usage 随行保账。
+            return {
+                "status": "ok",
+                "text": text_acc,
+                "thinking": thinking_acc,
+                "tool_calls": [],
+                "finish_reason": ABORTED_STOP_REASON,
+                "usage": usage,
+                "aborted": True,
+                "abort_reason": abort_reason,
+            }
 
         if budget_cut:
             return {

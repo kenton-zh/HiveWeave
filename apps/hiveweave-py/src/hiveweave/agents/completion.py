@@ -583,6 +583,12 @@ async def handle_completion(
 
     _auto_exit = turn_exit_mode() == "auto"
     _t16_budget_stop = _auto_exit and bool(result.get("budget_exhausted"))
+    # N3 批28-1 施工2：平台 abort（abort_stream 掐流，streamer 归类
+    # aborted 而非 error）⇒ run 走 interrupted 语义（对齐 pi：abort 是
+    # 人为掐，不是失败）。与 _t16_budget_stop 同族：保留产出、interrupt_run、
+    # 不做门禁收口；差异：**不自动续跑** —— 后续处置（重醒/改派/放弃）归
+    # abort 发起方（批28-2 检测器），延续唤醒会跟检测器的处置打架。
+    _stream_aborted = bool(result.get("aborted"))
 
     # E5: 成功一轮（收到正常 LLM 完成结果）即清除断流降级标志 —— 与
     # _run_id/ledger 写库解耦（审计修正：挂在 complete_run 成功副作用后，
@@ -758,7 +764,8 @@ async def handle_completion(
     # TurnResult（wait 契约=waiting；否则 done_slice；summary=末段
     # assistant 文本/最后工具结果），再走既有门禁判定与收口结构。
     # 预算掐断不合成（run 标 interrupted，不做门禁收口）。
-    if _auto_exit and not _t16_budget_stop:
+    # N3 批28-1 施工2：平台掐断同样不合成（run 标 interrupted）。
+    if _auto_exit and not _t16_budget_stop and not _stream_aborted:
         try:
             from hiveweave.services.turn_exit_auto import (
                 ensure_platform_turn_result,
@@ -938,6 +945,34 @@ async def handle_completion(
             "t16_budget_interrupt",
             agent_id=agent.id,
             run_id=_run_id_b,
+        )
+    elif _stream_aborted:
+        # N3 批28-1 施工2：平台 abort_stream 掐流 ⇒ run 标 interrupted
+        # （非 error —— pi 语义：abort 是人为掐，不是失败）。保留已累积
+        # 文本与工具产出（tool_loop 已落）；不 ACK pending inbox（abort
+        # 常因失联/失控，inbox 保留未读，下次唤醒仍可见）；不自动续跑
+        #（与 _t16_budget_stop 的差异：延续唤醒归 abort 发起方安排）。
+        pop_pending_turn_result(agent.id)
+        agent._turn_gate_count = 0
+        agent.disposition = "runnable"
+        _run_id_ab = getattr(agent, "_current_run_id", None)
+        if _run_id_ab:
+            try:
+                await agent._run_ledger.interrupt_run(
+                    agent.id,
+                    _run_id_ab,
+                    reason="stream_aborted",
+                    result_summary=build_run_result_summary(content or ""),
+                )
+            except Exception as e:
+                log.debug(
+                    "stream_aborted_interrupt_run_failed", error=str(e)
+                )
+        log.info(
+            "stream_aborted_interrupt",
+            agent_id=agent.id,
+            run_id=_run_id_ab,
+            abort_reason=result.get("abort_reason"),
         )
     elif not exit_decision.ok:
         unreplied_ids = {m["id"] for m in unreplied_asks}
@@ -1566,6 +1601,10 @@ async def handle_completion(
     # 收口仍违规走上面的显式记录分支，不再为补一句 commit_turn 开新 run。
     if _stall_parked:
         pass  # Parked — do not retrigger
+    elif _stream_aborted:
+        # N3 批28-1 施工2：平台掐断的 run 不自动续跑 —— abort 发起方
+        #（批28-2 检测器）拥有后续处置权，本地 retrigger 会与其打架。
+        pass
     elif _stall_resume_refs:
         # P1-3: 补偿唤醒优先于通用 retrigger 分支 —— 用卡死的同一上下文立刻
         # 重入只会再 stall；延迟唤醒 + 引导先核实状态再续跑/收口。

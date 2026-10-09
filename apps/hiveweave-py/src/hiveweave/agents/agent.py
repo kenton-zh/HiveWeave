@@ -1682,6 +1682,10 @@ class Agent:
                     steer_queue=self._steer_q,
                     usage_sink=pending_sink,
                     exit_gate_check=_gate_supplement_check,
+                    # N3 批28-1 施工2：run_id 登记 abort 注册表 —— 平台侧
+                    # abort_stream 按 run 陈旧判废（老 run 的迟到 abort 不掐
+                    # 新 run 的流）。
+                    run_id=self._current_run_id,
                 )
 
                 # Token metering: 主对话路径落库（best-effort，不阻塞主流程）。

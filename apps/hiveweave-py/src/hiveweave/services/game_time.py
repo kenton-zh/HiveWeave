@@ -882,18 +882,20 @@ class GameTimeService:
             )
 
     async def _sweep_expired_run_leases(self, project_id: str) -> None:
-        """P0-3：运行时 run 租约 sweep（30s 槽位）—— 收口进程内死亡 run 的悬挂行。
+        """P0-3 + 批28-2：运行时 run 租约 sweep（30s 槽位）—— 收口悬挂/失控 run。
 
         病灶：``agent_runs.lease_expires_at`` 此前只写不读 —— 进程内 run 死亡
         （收口路径漏掉 / task 静默消失 / OOM kill）后 running 行悬挂到重启
         才被 startup sweep 收口。本方法把启动 sweep 的收口语义搬到运行时，
-        判据 = lease 过期 **且** 该 run 不在进程内活跃注册表。
+        判据 = lease 过期；处置按注册表分流（批28-2 施工2 起）：
 
-        防误杀（注册表判据，取法照 ``_check_silent_agents`` 的 processing
-        豁免）：进程内仍在跑的 run 不能动 —— 豁免 = PROCESSING 中 agent 的
-        ``_current_run_id``。⚠ 健康长 run 的 lease 普遍已过期
-        （``check_budget`` 不按墙钟停），注册表是唯一豁免通道；同 agent
-        更早的遗留 running 行（真正的悬挂行）不在豁免内，照常收口。
+        - **不在注册表**（owner 不在跑）：直接收口 interrupted（P0-3 原语义）。
+        - **在注册表**（PROCESSING 中 agent 的 ``_current_run_id``）：不再
+          无条件豁免 —— 先 ``abort_stream`` 给宽限让流自收口（批28-1 管道
+          落 interrupted），宽限过后仍 running ⇒ 双保险收口（Robert 失控
+          run 超 lease 6 分钟仍 running 的病灶）。公平性由 ``renew_lease``
+          保证：LLM 轮/工具步边界续约，健康 run 的 lease 始续新鲜，收割
+          只打续约停止（流死/协程死）的真失控。
         """
         from hiveweave.agents.supervisor import agent_manager
         from hiveweave.agents.types import AgentState
