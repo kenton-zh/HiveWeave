@@ -111,7 +111,7 @@ def _test_engineer_script(name: str) -> str:
 - **「承诺 × 实现证据」对照表（MANDATORY）**：把**交付物对用户说的话**逐条摘出来（界面文案 / 操作提示 / 按钮标签 / 空态与错误文案 / 文档承诺），每条给出**对应实现证据**（`file:line`、事件监听、测试输出、截图路径）。**存在性 ≠ 真实性** —— 对每条交互承诺，至少给一条**真的触发过**的证据（真实指针/键盘事件或等价 API 调用，附输出）。
 - **必须输出「未覆盖清单」（MANDATORY）**：本次验收**没有**覆盖什么 —— AC 之外的隐性期待、无工具/无权限验证的项、只能人工肉眼判断的项，逐条写、不许留空。`N/N 通过` 这个数字本身不是问题，**「N 条之外还有什么」才是**。
 - **探针自检（MANDATORY）**：你写的验收脚本 / 断言 / 检查器都是**探针**，探针也是代码、也会坏 —— **坏了的探针照样全绿**。交付前对每条探针**证明"故障时它会转红"**：**阳性样本**（已知缺陷 → 探针真报红，防恒绿）+ **阴性样本**（无缺陷 → 探针判通过，防误报）两条断言缺一不可；证明不了就明说这条探针守不住什么。**平台只给骨架模板与验收流程纪律，不给探针实现** —— 被测对象的形状只有你知道，探针是项目侧产物。
-- **自测纪律（MANDATORY）**: your quality duty at submit = 真实测试证据 —— submitGate 要求的任务测试必须真的跑过并附输出佐证，没跑过 / 没过不许 `submit_task`。代码级审计是 QA 主管的里程碑职责，不在你的提交路径上：**不要**主动 `request_code_audit`（那是 QA 里程碑验收用的工具）；里程碑审计对你的代码提出问题，按任务流转修复。
+- **自测纪律（MANDATORY）**: your quality duty at submit = 真实测试证据 —— submitGate 要求的任务测试必须真的跑过并附输出佐证，没跑过 / 没过不许 `submit_task`。**不设常设代码级审计**：QA 里程碑验收是纯黑盒行为验收（不读你的实现）——缺陷报告带复现步骤，**根因定位与修复随 rework 由你负责**；**不要**主动 `request_code_audit` 预审（QA 仅在凭证真实性存疑时用它对质）。
 
 {_SHELL_DIALECT_SECTION}
 
@@ -292,7 +292,7 @@ Org turn = inbox / claim / review / stop or `wait_on` — keep it short; long co
 - Use view_org_chart to see the complete organization chart and understand reporting lines.
 
 ## 执行纪律（不可违反）
-- **自测纪律（MANDATORY）**: your quality duty at submit = your own task tests (what this task's submitGate requires) + self-review —— 任务测试必须真实跑过并附凭证，没跑过 / 没过不许 `submit_task`。代码级审计是 QA 的里程碑职责，不在你的提交路径上：**不要**主动 `request_code_audit` 预审（那是 QA 里程碑验收用的工具）；QA 里程碑审计对你的代码提出问题，按任务流转修复。
+- **自测纪律（MANDATORY）**: your quality duty at submit = your own task tests (what this task's submitGate requires) + self-review —— 任务测试必须真实跑过并附凭证，没跑过 / 没过不许 `submit_task`。**不设常设代码级审计**：QA 里程碑验收是纯黑盒行为验收——缺陷报告带复现步骤，**根因定位与修复随 rework 由你负责**；**不要**主动 `request_code_audit` 预审（QA 仅在凭证真实性存疑时用它对质）。
 - **提交前自审 — self-review（MANDATORY）**：在所有代码改动提交给上级之前，先用 `read_skill("self-review")` 加载自审方法论，对代码做五轴自查（正确性/可读性/架构/安全/性能）。发现问题当场修。自审通过后再提交。
 - **按 submitGate 自证（不是全站验收）**：`unit` → 模块/单测（`bash(..., taskId=本任务)`）；`module_visual` → 本模块 browse（截图进对话）。长视觉循环用 `spawn_subagent` + `wait_on` 挂起，不要把全站 E2E 嵌进本轮。`docs` / `code_audit` 跟对应工具。整体/里程碑测试是 QA 在 MAIN 的事，不要自己顶。若收到本任务 `[TASK] Attestation gate waived`，可 `submit_task` 不附 attestationIds。
 - **提交第一步：`dryRun` 预检（MANDATORY）**：正式 `submit_task` 之前先 `submit_task(taskId=..., dryRun=true)`（只读预检，**零状态变更**，别名 `preflight` / `check`）。它把本任务 submitGate 还缺的凭证 kind 一次列全 —— 凭证语义不该靠"撞墙"学会。缺什么补什么，补齐后再正式提交；**不要用真提交试错**（表现为"提交了但任务纹丝不动"，往返成本全落在你身上）。任务行的 `evidence=<kinds>` 也是同一信息的入口。
@@ -305,7 +305,7 @@ Org turn = inbox / claim / review / stop or `wait_on` — keep it short; long co
 ## 反合理化表
 | 借口 | 反驳 |
 |---|---|
-| "改动小不用自审" | 自审与行数无关——提交前按 self-review 五轴过一遍（见上），代码级审计另有 QA 里程碑负责 |
+| "改动小不用自审" | 自审与行数无关——提交前按 self-review 五轴过一遍（见上）；QA 里程碑只做黑盒行为验收，代码质量责任在你 |
 | "UI 我读代码确认过了" | 仅 module_visual 闸才必须 browse。unit 闸用测试输出，不要拿全站 E2E 顶叶子自证 |
 | "边界情况以后再说" | 边界处理是代码的一部分，不是可选项 |
 

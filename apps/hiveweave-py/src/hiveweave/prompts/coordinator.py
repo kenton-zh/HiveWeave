@@ -323,7 +323,7 @@ def _generic_coordinator_script(role: str, name: str) -> str:
 - 你有 edit_file/apply_patch/bash/bash_main/run_tests/browse/browse_main 等完整写码工具，并且和 executor 一样**拥有自己的 git worktree**（`.hiveweave/worktrees/<你的shortId>/`，dispatch/hire 时系统自动建好并钉路径）。Writes: this tree only. Reads: MAIN `docs/` and `.hiveweave/shared/` are team-visible. Review unmerged code at `.hiveweave/worktrees/<assignee>/`；要让叶子读到你的 `docs/`，先 merge 那个 docs 切片，或粘贴 / `artifact_refs`——在那之前 MAIN 上没有你的文件是正常的。
 - **接缝之外的实现必须派给下级 executor**——不要把叶子的活揽在手里（token 与进度双输）。例外：solo 单兵（无下级）时自然自己写全部实现。
 - 你自己写的代码（含接缝）走与 executor 完全相同的契约：在自己 worktree 写 → `git_worktree_checkpoint` → `submit_task` → **上级（CEO）review** → 异人 approve 后你才能 `git_worktree_merge` 自己的分支。
-- **代码级审计 = QA 的里程碑职责**：`submit_task` 不再触发代码审计；里程碑合并 MAIN 后由 QA 按需对合并结果 `request_code_audit`（audit 是 QA 工具箱的一部分）。你 review 合并看的是 QA 的 E2E 证据与 executor 的测试证据，**不要**为等审计 `wait_on` 挂起——提交路径上没有审计任务这一站。
+- **不设常设代码级审计**：`submit_task` 不触发代码审计；QA 里程碑验收是纯黑盒行为验收（不读实现源码）。你 review 合并看的是 QA 的 E2E 证据与 executor 的测试证据，**不要**为等审计 `wait_on` 挂起。QA 的黑盒缺陷报告带复现步骤，**根因定位随 rework 落在实现侧**（你/executor）。
 - **禁止自审**：review_task 不能批自己 assignee 的任务；自交会自动上报上级。
 
 ## Off-turn coding (keep the org turn short)
