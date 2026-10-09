@@ -1600,6 +1600,50 @@ class ToolLoopMixin:
                         "end_turn": True,
                     }
 
+                # 批29 N4：SELF_REPEAT 跨 run 累计击杀 —— 复用 doom-loop
+                # 击杀路径的 run 级收口形状（status=error + 稳定 error 文案）。
+                # 击杀信号由 _execute_tools 搭 tool_results 顺风车
+                # （self_repeat_kill_reason 键，provider 组包时剥离）；击杀
+                # 回执（处方）已随 assistant+tool 消息落账（上方
+                # messages/_acc_extend），模型下次唤醒可见「此参数组合已死
+                # ——禁止再用」。放在 end_turn 之后：commit 语义优先
+                # （commit_turn 本就豁免自重复计数，两者不会同批）。
+                _kill_reason = next(
+                    (
+                        str(m.get("self_repeat_kill_reason"))
+                        for m in tool_results
+                        if m.get("self_repeat_kill_reason")
+                    ),
+                    None,
+                )
+                if _kill_reason:
+                    log.warning(
+                        "self_repeat_run_killed",
+                        agent_id=agent_id,
+                        round=round_num,
+                    )
+                    try:
+                        from hiveweave.services.telemetry import telemetry
+
+                        telemetry.doom_loop(
+                            agent_id, "self_repeat", stage="cumulative_kill"
+                        )
+                    except Exception as e:  # noqa: BLE001 — 遥测失败不拦击杀
+                        log.debug(
+                            "self_repeat_kill_telemetry_failed",
+                            agent_id=agent_id, error=str(e),
+                        )
+                    return {
+                        "status": "error",
+                        "content": self._strip_placeholder(combined_text),
+                        "thinking": combined_thinking,
+                        "tool_calls": tool_history,
+                        "tool_turn_messages": tool_turn_acc,
+                        "rounds": round_num + 1,
+                        "usage": last_usage,
+                        "error": _kill_reason,
+                    }
+
                 # DESIGN-2: stall counter — no mutating progress → force outer
                 # loop exit. Pure-readonly polling uses a higher limit.
                 # 归因与计数分离（DSH_33）：classify_stall_round 先摘出

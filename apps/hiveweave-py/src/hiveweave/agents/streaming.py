@@ -465,10 +465,13 @@ async def on_tool_call(
         #   F4/F7 事实位（修复计划 2026-08-30）——必须透传给 tool_exec，
         #   否则 F8 advisory 归因拿不到「是墙的问题还是自己的问题」。
         #   这些键不会进入发给 LLM 的消息体 —— provider 组包时白名单剥离。
+        # - self_repeat_kill: 批29 N4 跨 run 累计自重复击杀 —— 透传给
+        #   tool_exec/tool_loop，复用 doom-loop 击杀路径收口整个 run。
         "success": result.get("success", False),
         "duplicate": result.get("duplicate", False),
         "end_turn": bool(result.get("end_turn")),
         "blocked": bool(result.get("blocked")),
+        "self_repeat_kill": bool(result.get("self_repeat_kill")),
         "runner_failed": result.get("runner_failed"),
         "command_failed": result.get("command_failed"),
         "timeout_kind": result.get("timeout_kind"),

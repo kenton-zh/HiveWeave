@@ -128,6 +128,33 @@ _TOKEN_COUNT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?tokens?\b", re.IGNORECASE)
 # （审计 LOW：{6,}+大小写不敏感会误吃 `tmpDirectory` 这类驼峰标识符）。
 _TMP_DIR_RE = re.compile(r"\btmp[a-z0-9_]{8}\b")
 
+# ── 批29 N5（2026-10-09）：attestation 包装的失败，指纹取内层 ──────────
+# 病灶（s24/d90 实测）：5 个不同 agent 撞「同一堵墙」（签名
+# `[ATTESTATION] … Command exited with code 1`），实为 5 个工程师**各自不同**
+# 的真实单测失败（TAP not ok 各不相同）——test_run 凭证的横幅
+# `[ATTESTATION] attestation_id=<id> kind=<kind>` 被算进签名头部，_MAX_SIG_LEN
+# 窗口被「横幅 + 统一 exit 文案」占满，异质失败折进同一签名 → 同桶，
+# 误导协调者做「封路」级决策。修法：剥掉包装前缀后对剩余正文（真实命令
+# 输出/TAP 差异）做归一化签名——不同失败签名各异（不再同桶），真正的
+# 「同一测试同一失败」仍聚。兼容：已有 memories 行不改；只影响新签名生成
+# （旧横幅签名条目对带横幅的新失败不再精确命中 —— 算法变更搁浅口径，
+# 与既有先例同律，见 signature_of docstring 的搁浅说明）。
+_ATTESTATION_BANNER_RE = re.compile(
+    r"^\[ATTESTATION\] attestation_id=\S+ kind=\S+[^\n]*\n?"
+)
+
+
+def strip_attestation_wrapper(error: str) -> str:
+    """剥掉 test_run 凭证的包装横幅首行（无横幅原样返回，剥后可能为空）。
+
+    横幅由 ``tools/bash._combine_attestation_output`` 前置在失败 error 的
+    **首行**（``[ATTESTATION] attestation_id=<id> kind=<kind>``），与根因
+    正交 —— 平台自产标识，与 uuid/时间戳同一判据（剥形状，不剥措辞）。
+    尾部 footer（``[attestation_id=… exit=N]``）**不剥**：其 id 已被 uuid/id8
+    归一、exit 码稳定，对聚合语义无害。
+    """
+    return _ATTESTATION_BANNER_RE.sub("", (error or "").strip(), count=1)
+
 
 def _dur_sub(m: "re.Match[str]") -> str:
     return "<n>" + (m.group(2) or m.group(4) or "")
@@ -233,6 +260,12 @@ def signature_of(error: str | None, root: str | None = None) -> str | None:
     if not error or not error.strip():
         return None
     sig = error.strip()
+    # 批29 N5：attestation 包装的失败，指纹取内层正文（剥横幅首行）——
+    # 横幅是平台自产标识，占满签名窗口会把异质测试失败折成同桶。
+    sig = strip_attestation_wrapper(sig)
+    if not sig:
+        # 整条 error 只有横幅（无内层正文）⇒ 无有效信息，不广播。
+        return None
     if root:
         escaped = re.escape(root.rstrip("\\/"))
         sig = re.sub(

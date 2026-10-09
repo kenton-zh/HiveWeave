@@ -172,6 +172,10 @@ class ToolExecMixin:
         duplicate_ids 标识"同参数已执行过、本次无新效果"的工具调用，供 doom
         tracker 做强制 +1 计数加速触顶。
         end_turn=True 表示本批含已接受的 commit_turn，应硬断工具循环（BUG-3）。
+        批29 N4：SELF_REPEAT 跨 run 累计击杀**不改返回元数**（既有调用方/测试
+        零感知）——击杀信号以 ``self_repeat_kill_reason`` 键搭 tool_results
+        顺风车（与 blocked/runner_failed 事实位同通道，provider 组包白名单
+        剥离、不进 LLM 请求体）；tool_loop 收到后复用 doom-loop 击杀路径收口。
         budget_s 在工具声明了超时时收紧预算（turn 预算写死启用，
         见 constants.py 顶部说明）。
         bash/read/write/edit 不声明，不被 wait_for 包裹。
@@ -263,6 +267,18 @@ class ToolExecMixin:
                 "content": content,
                 "tool_call_id": tc["id"],
             }
+            # 批29 N4：击杀信号搭 tool_results 顺风车（同事实位纪律：
+            # provider 组包白名单剥离，不进 LLM 请求体）。tool_loop 读到
+            # 即复用 doom-loop 击杀路径收口整个 run。只挂击杀回执自己的
+            # tool_msg，不扩散到批内后续调用。
+            if (
+                not isinstance(result, BaseException)
+                and result.get("self_repeat_kill")
+            ):
+                tool_msg["self_repeat_kill_reason"] = (
+                    content
+                    or "[SELF_REPEAT KILL] 同参重复累计超限，本 run 终止。"
+                )
             # F4（平台修复计划 2026-08-30）：正交事实位透传到 tool_results
             # —— blocked/runner_failed/command_failed 是 F8 advisory 归因的
             # 数据源。这里**选择性**添加（只加证据充分的位；不给成功的调用

@@ -3117,6 +3117,120 @@ def reset_self_repeat_streaks_for_tests() -> None:
         _SELF_REPEAT_STREAKS.clear()
 
 
+# ── 批29 N4（2026-10-09）：跨 run 累计拒绝击杀 ────────────────
+# 病灶（第六轮 s24 磐石实测）：12:56-14:34 以**完全相同参数**轮询
+# halyard/core/store.py 70 次（25 放行 + 45 拒绝）仍不终止——模型学会了
+# 「等 10 分钟窗口衰减 → 原样重试」：T9 连击是 per-agent 单槽 + 600s 窗，
+# 窗口一滑连击清零重计，拒绝永远只发生在「窗口内快连」的爆发段；而
+# run 级 doom-loop 击杀（×3）只覆盖单 run，轮询分散在多 run 永不触发。
+# 修法（最小侵入，与既有 ≥3/≥5 语义兼容）：
+# ① per-(agent_id, args_hash) 维护**累计拒绝计数**——跨窗口保留，窗口只
+#   控制 streak 的连续性判定与升级节奏，不控制累计总量（修「等衰减」绕过）；
+# ② 累计拒绝 ≥ 阈值（env HIVEWEAVE_SELF_REPEAT_CUMULATIVE_KILL，默认 12）
+#   ⇒ 击杀升级：回执从「本次拒绝」升为「此参数组合已死——禁止再用」，并
+#   带 self_repeat_kill 标记——由 streaming 桥接 → _execute_tools →
+#   tool_loop 复用 doom-loop 击杀路径做 **run 级**收口（status=error），
+#   不再只是单调用拒绝。已死后同参调用**即视即杀**（不必再等 streak 攒到 5）
+#   ——「禁止再用」必须可执行，否则击杀后下一个 run 又白送 4 次放行。
+# 边界（如实登记）：纯内存 best-effort，**进程重启即失忆**（跨重启累计
+# 需落 agent_events/memories，过重，本批拍板接受）；键含 args_hash 截断
+# 为 sha256 前 16 位，容量有界（LRU 式砍半，同 _SELF_REPEAT_STREAKS）。
+
+#: 跨 run 累计击杀阈值 env（HIVEWEAVE_SELF_REPEAT_CUMULATIVE_KILL）——默认 12。
+_SELF_REPEAT_CUMULATIVE_KILL_ENV = "HIVEWEAVE_SELF_REPEAT_CUMULATIVE_KILL"
+_SELF_REPEAT_CUMULATIVE_KILL_DEFAULT = 12
+
+# per-(agent, args_hash)：
+# {"count": int, "first_ts": float, "last_ts": float, "tool": str}
+_SELF_REPEAT_CUMULATIVE: dict[str, dict[str, Any]] = {}
+_SELF_REPEAT_CUMULATIVE_LOCK = threading.Lock()
+_SELF_REPEAT_CUMULATIVE_MAX_KEYS = 4000
+
+
+def _self_repeat_cumulative_kill_threshold() -> int:
+    """累计击杀阈值：env 覆盖，默认 12；clamp 到 ≥1（击杀以发生过拒绝为前提）。"""
+    raw = os.environ.get(_SELF_REPEAT_CUMULATIVE_KILL_ENV)
+    if raw is None or not raw.strip():
+        return _SELF_REPEAT_CUMULATIVE_KILL_DEFAULT
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return _SELF_REPEAT_CUMULATIVE_KILL_DEFAULT
+    return max(value, 1)
+
+
+def _self_repeat_cumulative_key(
+    agent_id: str, tool_name: str, tool_args: Any
+) -> str:
+    """累计键 = ``agent_id|sha256(call_identity)[:16]``（有界，同连击身份口径）。"""
+    from hiveweave.services.failure_signature import call_identity
+
+    identity = call_identity(tool_name, tool_args)
+    args_hash = hashlib.sha256(
+        identity.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    return f"{agent_id or ''}|{args_hash}"
+
+
+def _note_self_repeat_refusal(
+    agent_id: str, tool_name: str, tool_args: Any
+) -> int:
+    """登记一次平台拒绝，返回该 (agent, args_hash) 的**累计**拒绝数（本次计入）。
+
+    与 streak 的决定性差异：**跨窗口保留**——600s 窗滑动不清零重计，
+    「等衰减后原样重试」在累计口径下仍递增。豁免工具恒返 0。
+    """
+    if tool_name in _SELF_REPEAT_EXEMPT_TOOLS:
+        return 0
+    key = _self_repeat_cumulative_key(agent_id, tool_name, tool_args)
+    now = time.time()
+    with _SELF_REPEAT_CUMULATIVE_LOCK:
+        if len(_SELF_REPEAT_CUMULATIVE) >= _SELF_REPEAT_CUMULATIVE_MAX_KEYS:
+            stale = sorted(
+                _SELF_REPEAT_CUMULATIVE.items(),
+                key=lambda kv: kv[1].get("last_ts", 0),
+            )[: _SELF_REPEAT_CUMULATIVE_MAX_KEYS // 2]
+            for k, _ in stale:
+                _SELF_REPEAT_CUMULATIVE.pop(k, None)
+        entry = _SELF_REPEAT_CUMULATIVE.get(key)
+        if entry is None:
+            _SELF_REPEAT_CUMULATIVE[key] = {
+                "count": 1, "first_ts": now, "last_ts": now, "tool": tool_name,
+            }
+            return 1
+        entry["count"] = int(entry.get("count", 1)) + 1
+        entry["last_ts"] = now
+        return int(entry["count"])
+
+
+def _peek_self_repeat_cumulative(
+    agent_id: str, tool_name: str, tool_args: Any
+) -> int:
+    """读当前累计拒绝数（不递增）——已死组合的「即视即杀」判定用。"""
+    if tool_name in _SELF_REPEAT_EXEMPT_TOOLS:
+        return 0
+    key = _self_repeat_cumulative_key(agent_id, tool_name, tool_args)
+    with _SELF_REPEAT_CUMULATIVE_LOCK:
+        entry = _SELF_REPEAT_CUMULATIVE.get(key)
+        return int(entry.get("count", 0)) if entry else 0
+
+
+def self_repeat_kill_prescription(tool_name: str, cumulative: int) -> str:
+    """击杀处方——比拒绝处方更强一级：参数组合已死，禁止再用。"""
+    return (
+        f"[SELF_REPEAT KILL] 此参数组合在本任务内已死：'{tool_name}' 已被"
+        f"平台累计拒绝 {cumulative} 次（跨 run 累计）——**禁止再用**。"
+        "必须换工具/换参数/换路径，或用 send_message 向上级上报此卡点。"
+        "同参再次调用会被立即拒绝并终止当前 run。"
+    )
+
+
+def reset_self_repeat_cumulative_for_tests() -> None:
+    """测试用：清空跨 run 累计拒绝记忆。"""
+    with _SELF_REPEAT_CUMULATIVE_LOCK:
+        _SELF_REPEAT_CUMULATIVE.clear()
+
+
 def _append_self_repeat_prescription(
     result: dict[str, Any], tool_name: str, count: int
 ) -> dict[str, Any]:
@@ -3536,8 +3650,30 @@ class ToolExecutor:
         # 供 stall 归因分流；不走 _f10_result_hooks——拒绝不是工具失败，
         # 不写共享签名池）。升级带（3 ≤ count < 拒绝阈值）照常执行，回执
         # 追加强处方——由各路径汇聚点的 _f10_result_hooks(repeat_count=…) 完成。
+        # 批29 N4：跨 run 累计拒绝 ≥ 击杀阈值 ⇒ 升级为击杀回执（带
+        # self_repeat_kill 标记，tool_loop 复用 doom-loop 击杀路径收口整个
+        # run）；已死组合（累计已过阈值）同参调用**即视即杀**，不必再等
+        # streak 攒到拒绝阈值——「等窗口衰减再原样重试」从此每 run 首撞即死。
+        _cumulative_before = _peek_self_repeat_cumulative(agent_id, name, tool_args)
         _repeat_count = _note_same_identity_call(agent_id, name, tool_args)
-        if self_repeat_action(_repeat_count) == "refuse":
+        if (
+            self_repeat_action(_repeat_count) == "refuse"
+            or _cumulative_before >= _self_repeat_cumulative_kill_threshold()
+        ):
+            _cumulative = _note_self_repeat_refusal(agent_id, name, tool_args)
+            if _cumulative >= _self_repeat_cumulative_kill_threshold():
+                log.warning(
+                    "self_repeat_cumulative_kill",
+                    agent_id=agent_id, tool=name, cumulative=_cumulative,
+                    threshold=_self_repeat_cumulative_kill_threshold(),
+                )
+                refusal = self._error(
+                    self_repeat_kill_prescription(name, _cumulative)
+                )
+                refusal["blocked"] = True
+                refusal["fact"] = "runner_failed"
+                refusal["self_repeat_kill"] = True
+                return refusal
             log.warning(
                 "self_repeat_refused",
                 agent_id=agent_id, tool=name, count=_repeat_count,
