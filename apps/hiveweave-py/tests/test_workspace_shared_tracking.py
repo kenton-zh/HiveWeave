@@ -216,7 +216,8 @@ async def test_conflicting_contracts_abort_with_markers(tmp_path: Path) -> None:
     gwt = GitWorktreeService()
     await gwt.ensure_git_repo(str(repo))
     shared = repo / ".hiveweave" / "shared"
-    shared.mkdir(parents=True)
+    # P2-2 起 ensure_git_repo 会幂等物化 .hiveweave/shared/，测试 setup 需容忍已存在
+    shared.mkdir(parents=True, exist_ok=True)
     (shared / "api.md").write_text("v1\n", encoding="utf-8")
     _git(repo, "add", ".hiveweave/shared/api.md")
     _git(repo, "commit", "-m", "base contract")
