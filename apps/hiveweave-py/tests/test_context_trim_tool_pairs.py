@@ -139,3 +139,89 @@ def test_trim_does_not_pin_leading_assistant_tool_calls():
     # Recent user wake should survive
     assert trimmed[-1]["role"] == "user"
     assert any(m.get("role") == "assistant" for m in trimmed)
+
+
+# ── 硬裁滞回（2026-11-03 施工单 §1）：裁到 0.85 保留线，留 10% 带 ──
+
+from hiveweave.conversation.token_utils import estimate_tokens_for_messages
+from hiveweave.llm.streamer.constants import (
+    CONTEXT_TRIM_RETAIN_RATIO,
+    CONTEXT_TRIM_TRIGGER_RATIO,
+)
+
+
+def _provider_big() -> ProviderConfig:
+    # usable = 64_000 - 8_000 - 20_000 = 36_000（> 8192 地板，滞回带可见）
+    return _provider(context_window=64_000, max_output=8_000)
+
+
+def _text_history(target_tokens: int) -> list[dict]:
+    """纯文本消息（无 tool 输出可 prune），细粒度自适应填充到 ~target。"""
+    messages = [{"role": "system", "content": "IDENTITY " + "i" * 200}]
+    filler = "w" * 1_000
+    while estimate_tokens_for_messages(messages) < target_tokens:
+        messages.append({"role": "assistant", "content": filler})
+        messages.append({"role": "user", "content": filler})
+    return messages
+
+
+def test_hard_trim_targets_retain_band():
+    """96% 触发硬裁 ⇒ 裁后 ≤ 0.85 保留线（而非贴着 0.95）。"""
+    usable = 36_000
+    trim_at = max(int(usable * CONTEXT_TRIM_TRIGGER_RATIO), 8_192)
+    retain_at = max(int(usable * CONTEXT_TRIM_RETAIN_RATIO), 8_192)
+
+    messages = _text_history(int(usable * 0.96))
+    total = estimate_tokens_for_messages(messages)
+    assert total > trim_at, f"sanity: {total} must exceed trigger {trim_at}"
+
+    trimmed = Streamer()._trim_context_if_needed(messages, _provider_big())
+    trimmed_tokens = estimate_tokens_for_messages(trimmed)
+
+    assert trimmed_tokens <= retain_at, (
+        f"hard trim must cut to retain band: {trimmed_tokens} > {retain_at}"
+    )
+    assert trimmed[0]["role"] == "system"
+
+
+def test_hysteresis_band_not_trimmed():
+    """retain(0.85) 与 trigger(0.95) 之间不裁——滞回带语义。"""
+    usable = 36_000
+    trim_at = max(int(usable * CONTEXT_TRIM_TRIGGER_RATIO), 8_192)
+    retain_at = max(int(usable * CONTEXT_TRIM_RETAIN_RATIO), 8_192)
+
+    messages = _text_history(int(usable * 0.92))
+    total = estimate_tokens_for_messages(messages)
+    assert retain_at < total <= trim_at, f"sanity: {total} in ({retain_at}, {trim_at}]"
+
+    trimmed = Streamer()._trim_context_if_needed(messages, _provider_big())
+
+    assert estimate_tokens_for_messages(trimmed) == total
+    assert len(trimmed) == len(messages)
+
+
+def test_hard_trim_keeps_tool_pairs_intact():
+    """滞回硬裁后 tool_calls/tool_result 对仍完整（TEXT18 不变量）。"""
+    usable = 36_000
+    retain_at = max(int(usable * CONTEXT_TRIM_RETAIN_RATIO), 8_192)
+    trim_at = max(int(usable * CONTEXT_TRIM_TRIGGER_RATIO), 8_192)
+
+    # 大块纯文本（不可 prune）+ tool 对交错：prune 掉 tool 体后文本仍超线，
+    # 强制走 _hard_trim_tail，且从 tail 前端整对裁剪。
+    history: list[dict] = []
+    for i in range(24):
+        history.append({"role": "assistant", "content": "log " + "L" * 6_000})
+        tid = f"call_{i:02d}"
+        history.append(_assistant_tools(tid))
+        history.append(_tool(tid, "X" * 4_000))
+    messages = [
+        {"role": "system", "content": "IDENTITY " + "i" * 200},
+        *history,
+        {"role": "user", "content": "## Messages\n" + "m" * 1_000},
+    ]
+    assert estimate_tokens_for_messages(messages) > trim_at
+
+    trimmed = Streamer()._trim_context_if_needed(messages, _provider_big())
+
+    assert estimate_tokens_for_messages(trimmed) <= retain_at
+    _assert_no_orphan_tool_calls(trimmed)

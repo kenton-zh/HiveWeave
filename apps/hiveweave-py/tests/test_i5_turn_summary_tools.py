@@ -95,13 +95,14 @@ def _provider(
     api_format: ApiFormat = ApiFormat.OPENAI_COMPATIBLE,
     **kw,
 ) -> ProviderConfig:
+    if "max_output_tokens" not in kw:
+        kw["max_output_tokens"] = 8_192
     return ProviderConfig(
         api_format=api_format,
         base_url="https://gw.example/v1",
         api_key="k",
         model_name="m",
         context_window=128_000,
-        max_output_tokens=8_192,
         **kw,
     )
 
@@ -235,6 +236,43 @@ async def test_working_set_head_without_tools_kwarg_unchanged():
         None, provider, "transcript", session_id=None, agent_id=None,
     )
     assert "tools" not in client.bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_working_set_head_max_tokens_uses_model_cap():
+    """施工单 §2（2026-11-03）：摘要输出帽与主压缩同源（模型输出上限）。
+
+    固定 8192 帽已删（pi 6fcb48670 / opencode #57564：reasoning 与输出
+    共享帽时固定帽把摘要顶死）。provider 用 max_output≠8192 才能区分
+    「同源缺省」与「旧 8192 常量回归」。
+    """
+    provider = _provider(max_output_tokens=32_000)
+    client = _CapturingClient()
+    _install_client(provider, client)
+
+    await ContextMixin._summarize_working_set_head(
+        None, provider, "transcript", session_id=None, agent_id=None,
+    )
+    body = client.bodies[0]
+    assert body["max_tokens"] == 32_000
+    assert body["max_tokens"] != 8_192, "旧固定帽回归"
+
+
+@pytest.mark.asyncio
+async def test_working_set_head_empty_content_falls_back_to_none():
+    """兜底不变：空/空白 content ⇒ None（调用方硬裁），不抛异常。"""
+    provider = _provider()
+    for payload in (
+        {"choices": [{"message": {"content": ""}}]},
+        {"choices": [{"message": {"content": "   "}}]},
+        {"choices": []},
+    ):
+        client = _CapturingClient(payload=payload)
+        _install_client(provider, client)
+        text = await ContextMixin._summarize_working_set_head(
+            None, provider, "transcript", session_id=None, agent_id=None,
+        )
+        assert text is None
 
 
 @pytest.mark.asyncio

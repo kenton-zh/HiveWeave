@@ -122,6 +122,13 @@ SAFETY_BUFFER_TOKENS = 20_000
 CONTEXT_TRIM_TRIGGER_RATIO = 0.95
 """输入预算占用达到该比例时才硬截断历史（保留 system 头 + 最近 turn）。"""
 
+CONTEXT_TRIM_RETAIN_RATIO = 0.85
+"""硬截断的目标保留线：裁到 usable × 此值，而非触发线 0.95。
+
+与触发线之间留 10% 滞回带——上下文持续贴近上限时不会连续轮次
+「涨一点→裁一点」每轮改写尾部前缀（opencode 历史改写滞回口径）。
+"""
+
 # DSH compaction-basic: pressure at 0.8 × window, retain tail 0.16 × window.
 # HiveWeave scales against *usable input* (window − thinking − safety buffer)
 # because 0.8 × 1M would 400 before we compact.
@@ -130,9 +137,6 @@ WORKING_SET_PRESSURE_RATIO = 0.8
 
 WORKING_SET_RETAIN_RATIO = 0.16
 """压力压缩后从尾按 token 保留的原文比例（滞回，避免每步都压）。"""
-
-WORKING_SET_SUMMARY_MAX_TOKENS = 8192
-"""步边界摘要输出帽（对齐 DSH compaction-basic maxTokens）。"""
 
 WORKING_SET_CHECKPOINT_MARKER = "[Working-set checkpoint]"
 """循环内摘要节点标记。不要用跨回合 SUMMARY_MARKER，以免写入 compacted_prefix。"""

@@ -18,6 +18,7 @@ from hiveweave.conversation.token_utils import (
 from hiveweave.llm.provider import ProviderConfig
 
 from .constants import (
+    CONTEXT_TRIM_RETAIN_RATIO,
     CONTEXT_TRIM_TRIGGER_RATIO,
     MID_ROUND_REMINDER_RATIO,
     OUTPUT_TOKEN_GLOBAL_CAP,
@@ -26,7 +27,6 @@ from .constants import (
     WORKING_SET_CHECKPOINT_MARKER,
     WORKING_SET_PRESSURE_RATIO,
     WORKING_SET_RETAIN_RATIO,
-    WORKING_SET_SUMMARY_MAX_TOKENS,
 )
 from .types import DeltaCallback
 
@@ -443,11 +443,15 @@ class ContextMixin:
         if total <= trim_at:
             return messages
 
+        # 硬裁目标 = 滞回保留线（0.85），不是触发线（0.95）：裁完留出
+        # 10% 带，避免持续贴近上限时连续轮次「涨一点→裁一点」改写尾部。
+        retain_at = max(int(usable * CONTEXT_TRIM_RETAIN_RATIO), 8_192)
         log.info(
             "context_overflow_compact",
             total=total,
             usable=usable,
             trim_at=trim_at,
+            retain_at=retain_at,
             ratio=CONTEXT_TRIM_TRIGGER_RATIO,
         )
         compacted = self._compact_overflow_messages(messages)
@@ -455,7 +459,7 @@ class ContextMixin:
         if compacted_total <= trim_at:
             return self._drop_orphan_tool_artifacts(compacted)
 
-        trimmed = self._hard_trim_tail(compacted, trim_at)
+        trimmed = self._hard_trim_tail(compacted, retain_at)
         log.info(
             "context_trimmed",
             original=len(messages),
@@ -609,7 +613,9 @@ class ContextMixin:
             messages=summary_messages,
             stream=False,
             temperature=0.3,
-            max_tokens=WORKING_SET_SUMMARY_MAX_TOKENS,
+            # max_tokens 不传 ⇒ build_body 缺省走 self.max_output_tokens
+            # （与主压缩同源；pi 6fcb48670 / opencode #57564：reasoning 与
+            # 输出共享帽时，固定 8192 帽会把摘要顶死）。
             # 批 10 / I5（2026-09-27）：`tools=None` ⇒ 请求级工具表与主链路
             # 不同 ⇒ 缓存域切换（报告 I5：turn_summary 13 条命中率 7.4%）。
             # 本请求与主链路同 session（build_headers 已对齐），补上同源
