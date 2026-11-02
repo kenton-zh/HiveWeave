@@ -163,7 +163,10 @@ PROJECT_DB_TABLES = [
         compacted_prefix TEXT,
         created_at INTEGER,
         updated_at INTEGER,
-        last_active_at INTEGER
+        last_active_at INTEGER,
+        -- crash-loop 守卫（施工单 2026-11-03 §4）：连续「LLM 请求在飞时
+        -- 进程死亡」计数；成功 run 清零，≥ HIVEWEAVE_CRASH_LOOP_MAX 停止自动续跑。
+        crash_streak INTEGER DEFAULT 0
     )
     """,
     """
@@ -589,6 +592,10 @@ PROJECT_DB_TABLES = [
         activation_id TEXT,
         status TEXT NOT NULL DEFAULT 'running',
         lease_expires_at INTEGER,
+        -- crash-loop 守卫（施工单 2026-11-03 §4）：主 run 的 LLM 请求链
+        -- 在飞标记（http_stream 进入前写、finally 清）。NULL = 无在飞；
+        -- 无 DEFAULT（老行 NULL 与「未标记」同形，启动 sweep 据此记账）。
+        inflight_request_started_at INTEGER,
         budget_llm_calls INTEGER DEFAULT 50,
         budget_tool_calls INTEGER DEFAULT 100,
         budget_elapsed_ms INTEGER DEFAULT 600000,
@@ -1067,6 +1074,10 @@ PROJECT_DB_TABLES = [
     """,
     """ALTER TABLE user_pings ADD COLUMN question_id TEXT""",
     """ALTER TABLE user_pings ADD COLUMN status TEXT""",
+    # crash-loop 守卫（施工单 2026-11-03 §4）：在飞标记 + 持久化崩溃连击。
+    # 老行 NULL / 0 安全（NULL = 无在飞、0 = 无崩溃史）。
+    """ALTER TABLE agent_runs ADD COLUMN inflight_request_started_at INTEGER""",
+    """ALTER TABLE agents ADD COLUMN crash_streak INTEGER DEFAULT 0""",
 ]
 
 # ── Per-project DB 建表自检（迁移顺序缺陷防护）────────────────
@@ -1112,6 +1123,11 @@ PROJECT_DB_COLUMN_CHECKS: dict[str, set[str]] = {
     # （旧自建路径的 7 列形状）ALTER 补列断裂时启动即崩，而不是让 ping 台账
     # 的 status 同步静默失败（INSERT 带列名，缺列 = 行写不进 = 台账退回死表）。
     "user_pings": {"question_id", "status"},
+    # crash-loop 守卫（施工单 2026-11-03 §4）：在飞标记列与连击列。登记进
+    # 启动自检 ⇒ 迁移断裂（ALTER 被吞/旧库没跑）启动即 fail-loud，而不是让
+    # 「在飞死亡」静默退化为不可记账（守卫整体失效）。
+    "agent_runs": {"inflight_request_started_at"},
+    "agents": {"crash_streak"},
 }
 
 # ── Meta DB 建表自检（I6，fixplan 批 11，2026-09-27）────────────

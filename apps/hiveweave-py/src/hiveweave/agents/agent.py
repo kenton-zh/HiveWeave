@@ -74,6 +74,7 @@ from hiveweave.services.meetings import hold as meeting_hold
 from hiveweave.services.approval import approval_service
 from hiveweave.services.charter import charter_service
 from hiveweave.services.chat_message import ChatMessageService
+from hiveweave.services.crash_loop import crash_loop_guard_enabled, crash_loop_max
 from hiveweave.services.inbox import InboxService
 from hiveweave.services.memory import MemoryService
 from hiveweave.services.model import ModelService, NoModelConfiguredError
@@ -618,6 +619,22 @@ class Agent:
         self._resume_suppressed: bool = False
         self._resume_suppressed_at: float = 0.0  # monotonic when latch armed
         self._RESUME_SUPPRESS_DECAY_S = 30 * 60  # 30 min auto-unlock
+        # crash-loop 守卫（施工单 2026-11-03 §4）：持久化崩溃连击（跨进程）。
+        # 进程内存的 _consecutive_errors 死亡即归零 ⇒ 由 agents.crash_streak
+        # 承接跨进程语义：启动 sweep 记账，成功 run 清零（run_ledger）。加载
+        # 时已达上限 ⇒ 武装上面的 give-up latch（30min 衰减；user/task wake
+        # 仍可穿透手动恢复 —— try_clear_resume_suppressed 契约不变）。
+        # ⚠ 必须在 latch 三个属性初始化之后（否则武装被覆写回 False）。
+        self._crash_streak = (
+            int(config.get("crash_streak") or 0)
+            if crash_loop_guard_enabled() else 0
+        )
+        if self._crash_streak >= crash_loop_max():
+            self._arm_resume_suppressed()
+            log.warning(
+                "crash_loop_resume_suppressed_on_boot",
+                agent_id=agent_id, crash_streak=self._crash_streak,
+            )
         # Ephemeral resume hint — injected once into next _build_messages, not history
         self._pending_resume_hint: str | None = None
         self.disposition: str = "runnable"  # waiting_human|blocked|complete|…
@@ -3730,7 +3747,18 @@ class Agent:
             prev_interrupted = await self._run_ledger.find_interrupted_run(self.id)
             if prev_interrupted:
                 interrupted_run_id = prev_interrupted["run_id"]
-                if await self._run_ledger.is_latest_run(self.id, interrupted_run_id):
+                # crash-loop 守卫（施工单 2026-11-03 §4）：崩溃连击达上限时
+                # 不注入恢复简报（避免把更老的 interrupted run 回捞成「继续」
+                # 的依据）；run_id 照实返回 —— create_activation 的取证位不受
+                # 影响（「唤醒时存在中断 run」仍是事实）。
+                if getattr(self, "_crash_streak", 0) >= crash_loop_max():
+                    log.info(
+                        "run_recovery_crash_loop_skip",
+                        agent_id=self.id,
+                        interrupted_run_id=interrupted_run_id,
+                        crash_streak=getattr(self, "_crash_streak", 0),
+                    )
+                elif await self._run_ledger.is_latest_run(self.id, interrupted_run_id):
                     interrupted_summary = await self._run_ledger.generate_checkpoint(
                         self.id, interrupted_run_id
                     )

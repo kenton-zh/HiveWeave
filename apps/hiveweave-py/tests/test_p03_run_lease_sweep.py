@@ -419,3 +419,252 @@ async def test_game_time_predicate_exempts_only_processing_current_run(
     assert live["status"] == "running", live
     stale = await _run_row(seeded_project, "p03-run-stale")
     assert stale["status"] == "interrupted", stale
+
+
+# ── crash-loop 守卫（施工单 2026-11-03 §4，跨进程崩溃连击）──────────────
+
+from hiveweave.services import crash_loop as cl_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolated_crash_loop(monkeypatch):
+    """升级队列隔离 + 阈值/开关钉死（防环境变量/跨文件串扰）。"""
+    cl_mod.reset_pending_escalations()
+    monkeypatch.setenv("HIVEWEAVE_CRASH_LOOP_MAX", "3")
+    # 守卫总开关必须钉回开 —— 开发机若 export 了 HIVEWEAVE_CRASH_LOOP_GUARD=0
+    #（文档逃生门），记账/门禁用例会在无产品 bug 的情况下假红（OCR low-2）。
+    monkeypatch.delenv("HIVEWEAVE_CRASH_LOOP_GUARD", raising=False)
+    yield
+    cl_mod.reset_pending_escalations()
+
+
+async def _mark_inflight(proj: _Project, run_id: str) -> None:
+    cur = await proj.conn.execute(
+        "UPDATE agent_runs SET inflight_request_started_at = ? WHERE id = ?",
+        [int(time.time() * 1000), run_id],
+    )
+    await cur.close()
+    await proj.conn.commit()
+
+
+async def _agent_row(proj: _Project, agent_id: str) -> dict:
+    cur = await proj.conn.execute(
+        "SELECT crash_streak FROM agents WHERE id = ?", [agent_id]
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return dict(row) if row else {}
+
+
+async def _run_row_by_id(proj: _Project, run_id: str) -> dict:
+    cur = await proj.conn.execute(
+        "SELECT status, error_reason, inflight_request_started_at "
+        "FROM agent_runs WHERE id = ?",
+        [run_id],
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return dict(row) if row else {}
+
+
+@pytest.mark.asyncio
+async def test_inflight_marker_lifecycle(seeded_project):
+    """mark/clear 成对生命周期：终态行不复活标记（status 守卫）。"""
+    from hiveweave.services.run_ledger import RunLedger
+
+    proj = seeded_project
+    await _seed_run(proj, "cl-run-1", AGENT_A)
+    rl = RunLedger()
+
+    await rl.mark_inflight(AGENT_A, "cl-run-1")
+    assert (await _run_row_by_id(proj, "cl-run-1"))["inflight_request_started_at"] is not None
+
+    await rl.clear_inflight(AGENT_A, "cl-run-1")
+    assert (await _run_row_by_id(proj, "cl-run-1"))["inflight_request_started_at"] is None
+
+    cur = await proj.conn.execute(
+        "UPDATE agent_runs SET status = 'failed' WHERE id = 'cl-run-1'"
+    )
+    await cur.close()
+    await proj.conn.commit()
+    await rl.mark_inflight(AGENT_A, "cl-run-1")
+    assert (await _run_row_by_id(proj, "cl-run-1"))["inflight_request_started_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_three_inflight_deaths_mark_failed_and_escalate_once(seeded_project):
+    """三次在飞死亡：streak 递增、第三次 failed+升级恰好一次、无标记不计数。"""
+    proj = seeded_project
+    for i in range(3):
+        await _seed_run(proj, f"cl-crash-{i}", AGENT_A, lease_expires_at=None)
+        await _mark_inflight(proj, f"cl-crash-{i}")
+        # 对照：同批无标记 run（普通重启形态）不计数
+        await _seed_run(proj, f"cl-clean-{i}", AGENT_B, lease_expires_at=None)
+        swept = await sweep_stale_agent_runs(proj.ws)
+        assert swept == 2
+        assert (await _agent_row(proj, AGENT_A))["crash_streak"] == i + 1
+        assert (await _agent_row(proj, AGENT_B))["crash_streak"] == 0
+
+    crashed = await _run_row_by_id(proj, "cl-crash-2")
+    assert crashed["status"] == "failed", crashed
+    assert (crashed["error_reason"] or "").startswith("crash_loop:")
+    assert crashed["inflight_request_started_at"] is None
+    for i in (0, 1):
+        assert (await _run_row_by_id(proj, f"cl-crash-{i}"))["status"] == "interrupted"
+
+    esc = cl_mod.pending_escalations()
+    assert len(esc) == 1
+    assert esc[0]["agent_id"] == AGENT_A
+    assert esc[0]["streak"] == 3
+
+
+@pytest.mark.asyncio
+async def test_fourth_death_after_max_no_new_escalation(seeded_project):
+    """达上限后第 4 次死亡：仍标 failed，但升级不重复（==MAX 才发一次）。"""
+    proj = seeded_project
+    for i in range(4):
+        await _seed_run(proj, f"cl-4-{i}", AGENT_A, lease_expires_at=None)
+        await _mark_inflight(proj, f"cl-4-{i}")
+        await sweep_stale_agent_runs(proj.ws)
+
+    assert len(cl_mod.pending_escalations()) == 1
+    assert (await _run_row_by_id(proj, "cl-4-3"))["status"] == "failed"
+    assert (await _agent_row(proj, AGENT_A))["crash_streak"] == 4
+
+
+@pytest.mark.asyncio
+async def test_runtime_lease_sweep_does_not_account(seeded_project):
+    """运行时租约收割（活进程 hung 流）不计崩溃、只清标记。"""
+    proj = seeded_project
+    await _seed_run(proj, "cl-hung", AGENT_A)  # lease 缺省已过期
+    await _mark_inflight(proj, "cl-hung")
+
+    swept = await sweep_expired_run_leases(proj.ws)
+    assert swept == 1
+    assert (await _agent_row(proj, AGENT_A))["crash_streak"] == 0
+    row = await _run_row_by_id(proj, "cl-hung")
+    assert row["status"] == "interrupted"
+    assert row["inflight_request_started_at"] is None
+    assert cl_mod.pending_escalations() == []
+
+
+@pytest.mark.asyncio
+async def test_off_duty_close_reason_not_accounted(seeded_project):
+    """非启动来路（off_duty_close）不记账 —— 同状态不同来路语义可分。"""
+    proj = seeded_project
+    await _seed_run(proj, "cl-duty", AGENT_A, lease_expires_at=None)
+    await _mark_inflight(proj, "cl-duty")
+
+    await sweep_stale_agent_runs(
+        proj.ws, close_reason="off_duty_close: agent off duty"
+    )
+    assert (await _agent_row(proj, AGENT_A))["crash_streak"] == 0
+    assert (await _run_row_by_id(proj, "cl-duty"))["status"] == "interrupted"
+    assert cl_mod.pending_escalations() == []
+
+
+@pytest.mark.asyncio
+async def test_complete_run_resets_crash_streak(seeded_project):
+    """成功 run 清零崩溃连击（唯一复位路径）。"""
+    from hiveweave.services.run_ledger import RunLedger
+
+    proj = seeded_project
+    await _seed_run(proj, "cl-done", AGENT_A)
+    cur = await proj.conn.execute(
+        "UPDATE agents SET crash_streak = 2 WHERE id = ?", [AGENT_A]
+    )
+    await cur.close()
+    await proj.conn.commit()
+
+    await RunLedger().complete_run(AGENT_A, "cl-done", "ok")
+    assert (await _agent_row(proj, AGENT_A))["crash_streak"] == 0
+
+
+@pytest.mark.asyncio
+async def test_escalation_flush_sends_to_superior(monkeypatch):
+    """升级队列 → 上级 urgent inbox + trigger，best-effort、只发一次。"""
+    from hiveweave.services.inbox import InboxService
+    from hiveweave.services.org import OrgService
+    import hiveweave.agents.trigger as trigger_mod
+
+    sent: list[dict] = []
+    triggered: list[str] = []
+
+    async def fake_send(self, **kw):
+        sent.append(kw)
+        return {"id": "msg-1", "should_wake": True}
+
+    async def fake_superior(self, agent_id):
+        return {"id": "sup-1"}
+
+    async def fake_trigger(agent_id, **kw):
+        triggered.append(agent_id)
+
+    monkeypatch.setattr(InboxService, "send_message", fake_send)
+    monkeypatch.setattr(OrgService, "get_superior", fake_superior)
+    monkeypatch.setattr(trigger_mod, "trigger_coordinator", fake_trigger)
+
+    cl_mod.queue_escalations([
+        {"agent_id": AGENT_A, "streak": 3, "run_id": "r1",
+         "workspace_path": "ws"},
+    ])
+    sent_n = await cl_mod.flush_pending_escalations()
+    assert sent_n == 1
+    assert sent[0]["to_agent_id"] == "sup-1"
+    assert sent[0]["message_type"] == "escalation"
+    assert sent[0]["priority"] == "urgent"
+    assert "ESCALATION" in (sent[0]["message"] or "")
+    assert triggered == ["sup-1"]
+    assert cl_mod.pending_escalations() == []
+
+
+def test_agent_boot_arms_latch_on_crash_streak():
+    """Agent 加载：crash_streak ≥ MAX ⇒ 武装 give-up latch；无崩溃不武装。"""
+    from hiveweave.agents.agent import Agent
+
+    hot = Agent(
+        agent_id="cl-hot", project_id="proj-x",
+        config={"name": "Hot", "role": "executor", "crash_streak": 3},
+    )
+    assert hot._crash_streak == 3
+    assert hot._resume_suppressed is True
+
+    cold = Agent(
+        agent_id="cl-cold", project_id="proj-x",
+        config={"name": "Cold", "role": "executor"},
+    )
+    assert cold._crash_streak == 0
+    assert cold._resume_suppressed is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_context_suppressed_at_crash_max():
+    """崩溃连击达上限 ⇒ 恢复简报不注入（run_id 仍返回作取证位）。"""
+    from hiveweave.agents.agent import Agent
+
+    agent = Agent(
+        agent_id="cl-rec", project_id="proj-x",
+        config={"name": "Rec", "role": "executor"},
+    )
+
+    class _RL:
+        async def find_interrupted_run(self, agent_id):
+            return {"run_id": "run-old"}
+
+        async def is_latest_run(self, agent_id, run_id):
+            return True
+
+        async def generate_checkpoint(self, agent_id, run_id):
+            return "SHOULD NOT BE USED"
+
+    agent._run_ledger = _RL()
+
+    agent._crash_streak = 3
+    run_id, summary = await agent._load_recovery_context()
+    assert run_id == "run-old"
+    assert summary is None
+
+    agent._crash_streak = 0
+    run_id, summary = await agent._load_recovery_context()
+    assert run_id == "run-old"
+    assert summary == "SHOULD NOT BE USED"

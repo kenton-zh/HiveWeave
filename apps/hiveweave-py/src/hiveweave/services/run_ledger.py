@@ -788,6 +788,49 @@ class RunLedger:
                 agent_id=agent_id, run_id=rid, error=str(e),
             )
 
+    async def mark_inflight(self, agent_id: str, run_id: str) -> None:
+        """crash-loop 守卫（施工单 2026-11-03 §4）：打「LLM 请求在飞」标记。
+
+        ``http_stream`` 在主 run 的请求链进入前调用；``finally`` 调
+        ``clear_inflight`` 成对清除 ⇒ 只有「进程死在请求中间」才留下标记。
+        ``status='running'`` 守卫：不复活已收口 run 的标记。best-effort
+        （失败 debug —— 标记缺失的代价只是少计一次，不阻断请求）。
+        """
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET inflight_request_started_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                [_now_ms(), rid],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "run_ledger.mark_inflight_failed",
+                agent_id=agent_id, run_id=rid, error=str(e),
+            )
+
+    async def clear_inflight(self, agent_id: str, run_id: str) -> None:
+        """清除在飞标记（请求链 finally 成对调用；无状态守卫 —— 终态行的
+        残留标记也一并擦净，防下次启动 sweep 误读）。best-effort。"""
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agent_runs SET inflight_request_started_at = NULL "
+                "WHERE id = ?",
+                [rid],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "run_ledger.clear_inflight_failed",
+                agent_id=agent_id, run_id=rid, error=str(e),
+            )
+
     async def increment_tool_calls(self, agent_id: str, run_id: str) -> None:
         """Increment the tool-call counter for a run (BUG-7)."""
         try:
@@ -903,6 +946,19 @@ class RunLedger:
         # 批20 修复3：run 已终态 ⇒ 步级立即收口（run UPDATE 成功才收，
         # 保持「run 终态 ⇒ 步收口」的单向蕴含）
         await self._finalize_orphan_steps(agent_id, run_id, "completed")
+        # crash-loop 守卫（施工单 2026-11-03 §4）：成功 run 清零崩溃连击
+        # （best-effort；interrupted/error 不清零 —— 只有成功才证明链路健康）。
+        try:
+            await project_db.execute(
+                agent_id,
+                "UPDATE agents SET crash_streak = 0 WHERE id = ?",
+                [agent_id],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug(
+                "run_ledger.crash_streak_reset_failed",
+                agent_id=agent_id, error=str(e),
+            )
 
     async def interrupt_run(
         self,
@@ -1244,10 +1300,36 @@ async def sweep_stale_agent_runs(
     if not workspace_path:
         return 0
     now = _now_ms()
+    # crash-loop 守卫（施工单 2026-11-03 §4）：仅启动路径记账（close_reason
+    # 以 startup_sweep 开头）；下班/activate 回收传的是自己的来路文案 ⇒ 自动
+    # False。守卫总开关关闭时不记账（http_stream 也不会打标记）。升级收集
+    # 出锁后入 crash_loop 队列 —— sweep 时刻 agent_router 尚未重建，服务层
+    # 路由不可靠，不能在锁内/此刻直接发（见 services/crash_loop.py 模块注释）。
+    from hiveweave.services.crash_loop import (
+        crash_loop_guard_enabled,
+        queue_escalations,
+    )
+
+    account = (
+        close_reason.startswith("startup_sweep") and crash_loop_guard_enabled()
+    )
+    escalations: list[dict] = []
     lock = await project_db.get_workspace_write_lock(workspace_path)
     async with lock:
-        return await _sweep_stale_agent_runs_locked(
-            workspace_path, now, close_reason)
+        swept = await _sweep_stale_agent_runs_locked(
+            workspace_path, now, close_reason,
+            account_crashes=account,
+            crash_escalations=escalations,
+        )
+    if escalations:
+        if crash_loop_guard_enabled():
+            queue_escalations(escalations)
+        else:
+            log.info(
+                "run_ledger.crash_loop_guard_disabled_drop",
+                workspace=str(workspace_path), count=len(escalations),
+            )
+    return swept
 
 
 # P0-3（2026-10-02）：运行时租约 sweep 的收口来路文案（落 agent_runs.error_reason）。
@@ -1535,14 +1617,22 @@ async def _sweep_expired_run_leases_locked(
 
 async def _sweep_stale_agent_runs_locked(
     workspace_path: str, now: int, reason: str,
+    *,
+    account_crashes: bool = False,
+    crash_escalations: list[dict] | None = None,
 ) -> int:
     """startup sweep 的锁内入口（P0-3 提取后成为公共核心的薄壳）。
 
     启动时进程内必然没有活 run（agent_manager 还是空的），所以无条件
     收尾全部 running 行 —— 判据收窄与注册表豁免只在运行时租约 sweep
-    （``sweep_expired_run_leases``）需要。
+    （``sweep_expired_run_leases``）需要。``account_crashes`` /
+    ``crash_escalations`` 透传公共核心（crash-loop 守卫记账，仅启动路径开）。
     """
-    return await _sweep_running_rows_locked(workspace_path, now, reason)
+    return await _sweep_running_rows_locked(
+        workspace_path, now, reason,
+        account_crashes=account_crashes,
+        crash_escalations=crash_escalations,
+    )
 
 
 async def _sweep_running_rows_locked(
@@ -1558,6 +1648,8 @@ async def _sweep_running_rows_locked(
     steps_fail_event: str = "startup_sweep_steps_failed",
     fail_event: str = "startup_sweep_failed",
     per_row_log_event: str | None = None,
+    account_crashes: bool = False,
+    crash_escalations: list[dict] | None = None,
 ) -> int:
     """P0-3 提取的 sweep 收尾核心 —— startup / 运行时租约 sweep 共用。
 
@@ -1578,6 +1670,17 @@ async def _sweep_running_rows_locked(
       ``per_row_log_event``：日志事件名（落日志时统一挂 ``run_ledger.``
       前缀）。``per_row_log_event`` 仅供运行时 sweep 逐行落 run_id /
       agent_id / 悬挂时长（启动 sweep 沿用聚合计数，行为不变）。
+    - ``account_crashes``（crash-loop 守卫，施工单 2026-11-03 §4）：True
+      时把「带 ``inflight_request_started_at`` 标记的 running 行」计为
+      「LLM 请求在飞时进程死亡」—— ``agents.crash_streak += 1``，streak
+      ≥ ``HIVEWEAVE_CRASH_LOOP_MAX`` ⇒ 该 run 覆盖标 ``failed``（不再被
+      ``find_interrupted_run`` 回捞），streak **恰好等于** MAX 时收集升级
+      记录到 *crash_escalations*（调用方出锁后经 ``crash_loop`` 队列发送
+      —— 升级要走服务层路由，锁内/路由未重建时不可发）。仅启动 sweep 开
+      （``close_reason`` 以 ``startup_sweep`` 开头自动判定）；运行时租约
+      sweep / 下班 / activate 回收一律 False（活进程的 hung 流不是进程
+      死亡）。无论记账与否，收口 UPDATE 一并清 ``inflight_request_started_at``
+      （标记已消费，防终态行残留被后续误读）。
     """
     extra_where = f" AND {run_filter}" if run_filter else ""
     base_where = f"status = 'running'{extra_where}"
@@ -1601,7 +1704,7 @@ async def _sweep_running_rows_locked(
         conn = await project_db.ensure_project_db(workspace_path)
         cursor = await conn.execute(
             "SELECT id, agent_id, actual_llm_calls, result_summary, "
-            "started_at, lease_expires_at "
+            "started_at, lease_expires_at, inflight_request_started_at "
             f"FROM agent_runs WHERE {base_where}",
             fparams,
         )
@@ -1649,6 +1752,7 @@ async def _sweep_running_rows_locked(
         cursor = await conn.execute(
             "UPDATE agent_runs SET status = 'interrupted', ended_at = ?, "
             "error_reason = ?, "
+            "inflight_request_started_at = NULL, "
             "result_summary = COALESCE(NULLIF(result_summary, ''), ?) "
             f"WHERE {base_where}",
             [now, reason, reason, *fparams],
@@ -1662,6 +1766,84 @@ async def _sweep_running_rows_locked(
         # （审计 P1-2 后本函数已全程持 workspace 写锁，此处 commit 是锁内
         # 事务的正常收口。）
         await conn.commit()
+        # ── crash-loop 记账（施工单 2026-11-03 §4，仍持 workspace 写锁）──
+        # 只看本 sweep 抓到的 running 行：带在飞标记 ⇒ 进程死在 LLM 请求
+        # 中间 ⇒ agents.crash_streak += 1。streak ≥ MAX ⇒ 覆盖标 failed
+        # （比 interrupted 强一档：find_interrupted_run 不再回捞）；恰好
+        # == MAX 时收集升级（出锁后经 crash_loop 队列统一发送 —— 升级要
+        # 走服务层路由，锁内/路由未重建时不可发）。无标记不计。
+        if account_crashes and rows:
+            from hiveweave.services.crash_loop import CRASH_LOOP_REASON_TEMPLATE, crash_loop_max
+
+            crash_max = crash_loop_max()
+            for r in rows:
+                if r["inflight_request_started_at"] is None:
+                    continue
+                crash_agent_id = r["agent_id"]
+                try:
+                    bump = await conn.execute(
+                        "UPDATE agents SET crash_streak = "
+                        "COALESCE(crash_streak, 0) + 1 WHERE id = ?",
+                        [crash_agent_id],
+                    )
+                    bumped = bump.rowcount
+                    await bump.close()
+                    if not bumped:
+                        continue  # agent 行不存在（异常库态）——跳过
+                    sel = await conn.execute(
+                        "SELECT crash_streak FROM agents WHERE id = ?",
+                        [crash_agent_id],
+                    )
+                    bump_row = await sel.fetchone()
+                    await sel.close()
+                    streak = int(bump_row["crash_streak"] or 0) if bump_row else 0
+                except Exception as e:
+                    log.warning(
+                        "run_ledger.crash_streak_bump_failed",
+                        workspace=str(workspace_path),
+                        agent_id=crash_agent_id, error=str(e),
+                    )
+                    continue
+                if streak >= crash_max:
+                    try:
+                        await conn.execute(
+                            "UPDATE agent_runs SET status = 'failed', "
+                            "error_reason = ? WHERE id = ?",
+                            [
+                                CRASH_LOOP_REASON_TEMPLATE.format(streak=streak),
+                                r["id"],
+                            ],
+                        )
+                    except Exception as e:
+                        # best-effort 兜底（OCR low-1）：failed 覆盖失败不许
+                        # 穿出 —— 否则剩余记账被跳过、锁外 queue_escalations
+                        # 执行不到（已收集升级静默丢失）。
+                        log.warning(
+                            "run_ledger.crash_failed_mark_failed",
+                            workspace=str(workspace_path),
+                            run_id=r["id"], error=str(e),
+                        )
+                if streak == crash_max and crash_escalations is not None:
+                    crash_escalations.append({
+                        "agent_id": crash_agent_id,
+                        "streak": streak,
+                        "run_id": r["id"],
+                        "workspace_path": str(workspace_path),
+                    })
+                log.info(
+                    "run_ledger.crash_death_accounted",
+                    workspace=str(workspace_path),
+                    agent_id=crash_agent_id,
+                    run_id=r["id"],
+                    crash_streak=streak,
+                )
+            try:
+                await conn.commit()
+            except Exception as e:
+                log.warning(
+                    "run_ledger.crash_account_commit_failed",
+                    workspace=str(workspace_path), error=str(e),
+                )
         # P0-3：运行时租约 sweep 逐行落悬挂明细（run_id / agent_id / 悬挂
         # 时长），风格随 run_ledger 现有 orphan/interrupted 平铺字段日志。
         # overdue_ms = 距 lease 到期多久；hung_ms = 该 running 行悬挂总时长

@@ -34,6 +34,7 @@ from hiveweave.llm.unknown_error_samples import (
     flush_unknown_samples,
     note_unknown_sample,
 )
+from hiveweave.services.crash_loop import crash_loop_guard_enabled
 
 from .constants import (
     ABORT_POLL_S,
@@ -632,6 +633,25 @@ class HttpStreamMixin:
             )
             return switched is not None
 
+        # ── crash-loop 守卫（施工单 2026-11-03 §4）────────────────────
+        # 主 run 的 LLM 请求链（含 with_retry 内全部重试/转移）进入前打
+        # 「在飞」标记，finally 清除 —— 只有「进程死在请求中间」才留下
+        # 标记，启动 sweep 据此计入 crash_streak（services/crash_loop.py）。
+        # 工具执行中 / 请求间隙的正常重启不计数。oneshot/compaction 无
+        # _run_id 跳过；best-effort（失败 debug，不阻断请求）。
+        _inflight_marked = False
+        if crash_loop_guard_enabled() and getattr(self, "_run_id", None):
+            try:
+                from hiveweave.services.run_ledger import RunLedger
+
+                await RunLedger().mark_inflight(agent_id, self._run_id)
+                _inflight_marked = True
+            except Exception as mark_err:  # noqa: BLE001 — best-effort
+                log.debug(
+                    "crash_loop_mark_inflight_failed",
+                    agent_id=agent_id, error=str(mark_err),
+                )
+
         try:
             result = await self._retry_handler.with_retry(
                 do_request,
@@ -799,6 +819,17 @@ class HttpStreamMixin:
                 # stream_idle_exhausted 耗尽码会在这里凭空消失。
                 "error_code": getattr(e, "error_code", None),
             }
+        finally:
+            if _inflight_marked:
+                try:
+                    from hiveweave.services.run_ledger import RunLedger
+
+                    await RunLedger().clear_inflight(agent_id, self._run_id)
+                except Exception as clear_err:  # noqa: BLE001 — best-effort
+                    log.debug(
+                        "crash_loop_clear_inflight_failed",
+                        agent_id=agent_id, error=str(clear_err),
+                    )
 
     # ── 实际流式 HTTP 请求（线程池 + 同步 httpx）────────────────
 

@@ -1044,6 +1044,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("agent_recovery_failed", error=str(e))
 
+    # 5c. crash-loop 守卫（施工单 2026-11-03 §4）：启动 sweep 期间收集的
+    # 升级此刻统一发送 —— sweep 先于 agent_router 重建（:987）与 agent
+    # 启动，服务层按 agent_id 路由当时不可靠，故经 crash_loop 队列延迟到此。
+    try:
+        from hiveweave.services.crash_loop import flush_pending_escalations
+
+        flushed = await flush_pending_escalations()
+        if flushed:
+            log.info("crash_loop_escalations_flushed", count=flushed)
+    except Exception as e:
+        log.warning("crash_loop_escalation_flush_failed", error=str(e))
+
     # 6. Start independent health supervisor (not dependent on game_time)
     try:
         from hiveweave.services.health_supervisor import health_supervisor

@@ -280,7 +280,7 @@ class AgentManager:
                 "permission_type as role_type, backstory, "
                 "model_id, goal, permission_mode, bound_skills, "
                 "allowed_tools, denied_tools, ask_tools, "
-                "short_id, status "
+                "short_id, status, crash_streak "
                 "FROM agents WHERE project_id = ? AND status = 'active'",
                 [project_id],
             )
