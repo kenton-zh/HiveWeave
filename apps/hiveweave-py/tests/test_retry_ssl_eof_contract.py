@@ -68,6 +68,31 @@ def test_ssl_error_exception_is_retryable():
 
 
 @pytest.mark.parametrize(
+    "exc",
+    [
+        BrokenPipeError(32, "Broken pipe"),
+        ConnectionResetError(104, "Connection reset by peer"),
+    ],
+    ids=["epipe", "econnreset"],
+)
+def test_broken_pipe_family_is_retryable(exc: Exception):
+    """写半截断管/对端重置为瞬态网络故障（opencode #56307 EPIPE 口径）。"""
+    assert should_retry_exception(exc) is True
+
+
+def test_httpx_write_error_is_retryable():
+    """httpx.WriteError（写侧传输错误）与 ReadError 同语义可重试。"""
+    import httpx
+
+    assert should_retry_exception(httpx.WriteError("write failed")) is True
+
+
+def test_permanent_error_still_not_retried():
+    """PermanentError 实例不因新增分支被误判可重试。"""
+    assert should_retry_exception(PermanentError("invalid api key")) is False
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "File not found: /tmp/eof.txt",

@@ -596,9 +596,14 @@ def should_retry_exception(exc: BaseException) -> bool:
 
     if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout,
                         httpx.WriteTimeout, httpx.PoolTimeout,
-                        httpx.RemoteProtocolError, httpx.ReadError)):
+                        httpx.RemoteProtocolError, httpx.ReadError,
+                        httpx.WriteError)):
         return True
     if isinstance(exc, ssl.SSLError):
+        return True
+    # 写半截断管（EPIPE）与对端重置同为瞬态网络故障（opencode #56307 将
+    # EPIPE 列为可重试；与 ConnectError/ReadError 同语义）
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
         return True
     # asyncio.TimeoutError 是 streamer 的 idle watchdog 抛出的
     if isinstance(exc, asyncio.TimeoutError):
