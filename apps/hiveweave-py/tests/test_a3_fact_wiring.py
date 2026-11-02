@@ -57,7 +57,8 @@ class _FakeProjectDb:
             "ended_at INTEGER, error_reason TEXT, result_summary TEXT, "
             "upstream_retry_attempt INTEGER, stall_reason TEXT, "
             "empty_stream INTEGER DEFAULT 0, cache_verdict TEXT, "
-            "cache_drifts TEXT, orphan_steps INTEGER DEFAULT 0)"
+            "cache_drifts TEXT, orphan_steps INTEGER DEFAULT 0, "
+            "inflight_request_started_at INTEGER)"
         )
         self.conn.execute(
             "CREATE TABLE agent_activations ("
@@ -190,7 +191,8 @@ class _FakeSweepConn:
             "id TEXT PRIMARY KEY, agent_id TEXT, status TEXT, started_at INTEGER, "
             "lease_expires_at INTEGER, "
             "ended_at INTEGER, error_reason TEXT, result_summary TEXT, "
-            "actual_llm_calls INTEGER DEFAULT 0)"
+            "actual_llm_calls INTEGER DEFAULT 0, "
+            "inflight_request_started_at INTEGER)"
         )
         self.conn.execute(
             "CREATE TABLE run_steps ("
